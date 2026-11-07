@@ -57,31 +57,36 @@ async fn handle_api_request(mut stream: TcpStream, monitor: Arc<ConnectionManage
     let method = parts[0];
     let path = parts[1];
 
-    let (status, body) = match (method, path) {
-        ("OPTIONS", _) => ("204 No Content", String::new()),
-        ("GET", "/api/health") => ("200 OK", r#"{"status":"ok","engine":"FlowX"}"#.to_string()),
+    let (status, content_type, body) = match (method, path) {
+        ("OPTIONS", _) => ("204 No Content", "text/plain", String::new()),
+        ("GET", "/") | ("GET", "/dashboard") => {
+            let html = include_str!("../../frontend/index.html");
+            ("200 OK", "text/html; charset=utf-8", html.to_string())
+        }
+        ("GET", "/api/health") => ("200 OK", "application/json; charset=utf-8", r#"{"status":"ok","engine":"FlowX"}"#.to_string()),
         ("GET", "/api/stats") => {
             let stats = monitor.global_stats();
             let json = serde_json_to_string(&stats);
-            ("200 OK", json)
+            ("200 OK", "application/json; charset=utf-8", json)
         }
         ("GET", "/api/connections") => {
             let list = monitor.list_snapshots();
             let json = serde_json_to_string(&list);
-            ("200 OK", json)
+            ("200 OK", "application/json; charset=utf-8", json)
         }
-        _ => ("404 Not Found", r#"{"error":"Not Found"}"#.to_string()),
+        _ => ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"Not Found"}"#.to_string()),
     };
 
     let response = format!(
         "HTTP/1.1 {}\r\n\
-        Content-Type: application/json; charset=utf-8\r\n\
+        Content-Type: {}\r\n\
         Access-Control-Allow-Origin: *\r\n\
         Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
         Access-Control-Allow-Headers: *\r\n\
         Content-Length: {}\r\n\
         Connection: close\r\n\r\n{}",
         status,
+        content_type,
         body.len(),
         body
     );

@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="zh-CN" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FlowX - 现代透明代理与分流控制台</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: rgba(22, 30, 46, 0.7);
+      --card-border: rgba(255, 255, 255, 0.08);
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --accent-primary: #38bdf8;
+      --accent-success: #10b981;
+      --accent-warning: #f59e0b;
+      --accent-danger: #ef4444;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      font-family: var(--font);
+    }
+
+    body {
+      background-color: var(--bg);
+      background-image: radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.08) 0px, transparent 50%),
+                        radial-gradient(at 100% 100%, rgba(99, 102, 241, 0.06) 0px, transparent 50%);
+      color: var(--text-main);
+      min-height: 100vh;
+      display: flex;
+    }
+
+    /* 侧边导航栏 */
+    aside {
+      width: 250px;
+      border-right: 1px solid var(--card-border);
+      background: rgba(15, 23, 42, 0.6);
+      backdrop-filter: blur(16px);
+      padding: 28px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding-left: 12px;
+    }
+
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, #38bdf8, #6366f1);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 14px rgba(56, 189, 248, 0.4);
+    }
+
+    .brand-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .brand-badge {
+      font-size: 10px;
+      padding: 2px 6px;
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent-primary);
+      border-radius: 4px;
+      font-weight: 600;
+      margin-left: 4px;
+    }
+
+    nav {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .nav-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.2s;
+      cursor: pointer;
+    }
+
+    .nav-item:hover, .nav-item.active {
+      background: rgba(255, 255, 255, 0.06);
+      color: var(--text-main);
+    }
+
+    .nav-item.active {
+      color: var(--accent-primary);
+      background: rgba(56, 189, 248, 0.1);
+      border-left: 3px solid var(--accent-primary);
+    }
+
+    /* 主内容区 */
+    main {
+      flex: 1;
+      padding: 32px 40px;
+      overflow-y: auto;
+      max-height: 100vh;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 28px;
+    }
+
+    .header-title h1 {
+      font-size: 24px;
+      font-weight: 700;
+    }
+
+    .header-title p {
+      font-size: 13px;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+
+    .status-badge {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: rgba(16, 185, 129, 0.12);
+      border: 1px solid rgba(16, 185, 129, 0.25);
+      color: var(--accent-success);
+      border-radius: 20px;
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-success);
+      box-shadow: 0 0 10px var(--accent-success);
+    }
+
+    /* 概览卡片 */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 18px;
+      margin-bottom: 28px;
+    }
+
+    .stat-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 20px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    }
+
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-muted);
+      font-weight: 500;
+    }
+
+    .stat-value {
+      font-size: 26px;
+      font-weight: 700;
+      margin-top: 8px;
+      letter-spacing: -0.5px;
+    }
+
+    .stat-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+
+    /* 表格组件 */
+    .section-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 14px;
+      padding: 24px;
+      backdrop-filter: blur(16px);
+      margin-bottom: 24px;
+    }
+
+    .section-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+
+    .section-header h2 {
+      font-size: 16px;
+      font-weight: 600;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    th {
+      text-align: left;
+      padding: 10px 14px;
+      color: var(--text-muted);
+      font-weight: 600;
+      border-bottom: 1px solid var(--card-border);
+    }
+
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      color: var(--text-main);
+    }
+
+    tr:hover td {
+      background: rgba(255, 255, 255, 0.02);
+    }
+
+    .tag {
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 600;
+      display: inline-block;
+    }
+
+    .tag-proxy {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent-primary);
+    }
+
+    .tag-direct {
+      background: rgba(148, 163, 184, 0.15);
+      color: var(--text-muted);
+    }
+
+    .tag-block {
+      background: rgba(239, 68, 68, 0.15);
+      color: var(--accent-danger);
+    }
+
+    .btn-action {
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-main);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-action:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: var(--accent-danger);
+    }
+
+    /* 规则列表 */
+    .rule-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid var(--card-border);
+      margin-bottom: 10px;
+    }
+
+    .rule-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .rule-title {
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .rule-details {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* 视图切换隐藏 */
+    .view-content {
+      display: none;
+    }
+    .view-content.active {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <!-- 侧边栏 -->
+  <aside>
+    <div class="brand">
+      <div class="brand-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+        </svg>
+      </div>
+      <div>
+        <span class="brand-title">FlowX</span>
+        <span class="brand-badge">PRO</span>
+      </div>
+    </div>
+
+    <nav>
+      <div class="nav-item active" onclick="switchTab('dashboard')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
+        实时概览
+      </div>
+      <div class="nav-item" onclick="switchTab('connections')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
+        活跃连接
+      </div>
+      <div class="nav-item" onclick="switchTab('proxies')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+        节点与链路
+      </div>
+      <div class="nav-item" onclick="switchTab('rules')">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
+        分流策略
+      </div>
+    </nav>
+  </aside>
+
+  <!-- 主体区域 -->
+  <main>
+    <header>
+      <div class="header-title">
+        <h1 id="view-title">系统实时仪表盘</h1>
+        <p>高性能 Rust 异步核心 · 零 GC 延迟 · Fake-IP 虚拟化防泄漏</p>
+      </div>
+      <div class="status-badge">
+        <div class="status-dot"></div>
+        <span>透明分流核心正常运转</span>
+      </div>
+    </header>
+
+    <!-- 1. 仪表盘视图 -->
+    <div id="tab-dashboard" class="view-content active">
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-label">实时下载速率</div>
+          <div class="stat-value" id="val-down-speed">0.0 KB/s</div>
+          <div class="stat-sub">当前瞬时下行带宽</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">实时上传速率</div>
+          <div class="stat-value" id="val-up-speed">0.0 KB/s</div>
+          <div class="stat-sub">当前瞬时上行带宽</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">活跃会话数</div>
+          <div class="stat-value" id="val-active-conns">0</div>
+          <div class="stat-sub">各进程并发 TCP 流</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">总吞吐流量</div>
+          <div class="stat-value" id="val-total-bytes">0.0 MB</div>
+          <div class="stat-sub">本次核心启动后累计</div>
+        </div>
+      </div>
+
+      <div class="section-card">
+        <div class="section-header">
+          <h2>最新活跃进程连接</h2>
+          <button class="btn-action" onclick="fetchData()">立即刷新</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>进程名 (PID)</th>
+              <th>目标主机 / 域名</th>
+              <th>命中策略</th>
+              <th>上行</th>
+              <th>下行</th>
+              <th>持续时间</th>
+            </tr>
+          </thead>
+          <tbody id="connections-tbody-preview">
+            <tr>
+              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">
+                正在侦听系统出站连接...
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 2. 连接列表视图 -->
+    <div id="tab-connections" class="view-content">
+      <div class="section-card">
+        <div class="section-header">
+          <h2>全量活动网络连接跟踪</h2>
+          <button class="btn-action" onclick="fetchData()">刷新列表</button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>进程</th>
+              <th>可执行文件绝对路径</th>
+              <th>目标地址 (含 Fake-IP 还原)</th>
+              <th>决策动作</th>
+              <th>已传输字节</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="connections-tbody-full">
+            <tr><td colspan="7" style="text-align: center;">暂无活动连接</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- 3. 节点与链路视图 -->
+    <div id="tab-proxies" class="view-content">
+      <div class="section-card">
+        <div class="section-header">
+          <h2>可用代理节点 (Proxy Nodes)</h2>
+          <button class="btn-action">＋ 添加节点</button>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;">
+          <div class="stat-card" style="border-left: 4px solid var(--accent-primary);">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <strong>Node-101 (主节点)</strong>
+              <span class="tag tag-proxy">SOCKS5</span>
+            </div>
+            <div style="margin-top: 10px; font-size: 13px; color: var(--text-muted);">
+              地址: 127.0.0.1:10808<br>
+              认证: 无密码
+            </div>
+            <div style="margin-top: 14px; display: flex; justify-content: space-between; align-items: center;">
+              <span style="font-size: 12px; color: var(--accent-success); font-weight: 600;">● 延迟 12ms</span>
+              <button class="btn-action">测速</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 4. 分流策略视图 -->
+    <div id="tab-rules" class="view-content">
+      <div class="section-card">
+        <div class="section-header">
+          <h2>分流规则引擎 (自顶向下匹配)</h2>
+          <button class="btn-action">＋ 新建规则</button>
+        </div>
+        <div id="rules-container">
+          <div class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-title">1. LocalBypass (本地回环直连)</span>
+              <span class="rule-details">目标: 127.0.0.1, localhost, %ComputerName%, 192.168.0.0/16</span>
+            </div>
+            <span class="tag tag-direct">Direct (直连)</span>
+          </div>
+          <div class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-title">2. DevProxy (开发进程代理)</span>
+              <span class="rule-details">进程: node.exe, *antigravity*.exe · 目标: 全部</span>
+            </div>
+            <span class="tag tag-proxy">Proxy (Node-101)</span>
+          </div>
+          <div class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-title">3. Default (默认兜底)</span>
+              <span class="rule-details">未被上述规则命中的所有连接</span>
+            </div>
+            <span class="tag tag-direct">Direct (直连)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    function switchTab(tabId) {
+      document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.view-content').forEach(el => el.classList.remove('active'));
+
+      event.currentTarget.classList.add('active');
+      document.getElementById('tab-' + tabId).classList.add('active');
+
+      const titles = {
+        dashboard: '系统实时仪表盘',
+        connections: '活动网络连接追踪',
+        proxies: '代理节点与链路编排',
+        rules: '分流策略规则库'
+      };
+      document.getElementById('view-title').innerText = titles[tabId];
+    }
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
+
+    function formatSpeed(bps) {
+      return formatBytes(bps) + '/s';
+    }
+
+    async function fetchData() {
+      try {
+        const statsRes = await fetch('http://127.0.0.1:40080/api/stats');
+        if (statsRes.ok) {
+          const stats = await statsRes.json();
+          document.getElementById('val-down-speed').innerText = formatSpeed(stats.current_download_bps || 0);
+          document.getElementById('val-up-speed').innerText = formatSpeed(stats.current_upload_bps || 0);
+          document.getElementById('val-active-conns').innerText = stats.active_connections_count || 0;
+          const total = (stats.total_uploaded_bytes || 0) + (stats.total_downloaded_bytes || 0);
+          document.getElementById('val-total-bytes').innerText = formatBytes(total);
+        }
+
+        const connsRes = await fetch('http://127.0.0.1:40080/api/connections');
+        if (connsRes.ok) {
+          const conns = await connsRes.json();
+          renderConnections(conns);
+        }
+      } catch (e) {
+        // 后台未开启时的模拟演示数据
+      }
+    }
+
+    function renderConnections(conns) {
+      const tbodyPreview = document.getElementById('connections-tbody-preview');
+      const tbodyFull = document.getElementById('connections-tbody-full');
+
+      if (!conns || conns.length === 0) {
+        tbodyPreview.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">暂无活动连接</td></tr>';
+        tbodyFull.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">暂无活动连接</td></tr>';
+        return;
+      }
+
+      let previewHtml = '';
+      let fullHtml = '';
+
+      conns.forEach(c => {
+        const tagClass = c.action.includes('Proxy') ? 'tag-proxy' : (c.action === 'Block' ? 'tag-block' : 'tag-direct');
+        previewHtml += `
+          <tr>
+            <td><strong>${c.process_name}</strong> <span style="color:var(--text-muted); font-size:11px;">#${c.pid}</span></td>
+            <td>${c.target}</td>
+            <td><span class="tag ${tagClass}">${c.action}</span></td>
+            <td>${formatSpeed(c.upload_speed_bps)}</td>
+            <td>${formatSpeed(c.download_speed_bps)}</td>
+            <td>${c.duration_secs}s</td>
+          </tr>
+        `;
+
+        fullHtml += `
+          <tr>
+            <td>#${c.id}</td>
+            <td><strong>${c.process_name}</strong></td>
+            <td style="color:var(--text-muted); font-size:11px;">${c.process_path}</td>
+            <td>${c.target}</td>
+            <td><span class="tag ${tagClass}">${c.action}</span></td>
+            <td>↑${formatBytes(c.uploaded_bytes)} / ↓${formatBytes(c.downloaded_bytes)}</td>
+            <td><button class="btn-action">断开</button></td>
+          </tr>
+        `;
+      });
+
+      tbodyPreview.innerHTML = previewHtml;
+      tbodyFull.innerHTML = fullHtml;
+    }
+
+    // 启动定时轮询
+    setInterval(fetchData, 1000);
+    fetchData();
+  </script>
+</body>
+</html>
