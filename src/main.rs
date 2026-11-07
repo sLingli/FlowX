@@ -1,6 +1,6 @@
 pub mod config;
 pub mod dns;
-pub mod proxy;
+pub mod outbound;
 pub mod router;
 
 use tracing::{info, Level};
