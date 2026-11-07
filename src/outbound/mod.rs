@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use anyhow::Result;
 use tokio::net::TcpStream;
 
+pub mod chain;
 pub mod direct;
 pub mod http;
 pub mod socks4;
