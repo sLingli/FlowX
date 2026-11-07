@@ -1,6 +1,7 @@
 pub mod config;
 pub mod dns;
 pub mod interceptor;
+pub mod monitor;
 pub mod outbound;
 pub mod router;
 
