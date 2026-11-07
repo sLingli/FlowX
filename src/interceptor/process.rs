@@ -35,11 +35,10 @@ impl ProcessTracker {
         // 1. 读锁查询端口短期缓存
         {
             let cache = self.port_cache.read().unwrap_or_else(|e| e.into_inner());
-            if let Some((info, expire)) = cache.get(&local_port) {
-                if *expire > now {
+            if let Some((info, expire)) = cache.get(&local_port)
+                && *expire > now {
                     return Some(info.clone());
                 }
-            }
         }
 
         // 2. 端口缓存未命中，调用 Windows API 查找本地端口归属的 PID
@@ -48,13 +47,12 @@ impl ProcessTracker {
         // 3. 查询 PID 级缓存以避免重复调用昂贵的 OpenProcess + QueryFullProcessImageNameW
         {
             let p_cache = self.pid_cache.read().unwrap_or_else(|e| e.into_inner());
-            if let Some((info, expire)) = p_cache.get(&pid) {
-                if *expire > now {
+            if let Some((info, expire)) = p_cache.get(&pid)
+                && *expire > now {
                     let mut port_guard = self.port_cache.write().unwrap_or_else(|e| e.into_inner());
                     port_guard.insert(local_port, (info.clone(), now + self.port_ttl));
                     return Some(info.clone());
                 }
-            }
         }
 
         // 4. PID 缓存未命中，调用 Windows API 查询可执行文件完整路径
@@ -95,6 +93,12 @@ impl ProcessTracker {
             let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
             pid_guard.retain(|_, (_, expire)| *expire > now);
         }
+    }
+}
+
+impl Default for ProcessTracker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

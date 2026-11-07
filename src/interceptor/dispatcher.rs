@@ -27,14 +27,14 @@ pub struct DispatcherConfig {
 }
 
 pub struct StreamDispatcher {
-    config: DispatcherConfig,
+    config: Arc<DispatcherConfig>,
     concurrency_limit: Arc<Semaphore>,
 }
 
 impl StreamDispatcher {
     pub fn new(config: DispatcherConfig) -> Self {
         Self {
-            config,
+            config: Arc::new(config),
             concurrency_limit: Arc::new(Semaphore::new(10000)), // 最大并发连接保护
         }
     }
@@ -79,27 +79,10 @@ impl StreamDispatcher {
                 }
             };
 
-            let tracker = Arc::clone(&self.config.tracker);
-            let pool = Arc::clone(&self.config.fake_ip_pool);
-            let rule_engine = Arc::clone(&self.config.rule_engine);
-            let monitor = Arc::clone(&self.config.monitor);
-            let proxy_nodes = Arc::clone(&self.config.proxy_nodes);
-            let proxy_chains = Arc::clone(&self.config.proxy_chains);
-
+            let config = Arc::clone(&self.config);
             tokio::spawn(async move {
                 let _permit = permit; // 离开作用域自动释放并发令牌
-                if let Err(e) = handle_connection(
-                    local_stream,
-                    peer_addr,
-                    tracker,
-                    pool,
-                    rule_engine,
-                    monitor,
-                    proxy_nodes,
-                    proxy_chains,
-                )
-                .await
-                {
+                if let Err(e) = handle_connection(local_stream, peer_addr, config).await {
                     warn!("[调度核心] 连接中继结束或异常: {}", e);
                 }
             });
@@ -123,15 +106,10 @@ impl Drop for ConnectionGuard {
 async fn handle_connection(
     local_stream: TcpStream,
     peer_addr: SocketAddr,
-    tracker: Arc<ProcessTracker>,
-    pool: Arc<FakeIpPool>,
-    rule_engine: Arc<RuleEngine>,
-    monitor: Arc<ConnectionManager>,
-    proxy_nodes: Arc<HashMap<u32, Socks5Client>>,
-    proxy_chains: Arc<HashMap<u32, ProxyChain>>,
+    config: Arc<DispatcherConfig>,
 ) -> Result<()> {
     // 1. 通过源端口逆向追踪调用方进程
-    let proc_info = tracker.find_by_addr(&peer_addr);
+    let proc_info = config.tracker.find_by_addr(&peer_addr);
     let proc_name = proc_info.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Unknown".to_string());
     let proc_path = proc_info.as_ref().map(|p| p.path.clone()).unwrap_or_else(|| "Unknown".to_string());
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
@@ -140,11 +118,10 @@ async fn handle_connection(
     let dest_addr = local_stream.local_addr()?;
     let mut restored_domain: Option<String> = None;
 
-    if let IpAddr::V4(v4) = dest_addr.ip() {
-        if pool.is_fake_ip(&v4) {
-            restored_domain = pool.restore(&v4);
+    if let IpAddr::V4(v4) = dest_addr.ip()
+        && config.fake_ip_pool.is_fake_ip(&v4) {
+            restored_domain = config.fake_ip_pool.restore(&v4);
         }
-    }
 
     let target = match &restored_domain {
         Some(domain) => TargetAddr::Domain(domain.clone(), dest_addr.port()),
@@ -160,7 +137,7 @@ async fn handle_connection(
         target_port: dest_addr.port(),
     };
 
-    let (action, rule_name) = rule_engine.evaluate(&ctx);
+    let (action, rule_name) = config.rule_engine.evaluate(&ctx);
 
     let action_str = match &action {
         Action::Direct => "Direct".to_string(),
@@ -180,7 +157,7 @@ async fn handle_connection(
     );
 
     // 4. 注册到连接监视器并使用 RAII 守卫
-    let active_conn = monitor.register(
+    let active_conn = config.monitor.register(
         proc_name,
         proc_path,
         pid,
@@ -191,7 +168,7 @@ async fn handle_connection(
 
     let _guard = ConnectionGuard {
         id: active_conn.id,
-        monitor: Arc::clone(&monitor),
+        monitor: Arc::clone(&config.monitor),
     };
 
     // 5. 根据执行动作分发并全双工对拷（带实时流量监视）
@@ -213,7 +190,7 @@ async fn handle_connection(
             Ok(())
         }
         Action::Proxy(node_id) => {
-            let client = match proxy_nodes.get(&node_id) {
+            let client = match config.proxy_nodes.get(&node_id) {
                 Some(c) => c,
                 None => bail!("规则指定了不存在的代理节点 ID: {}", node_id),
             };
@@ -230,7 +207,7 @@ async fn handle_connection(
             Ok(())
         }
         Action::Chain(chain_id) => {
-            let chain = match proxy_chains.get(&chain_id) {
+            let chain = match config.proxy_chains.get(&chain_id) {
                 Some(c) => c,
                 None => bail!("规则指定了不存在的代理链 ID: {}", chain_id),
             };

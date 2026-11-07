@@ -102,14 +102,15 @@ impl RuleEngine {
                         }
                     }
                 }
-                if !app_matched && ctx.process_path.is_some() {
-                    let path_normalized = ctx.process_path.unwrap().to_lowercase().replace('\\', "/");
-                    for pat in patterns {
-                        if pat.matches(&path_normalized) {
-                            app_matched = true;
-                            break;
+                if !app_matched
+                    && let Some(path) = ctx.process_path {
+                        let path_normalized = path.to_lowercase().replace('\\', "/");
+                        for pat in patterns {
+                            if pat.matches(&path_normalized) {
+                                app_matched = true;
+                                break;
+                            }
                         }
-                    }
                 }
                 if !app_matched {
                     continue;
@@ -134,18 +135,16 @@ impl RuleEngine {
                 let mut target_matched = false;
 
                 // 检查 IP/CIDR
-                if let Some(subnets) = &rule.target_subnets {
-                    if let Some(ip) = ctx.target_ip {
-                        if subnets.iter().any(|subnet| subnet.contains(&ip)) {
+                if let Some(subnets) = &rule.target_subnets
+                    && let Some(ip) = ctx.target_ip
+                        && subnets.iter().any(|subnet| subnet.contains(&ip)) {
                             target_matched = true;
                         }
-                    }
-                }
 
                 // 检查域名（已预编译，支持 apex 匹配与通配）
-                if !target_matched {
-                    if let Some(domains) = &rule.target_domains {
-                        if let Some(host) = ctx.target_host {
+                if !target_matched
+                    && let Some(domains) = &rule.target_domains
+                        && let Some(host) = ctx.target_host {
                             for matcher in domains {
                                 if matcher.matches(host) {
                                     target_matched = true;
@@ -153,8 +152,6 @@ impl RuleEngine {
                                 }
                             }
                         }
-                    }
-                }
 
                 if !target_matched {
                     continue;

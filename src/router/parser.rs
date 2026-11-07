@@ -149,11 +149,10 @@ pub fn parse_ports(raw: &str) -> Option<Vec<PortRange>> {
         }
 
         if let Some((start_s, end_s)) = trimmed.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start_s.trim().parse::<u16>(), end_s.trim().parse::<u16>()) {
-                if start <= end {
+            if let (Ok(start), Ok(end)) = (start_s.trim().parse::<u16>(), end_s.trim().parse::<u16>())
+                && start <= end {
                     ranges.push(PortRange { start, end });
                 }
-            }
         } else if let Ok(port) = trimmed.parse::<u16>() {
             ranges.push(PortRange { start: port, end: port });
         }

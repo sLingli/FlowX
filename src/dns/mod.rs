@@ -51,20 +51,18 @@ impl FakeIpPool {
         // 1. 读锁快速路径：若已存在且未过期直接复用
         {
             let state = self.inner.read().unwrap_or_else(|e| e.into_inner());
-            if let Some((ip, expire)) = state.domain_to_ip.get(&domain_lower) {
-                if *expire > now {
+            if let Some((ip, expire)) = state.domain_to_ip.get(&domain_lower)
+                && *expire > now {
                     return *ip;
                 }
-            }
         }
 
         // 2. 写锁分配新 IP，Double-Check 确保锁升级间隙未被并发线程抢占
         let mut state = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        if let Some((ip, expire)) = state.domain_to_ip.get(&domain_lower) {
-            if *expire > now {
+        if let Some((ip, expire)) = state.domain_to_ip.get(&domain_lower)
+            && *expire > now {
                 return *ip;
             }
-        }
 
         let raw_ip = state.current;
         if state.current >= self.max {
