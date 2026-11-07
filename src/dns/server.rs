@@ -1,0 +1,241 @@
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use anyhow::{bail, Result};
+use tokio::net::UdpSocket;
+use tracing::{debug, error, info, warn};
+use super::FakeIpPool;
+
+/// 极简、零外部依赖的 RFC 1035 DNS 报文解析与构造器
+#[derive(Debug, Clone)]
+pub struct DnsQuestion {
+    pub name: String,
+    pub qtype: u16,  // 1 = A, 28 = AAAA
+    pub qclass: u16, // 1 = IN
+    pub raw_len: usize,
+}
+
+pub struct DnsPacketParser;
+
+impl DnsPacketParser {
+    pub fn parse_question(buf: &[u8]) -> Result<(u16, DnsQuestion)> {
+        if buf.len() < 12 {
+            bail!("DNS 报文过短 (小于头部 12 字节)");
+        }
+
+        let tx_id = u16::from_be_bytes([buf[0], buf[1]]);
+        let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
+        if qdcount == 0 {
+            bail!("DNS 查询未包含任何 Question 条目");
+        }
+
+        let mut offset = 12;
+        let mut domain_parts = Vec::new();
+
+        while offset < buf.len() {
+            let len = buf[offset] as usize;
+            offset += 1;
+            if len == 0 {
+                break;
+            }
+            if offset + len > buf.len() {
+                bail!("DNS 报文域名标签长度超出范围");
+            }
+            let label = String::from_utf8_lossy(&buf[offset..offset + len]);
+            domain_parts.push(label.to_string());
+            offset += len;
+        }
+
+        if offset + 4 > buf.len() {
+            bail!("DNS Question 缺少 QTYPE 或 QCLASS 字段");
+        }
+
+        let qtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let qclass = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
+        let raw_len = offset + 4;
+
+        Ok((
+            tx_id,
+            DnsQuestion {
+                name: domain_parts.join("."),
+                qtype,
+                qclass,
+                raw_len,
+            },
+        ))
+    }
+
+    /// 构造 Fake-IP A 记录应答报文
+    pub fn build_a_response(tx_id: u16, original_query: &[u8], question_len: usize, ip: Ipv4Addr) -> Vec<u8> {
+        let mut resp = Vec::with_capacity(question_len + 16);
+
+        // 1. 事务 ID
+        resp.extend_from_slice(&tx_id.to_be_bytes());
+
+        // 2. 标志位: 0x8180 (标准响应, 递归可用, No error)
+        resp.extend_from_slice(&[0x81, 0x80]);
+
+        // 3. 计数: QDCOUNT=1, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+
+        // 4. 拷贝原始 Question 部分 (从 offset 12 到 question_len)
+        if question_len > 12 && question_len <= original_query.len() {
+            resp.extend_from_slice(&original_query[12..question_len]);
+        }
+
+        // 5. Answer 资源记录
+        // 名称指针: 0xc00c 指向原始 Question 的域名起始位置 (第 12 字节)
+        resp.extend_from_slice(&[0xc0, 0x0c]);
+        // TYPE: 0x0001 (A), CLASS: 0x0001 (IN)
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // TTL: 10 秒 (防止操作系统长久缓存导致规则切换不及时)
+        resp.extend_from_slice(&10u32.to_be_bytes());
+        // RDLENGTH: 4 bytes
+        resp.extend_from_slice(&4u16.to_be_bytes());
+        // RDATA: IPv4 4 字节
+        resp.extend_from_slice(&ip.octets());
+
+        resp
+    }
+
+    /// 构造空的 NOERROR 应答 (用于阻断 IPv6 AAAA 查询，防止 IPv6 泄露)
+    pub fn build_empty_response(tx_id: u16, original_query: &[u8], question_len: usize) -> Vec<u8> {
+        let mut resp = Vec::with_capacity(question_len);
+        resp.extend_from_slice(&tx_id.to_be_bytes());
+        resp.extend_from_slice(&[0x81, 0x80]);
+        // ANCOUNT=0
+        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        if question_len > 12 && question_len <= original_query.len() {
+            resp.extend_from_slice(&original_query[12..question_len]);
+        }
+        resp
+    }
+}
+
+/// 本地 DNS 拦截处理服务
+pub struct DnsServer {
+    pub bind_addr: SocketAddr,
+    pub pool: Arc<FakeIpPool>,
+    pub upstream_dns: SocketAddr,
+    pub block_ipv6: bool,
+}
+
+impl DnsServer {
+    pub fn new(
+        bind_addr: SocketAddr,
+        pool: Arc<FakeIpPool>,
+        upstream_dns: SocketAddr,
+        block_ipv6: bool,
+    ) -> Self {
+        Self {
+            bind_addr,
+            pool,
+            upstream_dns,
+            block_ipv6,
+        }
+    }
+
+    /// 启动异步 UDP DNS 监听循环
+    pub async fn run(&self) -> Result<()> {
+        let socket = UdpSocket::bind(self.bind_addr).await?;
+        info!("[DNS 引擎] 本地 DNS 劫持与防泄漏服务已在 {} 启动", self.bind_addr);
+
+        let mut buf = [0u8; 1500];
+        loop {
+            let (len, peer) = match socket.recv_from(&mut buf).await {
+                Ok(res) => res,
+                Err(e) => {
+                    error!("[DNS 引擎] 接收 UDP DNS 数据包失败: {}", e);
+                    continue;
+                }
+            };
+
+            let query_bytes = &buf[..len];
+            match DnsPacketParser::parse_question(query_bytes) {
+                Ok((tx_id, question)) => {
+                    debug!(
+                        "[DNS 查询] 来源: {}, 域名: {}, QType: {}",
+                        peer, question.name, question.qtype
+                    );
+
+                    // 1. 若为 AAAA (IPv6) 且开启了防泄露，直接返回空应答
+                    if question.qtype == 28 && self.block_ipv6 {
+                        let empty_resp = DnsPacketParser::build_empty_response(
+                            tx_id,
+                            query_bytes,
+                            question.raw_len,
+                        );
+                        let _ = socket.send_to(&empty_resp, peer).await;
+                        continue;
+                    }
+
+                    // 2. 若为 A (IPv4) 查询，分配 Fake-IP 并应答
+                    if question.qtype == 1 {
+                        let fake_ip = self.pool.allocate(&question.name);
+                        let resp = DnsPacketParser::build_a_response(
+                            tx_id,
+                            query_bytes,
+                            question.raw_len,
+                            fake_ip,
+                        );
+                        let _ = socket.send_to(&resp, peer).await;
+                        continue;
+                    }
+
+                    // 3. 其它类型查询转向上游 DNS 进行代理解析
+                    if let Ok(upstream_socket) = UdpSocket::bind("0.0.0.0:0").await {
+                        let _ = upstream_socket.send_to(query_bytes, self.upstream_dns).await;
+                        let mut upstream_buf = [0u8; 1500];
+                        if let Ok(Ok(n)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            upstream_socket.recv(&mut upstream_buf),
+                        )
+                        .await
+                        {
+                            let _ = socket.send_to(&upstream_buf[..n], peer).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[DNS 引擎] 解析 DNS 请求报文失败: {}", e);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_and_build_dns_response() {
+        // 一个对 "example.com" 的标准 A 记录查询
+        // 12 bytes header + 7 "example" + 3 "com" + 0 + QTYPE(1) + QCLASS(1)
+        let mut sample_query = Vec::new();
+        sample_query.extend_from_slice(&[0x12, 0x34]); // TX ID: 0x1234
+        sample_query.extend_from_slice(&[0x01, 0x00]); // Standard query
+        sample_query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QD=1
+        sample_query.extend_from_slice(&[7]);
+        sample_query.extend_from_slice(b"example");
+        sample_query.extend_from_slice(&[3]);
+        sample_query.extend_from_slice(b"com");
+        sample_query.push(0);
+        sample_query.extend_from_slice(&[0x00, 0x01]); // QTYPE: A (1)
+        sample_query.extend_from_slice(&[0x00, 0x01]); // QCLASS: IN (1)
+
+        let (tx_id, question) = DnsPacketParser::parse_question(&sample_query).unwrap();
+        assert_eq!(tx_id, 0x1234);
+        assert_eq!(question.name, "example.com");
+        assert_eq!(question.qtype, 1);
+
+        let fake_ip = Ipv4Addr::new(198, 18, 0, 10);
+        let resp = DnsPacketParser::build_a_response(tx_id, &sample_query, question.raw_len, fake_ip);
+
+        // 校验响应头
+        assert_eq!(resp[0..2], [0x12, 0x34]); // ID 对齐
+        assert_eq!(resp[2..4], [0x81, 0x80]); // QR = 1, RD = 1, RA = 1
+        assert_eq!(resp[6..8], [0x00, 0x01]); // ANCOUNT = 1
+        // 校验末尾注入的 IP
+        assert_eq!(&resp[resp.len() - 4..], &[198, 18, 0, 10]);
+    }
+}

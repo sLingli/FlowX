@@ -3,6 +3,8 @@ use std::net::Ipv4Addr;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+pub mod server;
+
 /// Fake-IP 线程安全分配池与双向映射表
 pub struct FakeIpPool {
     current: RwLock<u32>,
