@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::dns::FakeIpPool;
@@ -39,20 +39,34 @@ impl StreamDispatcher {
         }
     }
 
-    /// 启动本地透明连接调度监听服务
-    pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.config.bind_addr).await?;
+    /// 同步绑定 TCP 监听器（Fail-Fast 检查端口占用）
+    pub async fn bind(&self) -> Result<TcpListener> {
+        let listener = TcpListener::bind(self.config.bind_addr)
+            .await
+            .with_context(|| format!("绑定透明流调度端口失败 ({})", self.config.bind_addr))?;
         info!(
-            "[调度核心] FlowX 本地流调度服务已在 {} 启动待命",
+            "[调度核心] FlowX 本地流调度服务已在 {} 绑定待命",
             self.config.bind_addr
         );
+        Ok(listener)
+    }
 
+    /// 启动本地透明连接调度监听服务（支持优雅停机）
+    pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         loop {
-            let (local_stream, peer_addr) = match listener.accept().await {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("[调度核心] 接受新 TCP 连接失败: {}", e);
-                    continue;
+            let (local_stream, peer_addr) = tokio::select! {
+                res = listener.accept() => {
+                    match res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("[调度核心] 接受新 TCP 连接失败: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("[调度核心] 接收到退出信号，停止接受新流");
+                    break;
                 }
             };
 
@@ -90,6 +104,7 @@ impl StreamDispatcher {
                 }
             });
         }
+        Ok(())
     }
 }
 

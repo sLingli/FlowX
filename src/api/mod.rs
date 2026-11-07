@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tracing::{error, info};
 use crate::monitor::ConnectionManager;
 
@@ -19,16 +20,31 @@ impl ApiServer {
         Self { bind_addr, monitor }
     }
 
-    pub async fn run(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.bind_addr).await?;
-        info!("[API 接口] FlowX 状态与控制 HTTP API 服务已在 http://{} 启动", self.bind_addr);
+    /// 同步绑定 TCP 监听器（Fail-Fast 检查端口占用）
+    pub async fn bind(&self) -> Result<TcpListener> {
+        let listener = TcpListener::bind(self.bind_addr)
+            .await
+            .with_context(|| format!("绑定 HTTP API 服务端口失败 ({})", self.bind_addr))?;
+        info!("[API 接口] FlowX 状态与控制 HTTP API 服务已在 http://{} 绑定", self.bind_addr);
+        Ok(listener)
+    }
 
+    /// 启动异步 HTTP API 监听服务（支持优雅停机）
+    pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         loop {
-            let (stream, _) = match listener.accept().await {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("[API 接口] 接收 HTTP API 请求失败: {}", e);
-                    continue;
+            let (stream, _) = tokio::select! {
+                res = listener.accept() => {
+                    match res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("[API 接口] 接收 HTTP API 请求失败: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("[API 接口] 接收到退出信号，停止接收 API 请求");
+                    break;
                 }
             };
 
@@ -39,6 +55,7 @@ impl ApiServer {
                 }
             });
         }
+        Ok(())
     }
 }
 

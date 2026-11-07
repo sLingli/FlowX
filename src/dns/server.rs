@@ -2,6 +2,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 use super::FakeIpPool;
 
@@ -163,18 +164,32 @@ impl DnsServer {
         }
     }
 
-    /// 启动异步 UDP DNS 监听循环（非阻塞多任务分发）
-    pub async fn run(&self) -> Result<()> {
-        let socket = Arc::new(UdpSocket::bind(self.bind_addr).await?);
-        info!("[DNS 引擎] 本地 DNS 劫持与防泄漏服务已在 {} 启动", self.bind_addr);
+    /// 同步绑定套接字（Fail-Fast 检查端口占用）
+    pub async fn bind(&self) -> Result<Arc<UdpSocket>> {
+        let socket = UdpSocket::bind(self.bind_addr)
+            .await
+            .with_context(|| format!("绑定 DNS 服务套接字失败 ({})", self.bind_addr))?;
+        info!("[DNS 引擎] 本地 DNS 劫持与防泄漏服务已在 {} 绑定", self.bind_addr);
+        Ok(Arc::new(socket))
+    }
 
+    /// 启动异步 UDP DNS 监听循环（支持优雅停机与多任务并发）
+    pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut buf = [0u8; 1500];
         loop {
-            let (len, peer) = match socket.recv_from(&mut buf).await {
-                Ok(res) => res,
-                Err(e) => {
-                    error!("[DNS 引擎] 接收 UDP DNS 数据包失败: {}", e);
-                    continue;
+            let (len, peer) = tokio::select! {
+                res = socket.recv_from(&mut buf) => {
+                    match res {
+                        Ok(r) => r,
+                        Err(e) => {
+                            error!("[DNS 引擎] 接收 UDP DNS 数据包失败: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("[DNS 引擎] 接收到退出信号，安全停止 DNS 监听");
+                    break;
                 }
             };
 
@@ -236,6 +251,7 @@ impl DnsServer {
                 }
             });
         }
+        Ok(())
     }
 }
 
@@ -245,7 +261,6 @@ mod tests {
 
     #[test]
     fn test_parse_and_build_dns_response() {
-        // 一个对 "example.com" 的标准 A 记录查询 (QR=0, Opcode=0)
         let mut sample_query = Vec::new();
         sample_query.extend_from_slice(&[0x12, 0x34]); // TX ID: 0x1234
         sample_query.extend_from_slice(&[0x01, 0x00]); // Standard query (RD=1, QR=0, Opcode=0)
@@ -267,23 +282,20 @@ mod tests {
         let resp = DnsPacketParser::build_a_response(tx_id, &sample_query, question.raw_len, fake_ip);
 
         // 校验响应头
-        assert_eq!(resp[0..2], [0x12, 0x34]); // ID 对齐
-        assert_eq!(resp[2..4], [0x81, 0x80]); // QR = 1, RD = 1, RA = 1
-        assert_eq!(resp[6..8], [0x00, 0x01]); // ANCOUNT = 1
-        // 校验末尾注入的 IP
+        assert_eq!(resp[0..2], [0x12, 0x34]);
+        assert_eq!(resp[2..4], [0x81, 0x80]);
+        assert_eq!(resp[6..8], [0x00, 0x01]);
         assert_eq!(&resp[resp.len() - 4..], &[198, 18, 0, 10]);
     }
 
     #[test]
     fn test_parse_dns_rejection() {
-        // 1. QR != 0 (响应报文误当查询)
         let mut query = vec![0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         query.extend_from_slice(&[3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
         assert!(DnsPacketParser::parse_question(&query).is_err());
 
-        // 2. 超长标签 (> 63 字节)
         let mut query_long = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        query_long.push(64); // > 63
+        query_long.push(64);
         query_long.extend_from_slice(&[b'a'; 64]);
         query_long.push(0);
         query_long.extend_from_slice(&[0, 1, 0, 1]);
