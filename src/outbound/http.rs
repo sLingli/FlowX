@@ -1,7 +1,10 @@
+use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use super::TargetAddr;
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct HttpConnectClient {
@@ -23,18 +26,34 @@ impl HttpConnectClient {
     }
 
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
-        let stream = TcpStream::connect(&self.proxy_addr)
-            .await
-            .with_context(|| format!("连接 HTTP 代理节点失败: {}", self.proxy_addr))?;
+        tokio::time::timeout(DEFAULT_TIMEOUT, async {
+            let stream = TcpStream::connect(&self.proxy_addr)
+                .await
+                .with_context(|| format!("连接 HTTP 代理节点失败: {}", self.proxy_addr))?;
 
-        self.handshake(stream, target).await
+            self.handshake(stream, target).await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("连接 HTTP 代理超时 ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
     }
 
     /// 在一个已存在的 TCP 流上发起 HTTP CONNECT 隧道握手
     pub async fn handshake(&self, mut stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
+        tokio::time::timeout(DEFAULT_TIMEOUT, self.handshake_internal(&mut stream, target))
+            .await
+            .map_err(|_| anyhow::anyhow!("HTTP CONNECT 握手超时 ({:?})", DEFAULT_TIMEOUT))??;
+        Ok(stream)
+    }
+
+    async fn handshake_internal(&self, stream: &mut TcpStream, target: &TargetAddr) -> Result<()> {
         let target_authority = match target {
             TargetAddr::Ip(addr) => addr.to_string(),
-            TargetAddr::Domain(host, port) => format!("{}:{}", host, port),
+            TargetAddr::Domain(host, port) => {
+                if host.contains('\r') || host.contains('\n') || host.contains(' ') {
+                    bail!("HTTP 目标域名包含非法控制字符: {:?}", host);
+                }
+                format!("{}:{}", host, port)
+            }
         };
 
         let mut req = format!(
@@ -43,6 +62,9 @@ impl HttpConnectClient {
         );
 
         if let Some((user, pass)) = &self.auth {
+            if user.contains('\r') || user.contains('\n') || pass.contains('\r') || pass.contains('\n') {
+                bail!("HTTP 代理认证信息包含非法控制字符");
+            }
             let encoded = base64_encode(format!("{}:{}", user, pass).as_bytes());
             req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
         }
@@ -79,19 +101,20 @@ impl HttpConnectClient {
             format!("无法解析 HTTP 代理响应状态码: {}", parts[1])
         })?;
 
-        if status_code != 200 {
+        // 遵循 RFC 7231: 允许所有 2xx 成功状态码
+        if !(200..=299).contains(&status_code) {
             let reason = match status_code {
                 407 => "代理需要认证或认证信息错误 (Proxy Authentication Required)",
                 403 => "代理拒绝访问目标地址 (Forbidden)",
                 502 => "网关错误/无法连接目标 (Bad Gateway)",
                 503 => "代理服务不可用 (Service Unavailable)",
                 504 => "连接上游目标超时 (Gateway Timeout)",
-                _ => "非 200 响应",
+                _ => "非 2xx 响应",
             };
             bail!("HTTP CONNECT 隧道建立失败 [{}]: {}", status_code, reason);
         }
 
-        Ok(stream)
+        Ok(())
     }
 }
 
