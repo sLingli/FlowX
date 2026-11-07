@@ -12,15 +12,19 @@ pub struct ProcessInfo {
 }
 
 pub struct ProcessTracker {
-    cache: RwLock<HashMap<u16, (ProcessInfo, Instant)>>,
-    cache_ttl: Duration,
+    port_cache: RwLock<HashMap<u16, (ProcessInfo, Instant)>>,
+    pid_cache: RwLock<HashMap<u32, (ProcessInfo, Instant)>>,
+    port_ttl: Duration,
+    pid_ttl: Duration,
 }
 
 impl ProcessTracker {
     pub fn new() -> Self {
         Self {
-            cache: RwLock::new(HashMap::new()),
-            cache_ttl: Duration::from_millis(500), // 500ms 缓存避免高频扫描
+            port_cache: RwLock::new(HashMap::new()),
+            pid_cache: RwLock::new(HashMap::new()),
+            port_ttl: Duration::from_millis(1000), // 端口映射缓存 1 秒
+            pid_ttl: Duration::from_secs(10),      // 进程路径缓存 10 秒
         }
     }
 
@@ -28,9 +32,9 @@ impl ProcessTracker {
     pub fn find_by_local_port(&self, local_port: u16) -> Option<ProcessInfo> {
         let now = Instant::now();
 
-        // 1. 读锁查询缓存
+        // 1. 读锁查询端口短期缓存
         {
-            let cache = self.cache.read().unwrap();
+            let cache = self.port_cache.read().unwrap_or_else(|e| e.into_inner());
             if let Some((info, expire)) = cache.get(&local_port) {
                 if *expire > now {
                     return Some(info.clone());
@@ -38,8 +42,22 @@ impl ProcessTracker {
             }
         }
 
-        // 2. 缓存未命中，调用 Windows API 遍历 TCP 连接所有者表
+        // 2. 端口缓存未命中，调用 Windows API 查找本地端口归属的 PID
         let pid = get_pid_by_local_port(local_port)?;
+
+        // 3. 查询 PID 级缓存以避免重复调用昂贵的 OpenProcess + QueryFullProcessImageNameW
+        {
+            let p_cache = self.pid_cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((info, expire)) = p_cache.get(&pid) {
+                if *expire > now {
+                    let mut port_guard = self.port_cache.write().unwrap_or_else(|e| e.into_inner());
+                    port_guard.insert(local_port, (info.clone(), now + self.port_ttl));
+                    return Some(info.clone());
+                }
+            }
+        }
+
+        // 4. PID 缓存未命中，调用 Windows API 查询可执行文件完整路径
         let path = get_process_image_path(pid).unwrap_or_else(|| "Unknown".to_string());
         let name = Path::new(&path)
             .file_name()
@@ -49,15 +67,34 @@ impl ProcessTracker {
 
         let info = ProcessInfo { pid, path, name };
 
-        // 3. 写入缓存
-        let mut cache = self.cache.write().unwrap();
-        cache.insert(local_port, (info.clone(), now + self.cache_ttl));
+        // 5. 写入二级缓存
+        {
+            let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
+            pid_guard.insert(pid, (info.clone(), now + self.pid_ttl));
+        }
+        {
+            let mut port_guard = self.port_cache.write().unwrap_or_else(|e| e.into_inner());
+            port_guard.insert(local_port, (info.clone(), now + self.port_ttl));
+        }
 
         Some(info)
     }
 
     pub fn find_by_addr(&self, addr: &SocketAddr) -> Option<ProcessInfo> {
         self.find_by_local_port(addr.port())
+    }
+
+    /// 清理过期的端口与 PID 缓存项
+    pub fn cleanup_expired(&self) {
+        let now = Instant::now();
+        {
+            let mut port_guard = self.port_cache.write().unwrap_or_else(|e| e.into_inner());
+            port_guard.retain(|_, (_, expire)| *expire > now);
+        }
+        {
+            let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
+            pid_guard.retain(|_, (_, expire)| *expire > now);
+        }
     }
 }
 
@@ -69,46 +106,50 @@ fn get_pid_by_local_port(target_port: u16) -> Option<u32> {
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
     unsafe {
-        let mut size = 0u32;
-        // 第一次调用获取所需内存缓冲区大小
-        let _ = GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
+        // 重试最多 3 次，处理高并发下表大小动态增长的问题 (ERROR_INSUFFICIENT_BUFFER)
+        for _ in 0..3 {
+            let mut size = 0u32;
+            let _ = GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
 
-        if size == 0 {
-            return None;
-        }
-
-        let mut buffer: Vec<u8> = vec![0; size as usize];
-        let ret = GetExtendedTcpTable(
-            buffer.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-
-        if ret != 0 {
-            return None;
-        }
-
-        let table = &*(buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
-        let entries_count = table.dwNumEntries as usize;
-        let rows_ptr = table.table.as_ptr();
-
-        for i in 0..entries_count {
-            let row = &*rows_ptr.add(i);
-            // 本地端口保存在网络字节序中
-            let port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
-            if port == target_port {
-                return Some(row.dwOwningPid);
+            if size == 0 {
+                return None;
             }
+
+            // 预留少量余量，防止两次调用间隙新增连接
+            let mut buffer: Vec<u8> = vec![0; (size as usize) + 512];
+            let ret = GetExtendedTcpTable(
+                buffer.as_mut_ptr() as *mut _,
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+
+            if ret != 0 {
+                continue; // 缓冲区变化，重试
+            }
+
+            let table = &*(buffer.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+            let entries_count = table.dwNumEntries as usize;
+            let rows_ptr = table.table.as_ptr();
+
+            for i in 0..entries_count {
+                let row = &*rows_ptr.add(i);
+                // 本地端口保存在网络字节序中
+                let port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+                if port == target_port {
+                    return Some(row.dwOwningPid);
+                }
+            }
+            return None;
         }
     }
 
@@ -164,7 +205,8 @@ mod tests {
     #[test]
     fn test_process_tracker_cache() {
         let tracker = ProcessTracker::new();
-        // 验证结构体正常初始化
+        // 验证结构体正常初始化与查询
         assert!(tracker.find_by_local_port(0).is_none() || tracker.find_by_local_port(0).is_some());
+        tracker.cleanup_expired();
     }
 }

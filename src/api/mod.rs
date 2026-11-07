@@ -1,10 +1,13 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 use crate::monitor::ConnectionManager;
+
+const API_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ApiServer {
     pub bind_addr: SocketAddr,
@@ -31,8 +34,8 @@ impl ApiServer {
 
             let monitor = Arc::clone(&self.monitor);
             tokio::spawn(async move {
-                if let Err(e) = handle_api_request(stream, monitor).await {
-                    error!("[API 接口] 处理请求异常: {}", e);
+                if let Err(e) = tokio::time::timeout(API_TIMEOUT, handle_api_request(stream, monitor)).await {
+                    error!("[API 接口] 处理请求超时或异常: {}", e);
                 }
             });
         }
@@ -79,12 +82,14 @@ async fn handle_api_request(mut stream: TcpStream, monitor: Arc<ConnectionManage
 
     let response = format!(
         "HTTP/1.1 {}\r\n\
-        Content-Type: {}\r\n\
-        Access-Control-Allow-Origin: *\r\n\
-        Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-        Access-Control-Allow-Headers: *\r\n\
-        Content-Length: {}\r\n\
-        Connection: close\r\n\r\n{}",
+Content-Type: {}\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+Access-Control-Allow-Headers: *\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\
+\r\n\
+{}",
         status,
         content_type,
         body.len(),

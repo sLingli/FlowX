@@ -32,6 +32,8 @@ pub struct ActiveConnection {
     pub downloaded_bytes: AtomicU64,
     last_up: AtomicU64,
     last_down: AtomicU64,
+    current_up_speed: AtomicU64,
+    current_down_speed: AtomicU64,
     last_tick: RwLock<Instant>,
 }
 
@@ -49,17 +51,18 @@ impl ActiveConnection {
         let up = self.uploaded_bytes.load(Ordering::Relaxed);
         let down = self.downloaded_bytes.load(Ordering::Relaxed);
 
-        let mut tick_guard = self.last_tick.write().unwrap();
+        let mut tick_guard = self.last_tick.write().unwrap_or_else(|e| e.into_inner());
         let elapsed = now.duration_since(*tick_guard).as_secs_f64();
 
-        let mut up_speed = 0;
-        let mut down_speed = 0;
-
+        // 仅当时间步长达到 0.5s 时更新速率缓存，避免高频并发轮询将速率重置为 0
         if elapsed >= 0.5 {
             let last_up = self.last_up.swap(up, Ordering::Relaxed);
             let last_down = self.last_down.swap(down, Ordering::Relaxed);
-            up_speed = ((up.saturating_sub(last_up) as f64) / elapsed) as u64;
-            down_speed = ((down.saturating_sub(last_down) as f64) / elapsed) as u64;
+            let up_speed = ((up.saturating_sub(last_up) as f64) / elapsed) as u64;
+            let down_speed = ((down.saturating_sub(last_down) as f64) / elapsed) as u64;
+
+            self.current_up_speed.store(up_speed, Ordering::Relaxed);
+            self.current_down_speed.store(down_speed, Ordering::Relaxed);
             *tick_guard = now;
         }
 
@@ -74,8 +77,8 @@ impl ActiveConnection {
             duration_secs: now.duration_since(self.start_time).as_secs(),
             uploaded_bytes: up,
             downloaded_bytes: down,
-            upload_speed_bps: up_speed,
-            download_speed_bps: down_speed,
+            upload_speed_bps: self.current_up_speed.load(Ordering::Relaxed),
+            download_speed_bps: self.current_down_speed.load(Ordering::Relaxed),
         }
     }
 }
@@ -84,10 +87,12 @@ impl ActiveConnection {
 pub struct ConnectionManager {
     next_id: AtomicU64,
     connections: RwLock<std::collections::HashMap<u64, Arc<ActiveConnection>>>,
-    total_uploaded: AtomicU64,
-    total_downloaded: AtomicU64,
+    closed_uploaded: AtomicU64,
+    closed_downloaded: AtomicU64,
     last_total_up: AtomicU64,
     last_total_down: AtomicU64,
+    current_up_speed: AtomicU64,
+    current_down_speed: AtomicU64,
     last_tick: RwLock<Instant>,
 }
 
@@ -105,10 +110,12 @@ impl ConnectionManager {
         Self {
             next_id: AtomicU64::new(1),
             connections: RwLock::new(std::collections::HashMap::new()),
-            total_uploaded: AtomicU64::new(0),
-            total_downloaded: AtomicU64::new(0),
+            closed_uploaded: AtomicU64::new(0),
+            closed_downloaded: AtomicU64::new(0),
             last_total_up: AtomicU64::new(0),
             last_total_down: AtomicU64::new(0),
+            current_up_speed: AtomicU64::new(0),
+            current_down_speed: AtomicU64::new(0),
             last_tick: RwLock::new(Instant::now()),
         }
     }
@@ -138,52 +145,75 @@ impl ConnectionManager {
             downloaded_bytes: AtomicU64::new(0),
             last_up: AtomicU64::new(0),
             last_down: AtomicU64::new(0),
+            current_up_speed: AtomicU64::new(0),
+            current_down_speed: AtomicU64::new(0),
             last_tick: RwLock::new(now),
         });
 
-        self.connections.write().unwrap().insert(id, Arc::clone(&conn));
+        self.connections
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, Arc::clone(&conn));
         conn
     }
 
     pub fn unregister(&self, id: u64) {
-        if let Some(conn) = self.connections.write().unwrap().remove(&id) {
+        if let Some(conn) = self
+            .connections
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+        {
             let up = conn.uploaded_bytes.load(Ordering::Relaxed);
             let down = conn.downloaded_bytes.load(Ordering::Relaxed);
-            self.total_uploaded.fetch_add(up, Ordering::Relaxed);
-            self.total_downloaded.fetch_add(down, Ordering::Relaxed);
+            self.closed_uploaded.fetch_add(up, Ordering::Relaxed);
+            self.closed_downloaded.fetch_add(down, Ordering::Relaxed);
         }
     }
 
     pub fn list_snapshots(&self) -> Vec<ConnectionSnapshot> {
-        let conns = self.connections.read().unwrap();
+        let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
         conns.values().map(|c| c.snapshot()).collect()
     }
 
     pub fn global_stats(&self) -> GlobalTrafficStats {
         let now = Instant::now();
-        let total_up = self.total_uploaded.load(Ordering::Relaxed);
-        let total_down = self.total_downloaded.load(Ordering::Relaxed);
 
-        let mut tick_guard = self.last_tick.write().unwrap();
+        // 实时汇总：已关闭连接流量 + 当前活跃连接传输量（避免大文件传输中途统计为 0）
+        let (active_up, active_down, active_count) = {
+            let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
+            let mut up = 0u64;
+            let mut down = 0u64;
+            for c in conns.values() {
+                up += c.uploaded_bytes.load(Ordering::Relaxed);
+                down += c.downloaded_bytes.load(Ordering::Relaxed);
+            }
+            (up, down, conns.len())
+        };
+
+        let total_up = self.closed_uploaded.load(Ordering::Relaxed) + active_up;
+        let total_down = self.closed_downloaded.load(Ordering::Relaxed) + active_down;
+
+        let mut tick_guard = self.last_tick.write().unwrap_or_else(|e| e.into_inner());
         let elapsed = now.duration_since(*tick_guard).as_secs_f64();
-
-        let mut up_bps = 0;
-        let mut down_bps = 0;
 
         if elapsed >= 0.5 {
             let last_up = self.last_total_up.swap(total_up, Ordering::Relaxed);
             let last_down = self.last_total_down.swap(total_down, Ordering::Relaxed);
-            up_bps = ((total_up.saturating_sub(last_up) as f64) / elapsed) as u64;
-            down_bps = ((total_down.saturating_sub(last_down) as f64) / elapsed) as u64;
+            let up_bps = ((total_up.saturating_sub(last_up) as f64) / elapsed) as u64;
+            let down_bps = ((total_down.saturating_sub(last_down) as f64) / elapsed) as u64;
+
+            self.current_up_speed.store(up_bps, Ordering::Relaxed);
+            self.current_down_speed.store(down_bps, Ordering::Relaxed);
             *tick_guard = now;
         }
 
         GlobalTrafficStats {
             total_uploaded_bytes: total_up,
             total_downloaded_bytes: total_down,
-            current_upload_bps: up_bps,
-            current_download_bps: down_bps,
-            active_connections_count: self.connections.read().unwrap().len(),
+            current_upload_bps: self.current_up_speed.load(Ordering::Relaxed),
+            current_download_bps: self.current_down_speed.load(Ordering::Relaxed),
+            active_connections_count: active_count,
         }
     }
 }
@@ -207,6 +237,11 @@ mod tests {
         assert_eq!(conn.id, 1);
         conn.add_upload(1024);
         conn.add_download(2048);
+
+        // 验证实时统计（无需等到 unregister 即可统计活跃流量）
+        let stats_live = mgr.global_stats();
+        assert_eq!(stats_live.total_uploaded_bytes, 1024);
+        assert_eq!(stats_live.total_downloaded_bytes, 2048);
 
         let list = mgr.list_snapshots();
         assert_eq!(list.len(), 1);
