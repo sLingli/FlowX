@@ -51,6 +51,27 @@ impl ProxyChain {
         self
     }
 
+    /// 校验代理链节点是否存在回环死锁风险
+    pub fn validate_loop(&self, forbidden_ports: &[u16]) -> Result<()> {
+        let mut visited = std::collections::HashSet::new();
+        for node in &self.nodes {
+            let addr = node.server_addr();
+            if !visited.insert(addr.to_string()) {
+                bail!("代理链 [{}] 包含重复节点，存在循环依赖: {}", self.name, addr);
+            }
+            if let Ok(target) = parse_target_addr(addr) {
+                let is_loopback = match &target {
+                    TargetAddr::Ip(ip) => ip.ip().is_loopback(),
+                    TargetAddr::Domain(h, _) => h == "localhost" || h == "127.0.0.1" || h == "::1",
+                };
+                if is_loopback && forbidden_ports.contains(&target.port()) {
+                    bail!("代理链 [{}] 节点指向自身服务端口，已被拦截防回环: {}", self.name, addr);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 通过代理链建立到达最终目标的多跳隧道
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
         if self.nodes.is_empty() {
@@ -111,7 +132,7 @@ impl ProxyChain {
     }
 }
 
-fn parse_target_addr(addr_str: &str) -> Result<TargetAddr> {
+pub fn parse_target_addr(addr_str: &str) -> Result<TargetAddr> {
     if let Ok(socket_addr) = addr_str.parse() {
         return Ok(TargetAddr::Ip(socket_addr));
     }
@@ -137,6 +158,13 @@ mod tests {
         assert_eq!(chain.nodes.len(), 2);
         assert_eq!(chain.nodes[0].server_addr(), "127.0.0.1:10808");
         assert_eq!(chain.nodes[1].server_addr(), "10.0.0.1:8080");
+
+        // 校验循环检测机制
+        assert!(chain.validate_loop(&[40001]).is_ok());
+
+        let loop_chain = ProxyChain::new("Loop-Chain")
+            .add_node(ProxyNode::Socks5(Socks5Client::new("127.0.0.1:40001")));
+        assert!(loop_chain.validate_loop(&[40001]).is_err());
     }
 
     #[test]

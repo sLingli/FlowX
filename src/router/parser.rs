@@ -3,10 +3,49 @@ use glob::Pattern;
 use ipnet::IpNet;
 use super::PortRange;
 
-/// 解析以分号分隔的应用程序路径/通配符（支持引号保护包含分号或空格的路径）
-pub fn parse_applications(raw: &str) -> Vec<Pattern> {
+#[derive(Debug, Clone)]
+pub enum DomainMatcher {
+    Exact(String),
+    Suffix(String), // e.g. "google.com" for "*.google.com", matching "google.com" and "*.google.com"
+    Pattern(Pattern),
+}
+
+impl DomainMatcher {
+    pub fn parse(raw: &str) -> Option<Self> {
+        let s = raw.trim().to_lowercase();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(stripped) = s.strip_prefix("*.") {
+            Some(DomainMatcher::Suffix(stripped.to_string()))
+        } else if s.contains('*') || s.contains('?') || s.contains('[') {
+            Pattern::new(&s).ok().map(DomainMatcher::Pattern)
+        } else {
+            Some(DomainMatcher::Exact(s))
+        }
+    }
+
+    pub fn matches(&self, host: &str) -> bool {
+        let host_lower = host.to_lowercase();
+        match self {
+            DomainMatcher::Exact(exact) => host_lower == *exact,
+            DomainMatcher::Suffix(suffix) => {
+                host_lower == *suffix || host_lower.ends_with(&format!(".{}", suffix))
+            }
+            DomainMatcher::Pattern(pat) => pat.matches(&host_lower),
+        }
+    }
+}
+
+/// 解析以分号分隔的应用程序路径/通配符（支持引号与 Fail-Closed 约束模式）
+pub fn parse_applications(raw: &str) -> Option<Vec<Pattern>> {
+    let trimmed_raw = raw.trim();
+    if trimmed_raw.is_empty() {
+        return None; // 无约束：匹配所有应用
+    }
+
     let mut patterns = Vec::new();
-    let tokens = split_quoted_tokens(raw, ';');
+    let tokens = split_quoted_tokens(trimmed_raw, ';');
 
     for token in tokens {
         let trimmed = token.trim().trim_matches('"').trim();
@@ -19,14 +58,33 @@ pub fn parse_applications(raw: &str) -> Vec<Pattern> {
             patterns.push(pat);
         }
     }
-    patterns
+
+    Some(patterns) // 即使为空也是 Some(vec![])，实现 Fail-Closed
 }
 
-/// 解析以分号分隔的目标主机（支持 IP, CIDR 子网与域名通配符）
-pub fn parse_targets(raw: &str) -> (Vec<String>, Vec<IpNet>) {
+/// 展开环境变量（如 %ComputerName%）
+fn expand_env_vars(input: &str) -> String {
+    let mut result = input.to_string();
+    if result.to_lowercase().contains("%computername%") {
+        let computer_name = std::env::var("COMPUTERNAME")
+            .unwrap_or_else(|_| "localhost".to_string());
+        result = result.replace("%COMPUTERNAME%", &computer_name)
+            .replace("%computername%", &computer_name);
+    }
+    result
+}
+
+/// 解析以分号分隔的目标主机（支持 IP, CIDR 子网与域名预编译匹配器）
+pub fn parse_targets(raw: &str) -> (Option<Vec<DomainMatcher>>, Option<Vec<IpNet>>) {
+    let trimmed_raw = raw.trim();
+    if trimmed_raw.is_empty() {
+        return (None, None);
+    }
+
+    let expanded = expand_env_vars(trimmed_raw);
     let mut domain_patterns = Vec::new();
     let mut subnets = Vec::new();
-    let tokens = split_quoted_tokens(raw, ';');
+    let tokens = split_quoted_tokens(&expanded, ';');
 
     for token in tokens {
         let trimmed = token.trim().trim_matches('"').trim();
@@ -50,18 +108,39 @@ pub fn parse_targets(raw: &str) -> (Vec<String>, Vec<IpNet>) {
             continue;
         }
 
-        // 3. 作为域名通配符 (如 *.google.com, localhost, %ComputerName%)
-        domain_patterns.push(trimmed.to_lowercase());
+        // 3. 作为域名匹配器预编译 (支持 *.example.com 同时匹配顶域与子域)
+        if let Some(matcher) = DomainMatcher::parse(trimmed) {
+            domain_patterns.push(matcher);
+        }
     }
 
-    (domain_patterns, subnets)
+    let domains_opt = if domain_patterns.is_empty() && subnets.is_empty() {
+        Some(Vec::new()) // Fail-Closed
+    } else if domain_patterns.is_empty() {
+        None
+    } else {
+        Some(domain_patterns)
+    };
+
+    let subnets_opt = if subnets.is_empty() {
+        None
+    } else {
+        Some(subnets)
+    };
+
+    (domains_opt, subnets_opt)
 }
 
 /// 解析端口配置（支持单端口、逗号/分号列表与破折号范围，如 "80; 443; 8000-8080"）
-pub fn parse_ports(raw: &str) -> Vec<PortRange> {
+pub fn parse_ports(raw: &str) -> Option<Vec<PortRange>> {
+    let trimmed_raw = raw.trim();
+    if trimmed_raw.is_empty() {
+        return None;
+    }
+
     let mut ranges = Vec::new();
     let delimiters = [';', ','];
-    let tokens = raw.split(&delimiters[..]);
+    let tokens = trimmed_raw.split(&delimiters[..]);
 
     for token in tokens {
         let trimmed = token.trim();
@@ -80,7 +159,7 @@ pub fn parse_ports(raw: &str) -> Vec<PortRange> {
         }
     }
 
-    ranges
+    Some(ranges) // Fail-Closed
 }
 
 /// 辅助函数：根据分隔符拆分字符串，同时尊重双引号内包含的内容
@@ -114,7 +193,7 @@ mod tests {
 
     #[test]
     fn test_parse_ports() {
-        let ranges = parse_ports("80; 443, 8000-8080");
+        let ranges = parse_ports("80; 443, 8000-8080").unwrap();
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].start, 80);
         assert_eq!(ranges[0].end, 80);
@@ -126,15 +205,19 @@ mod tests {
     #[test]
     fn test_parse_targets() {
         let (domains, subnets) = parse_targets("127.0.0.1; *.google.com; 10.0.0.0/8; localhost");
+        let domains = domains.unwrap();
+        let subnets = subnets.unwrap();
         assert_eq!(domains.len(), 2);
-        assert!(domains.contains(&"*.google.com".to_string()));
-        assert!(domains.contains(&"localhost".to_string()));
+        assert!(domains[0].matches("google.com"));
+        assert!(domains[0].matches("mail.google.com"));
+        assert!(!domains[0].matches("google.org"));
+        assert!(domains[1].matches("localhost"));
         assert_eq!(subnets.len(), 2);
     }
 
     #[test]
     fn test_parse_applications() {
-        let pats = parse_applications(r#"node.exe; *chrome*.exe; "C:\Program Files\App\app.exe""#);
+        let pats = parse_applications(r#"node.exe; *chrome*.exe; "C:\Program Files\App\app.exe""#).unwrap();
         assert_eq!(pats.len(), 3);
         assert!(pats[0].matches("node.exe"));
         assert!(pats[1].matches("google-chrome.exe"));

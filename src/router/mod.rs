@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 use glob::Pattern;
 use ipnet::IpNet;
+use self::parser::DomainMatcher;
 
 pub mod parser;
 
@@ -22,10 +23,10 @@ pub struct PortRange {
 pub struct Rule {
     pub name: String,
     pub enabled: bool,
-    pub application_patterns: Vec<Pattern>,
-    pub target_patterns: Vec<String>,
-    pub target_subnets: Vec<IpNet>,
-    pub ports: Vec<PortRange>,
+    pub application_patterns: Option<Vec<Pattern>>,
+    pub target_domains: Option<Vec<DomainMatcher>>,
+    pub target_subnets: Option<Vec<IpNet>>,
+    pub ports: Option<Vec<PortRange>>,
     pub action: Action,
 }
 
@@ -38,23 +39,19 @@ impl Rule {
         ports_raw: Option<&str>,
         action: Action,
     ) -> Self {
-        let application_patterns = apps_raw
-            .map(parser::parse_applications)
-            .unwrap_or_default();
+        let application_patterns = apps_raw.and_then(parser::parse_applications);
 
-        let (target_patterns, target_subnets) = targets_raw
+        let (target_domains, target_subnets) = targets_raw
             .map(parser::parse_targets)
-            .unwrap_or_default();
+            .unwrap_or((None, None));
 
-        let ports = ports_raw
-            .map(parser::parse_ports)
-            .unwrap_or_default();
+        let ports = ports_raw.and_then(parser::parse_ports);
 
         Self {
             name: name.into(),
             enabled,
             application_patterns,
-            target_patterns,
+            target_domains,
             target_subnets,
             ports,
             action,
@@ -83,19 +80,22 @@ impl RuleEngine {
         }
     }
 
-    /// 按照自顶向下顺序对流量进行求值匹配 (First Match Wins)
-    pub fn evaluate(&self, ctx: &RouteContext) -> Action {
+    /// 按照自顶向下顺序对流量进行求值匹配 (First Match Wins)，带 Fail-Closed 约束保护
+    pub fn evaluate(&self, ctx: &RouteContext) -> (Action, String) {
         for rule in &self.rules {
             if !rule.enabled {
                 continue;
             }
 
-            // 1. 匹配应用程序
-            if !rule.application_patterns.is_empty() {
+            // 1. 匹配应用程序 (Fail-Closed: 若配置了规则但列表为空，绝不放行)
+            if let Some(patterns) = &rule.application_patterns {
+                if patterns.is_empty() {
+                    continue;
+                }
                 let mut app_matched = false;
                 if let Some(pname) = ctx.process_name {
                     let pname_normalized = pname.to_lowercase().replace('\\', "/");
-                    for pat in &rule.application_patterns {
+                    for pat in patterns {
                         if pat.matches(&pname_normalized) {
                             app_matched = true;
                             break;
@@ -104,7 +104,7 @@ impl RuleEngine {
                 }
                 if !app_matched && ctx.process_path.is_some() {
                     let path_normalized = ctx.process_path.unwrap().to_lowercase().replace('\\', "/");
-                    for pat in &rule.application_patterns {
+                    for pat in patterns {
                         if pat.matches(&path_normalized) {
                             app_matched = true;
                             break;
@@ -117,8 +117,11 @@ impl RuleEngine {
             }
 
             // 2. 匹配端口
-            if !rule.ports.is_empty() {
-                let port_matched = rule.ports.iter().any(|r| {
+            if let Some(ports) = &rule.ports {
+                if ports.is_empty() {
+                    continue;
+                }
+                let port_matched = ports.iter().any(|r| {
                     ctx.target_port >= r.start && ctx.target_port <= r.end
                 });
                 if !port_matched {
@@ -127,23 +130,24 @@ impl RuleEngine {
             }
 
             // 3. 匹配目标地址 (域名通配或 IP/CIDR)
-            if !rule.target_patterns.is_empty() || !rule.target_subnets.is_empty() {
+            if rule.target_domains.is_some() || rule.target_subnets.is_some() {
                 let mut target_matched = false;
 
                 // 检查 IP/CIDR
-                if let Some(ip) = ctx.target_ip {
-                    if rule.target_subnets.iter().any(|subnet| subnet.contains(&ip)) {
-                        target_matched = true;
+                if let Some(subnets) = &rule.target_subnets {
+                    if let Some(ip) = ctx.target_ip {
+                        if subnets.iter().any(|subnet| subnet.contains(&ip)) {
+                            target_matched = true;
+                        }
                     }
                 }
 
-                // 检查域名
+                // 检查域名（已预编译，支持 apex 匹配与通配）
                 if !target_matched {
-                    if let Some(host) = ctx.target_host {
-                        let host_lower = host.to_lowercase();
-                        for pat_str in &rule.target_patterns {
-                            if let Ok(pattern) = Pattern::new(pat_str) {
-                                if pattern.matches(&host_lower) {
+                    if let Some(domains) = &rule.target_domains {
+                        if let Some(host) = ctx.target_host {
+                            for matcher in domains {
+                                if matcher.matches(host) {
                                     target_matched = true;
                                     break;
                                 }
@@ -157,10 +161,10 @@ impl RuleEngine {
                 }
             }
 
-            return rule.action.clone();
+            return (rule.action.clone(), rule.name.clone());
         }
 
-        self.default_action.clone()
+        (self.default_action.clone(), "Default".to_string())
     }
 }
 
@@ -198,17 +202,21 @@ mod tests {
             target_ip: Some("127.0.0.1".parse().unwrap()),
             target_port: 8080,
         };
-        assert_eq!(engine.evaluate(&ctx_local), Action::Direct);
+        let (action, rule_name) = engine.evaluate(&ctx_local);
+        assert_eq!(action, Action::Direct);
+        assert_eq!(rule_name, "LocalBypass");
 
-        // 2. 测试 node 进程命中 r2
+        // 2. 测试 node 进程命中 r2 (验证 *.github.com 匹配 api.github.com 以及 github.com)
         let ctx_node = RouteContext {
             process_path: Some(r"C:\Program Files\nodejs\node.exe"),
             process_name: Some("node.exe"),
-            target_host: Some("api.github.com"),
+            target_host: Some("github.com"),
             target_ip: None,
             target_port: 443,
         };
-        assert_eq!(engine.evaluate(&ctx_node), Action::Proxy(101));
+        let (action_node, rule_name_node) = engine.evaluate(&ctx_node);
+        assert_eq!(action_node, Action::Proxy(101));
+        assert_eq!(rule_name_node, "NodeProxy");
 
         // 3. 测试未命中走 Default 兜底 Action::Block
         let ctx_other = RouteContext {
@@ -218,6 +226,8 @@ mod tests {
             target_ip: Some("8.8.8.8".parse().unwrap()),
             target_port: 53,
         };
-        assert_eq!(engine.evaluate(&ctx_other), Action::Block);
+        let (action_other, rule_name_other) = engine.evaluate(&ctx_other);
+        assert_eq!(action_other, Action::Block);
+        assert_eq!(rule_name_other, "Default");
     }
 }

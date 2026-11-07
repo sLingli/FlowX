@@ -88,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         tracker: Arc::clone(&process_tracker),
         fake_ip_pool: Arc::clone(&fake_ip_pool),
         rule_engine: Arc::clone(&rule_engine),
+        monitor: Arc::clone(&connection_manager),
         proxy_nodes: Arc::clone(&proxy_nodes),
         proxy_chains: Arc::clone(&proxy_chains),
     });
