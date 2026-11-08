@@ -1,89 +1,99 @@
-# FlowX 核心架构与工程设计规范 (FlowX Architecture & Engineering Specification)
+# FlowX 核心架构与工程规范 (FlowX Architecture & Engineering Specification)
 
-FlowX 是一套基于 Rust 构建的现代透明网络重定向与进程级分流引擎。本文档阐述 FlowX 的系统拓扑、核心技术实现与工程规范。
+FlowX 是一套基于 Rust（Edition 2024）构建的进程级透明网络代理与分流引擎。本文档描述当前代码实现的真实系统拓扑、核心模块职责及后续演进路线。
 
 ---
 
 ## 1. 系统总体架构与拓扑
 
-FlowX 采用分层解耦的现代化网络软件设计，包含四大核心平面：
+FlowX 采用分层解耦的设计，包含入站接管与进程追踪、核心路由与协议引擎、配置持久化以及内嵌 Web 控制台四大平面：
 
 ```mermaid
 flowchart TD
     subgraph AppLayer ["应用层"]
-        A1["业务进程 1 (如 node.exe / chrome.exe)"]
-        A2["业务进程 2 (其它 Windows 应用程序)"]
+        A1["业务进程 (curl.exe / node.exe / chrome.exe)"]
+        A2["本地 DNS 查询方"]
     end
 
-    subgraph InterceptionLayer ["流量接管层 (Wintun / WinDivert / Packet Filter)"]
-        TunEngine["TUN 虚拟网络适配器 (Wintun)"]
-        ProcessTracker["进程五元组关联器 (GetExtendedTcpTable)"]
+    subgraph InterceptionLayer ["入站与进程识别层"]
+        MixedInbound["混合协议入站 (src/inbound/mod.rs · 127.0.0.1:40001)"]
+        ProcessTracker["TCP 四元组进程追踪器 (src/interceptor/process.rs)"]
     end
 
     subgraph CoreEngine ["FlowX 核心路由与协议引擎"]
-        LocalRedirect["本地流分发调度中心"]
-        FakeIpEngine["Fake-IP 分配池与双向映射表 (198.18.0.0/15)"]
-        DnsServer["本地 DNS 拦截与防泄漏服务"]
-        RouterEngine["多维规则匹配求值器 (Process, Target, Port, Action)"]
-        OutboundMgr["多协议出站客户端 (SOCKS5/4, HTTP, Chain)"]
+        Dispatcher["流分发调度中心 (src/interceptor/dispatcher.rs)"]
+        FakeIpEngine["Fake-IP 分配池与双向映射 (src/dns/mod.rs · 198.18.0.0/15)"]
+        DnsServer["本地 DNS 服务 (src/dns/server.rs · 127.0.0.1:1053)"]
+        RouterEngine["多维规则匹配引擎 (src/router/mod.rs)"]
+        OutboundMgr["出站协议与代理链 (src/outbound/)"]
     end
 
-    subgraph PresentationLayer ["交互与遥测层"]
-        Telemetry["连接监视与瞬时测速器"]
-        ApiServer["微型管理接口 (WebSocket / HTTP)"]
-        WebDashboard["现代化桌面控制台 (React + Tailwind + Tauri)"]
+    subgraph PresentationLayer ["遥测、配置与控制台"]
+        Monitor["连接监视与速率统计 (src/monitor/mod.rs)"]
+        ConfigStore["XML 配置加载与原子持久化 (src/config/mod.rs · flowx.xml)"]
+        ApiServer["同源加固 HTTP API (src/api/mod.rs · 127.0.0.1:40080)"]
+        WebDashboard["单文件零依赖控制台 (frontend/index.html)"]
     end
 
     subgraph RemoteNetwork ["远端网络"]
-        ProxyNode["上游代理节点 (SOCKS5 / HTTP CONNECT)"]
-        TargetHost["目标服务器 (互联网服务)"]
+        ProxyNode["上游代理节点 (SOCKS5 / HTTP / SOCKS4a)"]
+        TargetHost["目标服务器"]
     end
 
-    A1 --> TunEngine
-    A2 --> TunEngine
-    TunEngine --> LocalRedirect
-    ProcessTracker -.-> LocalRedirect
-    LocalRedirect --> RouterEngine
-    RouterEngine --> FakeIpEngine
-    RouterEngine --> DnsServer
-    RouterEngine --> OutboundMgr
+    A1 -->|"SOCKS5 / SOCKS4a / HTTP"| MixedInbound
+    A2 -->|"UDP 53"| DnsServer
+    DnsServer --> FakeIpEngine
+    MixedInbound --> Dispatcher
+    ProcessTracker -.->|"GetExtendedTcpTable 四元组"| Dispatcher
+    Dispatcher --> FakeIpEngine
+    Dispatcher --> RouterEngine
+    Dispatcher --> OutboundMgr
     OutboundMgr --> ProxyNode
+    OutboundMgr --> TargetHost
     ProxyNode --> TargetHost
-    LocalRedirect -.-> Telemetry
-    Telemetry --> ApiServer
+    Dispatcher -.-> Monitor
+    Monitor --> ApiServer
+    RouterEngine <--> ConfigStore
+    ApiServer <--> ConfigStore
     ApiServer <--> WebDashboard
 ```
 
 ---
 
-## 2. 核心模块与功能设计
+## 2. 已实现核心模块
 
-### 2.1 流量拦截与进程关联 (Traffic Interception & Process Tracking)
-- **底层驱动**：通过 WireGuard 官方经过 Windows 签名的 `wintun.dll` 建立虚拟网卡，保证驱动层的绝对安全与零蓝屏风险。
-- **进程追踪**：通过 Windows IP Helper API（`GetExtendedTcpTable` / `GetExtendedUdpTable`）结合本地套接字，以高频只读缓存形式毫秒级关联到发起连接的进程 PID 与执行路径（`QueryFullProcessImageNameW`）。
+### 2.1 混合协议入站与回环防护 (`src/inbound/mod.rs`, `src/interceptor/dispatcher.rs`)
+- **单端口多协议嗅探**：在 `127.0.0.1:40001` 上通过首字节自动识别 `SOCKS5`、`SOCKS4 / SOCKS4a`、`HTTP CONNECT` 与 `HTTP` 绝对 URI 明文转发请求。
+- **真实目标解析与安全改写**：从代理握手报文中提取真实目标地址与端口；对 `HTTP` 明文转发自动改写为 origin-form，剥离逐跳代理头并强制 `Connection: close`，防止 keep-alive 连接串目标。
+- **自连回环防护**：拒绝目标指向 FlowX 自身服务端口（`40001` / `40080` / `1053`）的请求，杜绝自连死循环。
 
-### 2.2 DNS 虚拟化与 Fake-IP 机制
-- 拦截系统对外的 UDP 53 DNS 解析请求。
-- 命中代理规则的域名不进行本地公网解析，而是从保留测试网段 `198.18.0.0/15` 中动态分配一个独一无二的 Fake-IP，并缓存双向映射关系（`Domain <-> Fake-IP`）。
-- 当进程尝试对该 Fake-IP 建立 TCP 连接时，引擎查表逆向还原真实域名，并在向上游代理发起握手时直接附带域名（例如 SOCKS5 的 `ATYP=0x03`），彻底避免 DNS 污染与本地 IP 泄漏。
+### 2.2 进程四元组精确追踪 (`src/interceptor/process.rs`)
+- **四元组匹配**：在 Windows 上调用 `GetExtendedTcpTable` 按完整四元组（`local == client && remote == server`）精确检索归属 PID，再通过 `QueryFullProcessImageNameW` 获取完整可执行路径。
+- **二级 TTL 缓存**：结合 1 秒连接缓存与 10 秒 PID 路径缓存，并通过 `spawn_blocking` 隔离 Win32 阻塞调用，避免阻塞 Tokio 调度线程。
 
-### 2.3 多维规则路由引擎 (Multi-Dimensional Routing Engine)
-- **进程匹配**：支持应用程序文件名与 Glob 通配符（例如 `*antigravity*.exe; node.exe`）。
-- **目标地址**：支持 IPv4/IPv6 CIDR 子网掩码、域名通配符（`*.github.com`）以及精确域名。
-- **端口过滤**：支持离散端口（`80; 443`）与端口范围（`8000-8088`）。
-- **策略动作**：
-  - `Direct`：直连放行。
-  - `Block`：立即静默阻断或重置连接。
-  - `Proxy`：重定向至指定代理服务器。
-  - `Chain`：通过多跳级联代理链进行转发。
-- **决策顺序**：自顶向下严格按顺序求值（First-Match Wins），末尾提供默认兜底规则。
+### 2.3 DNS 拦截与 Fake-IP 机制 (`src/dns/mod.rs`, `src/dns/server.rs`)
+- **本地 DNS 服务**：监听 `127.0.0.1:1053`，默认开启 `AAAA` 空应答以防止 IPv6 流量旁路泄漏；其余查询通过复用的上游 UDP 套接字转发至 `223.5.5.5:53`。
+- **Fake-IP 滑动续期**：为 `A` 查询从 `198.18.0.0/15` 分配虚拟 IP 并维护双向映射；在 `allocate()` / `restore()` 命中活跃域名时自动滑动续期 TTL，防止活跃会话中途丢失域名映射。
 
-### 2.4 多协议出站客户端与代理链 (Outbound Protocols & Chaining)
-- **SOCKS5 (RFC 1928 / RFC 1929)**：支持无认证与用户名/密码认证；支持 IPv4、IPv6 与域名地址类型。
-- **HTTP / HTTPS CONNECT (RFC 7231)**：支持通过 HTTP 代理建立全双工 TCP 隧道。
-- **SOCKS4 / SOCKS4a**：兼容经典协议及远程域名扩展。
-- **代理链 (Chaining)**：在既有代理隧道上递归嵌套下一个代理握手，实现多重跳板链路。
+### 2.4 多维规则路由引擎 (`src/router/mod.rs`, `src/router/parser.rs`)
+- **多维条件**：支持应用程序名/路径 Glob 通配符（分号分隔）、目标域名通配与 IPv4/IPv6 CIDR 网段、离散端口与端口范围（如 `80; 443; 8000-8080`）。
+- **动作与顺序**：支持 `Direct`、`Block`、`Proxy(node_id)` 与 `Chain(chain_id)`；采用自顶向下 First-Match Wins 求值与不可变快照 CoW 更新，末尾提供兜底默认动作。
+- **动态管理**：支持运行时新增、删除、启停开关（`toggle_rule`）与优先级调整（`move_rule`：`up` / `down` / `top` / `bottom`）。
 
-### 2.5 现代化控制台 (Modern Presentation)
-- 彻底告别传统陈旧的 MFC 界面，采用 **Tauri + 现代化 Web 前端（Vite + React + Tailwind CSS + Lucide Icons）**。
-- 提供深色/浅色极简美学、平滑动效、实时网络吞吐曲线图、连接列表动态测速与一键断开功能。
+### 2.5 多协议出站与代理链 (`src/outbound/`)
+- **协议支持**：`DirectOutbound`（10 秒建连超时保护）、`Socks5Client`（RFC 1928/1929 账密认证）、`HttpConnectClient`（Basic 认证与 CRLF 注入校验）、`Socks4Client`（含 SOCKS4a 域名扩展）。
+- **多跳代理链 (`ProxyChain`)**：支持在已有隧道流上递归握手串联多跳节点，具备循环检测与单跳/全链路超时控制。
+- **流量监视中继**：全双工对拷内置 120 秒空闲超时与实时手动熔断切断通知（`Notify`）。
+
+### 2.6 配置持久化与同源加固控制台 (`src/config/mod.rs`, `src/api/mod.rs`, `frontend/index.html`)
+- **XML 配置 (`flowx.xml`)**：支持通过 `--config <路径>` 或环境变量 `FLOWX_CONFIG` 指定配置文件，缺省自动生成默认 `flowx.xml`；Web API 修改节点或规则后串行化原子写回磁盘（临时文件写入 + `rename` 替换）。
+- **API 安全加固**：移除通配 CORS，强制 `Host` 回环白名单（防 DNS Rebinding）与 `Origin` / `Referer` / `Sec-Fetch-Site` 同源校验（防 CSRF）；`/api/nodes/ping` 仅按已注册节点 ID 探测，防止 SSRF 端口扫描。
+- **内嵌现代 Web 控制台**：单文件零外部依赖 HTML/CSS/JS（`include_str!` 打包），提供深色/浅色主题、60 秒实时吞吐 SVG 折线图、连接过滤与切断、节点批量测速以及规则启停与排序控制。
+
+---
+
+## 3. 演进路线（规划中）
+
+- **驱动级透明接管**：集成 `wintun.dll` 或 WinDivert，实现无需业务进程显式配置代理端口的系统级透明流量重定向与 UDP 转发。
+- **代理链可视化编排**：在 Web 控制台中开放多跳 `ProxyChain` 的创建与管理界面。
+- **桌面壳包装**：可选基于 Tauri 封装为独立桌面托盘应用。
