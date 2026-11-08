@@ -133,7 +133,7 @@ impl DnsPacketParser {
         resp
     }
 
-    /// 构造空的 NOERROR 应答 (用于阻断 IPv6 AAAA 查询，防止 IPv6 泄露)
+    /// 构造空的 NOERROR 应答 (用于阻断 IPv6 AAAA 及现代浏览器 HTTPS/SVCB 记录，防止 DNS 泄露与 Fake-IP 绕过)
     pub fn build_empty_response(tx_id: u16, original_query: &[u8], question_len: usize) -> Vec<u8> {
         let mut resp = Vec::with_capacity(question_len);
         resp.extend_from_slice(&tx_id.to_be_bytes());
@@ -154,6 +154,73 @@ pub struct DnsServer {
     pub upstream_dns: SocketAddr,
     pub block_ipv6: bool,
     concurrency_limit: Arc<Semaphore>,
+}
+
+/// 规范化套接字地址，避免双栈环境下的 IPv4-mapped IPv6 形式影响源地址核验
+fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => {
+            if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+            } else {
+                SocketAddr::V6(v6)
+            }
+        }
+        v4 => v4,
+    }
+}
+
+/// 从 OS CSPRNG 种子随机挑选未占用的 16 位内部事务 ID，避免不同客户端 TxID 冲突串包
+fn allocate_internal_tx_id(
+    pending: &Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>,
+    sender: oneshot::Sender<Vec<u8>>,
+) -> Option<u16> {
+    use std::collections::hash_map::{Entry, RandomState};
+    use std::hash::{BuildHasher, Hasher};
+
+    let seed = RandomState::new().build_hasher().finish();
+    let start = ((seed ^ (seed >> 16) ^ (seed >> 32)) & 0xFFFF) as u16;
+    let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
+    for offset in 0..=u16::MAX {
+        let candidate = start.wrapping_add(offset);
+        if let Entry::Vacant(entry) = guard.entry(candidate) {
+            entry.insert(sender);
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// RAII 守卫：在超时、发送失败或任务取消时自动回收挂起的内部事务 ID
+struct PendingQueryGuard {
+    tx_id: u16,
+    pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
+    active: bool,
+}
+
+impl PendingQueryGuard {
+    fn new(tx_id: u16, pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>) -> Self {
+        Self {
+            tx_id,
+            pending,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingQueryGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.tx_id);
+        }
+    }
 }
 
 impl DnsServer {
@@ -185,9 +252,14 @@ impl DnsServer {
     pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut buf = [0u8; 1500];
 
-        // 绑定单个复用的上游 DNS 转发客户端，杜绝反复 bind 耗尽临时端口
+        // 绑定单个复用的上游 DNS 转发客户端（按上游地址族匹配 IPv4 / IPv6），杜绝反复 bind 耗尽临时端口
+        let upstream_bind = if self.upstream_dns.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let upstream_client = Arc::new(
-            UdpSocket::bind("0.0.0.0:0")
+            UdpSocket::bind(upstream_bind)
                 .await
                 .context("绑定 DNS 上游客户端套接字失败")?,
         );
@@ -197,6 +269,7 @@ impl DnsServer {
         // 启动后台上游 DNS 响应多路复用接收循环
         let uc = Arc::clone(&upstream_client);
         let pq = Arc::clone(&pending_queries);
+        let expected_upstream = normalize_socket_addr(self.upstream_dns);
         let mut shutdown_rx_upstream = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut up_buf = [0u8; 1500];
@@ -204,13 +277,27 @@ impl DnsServer {
                 tokio::select! {
                     res = uc.recv_from(&mut up_buf) => {
                         match res {
-                            Ok((n, _)) if n >= 2 => {
-                                let tx_id = u16::from_be_bytes([up_buf[0], up_buf[1]]);
-                                if let Some(sender) = pq.lock().unwrap().remove(&tx_id) {
+                            Ok((n, src_addr)) if n >= 2 => {
+                                if normalize_socket_addr(src_addr) != expected_upstream {
+                                    warn!(
+                                        "[DNS 引擎] 丢弃非指定上游源地址 {} 返回的响应包 (期望 {})",
+                                        src_addr, expected_upstream
+                                    );
+                                    continue;
+                                }
+                                let internal_id = u16::from_be_bytes([up_buf[0], up_buf[1]]);
+                                let sender = pq
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&internal_id);
+                                if let Some(sender) = sender {
                                     let _ = sender.send(up_buf[..n].to_vec());
                                 }
                             }
                             Ok(_) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                                debug!("[DNS 引擎] 上游 UDP 端点暂不可达: {}", e);
+                            }
                             Err(e) => {
                                 error!("[DNS 引擎] 上游响应接收异常: {}", e);
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -258,16 +345,17 @@ impl DnsServer {
             tokio::spawn(async move {
                 let _permit = permit;
                 match DnsPacketParser::parse_question(&query_bytes) {
-                    Ok((tx_id, question)) => {
+                    Ok((client_tx_id, question)) => {
                         debug!(
                             "[DNS 查询] 来源: {}, 域名: {}, QType: {}",
                             peer, question.name, question.qtype
                         );
 
-                        // 1. 若为 AAAA (IPv6) 且开启了防泄露，直接返回空应答
-                        if question.qtype == 28 && block_ipv6 {
+                        // 1. 开启防泄露模式时，阻断 AAAA (28) 以及现代浏览器的 SVCB (64) / HTTPS (65) 记录查询，
+                        //    防止域名明文泄露给公网 DNS 或因 ipv4hint 绕过 Fake-IP 与分流规则
+                        if block_ipv6 && matches!(question.qtype, 28 | 64 | 65) {
                             let empty_resp = DnsPacketParser::build_empty_response(
-                                tx_id,
+                                client_tx_id,
                                 &query_bytes,
                                 question.raw_len,
                             );
@@ -276,10 +364,10 @@ impl DnsServer {
                         }
 
                         // 2. 若为 A (IPv4) 查询，分配 Fake-IP 并应答
-                        if question.qtype == 1 {
+                        if question.qtype == 1 && question.qclass == 1 {
                             let fake_ip = pool_clone.allocate(&question.name);
                             let resp = DnsPacketParser::build_a_response(
-                                tx_id,
+                                client_tx_id,
                                 &query_bytes,
                                 question.raw_len,
                                 fake_ip,
@@ -288,19 +376,26 @@ impl DnsServer {
                             return;
                         }
 
-                        // 3. 其它类型查询转向上游 DNS 进行代理解析（单套接字多路复用，不耗尽临时端口）
+                        // 3. 其它类型查询转向上游 DNS 进行代理解析：
+                        //    使用独立的内部事务 ID 防止多客户端同 TxID 串包，响应后还原客户端原始 TxID
                         let (tx, rx) = oneshot::channel();
+                        let Some(internal_tx_id) = allocate_internal_tx_id(&pq_clone, tx) else {
+                            warn!("[DNS 引擎] 上游 DNS 事务 ID 映射表已满，丢弃查询: {}", question.name);
+                            return;
+                        };
+                        let mut pending_guard = PendingQueryGuard::new(internal_tx_id, Arc::clone(&pq_clone));
+                        let mut forward_bytes = query_bytes;
+                        forward_bytes[0..2].copy_from_slice(&internal_tx_id.to_be_bytes());
+
+                        if uc_clone.send_to(&forward_bytes, upstream_dns).await.is_ok()
+                            && let Ok(Ok(mut resp_bytes)) =
+                                tokio::time::timeout(std::time::Duration::from_secs(2), rx).await
                         {
-                            pq_clone.lock().unwrap().insert(tx_id, tx);
-                        }
-                        if uc_clone.send_to(&query_bytes, upstream_dns).await.is_ok() {
-                            if let Ok(Ok(resp_bytes)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+                            pending_guard.disarm();
+                            if resp_bytes.len() >= 2 {
+                                resp_bytes[0..2].copy_from_slice(&client_tx_id.to_be_bytes());
                                 let _ = socket_clone.send_to(&resp_bytes, peer).await;
-                            } else {
-                                pq_clone.lock().unwrap().remove(&tx_id);
                             }
-                        } else {
-                            pq_clone.lock().unwrap().remove(&tx_id);
                         }
                     }
                     Err(e) => {
@@ -317,19 +412,24 @@ impl DnsServer {
 mod tests {
     use super::*;
 
+    fn build_sample_query(tx_id: u16, domain: &str, qtype: u16) -> Vec<u8> {
+        let mut q = Vec::new();
+        q.extend_from_slice(&tx_id.to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00]); // Standard query, RD=1
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QD=1
+        for label in domain.split('.') {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&[0x00, 0x01]); // IN
+        q
+    }
+
     #[test]
     fn test_parse_and_build_dns_response() {
-        let mut sample_query = Vec::new();
-        sample_query.extend_from_slice(&[0x12, 0x34]); // TX ID: 0x1234
-        sample_query.extend_from_slice(&[0x01, 0x00]); // Standard query (RD=1, QR=0, Opcode=0)
-        sample_query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QD=1
-        sample_query.extend_from_slice(&[7]);
-        sample_query.extend_from_slice(b"example");
-        sample_query.extend_from_slice(&[3]);
-        sample_query.extend_from_slice(b"com");
-        sample_query.push(0);
-        sample_query.extend_from_slice(&[0x00, 0x01]); // QTYPE: A (1)
-        sample_query.extend_from_slice(&[0x00, 0x01]); // QCLASS: IN (1)
+        let sample_query = build_sample_query(0x1234, "example.com", 1);
 
         let (tx_id, question) = DnsPacketParser::parse_question(&sample_query).unwrap();
         assert_eq!(tx_id, 0x1234);
@@ -362,5 +462,142 @@ mod tests {
         // 测试空域名 (Root Query) 被拒绝
         let query_empty = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 1, 0, 1];
         assert!(DnsPacketParser::parse_question(&query_empty).is_err());
+    }
+
+    /// P0-3 回归测试：开启防泄露模式下，AAAA (28)、SVCB (64) 与 HTTPS (65) 均返回空应答且不泄露给上游 DNS
+    #[tokio::test]
+    async fn test_dns_blocks_https_svcb_and_aaaa_queries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mock_upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = mock_upstream.local_addr().unwrap();
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&upstream_hits);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while mock_upstream.recv_from(&mut buf).await.is_ok() {
+                hits_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let pool = Arc::new(FakeIpPool::new_default());
+        let server = DnsServer::new("127.0.0.1:0".parse().unwrap(), pool, upstream_addr, true);
+        let sock = server.bind().await.unwrap();
+        let dns_addr = sock.local_addr().unwrap();
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { server.run(sock, rx).await });
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for (idx, qtype) in [28u16, 64u16, 65u16].into_iter().enumerate() {
+            let tx_id = 0x2000 + idx as u16;
+            let q = build_sample_query(tx_id, "browser-hint.example", qtype);
+            client.send_to(&q, dns_addr).await.unwrap();
+
+            let mut resp = [0u8; 512];
+            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_from(&mut resp))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(n >= 12);
+            assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), tx_id);
+            assert_eq!([resp[2], resp[3]], [0x81, 0x80]); // NOERROR
+            assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // ANCOUNT=0
+        }
+
+        assert_eq!(upstream_hits.load(Ordering::Relaxed), 0, "SVCB/HTTPS/AAAA 查询绝不应透传至公网 DNS");
+    }
+
+    /// P0-2 回归测试：相同客户端 TxID 并发透传上游时通过内部事务 ID 隔离防止串包，并拒绝伪造源地址响应
+    #[tokio::test]
+    async fn test_dns_upstream_txid_isolation_and_source_verification() {
+        let mock_upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = mock_upstream.local_addr().unwrap();
+        let spoof_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let mock_up_task = {
+            let mock_upstream = Arc::clone(&mock_upstream);
+            tokio::spawn(async move {
+                let mut buf1 = [0u8; 512];
+                let (n1, src1) = mock_upstream.recv_from(&mut buf1).await.unwrap();
+                let mut buf2 = [0u8; 512];
+                let (n2, src2) = mock_upstream.recv_from(&mut buf2).await.unwrap();
+
+                let id1 = u16::from_be_bytes([buf1[0], buf1[1]]);
+                let id2 = u16::from_be_bytes([buf2[0], buf2[1]]);
+                assert_ne!(id1, id2, "即使客户端使用相同 TxID，转发至上游的内部事务 ID 也必须不同");
+
+                // 构造一个来自错误源地址的伪造响应（复刻 id1），应被接收器直接丢弃
+                let mut spoof_resp = vec![0u8; n1];
+                spoof_resp[..n1].copy_from_slice(&buf1[..n1]);
+                spoof_resp[2] = 0x81;
+                spoof_resp[3] = 0x80;
+                spoof_resp.extend_from_slice(b"SPOOFED");
+                let _ = spoof_socket.send_to(&spoof_resp, src1).await;
+
+                let (_, q1) = DnsPacketParser::parse_question(&buf1[..n1]).unwrap();
+                let (_, q2) = DnsPacketParser::parse_question(&buf2[..n2]).unwrap();
+                assert_ne!(q1.name, q2.name);
+
+                let tag_for = |name: &str| -> &'static [u8] {
+                    if name == "alpha.example" {
+                        b"ANS-ALPHA"
+                    } else {
+                        b"ANS-BETA!"
+                    }
+                };
+
+                // 先乱序回复第二个查询，再回复第一个查询，验证各自精准对应到原域名与原客户端
+                let build_marked_resp = |req: &[u8], tag: &[u8]| {
+                    let mut r = req.to_vec();
+                    r[2] = 0x81;
+                    r[3] = 0x80;
+                    r.extend_from_slice(tag);
+                    r
+                };
+                let resp2 = build_marked_resp(&buf2[..n2], tag_for(&q2.name));
+                let resp1 = build_marked_resp(&buf1[..n1], tag_for(&q1.name));
+                mock_upstream.send_to(&resp2, src2).await.unwrap();
+                mock_upstream.send_to(&resp1, src1).await.unwrap();
+            })
+        };
+
+        let pool = Arc::new(FakeIpPool::new_default());
+        let server = DnsServer::new("127.0.0.1:0".parse().unwrap(), pool, upstream_addr, true);
+        let sock = server.bind().await.unwrap();
+        let dns_addr = sock.local_addr().unwrap();
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { server.run(sock, rx).await });
+
+        let client1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // 两个独立客户端故意发送完全相同的客户端 TxID (0x1234)
+        let q1 = build_sample_query(0x1234, "alpha.example", 16);
+        let q2 = build_sample_query(0x1234, "beta.example", 16);
+        client1.send_to(&q1, dns_addr).await.unwrap();
+        client2.send_to(&q2, dns_addr).await.unwrap();
+
+        let mut r1 = [0u8; 512];
+        let mut r2 = [0u8; 512];
+        let (res1, res2) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            async { tokio::join!(client1.recv_from(&mut r1), client2.recv_from(&mut r2)) },
+        )
+        .await
+        .unwrap();
+        let (len1, len2) = (res1.unwrap().0, res2.unwrap().0);
+
+        mock_up_task.await.unwrap();
+
+        assert_eq!(&r1[0..2], &[0x12, 0x34]);
+        assert_eq!(&r2[0..2], &[0x12, 0x34]);
+        let p1 = &r1[..len1];
+        let p2 = &r2[..len2];
+        assert!(!p1.windows(7).any(|w| w == b"SPOOFED"));
+        assert!(!p2.windows(7).any(|w| w == b"SPOOFED"));
+        assert!(p1.windows(9).any(|w| w == b"ANS-ALPHA"), "客户端 1 必须收到 alpha 响应");
+        assert!(!p1.windows(9).any(|w| w == b"ANS-BETA!"), "客户端 1 不应收到 beta 响应");
+        assert!(p2.windows(9).any(|w| w == b"ANS-BETA!"), "客户端 2 必须收到 beta 响应");
+        assert!(!p2.windows(9).any(|w| w == b"ANS-ALPHA"), "客户端 2 不应收到 alpha 响应");
     }
 }
