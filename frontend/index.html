@@ -7,14 +7,16 @@
   <style>
     :root {
       --bg: #090d16;
-      --card-bg: rgba(22, 30, 46, 0.7);
+      --card-bg: rgba(22, 30, 46, 0.75);
       --card-border: rgba(255, 255, 255, 0.08);
       --text-main: #f1f5f9;
       --text-muted: #94a3b8;
       --accent-primary: #38bdf8;
+      --accent-primary-hover: #0284c7;
       --accent-success: #10b981;
       --accent-warning: #f59e0b;
       --accent-danger: #ef4444;
+      --accent-danger-hover: #dc2626;
       --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "PingFang SC", "Microsoft YaHei", sans-serif;
     }
 
@@ -38,12 +40,13 @@
     aside {
       width: 250px;
       border-right: 1px solid var(--card-border);
-      background: rgba(15, 23, 42, 0.6);
+      background: rgba(15, 23, 42, 0.65);
       backdrop-filter: blur(16px);
       padding: 28px 16px;
       display: flex;
       flex-direction: column;
       gap: 32px;
+      flex-shrink: 0;
     }
 
     .brand {
@@ -90,7 +93,7 @@
       display: flex;
       align-items: center;
       gap: 12px;
-      padding: 10px 14px;
+      padding: 11px 14px;
       border-radius: 8px;
       color: var(--text-muted);
       text-decoration: none;
@@ -98,17 +101,19 @@
       font-weight: 500;
       transition: all 0.2s;
       cursor: pointer;
+      user-select: none;
     }
 
-    .nav-item:hover, .nav-item.active {
+    .nav-item:hover {
       background: rgba(255, 255, 255, 0.06);
       color: var(--text-main);
     }
 
     .nav-item.active {
       color: var(--accent-primary);
-      background: rgba(56, 189, 248, 0.1);
+      background: rgba(56, 189, 248, 0.12);
       border-left: 3px solid var(--accent-primary);
+      font-weight: 600;
     }
 
     /* 主内容区 */
@@ -156,9 +161,15 @@
       border-radius: 50%;
       background: var(--accent-success);
       box-shadow: 0 0 10px var(--accent-success);
+      animation: pulse 2s infinite;
     }
 
-    /* 概览卡片 */
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* 概览统计卡片 */
     .stats-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -194,7 +205,7 @@
       margin-top: 6px;
     }
 
-    /* 表格组件 */
+    /* 模块卡片容器 */
     .section-card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
@@ -216,6 +227,77 @@
       font-weight: 600;
     }
 
+    /* 按钮规范 */
+    .btn {
+      padding: 7px 14px;
+      border-radius: 7px;
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid transparent;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.2s;
+    }
+
+    .btn-primary {
+      background: var(--accent-primary);
+      color: #031122;
+      font-weight: 600;
+    }
+
+    .btn-primary:hover {
+      background: #7dd3fc;
+      box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+    }
+
+    .btn-secondary {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: var(--card-border);
+      color: var(--text-main);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.12);
+    }
+
+    .btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: rgba(239, 68, 68, 0.3);
+      color: var(--accent-danger);
+    }
+
+    .btn-danger:hover {
+      background: var(--accent-danger);
+      color: #fff;
+    }
+
+    .btn-action {
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-main);
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .btn-action:hover {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: var(--accent-primary);
+      color: var(--accent-primary);
+    }
+
+    .btn-action.btn-action-danger:hover {
+      background: rgba(239, 68, 68, 0.2);
+      border-color: rgba(239, 68, 68, 0.4);
+      color: var(--accent-danger);
+    }
+
+    /* 表格 */
     table {
       width: 100%;
       border-collapse: collapse;
@@ -240,6 +322,7 @@
       background: rgba(255, 255, 255, 0.02);
     }
 
+    /* 标签 */
     .tag {
       padding: 3px 8px;
       border-radius: 6px;
@@ -251,34 +334,31 @@
     .tag-proxy {
       background: rgba(56, 189, 248, 0.15);
       color: var(--accent-primary);
+      border: 1px solid rgba(56, 189, 248, 0.25);
     }
 
     .tag-direct {
       background: rgba(148, 163, 184, 0.15);
       color: var(--text-muted);
+      border: 1px solid rgba(148, 163, 184, 0.25);
     }
 
     .tag-block {
       background: rgba(239, 68, 68, 0.15);
       color: var(--accent-danger);
+      border: 1px solid rgba(239, 68, 68, 0.25);
     }
 
-    .btn-action {
-      padding: 4px 10px;
-      border-radius: 6px;
-      font-size: 12px;
-      font-weight: 500;
-      border: 1px solid var(--card-border);
-      background: rgba(255, 255, 255, 0.05);
-      color: var(--text-main);
-      cursor: pointer;
-      transition: all 0.2s;
+    .tag-socks4 {
+      background: rgba(245, 158, 11, 0.15);
+      color: var(--accent-warning);
+      border: 1px solid rgba(245, 158, 11, 0.25);
     }
 
-    .btn-action:hover {
-      background: rgba(239, 68, 68, 0.2);
-      border-color: rgba(239, 68, 68, 0.4);
-      color: var(--accent-danger);
+    .tag-http {
+      background: rgba(168, 85, 247, 0.15);
+      color: #c084fc;
+      border: 1px solid rgba(168, 85, 247, 0.25);
     }
 
     /* 规则列表 */
@@ -286,39 +366,274 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 14px 16px;
+      padding: 14px 18px;
       border-radius: 10px;
       background: rgba(255, 255, 255, 0.03);
       border: 1px solid var(--card-border);
-      margin-bottom: 10px;
+      margin-bottom: 12px;
+      transition: all 0.2s;
+    }
+
+    .rule-item:hover {
+      background: rgba(255, 255, 255, 0.05);
+      border-color: rgba(255, 255, 255, 0.12);
     }
 
     .rule-meta {
       display: flex;
       flex-direction: column;
-      gap: 4px;
+      gap: 6px;
     }
 
     .rule-title {
       font-weight: 600;
       font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
 
     .rule-details {
       font-size: 12px;
       color: var(--text-muted);
+      line-height: 1.5;
     }
 
-    /* 视图切换隐藏 */
+    .rule-actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    /* 节点网格卡片 */
+    .nodes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 18px;
+    }
+
+    .node-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 20px;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+      transition: all 0.2s;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .node-card:hover {
+      border-color: rgba(56, 189, 248, 0.3);
+      transform: translateY(-2px);
+    }
+
+    .node-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .node-info {
+      font-size: 13px;
+      color: var(--text-muted);
+      line-height: 1.6;
+      margin-bottom: 16px;
+    }
+
+    .node-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-top: 1px solid var(--card-border);
+      padding-top: 12px;
+    }
+
+    .latency-pill {
+      font-size: 12px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .latency-pill.ok {
+      color: var(--accent-success);
+    }
+
+    .latency-pill.warn {
+      color: var(--accent-warning);
+    }
+
+    .latency-pill.err {
+      color: var(--accent-danger);
+    }
+
+    .latency-pill.unknown {
+      color: var(--text-muted);
+    }
+
+    /* 模态弹窗 */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(3, 7, 18, 0.7);
+      backdrop-filter: blur(8px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal-overlay.active {
+      display: flex;
+      animation: fadeIn 0.15s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    .modal-box {
+      width: 480px;
+      max-width: 90vw;
+      background: #111827;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 14px;
+      padding: 28px;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    .modal-title {
+      font-size: 18px;
+      font-weight: 700;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .modal-close {
+      cursor: pointer;
+      color: var(--text-muted);
+      font-size: 20px;
+      line-height: 1;
+      padding: 4px;
+    }
+
+    .modal-close:hover {
+      color: var(--text-main);
+    }
+
+    .form-group {
+      margin-bottom: 16px;
+    }
+
+    .form-label {
+      display: block;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .form-input, .form-select {
+      width: 100%;
+      padding: 10px 12px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: var(--text-main);
+      font-size: 13px;
+      outline: none;
+      transition: all 0.2s;
+    }
+
+    .form-input:focus, .form-select:focus {
+      border-color: var(--accent-primary);
+      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+    }
+
+    .form-select option {
+      background: #1f2937;
+      color: #fff;
+    }
+
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    /* Toast 通知 */
+    .toast-container {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 2000;
+      pointer-events: none;
+    }
+
+    .toast {
+      padding: 12px 18px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      color: #fff;
+      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      pointer-events: auto;
+      animation: slideIn 0.2s ease-out;
+      transition: opacity 0.3s;
+    }
+
+    .toast-success {
+      background: #065f46;
+      border: 1px solid #10b981;
+    }
+
+    .toast-error {
+      background: #991b1b;
+      border: 1px solid #ef4444;
+    }
+
+    .toast-info {
+      background: #0c4a6e;
+      border: 1px solid #0284c7;
+    }
+
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to { transform: translateX(0); opacity: 1; }
+    }
+
+    /* 视图切换 */
     .view-content {
       display: none;
     }
     .view-content.active {
       display: block;
+      animation: fadeIn 0.2s;
     }
   </style>
 </head>
 <body>
+  <!-- Toast 通知容器 -->
+  <div class="toast-container" id="toast-container"></div>
+
   <!-- 侧边栏 -->
   <aside>
     <div class="brand">
@@ -334,19 +649,19 @@
     </div>
 
     <nav>
-      <div class="nav-item active" onclick="switchTab('dashboard')">
+      <div class="nav-item active" id="nav-dashboard" onclick="switchTab('dashboard')">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
         实时概览
       </div>
-      <div class="nav-item" onclick="switchTab('connections')">
+      <div class="nav-item" id="nav-connections" onclick="switchTab('connections')">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
         活跃连接
       </div>
-      <div class="nav-item" onclick="switchTab('proxies')">
+      <div class="nav-item" id="nav-proxies" onclick="switchTab('proxies')">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
         节点与链路
       </div>
-      <div class="nav-item" onclick="switchTab('rules')">
+      <div class="nav-item" id="nav-rules" onclick="switchTab('rules')">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
         分流策略
       </div>
@@ -394,7 +709,10 @@
       <div class="section-card">
         <div class="section-header">
           <h2>最新活跃进程连接</h2>
-          <button class="btn-action" onclick="fetchData()">立即刷新</button>
+          <button class="btn btn-secondary" onclick="fetchData()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
+            刷新数据
+          </button>
         </div>
         <table>
           <thead>
@@ -402,8 +720,8 @@
               <th>进程名 (PID)</th>
               <th>目标主机 / 域名</th>
               <th>命中策略</th>
-              <th>上行</th>
-              <th>下行</th>
+              <th>上行速率</th>
+              <th>下行速率</th>
               <th>持续时间</th>
             </tr>
           </thead>
@@ -423,7 +741,7 @@
       <div class="section-card">
         <div class="section-header">
           <h2>全量活动网络连接跟踪</h2>
-          <button class="btn-action" onclick="fetchData()">刷新列表</button>
+          <button class="btn btn-secondary" onclick="fetchData()">刷新列表</button>
         </div>
         <table>
           <thead>
@@ -433,12 +751,12 @@
               <th>可执行文件绝对路径</th>
               <th>目标地址 (含 Fake-IP 还原)</th>
               <th>决策动作</th>
-              <th>已传输字节</th>
+              <th>已传输流量</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody id="connections-tbody-full">
-            <tr><td colspan="7" style="text-align: center;">暂无活动连接</td></tr>
+            <tr><td colspan="7" style="text-align: center; padding: 24px;">暂无活动连接</td></tr>
           </tbody>
         </table>
       </div>
@@ -449,23 +767,13 @@
       <div class="section-card">
         <div class="section-header">
           <h2>可用代理节点 (Proxy Nodes)</h2>
-          <button class="btn-action">＋ 添加节点</button>
+          <button class="btn btn-primary" onclick="openAddNodeModal()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            添加节点
+          </button>
         </div>
-        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;">
-          <div class="stat-card" style="border-left: 4px solid var(--accent-primary);">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-              <strong>Node-101 (主节点)</strong>
-              <span class="tag tag-proxy">SOCKS5</span>
-            </div>
-            <div style="margin-top: 10px; font-size: 13px; color: var(--text-muted);">
-              地址: 127.0.0.1:10808<br>
-              认证: 无密码
-            </div>
-            <div style="margin-top: 14px; display: flex; justify-content: space-between; align-items: center;">
-              <span style="font-size: 12px; color: var(--accent-success); font-weight: 600;">● 延迟 12ms</span>
-              <button class="btn-action">测速</button>
-            </div>
-          </div>
+        <div class="nodes-grid" id="nodes-container">
+          <!-- 动态渲染节点卡片 -->
         </div>
       </div>
     </div>
@@ -475,42 +783,114 @@
       <div class="section-card">
         <div class="section-header">
           <h2>分流规则引擎 (自顶向下匹配)</h2>
-          <button class="btn-action">＋ 新建规则</button>
+          <button class="btn btn-primary" onclick="openAddRuleModal()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            添加配置 / 新建规则
+          </button>
         </div>
         <div id="rules-container">
-          <div class="rule-item">
-            <div class="rule-meta">
-              <span class="rule-title">1. LocalBypass (本地回环直连)</span>
-              <span class="rule-details">目标: 127.0.0.1, localhost, %ComputerName%, 192.168.0.0/16</span>
-            </div>
-            <span class="tag tag-direct">Direct (直连)</span>
-          </div>
-          <div class="rule-item">
-            <div class="rule-meta">
-              <span class="rule-title">2. DevProxy (开发进程代理)</span>
-              <span class="rule-details">进程: node.exe, *antigravity*.exe · 目标: 全部</span>
-            </div>
-            <span class="tag tag-proxy">Proxy (Node-101)</span>
-          </div>
-          <div class="rule-item">
-            <div class="rule-meta">
-              <span class="rule-title">3. Default (默认兜底)</span>
-              <span class="rule-details">未被上述规则命中的所有连接</span>
-            </div>
-            <span class="tag tag-direct">Direct (直连)</span>
-          </div>
+          <!-- 动态渲染规则列表 -->
         </div>
       </div>
     </div>
   </main>
 
+  <!-- 模态框：添加节点 -->
+  <div class="modal-overlay" id="modal-node">
+    <div class="modal-box">
+      <div class="modal-title">
+        <span>添加代理节点</span>
+        <span class="modal-close" onclick="closeModal('modal-node')">&times;</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label">节点名称</label>
+        <input type="text" class="form-input" id="node-name" placeholder="例如: HK-Socks-01">
+      </div>
+      <div class="form-group">
+        <label class="form-label">代理协议</label>
+        <select class="form-select" id="node-protocol">
+          <option value="SOCKS5">SOCKS5 (推荐)</option>
+          <option value="HTTP">HTTP CONNECT</option>
+          <option value="SOCKS4">SOCKS4 / SOCKS4a</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">服务器地址 (主机:端口)</label>
+        <input type="text" class="form-input" id="node-addr" placeholder="例如: 127.0.0.1:10808 或 proxy.example.com:443">
+      </div>
+      <div class="form-group">
+        <label class="form-label">认证用户名 (可选)</label>
+        <input type="text" class="form-input" id="node-user" placeholder="无认证请留空">
+      </div>
+      <div class="form-group">
+        <label class="form-label">认证密码 (可选)</label>
+        <input type="password" class="form-input" id="node-pass" placeholder="无认证请留空">
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeModal('modal-node')">取消</button>
+        <button class="btn btn-primary" onclick="submitAddNode()">保存节点</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框：添加分流规则 -->
+  <div class="modal-overlay" id="modal-rule">
+    <div class="modal-box">
+      <div class="modal-title">
+        <span>新建分流规则</span>
+        <span class="modal-close" onclick="closeModal('modal-rule')">&times;</span>
+      </div>
+      <div class="form-group">
+        <label class="form-label">规则名称</label>
+        <input type="text" class="form-input" id="rule-name" placeholder="例如: WebBrowserProxy">
+      </div>
+      <div class="form-group">
+        <label class="form-label">应用程序筛选 (分号分隔，支持通配符)</label>
+        <input type="text" class="form-input" id="rule-apps" placeholder="例如: chrome.exe; *edge*.exe; node.exe (留空匹配所有)">
+      </div>
+      <div class="form-group">
+        <label class="form-label">目标地址筛选 (域名/IP/CIDR，分号分隔)</label>
+        <input type="text" class="form-input" id="rule-targets" placeholder="例如: *.github.com; 1.1.1.1/32; localhost (留空匹配所有)">
+      </div>
+      <div class="form-group">
+        <label class="form-label">目标端口筛选 (单端口、逗号或范围)</label>
+        <input type="text" class="form-input" id="rule-ports" placeholder="例如: 80; 443; 8000-8080 (留空匹配所有)">
+      </div>
+      <div class="form-group">
+        <label class="form-label">执行动作</label>
+        <select class="form-select" id="rule-action" onchange="onRuleActionChange()">
+          <option value="Direct">Direct (直连)</option>
+          <option value="Proxy" selected>Proxy (通过代理节点转发)</option>
+          <option value="Block">Block (阻断连接)</option>
+        </select>
+      </div>
+      <div class="form-group" id="group-node-select">
+        <label class="form-label">指定代理节点</label>
+        <select class="form-select" id="rule-node-id">
+          <!-- 动态加载可用节点 -->
+        </select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeModal('modal-rule')">取消</button>
+        <button class="btn btn-primary" onclick="submitAddRule()">保存规则</button>
+      </div>
+    </div>
+  </div>
+
   <script>
+    // 全局节点缓存
+    let g_nodes = [];
+
+    // 选项卡切换
     function switchTab(tabId) {
       document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
       document.querySelectorAll('.view-content').forEach(el => el.classList.remove('active'));
 
-      event.currentTarget.classList.add('active');
-      document.getElementById('tab-' + tabId).classList.add('active');
+      const navEl = document.getElementById('nav-' + tabId);
+      if (navEl) navEl.classList.add('active');
+
+      const tabEl = document.getElementById('tab-' + tabId);
+      if (tabEl) tabEl.classList.add('active');
 
       const titles = {
         dashboard: '系统实时仪表盘',
@@ -518,22 +898,41 @@
         proxies: '代理节点与链路编排',
         rules: '分流策略规则库'
       };
-      document.getElementById('view-title').innerText = titles[tabId];
+      document.getElementById('view-title').innerText = titles[tabId] || '控制台';
+
+      if (tabId === 'proxies') loadNodes();
+      if (tabId === 'rules') loadRules();
     }
 
+    // Toast 浮窗提示
+    function showToast(msg, type = 'success') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      toast.className = `toast toast-${type}`;
+      toast.innerText = msg;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.style.opacity = '0';
+        setTimeout(() => toast.remove(), 300);
+      }, 3000);
+    }
+
+    // 格式化函数
     function formatBytes(bytes) {
       if (bytes < 1024) return bytes + ' B';
       if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-      return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+      return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
     }
 
     function formatSpeed(bps) {
       return formatBytes(bps) + '/s';
     }
 
+    // 定时轮询与数据同步
     async function fetchData() {
       try {
-        const statsRes = await fetch('http://127.0.0.1:40080/api/stats');
+        const statsRes = await fetch('/api/stats');
         if (statsRes.ok) {
           const stats = await statsRes.json();
           document.getElementById('val-down-speed').innerText = formatSpeed(stats.current_download_bps || 0);
@@ -543,16 +942,17 @@
           document.getElementById('val-total-bytes').innerText = formatBytes(total);
         }
 
-        const connsRes = await fetch('http://127.0.0.1:40080/api/connections');
+        const connsRes = await fetch('/api/connections');
         if (connsRes.ok) {
           const conns = await connsRes.json();
           renderConnections(conns);
         }
       } catch (e) {
-        // 后台未开启时的模拟演示数据
+        // 后台连接异常处理
       }
     }
 
+    // 渲染连接列表
     function renderConnections(conns) {
       const tbodyPreview = document.getElementById('connections-tbody-preview');
       const tbodyFull = document.getElementById('connections-tbody-full');
@@ -570,9 +970,9 @@
         const tagClass = c.action.includes('Proxy') ? 'tag-proxy' : (c.action === 'Block' ? 'tag-block' : 'tag-direct');
         previewHtml += `
           <tr>
-            <td><strong>${c.process_name}</strong> <span style="color:var(--text-muted); font-size:11px;">#${c.pid}</span></td>
-            <td>${c.target}</td>
-            <td><span class="tag ${tagClass}">${c.action}</span></td>
+            <td><strong>${escapeHtml(c.process_name)}</strong> <span style="color:var(--text-muted); font-size:11px;">#${c.pid}</span></td>
+            <td>${escapeHtml(c.target)}</td>
+            <td><span class="tag ${tagClass}">${escapeHtml(c.action)}</span></td>
             <td>${formatSpeed(c.upload_speed_bps)}</td>
             <td>${formatSpeed(c.download_speed_bps)}</td>
             <td>${c.duration_secs}s</td>
@@ -582,12 +982,12 @@
         fullHtml += `
           <tr>
             <td>#${c.id}</td>
-            <td><strong>${c.process_name}</strong></td>
-            <td style="color:var(--text-muted); font-size:11px;">${c.process_path}</td>
-            <td>${c.target}</td>
-            <td><span class="tag ${tagClass}">${c.action}</span></td>
+            <td><strong>${escapeHtml(c.process_name)}</strong></td>
+            <td style="color:var(--text-muted); font-size:11px;">${escapeHtml(c.process_path)}</td>
+            <td>${escapeHtml(c.target)}</td>
+            <td><span class="tag ${tagClass}">${escapeHtml(c.action)}</span></td>
             <td>↑${formatBytes(c.uploaded_bytes)} / ↓${formatBytes(c.downloaded_bytes)}</td>
-            <td><button class="btn-action">断开</button></td>
+            <td><button class="btn-action btn-action-danger" onclick="killConnection(${c.id})">断开</button></td>
           </tr>
         `;
       });
@@ -596,9 +996,312 @@
       tbodyFull.innerHTML = fullHtml;
     }
 
-    // 启动定时轮询
-    setInterval(fetchData, 1000);
+    // 断开连接
+    async function killConnection(id) {
+      try {
+        const res = await fetch(`/api/connections/kill?id=${id}`, { method: 'POST' });
+        if (res.ok) {
+          showToast(`已断开连接 #${id}`, 'info');
+          fetchData();
+        } else {
+          showToast('断开连接失败', 'error');
+        }
+      } catch (e) {
+        showToast('请求超时或失败: ' + e.message, 'error');
+      }
+    }
+
+    // 模态弹窗控制
+    function openModal(modalId) {
+      document.getElementById(modalId).classList.add('active');
+    }
+
+    function closeModal(modalId) {
+      document.getElementById(modalId).classList.remove('active');
+    }
+
+    function openAddNodeModal() {
+      document.getElementById('node-name').value = '';
+      document.getElementById('node-addr').value = '';
+      document.getElementById('node-user').value = '';
+      document.getElementById('node-pass').value = '';
+      openModal('modal-node');
+    }
+
+    function openAddRuleModal() {
+      document.getElementById('rule-name').value = '';
+      document.getElementById('rule-apps').value = '';
+      document.getElementById('rule-targets').value = '';
+      document.getElementById('rule-ports').value = '';
+      document.getElementById('rule-action').value = 'Proxy';
+      onRuleActionChange();
+      openModal('modal-rule');
+    }
+
+    function onRuleActionChange() {
+      const act = document.getElementById('rule-action').value;
+      const group = document.getElementById('group-node-select');
+      group.style.display = (act === 'Proxy') ? 'block' : 'none';
+      if (act === 'Proxy') {
+        const select = document.getElementById('rule-node-id');
+        select.innerHTML = g_nodes.map(n => `<option value="${n.id}">${escapeHtml(n.name)} (${n.protocol} - ${escapeHtml(n.server_addr)})</option>`).join('');
+      }
+    }
+
+    // 节点管理: 加载节点列表
+    async function loadNodes() {
+      try {
+        const res = await fetch('/api/nodes');
+        if (res.ok) {
+          g_nodes = await res.json();
+          renderNodes(g_nodes);
+        }
+      } catch (e) {
+        showToast('加载代理节点失败', 'error');
+      }
+    }
+
+    function renderNodes(nodes) {
+      const container = document.getElementById('nodes-container');
+      if (!nodes || nodes.length === 0) {
+        container.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">暂无配置的代理节点，请点击右上角添加</div>';
+        return;
+      }
+
+      container.innerHTML = nodes.map(n => {
+        let tagClass = 'tag-proxy';
+        if (n.protocol === 'HTTP') tagClass = 'tag-http';
+        if (n.protocol === 'SOCKS4') tagClass = 'tag-socks4';
+
+        return `
+          <div class="node-card" id="node-card-${n.id}">
+            <div>
+              <div class="node-header">
+                <strong>${escapeHtml(n.name)}</strong>
+                <span class="tag ${tagClass}">${n.protocol}</span>
+              </div>
+              <div class="node-info">
+                服务器地址: ${escapeHtml(n.server_addr)}<br>
+                认证状态: ${n.auth_configured ? '已配置用户名密码' : '无密码'}
+              </div>
+            </div>
+            <div class="node-footer">
+              <span class="latency-pill unknown" id="latency-${n.id}">● 未测速</span>
+              <div style="display:flex; gap:6px;">
+                <button class="btn-action" onclick="pingNode(${n.id}, '${escapeHtml(n.server_addr)}')">测速</button>
+                <button class="btn-action btn-action-danger" onclick="deleteNode(${n.id})">删除</button>
+              </div>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // 提交添加节点
+    async function submitAddNode() {
+      const name = document.getElementById('node-name').value.trim();
+      const protocol = document.getElementById('node-protocol').value;
+      const addr = document.getElementById('node-addr').value.trim();
+      const user = document.getElementById('node-user').value.trim();
+      const pass = document.getElementById('node-pass').value.trim();
+
+      if (!name || !addr) {
+        showToast('请完整填写节点名称与服务器地址', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/nodes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            protocol,
+            server_addr: addr,
+            username: user || null,
+            password: pass || null
+          })
+        });
+
+        if (res.ok) {
+          showToast(`代理节点 [${name}] 保存成功`);
+          closeModal('modal-node');
+          loadNodes();
+        } else {
+          const err = await res.json();
+          showToast('添加失败: ' + (err.error || '未知错误'), 'error');
+        }
+      } catch (e) {
+        showToast('网络请求异常: ' + e.message, 'error');
+      }
+    }
+
+    // 节点测速
+    async function pingNode(id, addr) {
+      const pill = document.getElementById(`latency-${id}`);
+      pill.className = 'latency-pill unknown';
+      pill.innerHTML = '● 测速中...';
+
+      try {
+        const res = await fetch('/api/nodes/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ addr })
+        });
+        const data = await res.json();
+        if (data.ok) {
+          pill.className = 'latency-pill ok';
+          pill.innerHTML = `● ${data.latency_ms} ms`;
+          showToast(`[${addr}] 测速成功: ${data.latency_ms} ms`);
+        } else {
+          pill.className = 'latency-pill err';
+          pill.innerHTML = `● ${data.message || '连接失败'}`;
+          showToast(`[${addr}] 连接超时或失败`, 'error');
+        }
+      } catch (e) {
+        pill.className = 'latency-pill err';
+        pill.innerHTML = '● 失败';
+        showToast('测速网络超时', 'error');
+      }
+    }
+
+    // 删除节点
+    async function deleteNode(id) {
+      if (!confirm(`确认删除代理节点 #${id} 吗？`)) return;
+      try {
+        const res = await fetch(`/api/nodes?id=${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showToast('节点已删除');
+          loadNodes();
+        } else {
+          showToast('删除节点失败', 'error');
+        }
+      } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+      }
+    }
+
+    // 规则管理: 加载规则列表
+    async function loadRules() {
+      try {
+        const res = await fetch('/api/rules');
+        if (res.ok) {
+          const rules = await res.json();
+          renderRules(rules);
+        }
+      } catch (e) {
+        showToast('加载规则失败', 'error');
+      }
+    }
+
+    function renderRules(rules) {
+      const container = document.getElementById('rules-container');
+      if (!rules || rules.length === 0) {
+        container.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-muted);">暂无配置的分流规则，请点击右上角新建</div>';
+        return;
+      }
+
+      container.innerHTML = rules.map((r, idx) => {
+        let tagClass = 'tag-direct';
+        if (r.action.includes('Proxy')) tagClass = 'tag-proxy';
+        if (r.action.includes('Block')) tagClass = 'tag-block';
+
+        const descParts = [];
+        if (r.apps) descParts.push(`<b>应用:</b> ${escapeHtml(r.apps)}`);
+        if (r.targets) descParts.push(`<b>目标:</b> ${escapeHtml(r.targets)}`);
+        if (r.ports) descParts.push(`<b>端口:</b> ${escapeHtml(r.ports)}`);
+        const descHtml = descParts.length > 0 ? descParts.join(' · ') : '所有应用与目标流量';
+
+        return `
+          <div class="rule-item">
+            <div class="rule-meta">
+              <span class="rule-title">
+                ${idx + 1}. ${escapeHtml(r.name)}
+              </span>
+              <span class="rule-details">${descHtml}</span>
+            </div>
+            <div class="rule-actions">
+              <span class="tag ${tagClass}">${escapeHtml(r.action)}</span>
+              <button class="btn-action btn-action-danger" onclick="deleteRule(${r.id})">删除</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    // 提交添加规则
+    async function submitAddRule() {
+      const name = document.getElementById('rule-name').value.trim();
+      const apps = document.getElementById('rule-apps').value.trim();
+      const targets = document.getElementById('rule-targets').value.trim();
+      const ports = document.getElementById('rule-ports').value.trim();
+      const action = document.getElementById('rule-action').value;
+      const nodeId = parseInt(document.getElementById('rule-node-id').value) || null;
+
+      if (!name) {
+        showToast('请输入规则名称', 'error');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/rules', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            apps: apps || null,
+            targets: targets || null,
+            ports: ports || null,
+            action,
+            node_id: nodeId
+          })
+        });
+
+        if (res.ok) {
+          showToast(`分流规则 [${name}] 添加成功`);
+          closeModal('modal-rule');
+          loadRules();
+        } else {
+          const err = await res.json();
+          showToast('添加失败: ' + (err.error || '未知错误'), 'error');
+        }
+      } catch (e) {
+        showToast('请求异常: ' + e.message, 'error');
+      }
+    }
+
+    // 删除规则
+    async function deleteRule(id) {
+      if (!confirm('确认删除该分流规则吗？')) return;
+      try {
+        const res = await fetch(`/api/rules?id=${id}`, { method: 'DELETE' });
+        if (res.ok) {
+          showToast('规则已成功删除');
+          loadRules();
+        } else {
+          showToast('删除规则失败', 'error');
+        }
+      } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+      }
+    }
+
+    // HTML 转义防 XSS
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    // 页面初始化
+    loadNodes();
+    loadRules();
     fetchData();
+    setInterval(fetchData, 1000);
   </script>
 </body>
 </html>

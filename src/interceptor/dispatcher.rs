@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use anyhow::{bail, Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
@@ -9,11 +9,20 @@ use tracing::{error, info, warn};
 use crate::dns::FakeIpPool;
 use crate::interceptor::process::ProcessTracker;
 use crate::monitor::ConnectionManager;
-use crate::outbound::chain::ProxyChain;
+use crate::outbound::chain::{ProxyChain, ProxyNode};
 use crate::outbound::direct::DirectOutbound;
-use crate::outbound::socks5::Socks5Client;
 use crate::outbound::{relay_stream_monitored, TargetAddr};
 use crate::router::{Action, RouteContext, RuleEngine};
+
+#[derive(Debug, Clone)]
+pub struct ProxyNodeEntry {
+    pub id: u32,
+    pub name: String,
+    pub protocol: String,
+    pub server_addr: String,
+    pub username: Option<String>,
+    pub client: ProxyNode,
+}
 
 /// 流量调度核心配置
 pub struct DispatcherConfig {
@@ -22,7 +31,7 @@ pub struct DispatcherConfig {
     pub fake_ip_pool: Arc<FakeIpPool>,
     pub rule_engine: Arc<RuleEngine>,
     pub monitor: Arc<ConnectionManager>,
-    pub proxy_nodes: Arc<HashMap<u32, Socks5Client>>,
+    pub proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     pub proxy_chains: Arc<HashMap<u32, ProxyChain>>,
 }
 
@@ -81,7 +90,7 @@ impl StreamDispatcher {
 
             let config = Arc::clone(&self.config);
             tokio::spawn(async move {
-                let _permit = permit; // 离开作用域自动释放并发令牌
+                let _permit = permit;
                 if let Err(e) = handle_connection(local_stream, peer_addr, config).await {
                     warn!("[调度核心] 连接中继结束或异常: {}", e);
                 }
@@ -190,11 +199,18 @@ async fn handle_connection(
             Ok(())
         }
         Action::Proxy(node_id) => {
-            let client = match config.proxy_nodes.get(&node_id) {
-                Some(c) => c,
-                None => bail!("规则指定了不存在的代理节点 ID: {}", node_id),
+            let client = {
+                let nodes_guard = config.proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
+                match nodes_guard.get(&node_id) {
+                    Some(e) => e.client.clone(),
+                    None => bail!("规则指定了不存在的代理节点 ID: {}", node_id),
+                }
             };
-            let remote_stream = client.connect(&target).await?;
+            let remote_stream = match &client {
+                ProxyNode::Socks5(s) => s.connect(&target).await?,
+                ProxyNode::Http(h) => h.connect(&target).await?,
+                ProxyNode::Socks4(s) => s.connect(&target).await?,
+            };
             let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
             info!(
                 "[代理完成] [{}] 目标 {}:{} 上传: {} B, 下载: {} B",

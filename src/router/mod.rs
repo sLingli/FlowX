@@ -1,11 +1,13 @@
 use std::net::IpAddr;
+use std::sync::RwLock;
 use glob::Pattern;
 use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
 use self::parser::DomainMatcher;
 
 pub mod parser;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Direct,
     Block,
@@ -13,16 +15,30 @@ pub enum Action {
     Chain(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRange {
     pub start: u16,
     pub end: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuleView {
+    pub id: usize,
+    pub name: String,
+    pub enabled: bool,
+    pub apps: String,
+    pub targets: String,
+    pub ports: String,
+    pub action: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Rule {
     pub name: String,
     pub enabled: bool,
+    pub apps_raw: String,
+    pub targets_raw: String,
+    pub ports_raw: String,
     pub application_patterns: Option<Vec<Pattern>>,
     pub target_domains: Option<Vec<DomainMatcher>>,
     pub target_subnets: Option<Vec<IpNet>>,
@@ -50,6 +66,9 @@ impl Rule {
         Self {
             name: name.into(),
             enabled,
+            apps_raw: apps_raw.unwrap_or_default().to_string(),
+            targets_raw: targets_raw.unwrap_or_default().to_string(),
+            ports_raw: ports_raw.unwrap_or_default().to_string(),
             application_patterns,
             target_domains,
             target_subnets,
@@ -68,21 +87,62 @@ pub struct RouteContext<'a> {
 }
 
 pub struct RuleEngine {
-    pub rules: Vec<Rule>,
+    pub rules: RwLock<Vec<Rule>>,
     pub default_action: Action,
 }
 
 impl RuleEngine {
     pub fn new(rules: Vec<Rule>, default_action: Action) -> Self {
         Self {
-            rules,
+            rules: RwLock::new(rules),
             default_action,
+        }
+    }
+
+    pub fn list_rules_view(&self) -> Vec<RuleView> {
+        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        rules
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let action_desc = match &r.action {
+                    Action::Direct => "Direct (直连)".to_string(),
+                    Action::Block => "Block (阻断)".to_string(),
+                    Action::Proxy(id) => format!("Proxy (节点-{})", id),
+                    Action::Chain(id) => format!("Chain (链路-{})", id),
+                };
+                RuleView {
+                    id: i,
+                    name: r.name.clone(),
+                    enabled: r.enabled,
+                    apps: r.apps_raw.clone(),
+                    targets: r.targets_raw.clone(),
+                    ports: r.ports_raw.clone(),
+                    action: action_desc,
+                }
+            })
+            .collect()
+    }
+
+    pub fn add_rule(&self, rule: Rule) {
+        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        rules.push(rule);
+    }
+
+    pub fn delete_rule(&self, index: usize) -> bool {
+        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        if index < rules.len() {
+            rules.remove(index);
+            true
+        } else {
+            false
         }
     }
 
     /// 按照自顶向下顺序对流量进行求值匹配 (First Match Wins)，带 Fail-Closed 约束保护
     pub fn evaluate(&self, ctx: &RouteContext) -> (Action, String) {
-        for rule in &self.rules {
+        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        for rule in rules.iter() {
             if !rule.enabled {
                 continue;
             }

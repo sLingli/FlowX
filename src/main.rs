@@ -8,7 +8,7 @@ pub mod router;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
@@ -16,9 +16,10 @@ use tracing_subscriber::FmtSubscriber;
 use crate::api::ApiServer;
 use crate::dns::server::DnsServer;
 use crate::dns::FakeIpPool;
-use crate::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
+use crate::interceptor::dispatcher::{DispatcherConfig, ProxyNodeEntry, StreamDispatcher};
 use crate::interceptor::process::ProcessTracker;
 use crate::monitor::ConnectionManager;
+use crate::outbound::chain::ProxyNode;
 use crate::outbound::socks5::Socks5Client;
 use crate::router::{Action, Rule, RuleEngine};
 
@@ -42,8 +43,18 @@ async fn main() -> anyhow::Result<()> {
     // 3. 配置默认代理节点与路由规则
     let mut proxy_nodes = HashMap::new();
     // 注册示范 SOCKS5 节点 (Node 101: 127.0.0.1:10808)
-    proxy_nodes.insert(101, Socks5Client::new("127.0.0.1:10808"));
-    let proxy_nodes = Arc::new(proxy_nodes);
+    proxy_nodes.insert(
+        101,
+        ProxyNodeEntry {
+            id: 101,
+            name: "Node-101 (主节点)".to_string(),
+            protocol: "SOCKS5".to_string(),
+            server_addr: "127.0.0.1:10808".to_string(),
+            username: None,
+            client: ProxyNode::Socks5(Socks5Client::new("127.0.0.1:10808")),
+        },
+    );
+    let proxy_nodes = Arc::new(RwLock::new(proxy_nodes));
     let proxy_chains = Arc::new(HashMap::new());
 
     // 默认内置分流规则 (自顶向下匹配，带 Fail-Closed 约束保护)
@@ -91,7 +102,12 @@ async fn main() -> anyhow::Result<()> {
     let dispatcher_listener = dispatcher.bind().await?;
 
     let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
-    let api_server = ApiServer::new(api_bind, Arc::clone(&connection_manager));
+    let api_server = ApiServer::new(
+        api_bind,
+        Arc::clone(&connection_manager),
+        Arc::clone(&rule_engine),
+        Arc::clone(&proxy_nodes),
+    );
     let api_listener = api_server.bind().await?;
 
     // 5. 初始化全局优雅停机广播通知通道
