@@ -1,303 +1,670 @@
 <!DOCTYPE html>
-<html lang="zh-CN" class="dark">
+<html lang="zh-CN" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FlowX - 现代透明代理与分流控制台</title>
+  <title>FlowX — 透明网络代理与进程分流控制台</title>
   <style>
-    :root {
-      --bg: #090d16;
-      --card-bg: rgba(22, 30, 46, 0.75);
-      --card-border: rgba(255, 255, 255, 0.08);
-      --text-main: #f1f5f9;
-      --text-muted: #94a3b8;
-      --accent-primary: #38bdf8;
-      --accent-primary-hover: #0284c7;
-      --accent-success: #10b981;
-      --accent-warning: #f59e0b;
-      --accent-danger: #ef4444;
-      --accent-danger-hover: #dc2626;
-      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "PingFang SC", "Microsoft YaHei", sans-serif;
+    :root, [data-theme="dark"] {
+      --bg-canvas: #090d14;
+      --bg-sidebar: #0d121c;
+      --bg-surface: #111826;
+      --bg-elevated: #172033;
+      --bg-hover: rgba(255, 255, 255, 0.045);
+      --bg-input: #0b101b;
+      --border: rgba(255, 255, 255, 0.08);
+      --border-strong: rgba(255, 255, 255, 0.15);
+      --text-primary: #eef2f7;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent: #22d3ee;
+      --accent-soft: rgba(34, 211, 238, 0.12);
+      --accent-border: rgba(34, 211, 238, 0.30);
+      --accent-ink: #041b22;
+      --green: #10b981;
+      --green-soft: rgba(16, 185, 129, 0.13);
+      --green-border: rgba(16, 185, 129, 0.30);
+      --amber: #f59e0b;
+      --amber-soft: rgba(245, 158, 11, 0.13);
+      --amber-border: rgba(245, 158, 11, 0.30);
+      --red: #f43f5e;
+      --red-soft: rgba(244, 63, 94, 0.13);
+      --red-border: rgba(244, 63, 94, 0.32);
+      --indigo: #60a5fa;
+      --indigo-soft: rgba(96, 165, 250, 0.13);
+      --indigo-border: rgba(96, 165, 250, 0.30);
+      --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.22);
+      --shadow-modal: 0 24px 64px rgba(0, 0, 0, 0.65);
     }
 
-    * {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-      font-family: var(--font);
+    [data-theme="light"] {
+      --bg-canvas: #f3f6fa;
+      --bg-sidebar: #ffffff;
+      --bg-surface: #ffffff;
+      --bg-elevated: #f8fafc;
+      --bg-hover: rgba(15, 23, 42, 0.035);
+      --bg-input: #f8fafc;
+      --border: rgba(15, 23, 42, 0.09);
+      --border-strong: rgba(15, 23, 42, 0.18);
+      --text-primary: #0f172a;
+      --text-secondary: #475569;
+      --text-muted: #64748b;
+      --accent: #0284c7;
+      --accent-soft: rgba(2, 132, 199, 0.10);
+      --accent-border: rgba(2, 132, 199, 0.28);
+      --accent-ink: #ffffff;
+      --green: #059669;
+      --green-soft: rgba(5, 150, 105, 0.10);
+      --green-border: rgba(5, 150, 105, 0.28);
+      --amber: #d97706;
+      --amber-soft: rgba(217, 119, 6, 0.10);
+      --amber-border: rgba(217, 119, 6, 0.28);
+      --red: #e11d48;
+      --red-soft: rgba(225, 29, 72, 0.10);
+      --red-border: rgba(225, 29, 72, 0.28);
+      --indigo: #2563eb;
+      --indigo-soft: rgba(37, 99, 235, 0.10);
+      --indigo-border: rgba(37, 99, 235, 0.28);
+      --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 14px rgba(15, 23, 42, 0.04);
+      --shadow-modal: 0 20px 50px rgba(15, 23, 42, 0.18);
     }
 
-    body {
-      background-color: var(--bg);
-      background-image: radial-gradient(at 0% 0%, rgba(56, 189, 248, 0.08) 0px, transparent 50%),
-                        radial-gradient(at 100% 100%, rgba(99, 102, 241, 0.06) 0px, transparent 50%);
-      color: var(--text-main);
-      min-height: 100vh;
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--bg-canvas);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .num { font-variant-numeric: tabular-nums; }
+
+    /* 整体壳层 */
+    .app-shell {
       display: flex;
+      min-height: 100vh;
     }
 
-    /* 侧边导航栏 */
-    aside {
-      width: 250px;
-      border-right: 1px solid var(--card-border);
-      background: rgba(15, 23, 42, 0.65);
-      backdrop-filter: blur(16px);
-      padding: 28px 16px;
+    /* 侧边栏 */
+    .sidebar {
+      width: 244px;
+      background: var(--bg-sidebar);
+      border-right: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      gap: 32px;
+      padding: 20px 14px;
       flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      height: 100vh;
     }
 
     .brand {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding-left: 12px;
+      gap: 11px;
+      padding: 4px 10px 22px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 16px;
     }
 
-    .brand-icon {
-      width: 36px;
-      height: 36px;
-      background: linear-gradient(135deg, #38bdf8, #6366f1);
-      border-radius: 10px;
+    .brand-logo {
+      width: 34px;
+      height: 34px;
+      border-radius: 9px;
+      background: var(--accent-soft);
+      border: 1px solid var(--accent-border);
+      color: var(--accent);
       display: flex;
       align-items: center;
       justify-content: center;
-      box-shadow: 0 4px 14px rgba(56, 189, 248, 0.4);
+      flex-shrink: 0;
     }
 
-    .brand-title {
-      font-size: 18px;
-      font-weight: 700;
-      letter-spacing: 0.5px;
-    }
-
-    .brand-badge {
-      font-size: 10px;
-      padding: 2px 6px;
-      background: rgba(56, 189, 248, 0.15);
-      color: var(--accent-primary);
-      border-radius: 4px;
-      font-weight: 600;
-      margin-left: 4px;
-    }
-
-    nav {
+    .brand-text {
       display: flex;
       flex-direction: column;
+      min-width: 0;
+    }
+
+    .brand-name {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+      display: flex;
+      align-items: center;
       gap: 6px;
+    }
+
+    .brand-ver {
+      font-size: 10px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      border: 1px solid var(--accent-border);
+      font-weight: 600;
+    }
+
+    .brand-sub {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .nav-list {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      flex: 1;
     }
 
     .nav-item {
       display: flex;
       align-items: center;
-      gap: 12px;
-      padding: 11px 14px;
+      justify-content: space-between;
+      padding: 10px 12px;
       border-radius: 8px;
-      color: var(--text-muted);
-      text-decoration: none;
-      font-size: 14px;
+      color: var(--text-secondary);
       font-weight: 500;
-      transition: all 0.2s;
       cursor: pointer;
       user-select: none;
+      border: 1px solid transparent;
+      background: transparent;
+      width: 100%;
+      text-align: left;
+      font-size: 13.5px;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+
+    .nav-item-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
 
     .nav-item:hover {
-      background: rgba(255, 255, 255, 0.06);
-      color: var(--text-main);
+      background: var(--bg-hover);
+      color: var(--text-primary);
     }
 
     .nav-item.active {
-      color: var(--accent-primary);
-      background: rgba(56, 189, 248, 0.12);
-      border-left: 3px solid var(--accent-primary);
+      background: var(--accent-soft);
+      border-color: var(--accent-border);
+      color: var(--accent);
       font-weight: 600;
     }
 
-    /* 主内容区 */
-    main {
-      flex: 1;
-      padding: 32px 40px;
-      overflow-y: auto;
-      max-height: 100vh;
+    .nav-count {
+      font-size: 11px;
+      padding: 1px 7px;
+      border-radius: 999px;
+      background: var(--bg-elevated);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
     }
 
-    header {
+    .nav-item.active .nav-count {
+      background: var(--accent-soft);
+      border-color: var(--accent-border);
+      color: var(--accent);
+    }
+
+    .sidebar-footer {
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
       display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 28px;
+      flex-direction: column;
+      gap: 10px;
     }
 
-    .header-title h1 {
-      font-size: 24px;
-      font-weight: 700;
+    .inbound-chip {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
     }
 
-    .header-title p {
-      font-size: 13px;
+    .inbound-chip-label {
+      font-size: 11px;
       color: var(--text-muted);
-      margin-top: 4px;
-    }
-
-    .status-badge {
       display: flex;
       align-items: center;
-      gap: 8px;
-      padding: 6px 14px;
-      background: rgba(16, 185, 129, 0.12);
-      border: 1px solid rgba(16, 185, 129, 0.25);
-      color: var(--accent-success);
-      border-radius: 20px;
-      font-size: 13px;
-      font-weight: 600;
+      justify-content: space-between;
     }
 
-    .status-dot {
-      width: 8px;
-      height: 8px;
+    .inbound-chip-val {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+    }
+
+    .copy-mini {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      border-radius: 5px;
+      padding: 2px 6px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .copy-mini:hover {
+      border-color: var(--accent-border);
+      color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    /* 主工作区 */
+    .main-area {
+      flex: 1;
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 28px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg-sidebar);
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .mobile-menu-btn {
+      display: none;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      color: var(--text-primary);
+      border-radius: 8px;
+      width: 34px;
+      height: 34px;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+
+    .page-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.2px;
+    }
+
+    .page-subtitle {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .health-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      background: var(--green-soft);
+      border: 1px solid var(--green-border);
+      color: var(--green);
+    }
+
+    .health-pill.offline {
+      background: var(--red-soft);
+      border-color: var(--red-border);
+      color: var(--red);
+    }
+
+    .health-dot {
+      width: 7px;
+      height: 7px;
       border-radius: 50%;
-      background: var(--accent-success);
-      box-shadow: 0 0 10px var(--accent-success);
+      background: currentColor;
+    }
+
+    .health-pill:not(.offline) .health-dot {
       animation: pulse 2s infinite;
     }
 
     @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.4; }
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.85); }
     }
 
-    /* 概览统计卡片 */
-    .stats-grid {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 18px;
-      margin-bottom: 28px;
+    .content-wrap {
+      padding: 24px 28px 36px;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
     }
 
-    .stat-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 20px;
-      backdrop-filter: blur(12px);
-      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
-    }
+    .view-panel { display: none; }
+    .view-panel.active { display: block; animation: fadeIn 0.16s ease-out; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 
-    .stat-label {
-      font-size: 13px;
-      color: var(--text-muted);
-      font-weight: 500;
-    }
-
-    .stat-value {
-      font-size: 26px;
-      font-weight: 700;
-      margin-top: 8px;
-      letter-spacing: -0.5px;
-    }
-
-    .stat-sub {
-      font-size: 11px;
-      color: var(--text-muted);
-      margin-top: 6px;
-    }
-
-    /* 模块卡片容器 */
-    .section-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 14px;
-      padding: 24px;
-      backdrop-filter: blur(16px);
-      margin-bottom: 24px;
-    }
-
-    .section-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 18px;
-    }
-
-    .section-header h2 {
-      font-size: 16px;
-      font-weight: 600;
-    }
-
-    /* 按钮规范 */
+    /* 通用按钮 */
     .btn {
-      padding: 7px 14px;
-      border-radius: 7px;
-      font-size: 13px;
-      font-weight: 500;
-      border: 1px solid transparent;
-      cursor: pointer;
       display: inline-flex;
       align-items: center;
+      justify-content: center;
       gap: 6px;
-      transition: all 0.2s;
+      padding: 7px 13px;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      background: var(--bg-elevated);
+      color: var(--text-primary);
+      cursor: pointer;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+
+    .btn:hover:not(:disabled) {
+      border-color: var(--border-strong);
+      background: var(--bg-hover);
+    }
+
+    .btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
 
     .btn-primary {
-      background: var(--accent-primary);
-      color: #031122;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--accent-ink);
       font-weight: 600;
     }
 
-    .btn-primary:hover {
-      background: #7dd3fc;
-      box-shadow: 0 0 12px rgba(56, 189, 248, 0.4);
+    .btn-primary:hover:not(:disabled) {
+      filter: brightness(1.08);
+      background: var(--accent);
+      border-color: var(--accent);
     }
 
-    .btn-secondary {
-      background: rgba(255, 255, 255, 0.06);
-      border-color: var(--card-border);
-      color: var(--text-main);
+    .btn-danger-ghost {
+      color: var(--red);
+      background: transparent;
+      border-color: var(--border);
     }
 
-    .btn-secondary:hover {
-      background: rgba(255, 255, 255, 0.12);
+    .btn-danger-ghost:hover:not(:disabled) {
+      background: var(--red-soft);
+      border-color: var(--red-border);
     }
 
-    .btn-danger {
-      background: rgba(239, 68, 68, 0.15);
-      border-color: rgba(239, 68, 68, 0.3);
-      color: var(--accent-danger);
+    .btn-sm {
+      padding: 4px 9px;
+      font-size: 12px;
+      border-radius: 6px;
     }
 
-    .btn-danger:hover {
-      background: var(--accent-danger);
-      color: #fff;
+    .icon-btn {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 8px;
     }
 
-    .btn-action {
+    /* 统计卡片网格 */
+    .kpi-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .kpi-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 20px;
+      box-shadow: var(--shadow-card);
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .kpi-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      font-weight: 500;
+    }
+
+    .kpi-icon {
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .kpi-icon.down { background: var(--accent-soft); color: var(--accent); }
+    .kpi-icon.up { background: var(--green-soft); color: var(--green); }
+    .kpi-icon.conns { background: var(--indigo-soft); color: var(--indigo); }
+    .kpi-icon.total { background: var(--amber-soft); color: var(--amber); }
+
+    .kpi-value {
+      font-size: 25px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: var(--text-primary);
+    }
+
+    .kpi-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* 仪表盘第二行：图表 + 系统信息 */
+    .dash-split {
+      display: grid;
+      grid-template-columns: minmax(0, 1.65fr) minmax(300px, 1fr);
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+      box-shadow: var(--shadow-card);
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    .card-title {
+      font-size: 15px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .card-sub {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .chart-legend {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .legend-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 5px;
+    }
+
+    .chart-wrap {
+      width: 100%;
+      height: 188px;
+      position: relative;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      overflow: hidden;
+    }
+
+    .chart-svg {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .chart-peak {
+      position: absolute;
+      top: 8px;
+      left: 12px;
+      font-size: 11px;
+      color: var(--text-muted);
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 6px;
+    }
+
+    /* 系统信息键值对 */
+    .kv-list {
+      display: flex;
+      flex-direction: column;
+      gap: 9px;
+    }
+
+    .kv-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 12.5px;
+    }
+
+    .kv-key { color: var(--text-secondary); }
+    .kv-val {
+      color: var(--text-primary);
+      font-weight: 600;
+      text-align: right;
+      word-break: break-all;
+    }
+
+    .proto-chips {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    /* 过滤栏 */
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .search-input {
+      padding: 7px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text-primary);
+      font-size: 13px;
+      outline: none;
+      min-width: 220px;
+      transition: border-color 0.15s;
+    }
+
+    .search-input:focus { border-color: var(--accent); }
+
+    .filter-tabs {
+      display: inline-flex;
+      padding: 3px;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      gap: 2px;
+    }
+
+    .filter-tab {
       padding: 4px 10px;
       border-radius: 6px;
       font-size: 12px;
       font-weight: 500;
-      border: 1px solid var(--card-border);
-      background: rgba(255, 255, 255, 0.05);
-      color: var(--text-main);
+      color: var(--text-secondary);
+      background: transparent;
+      border: none;
       cursor: pointer;
-      transition: all 0.2s;
     }
 
-    .btn-action:hover {
-      background: rgba(56, 189, 248, 0.15);
-      border-color: var(--accent-primary);
-      color: var(--accent-primary);
-    }
-
-    .btn-action.btn-action-danger:hover {
-      background: rgba(239, 68, 68, 0.2);
-      border-color: rgba(239, 68, 68, 0.4);
-      color: var(--accent-danger);
+    .filter-tab.active {
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
     }
 
     /* 表格 */
+    .table-wrap {
+      overflow-x: auto;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -307,794 +674,1299 @@
     th {
       text-align: left;
       padding: 10px 14px;
-      color: var(--text-muted);
+      font-size: 12px;
       font-weight: 600;
-      border-bottom: 1px solid var(--card-border);
+      color: var(--text-muted);
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
     }
 
     td {
-      padding: 12px 14px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
-      color: var(--text-main);
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
     }
 
-    tr:hover td {
-      background: rgba(255, 255, 255, 0.02);
+    tbody tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: var(--bg-hover); }
+
+    .proc-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    .proc-name { font-weight: 600; color: var(--text-primary); }
+    .proc-path {
+      font-size: 11px;
+      color: var(--text-muted);
+      max-width: 280px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     /* 标签 */
-    .tag {
-      padding: 3px 8px;
-      border-radius: 6px;
-      font-size: 11px;
-      font-weight: 600;
-      display: inline-block;
-    }
-
-    .tag-proxy {
-      background: rgba(56, 189, 248, 0.15);
-      color: var(--accent-primary);
-      border: 1px solid rgba(56, 189, 248, 0.25);
-    }
-
-    .tag-direct {
-      background: rgba(148, 163, 184, 0.15);
-      color: var(--text-muted);
-      border: 1px solid rgba(148, 163, 184, 0.25);
-    }
-
-    .tag-block {
-      background: rgba(239, 68, 68, 0.15);
-      color: var(--accent-danger);
-      border: 1px solid rgba(239, 68, 68, 0.25);
-    }
-
-    .tag-socks4 {
-      background: rgba(245, 158, 11, 0.15);
-      color: var(--accent-warning);
-      border: 1px solid rgba(245, 158, 11, 0.25);
-    }
-
-    .tag-http {
-      background: rgba(168, 85, 247, 0.15);
-      color: #c084fc;
-      border: 1px solid rgba(168, 85, 247, 0.25);
-    }
-
-    /* 规则列表 */
-    .rule-item {
-      display: flex;
-      justify-content: space-between;
+    .badge {
+      display: inline-flex;
       align-items: center;
-      padding: 14px 18px;
-      border-radius: 10px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--card-border);
-      margin-bottom: 12px;
-      transition: all 0.2s;
+      gap: 4px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      font-weight: 600;
+      border: 1px solid transparent;
+      white-space: nowrap;
     }
 
-    .rule-item:hover {
-      background: rgba(255, 255, 255, 0.05);
-      border-color: rgba(255, 255, 255, 0.12);
+    .badge-proxy { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+    .badge-direct { background: var(--green-soft); color: var(--green); border-color: var(--green-border); }
+    .badge-block { background: var(--red-soft); color: var(--red); border-color: var(--red-border); }
+    .badge-http { background: var(--indigo-soft); color: var(--indigo); border-color: var(--indigo-border); }
+    .badge-socks4 { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-border); }
+    .badge-muted { background: var(--bg-elevated); color: var(--text-secondary); border-color: var(--border); }
+
+    /* 节点卡片 */
+    .nodes-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+      gap: 16px;
     }
 
-    .rule-meta {
+    .node-card {
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 18px;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      justify-content: space-between;
+      gap: 14px;
+      transition: border-color 0.15s, transform 0.15s;
     }
 
-    .rule-title {
+    .node-card:hover {
+      border-color: var(--accent-border);
+      transform: translateY(-1px);
+    }
+
+    .node-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .node-title {
+      font-size: 15px;
       font-weight: 600;
-      font-size: 14px;
       display: flex;
       align-items: center;
       gap: 8px;
     }
 
-    .rule-details {
-      font-size: 12px;
+    .node-id {
+      font-size: 11px;
       color: var(--text-muted);
-      line-height: 1.5;
+      padding: 1px 6px;
+      border-radius: 5px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
     }
 
-    .rule-actions {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    /* 节点网格卡片 */
-    .nodes-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-      gap: 18px;
-    }
-
-    .node-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 12px;
-      padding: 20px;
-      backdrop-filter: blur(12px);
-      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
-      transition: all 0.2s;
+    .node-meta {
       display: flex;
       flex-direction: column;
-      justify-content: space-between;
+      gap: 5px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
     }
 
-    .node-card:hover {
-      border-color: rgba(56, 189, 248, 0.3);
-      transform: translateY(-2px);
-    }
-
-    .node-header {
+    .node-bottom {
       display: flex;
-      justify-content: space-between;
       align-items: center;
-      margin-bottom: 12px;
-    }
-
-    .node-info {
-      font-size: 13px;
-      color: var(--text-muted);
-      line-height: 1.6;
-      margin-bottom: 16px;
-    }
-
-    .node-footer {
-      display: flex;
       justify-content: space-between;
-      align-items: center;
-      border-top: 1px solid var(--card-border);
       padding-top: 12px;
+      border-top: 1px solid var(--border);
+      gap: 10px;
     }
 
     .latency-pill {
-      font-size: 12px;
-      font-weight: 600;
-      display: flex;
+      display: inline-flex;
       align-items: center;
       gap: 6px;
-    }
-
-    .latency-pill.ok {
-      color: var(--accent-success);
-    }
-
-    .latency-pill.warn {
-      color: var(--accent-warning);
-    }
-
-    .latency-pill.err {
-      color: var(--accent-danger);
-    }
-
-    .latency-pill.unknown {
+      font-size: 12px;
+      font-weight: 600;
       color: var(--text-muted);
     }
 
-    /* 模态弹窗 */
+    .latency-pill.ok { color: var(--green); }
+    .latency-pill.warn { color: var(--amber); }
+    .latency-pill.err { color: var(--red); }
+
+    /* 规则列表 */
+    .rule-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 14px;
+      border-radius: 9px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      margin-bottom: 16px;
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      flex-wrap: wrap;
+    }
+
+    .rules-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .rule-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      transition: border-color 0.15s, opacity 0.15s;
+    }
+
+    .rule-row:hover { border-color: var(--border-strong); }
+    .rule-row.disabled { opacity: 0.55; }
+
+    .rule-row-left {
+      display: flex;
+      align-items: flex-start;
+      gap: 14px;
+      min-width: 0;
+      flex: 1;
+    }
+
+    .rule-order {
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 12px;
+      font-weight: 600;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .rule-info {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .rule-name {
+      font-size: 14.5px;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .rule-conds {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 12px;
+      color: var(--text-secondary);
+    }
+
+    .cond-chip {
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 6px;
+      max-width: 440px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .rule-row-right {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    /* 开关控件 */
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 38px;
+      height: 21px;
+      flex-shrink: 0;
+    }
+
+    .switch input { opacity: 0; width: 0; height: 0; }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      transition: 0.2s;
+    }
+
+    .slider::before {
+      content: "";
+      position: absolute;
+      height: 15px;
+      width: 15px;
+      left: 2px;
+      top: 2px;
+      background: var(--text-muted);
+      border-radius: 50%;
+      transition: 0.2s;
+    }
+
+    .switch input:checked + .slider {
+      background: var(--accent-soft);
+      border-color: var(--accent-border);
+    }
+
+    .switch input:checked + .slider::before {
+      transform: translateX(17px);
+      background: var(--accent);
+    }
+
+    .default-rule-box {
+      margin-top: 12px;
+      padding: 12px 16px;
+      border-radius: 10px;
+      border: 1px dashed var(--border-strong);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 13px;
+      color: var(--text-secondary);
+    }
+
+    /* 空状态 */
+    .empty-state {
+      text-align: center;
+      padding: 40px 20px;
+      color: var(--text-muted);
+      font-size: 13px;
+    }
+
+    /* 模态框 */
     .modal-overlay {
       position: fixed;
-      top: 0;
-      left: 0;
-      width: 100vw;
-      height: 100vh;
-      background: rgba(3, 7, 18, 0.7);
-      backdrop-filter: blur(8px);
+      inset: 0;
+      background: rgba(2, 6, 23, 0.72);
+      backdrop-filter: blur(5px);
       display: none;
       align-items: center;
       justify-content: center;
       z-index: 1000;
+      padding: 16px;
     }
 
-    .modal-overlay.active {
-      display: flex;
-      animation: fadeIn 0.15s ease-out;
-    }
-
-    @keyframes fadeIn {
-      from { opacity: 0; }
-      to { opacity: 1; }
-    }
+    .modal-overlay.active { display: flex; }
 
     .modal-box {
-      width: 480px;
-      max-width: 90vw;
-      background: #111827;
-      border: 1px solid rgba(255, 255, 255, 0.12);
+      width: 490px;
+      max-width: 100%;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
       border-radius: 14px;
-      padding: 28px;
-      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+      padding: 24px;
+      box-shadow: var(--shadow-modal);
     }
 
-    .modal-title {
-      font-size: 18px;
-      font-weight: 700;
-      margin-bottom: 20px;
+    .modal-header {
       display: flex;
-      justify-content: space-between;
       align-items: center;
+      justify-content: space-between;
+      margin-bottom: 18px;
     }
+
+    .modal-title { font-size: 16px; font-weight: 700; }
 
     .modal-close {
-      cursor: pointer;
+      background: transparent;
+      border: none;
       color: var(--text-muted);
       font-size: 20px;
-      line-height: 1;
-      padding: 4px;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
     }
 
-    .modal-close:hover {
-      color: var(--text-main);
+    .modal-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+    .form-grid-2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
     }
 
-    .form-group {
-      margin-bottom: 16px;
-    }
+    .form-group { margin-bottom: 14px; }
 
     .form-label {
       display: block;
-      font-size: 13px;
-      font-weight: 500;
-      color: var(--text-muted);
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--text-secondary);
       margin-bottom: 6px;
     }
 
     .form-input, .form-select {
       width: 100%;
-      padding: 10px 12px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--card-border);
+      padding: 9px 12px;
       border-radius: 8px;
-      color: var(--text-main);
+      border: 1px solid var(--border);
+      background: var(--bg-input);
+      color: var(--text-primary);
       font-size: 13px;
       outline: none;
-      transition: all 0.2s;
+      transition: border-color 0.15s;
     }
 
     .form-input:focus, .form-select:focus {
-      border-color: var(--accent-primary);
-      box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+      border-color: var(--accent);
     }
 
-    .form-select option {
-      background: #1f2937;
-      color: #fff;
+    .form-hint {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      margin-top: 4px;
     }
 
     .modal-actions {
       display: flex;
       justify-content: flex-end;
       gap: 10px;
-      margin-top: 24px;
+      margin-top: 20px;
     }
 
-    /* Toast 通知 */
+    /* Toast */
     .toast-container {
       position: fixed;
-      top: 24px;
-      right: 24px;
+      top: 18px;
+      right: 18px;
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 8px;
       z-index: 2000;
       pointer-events: none;
     }
 
     .toast {
-      padding: 12px 18px;
-      border-radius: 8px;
+      padding: 10px 15px;
+      border-radius: 9px;
       font-size: 13px;
       font-weight: 500;
-      color: #fff;
-      box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+      background: var(--bg-surface);
+      color: var(--text-primary);
+      border: 1px solid var(--border-strong);
+      box-shadow: var(--shadow-card);
+      pointer-events: auto;
       display: flex;
       align-items: center;
-      gap: 10px;
-      pointer-events: auto;
-      animation: slideIn 0.2s ease-out;
-      transition: opacity 0.3s;
+      gap: 8px;
+      animation: slideIn 0.18s ease-out;
+      transition: opacity 0.25s;
     }
 
-    .toast-success {
-      background: #065f46;
-      border: 1px solid #10b981;
-    }
-
-    .toast-error {
-      background: #991b1b;
-      border: 1px solid #ef4444;
-    }
-
-    .toast-info {
-      background: #0c4a6e;
-      border: 1px solid #0284c7;
-    }
+    .toast-success { border-left: 3px solid var(--green); }
+    .toast-error { border-left: 3px solid var(--red); }
+    .toast-info { border-left: 3px solid var(--accent); }
 
     @keyframes slideIn {
-      from { transform: translateX(100%); opacity: 0; }
+      from { transform: translateX(16px); opacity: 0; }
       to { transform: translateX(0); opacity: 1; }
     }
 
-    /* 视图切换 */
-    .view-content {
-      display: none;
+    /* 响应式 */
+    @media (max-width: 1080px) {
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .dash-split { grid-template-columns: 1fr; }
     }
-    .view-content.active {
-      display: block;
-      animation: fadeIn 0.2s;
+
+    @media (max-width: 780px) {
+      .sidebar {
+        position: fixed;
+        left: -260px;
+        z-index: 50;
+        transition: left 0.2s ease;
+      }
+      .sidebar.open { left: 0; }
+      .mobile-menu-btn { display: inline-flex; }
+      .topbar { padding: 14px 16px; }
+      .content-wrap { padding: 16px; }
+      .kpi-grid { grid-template-columns: 1fr; }
+      .rule-row { flex-direction: column; align-items: stretch; }
+      .rule-row-right { justify-content: flex-end; }
+      .form-grid-2 { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <!-- Toast 通知容器 -->
   <div class="toast-container" id="toast-container"></div>
 
-  <!-- 侧边栏 -->
-  <aside>
-    <div class="brand">
-      <div class="brand-icon">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
-        </svg>
-      </div>
-      <div>
-        <span class="brand-title">FlowX</span>
-        <span class="brand-badge">PRO</span>
-      </div>
-    </div>
-
-    <nav>
-      <div class="nav-item active" id="nav-dashboard" onclick="switchTab('dashboard')">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-        实时概览
-      </div>
-      <div class="nav-item" id="nav-connections" onclick="switchTab('connections')">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"></path><path d="m12 5 7 7-7 7"></path></svg>
-        活跃连接
-      </div>
-      <div class="nav-item" id="nav-proxies" onclick="switchTab('proxies')">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
-        节点与链路
-      </div>
-      <div class="nav-item" id="nav-rules" onclick="switchTab('rules')">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line><polyline points="10 9 9 9 8 9"></polyline></svg>
-        分流策略
-      </div>
-    </nav>
-  </aside>
-
-  <!-- 主体区域 -->
-  <main>
-    <header>
-      <div class="header-title">
-        <h1 id="view-title">系统实时仪表盘</h1>
-        <p>高性能 Rust 异步核心 · 零 GC 延迟 · Fake-IP 虚拟化防泄漏</p>
-      </div>
-      <div class="status-badge">
-        <div class="status-dot"></div>
-        <span>透明分流核心正常运转</span>
-      </div>
-    </header>
-
-    <!-- 1. 仪表盘视图 -->
-    <div id="tab-dashboard" class="view-content active">
-      <div class="stats-grid">
-        <div class="stat-card">
-          <div class="stat-label">实时下载速率</div>
-          <div class="stat-value" id="val-down-speed">0.0 KB/s</div>
-          <div class="stat-sub">当前瞬时下行带宽</div>
+  <div class="app-shell">
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="brand-logo">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+          </svg>
         </div>
-        <div class="stat-card">
-          <div class="stat-label">实时上传速率</div>
-          <div class="stat-value" id="val-up-speed">0.0 KB/s</div>
-          <div class="stat-sub">当前瞬时上行带宽</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">活跃会话数</div>
-          <div class="stat-value" id="val-active-conns">0</div>
-          <div class="stat-sub">各进程并发 TCP 流</div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-label">总吞吐流量</div>
-          <div class="stat-value" id="val-total-bytes">0.0 MB</div>
-          <div class="stat-sub">本次核心启动后累计</div>
+        <div class="brand-text">
+          <div class="brand-name">FlowX <span class="brand-ver" id="sys-version">v0.1.0</span></div>
+          <div class="brand-sub">进程级透明代理引擎</div>
         </div>
       </div>
 
-      <div class="section-card">
-        <div class="section-header">
-          <h2>最新活跃进程连接</h2>
-          <button class="btn btn-secondary" onclick="fetchData()">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M2.5 22v-6h6M2 11.5a10 10 0 0 1 18.8-4.3M22 12.5a10 10 0 0 1-18.8 4.2"/></svg>
-            刷新数据
+      <div class="nav-list">
+        <button class="nav-item active" id="nav-dashboard" onclick="switchTab('dashboard')">
+          <span class="nav-item-left">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect></svg>
+            实时概览
+          </span>
+        </button>
+        <button class="nav-item" id="nav-connections" onclick="switchTab('connections')">
+          <span class="nav-item-left">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+            活跃连接
+          </span>
+          <span class="nav-count mono" id="nav-count-conns">0</span>
+        </button>
+        <button class="nav-item" id="nav-proxies" onclick="switchTab('proxies')">
+          <span class="nav-item-left">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
+            代理节点
+          </span>
+          <span class="nav-count mono" id="nav-count-nodes">0</span>
+        </button>
+        <button class="nav-item" id="nav-rules" onclick="switchTab('rules')">
+          <span class="nav-item-left">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
+            分流策略
+          </span>
+          <span class="nav-count mono" id="nav-count-rules">0</span>
+        </button>
+      </div>
+
+      <div class="sidebar-footer">
+        <div class="inbound-chip">
+          <div class="inbound-chip-label">
+            <span>混合代理入站</span>
+            <span>SOCKS / HTTP</span>
+          </div>
+          <div class="inbound-chip-val">
+            <span class="mono" id="sidebar-inbound">127.0.0.1:40001</span>
+            <button class="copy-mini" onclick="copyText(state.system.inbound_addr || '127.0.0.1:40001', '代理地址')">复制</button>
+          </div>
+        </div>
+        <div class="inbound-chip">
+          <div class="inbound-chip-label">
+            <span>运行时长</span>
+            <span class="mono" id="sidebar-uptime">00:00:00</span>
+          </div>
+          <div class="inbound-chip-label">
+            <span>配置文件</span>
+            <span class="mono" id="sidebar-config">flowx.xml</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <div class="main-area">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button class="mobile-menu-btn" onclick="toggleSidebar()" aria-label="菜单">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+          </button>
+          <div>
+            <div class="page-title" id="view-title">实时概览</div>
+            <div class="page-subtitle" id="view-subtitle">混合协议入站 · Windows 进程四元组追踪 · Fake-IP 防泄漏</div>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <div class="health-pill" id="engine-health">
+            <span class="health-dot"></span>
+            <span id="engine-health-text">核心运行中</span>
+          </div>
+          <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" title="切换浅色/深色主题">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
+          </button>
+          <button class="btn" onclick="refreshAll()">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+            立即刷新
           </button>
         </div>
-        <table>
-          <thead>
-            <tr>
-              <th>进程名 (PID)</th>
-              <th>目标主机 / 域名</th>
-              <th>命中策略</th>
-              <th>上行速率</th>
-              <th>下行速率</th>
-              <th>持续时间</th>
-            </tr>
-          </thead>
-          <tbody id="connections-tbody-preview">
-            <tr>
-              <td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">
-                正在侦听系统出站连接...
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
+      </header>
 
-    <!-- 2. 连接列表视图 -->
-    <div id="tab-connections" class="view-content">
-      <div class="section-card">
-        <div class="section-header">
-          <h2>全量活动网络连接跟踪</h2>
-          <button class="btn btn-secondary" onclick="fetchData()">刷新列表</button>
-        </div>
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th>
-              <th>进程</th>
-              <th>可执行文件绝对路径</th>
-              <th>目标地址 (含 Fake-IP 还原)</th>
-              <th>决策动作</th>
-              <th>已传输流量</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody id="connections-tbody-full">
-            <tr><td colspan="7" style="text-align: center; padding: 24px;">暂无活动连接</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
+      <div class="content-wrap">
+        <!-- 1. 实时概览 -->
+        <section id="tab-dashboard" class="view-panel active">
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-head">
+                <span>实时下载速率</span>
+                <span class="kpi-icon down">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
+                </span>
+              </div>
+              <div class="kpi-value mono" id="val-down-speed">0 B/s</div>
+              <div class="kpi-sub">累计下行 <span class="mono" id="val-total-down">0 B</span></div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-head">
+                <span>实时上传速率</span>
+                <span class="kpi-icon up">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                </span>
+              </div>
+              <div class="kpi-value mono" id="val-up-speed">0 B/s</div>
+              <div class="kpi-sub">累计上行 <span class="mono" id="val-total-up">0 B</span></div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-head">
+                <span>活跃 TCP 会话</span>
+                <span class="kpi-icon conns">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+                </span>
+              </div>
+              <div class="kpi-value mono" id="val-active-conns">0</div>
+              <div class="kpi-sub">启用规则 <span class="mono" id="val-enabled-rules">0 / 0</span></div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-head">
+                <span>总吞吐流量</span>
+                <span class="kpi-icon total">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>
+                </span>
+              </div>
+              <div class="kpi-value mono" id="val-total-bytes">0 B</div>
+              <div class="kpi-sub">Fake-IP 缓存 <span class="mono" id="val-fakeip-count">0</span> 条</div>
+            </div>
+          </div>
 
-    <!-- 3. 节点与链路视图 -->
-    <div id="tab-proxies" class="view-content">
-      <div class="section-card">
-        <div class="section-header">
-          <h2>可用代理节点 (Proxy Nodes)</h2>
-          <button class="btn btn-primary" onclick="openAddNodeModal()">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            添加节点
-          </button>
-        </div>
-        <div class="nodes-grid" id="nodes-container">
-          <!-- 动态渲染节点卡片 -->
-        </div>
-      </div>
-    </div>
+          <div class="dash-split">
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">实时吞吐趋势（最近 60 秒）</div>
+                  <div class="card-sub">每秒采样一次，真实反映活跃中继链路上下行带宽</div>
+                </div>
+                <div class="chart-legend">
+                  <span><span class="legend-dot" style="background: var(--accent);"></span>下行</span>
+                  <span><span class="legend-dot" style="background: var(--green);"></span>上行</span>
+                </div>
+              </div>
+              <div class="chart-wrap">
+                <span class="chart-peak mono" id="chart-peak-label">峰值: 0 B/s</span>
+                <svg class="chart-svg" id="traffic-chart" viewBox="0 0 600 180" preserveAspectRatio="none"></svg>
+              </div>
+            </div>
 
-    <!-- 4. 分流策略视图 -->
-    <div id="tab-rules" class="view-content">
-      <div class="section-card">
-        <div class="section-header">
-          <h2>分流规则引擎 (自顶向下匹配)</h2>
-          <button class="btn btn-primary" onclick="openAddRuleModal()">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            添加配置 / 新建规则
-          </button>
-        </div>
-        <div id="rules-container">
-          <!-- 动态渲染规则列表 -->
-        </div>
-      </div>
-    </div>
-  </main>
+            <div class="card">
+              <div class="card-header">
+                <div>
+                  <div class="card-title">引擎运行参数与接入点</div>
+                  <div class="card-sub">配置持久化文件: <span class="mono" id="info-config-path">flowx.xml</span></div>
+                </div>
+                <button class="btn btn-sm" onclick="copyText('http://' + (state.system.inbound_addr || '127.0.0.1:40001'), 'HTTP 代理 URL')">复制代理</button>
+              </div>
+              <div class="kv-list">
+                <div class="kv-row">
+                  <span class="kv-key">混合代理入站</span>
+                  <span class="kv-val mono" id="info-inbound">127.0.0.1:40001</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-key">本地 DNS / 上游</span>
+                  <span class="kv-val mono" id="info-dns">127.0.0.1:1053 → 223.5.5.5:53</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-key">Fake-IP 保留网段</span>
+                  <span class="kv-val mono" id="info-fakeip">198.18.0.0/15 (0 条)</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-key">兜底默认策略</span>
+                  <span class="kv-val" id="info-default-action">Direct (直连)</span>
+                </div>
+              </div>
+              <div class="proto-chips" id="info-protocols">
+                <span class="badge badge-muted">SOCKS5</span>
+                <span class="badge badge-muted">SOCKS4a</span>
+                <span class="badge badge-muted">HTTP</span>
+                <span class="badge badge-muted">HTTP CONNECT</span>
+              </div>
+            </div>
+          </div>
 
-  <!-- 模态框：添加节点 -->
-  <div class="modal-overlay" id="modal-node">
-    <div class="modal-box">
-      <div class="modal-title">
-        <span>添加代理节点</span>
-        <span class="modal-close" onclick="closeModal('modal-node')">&times;</span>
-      </div>
-      <div class="form-group">
-        <label class="form-label">节点名称</label>
-        <input type="text" class="form-input" id="node-name" placeholder="例如: HK-Socks-01">
-      </div>
-      <div class="form-group">
-        <label class="form-label">代理协议</label>
-        <select class="form-select" id="node-protocol">
-          <option value="SOCKS5">SOCKS5 (推荐)</option>
-          <option value="HTTP">HTTP CONNECT</option>
-          <option value="SOCKS4">SOCKS4 / SOCKS4a</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label class="form-label">服务器地址 (主机:端口)</label>
-        <input type="text" class="form-input" id="node-addr" placeholder="例如: 127.0.0.1:10808 或 proxy.example.com:443">
-      </div>
-      <div class="form-group">
-        <label class="form-label">认证用户名 (可选)</label>
-        <input type="text" class="form-input" id="node-user" placeholder="无认证请留空">
-      </div>
-      <div class="form-group">
-        <label class="form-label">认证密码 (可选)</label>
-        <input type="password" class="form-input" id="node-pass" placeholder="无认证请留空">
-      </div>
-      <div class="modal-actions">
-        <button class="btn btn-secondary" onclick="closeModal('modal-node')">取消</button>
-        <button class="btn btn-primary" onclick="submitAddNode()">保存节点</button>
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">最新活跃连接</div>
+                <div class="card-sub">仅展示最近 8 条会话，完整追踪请前往「活跃连接」</div>
+              </div>
+              <button class="btn btn-sm" onclick="switchTab('connections')">查看全部</button>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>进程 (PID)</th>
+                    <th>目标主机 / 域名</th>
+                    <th>命中规则</th>
+                    <th>动作</th>
+                    <th>上行 / 下行速率</th>
+                    <th>时长</th>
+                  </tr>
+                </thead>
+                <tbody id="connections-tbody-preview">
+                  <tr><td colspan="6" class="empty-state">正在等待本地代理入站流量...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. 活跃连接 -->
+        <section id="tab-connections" class="view-panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">全量活动网络连接跟踪</div>
+                <div class="card-sub">按连接 ID 倒序排列，支持按进程、目标域名或动作过滤与手动切断</div>
+              </div>
+              <div class="toolbar">
+                <input type="text" class="search-input" id="conn-search" placeholder="过滤进程名、目标地址或规则..." oninput="renderConnections()">
+                <div class="filter-tabs" id="conn-action-filter">
+                  <button class="filter-tab active" data-filter="ALL" onclick="setConnFilter('ALL', this)">全部</button>
+                  <button class="filter-tab" data-filter="PROXY" onclick="setConnFilter('PROXY', this)">代理</button>
+                  <button class="filter-tab" data-filter="DIRECT" onclick="setConnFilter('DIRECT', this)">直连</button>
+                  <button class="filter-tab" data-filter="BLOCK" onclick="setConnFilter('BLOCK', this)">阻断</button>
+                </div>
+                <button class="btn btn-sm" id="pause-poll-btn" onclick="togglePausePolling()">暂停刷新</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>ID</th>
+                    <th>进程与可执行路径</th>
+                    <th>目标地址</th>
+                    <th>命中规则</th>
+                    <th>动作</th>
+                    <th>实时速率</th>
+                    <th>累计流量</th>
+                    <th>时长</th>
+                    <th>操作</th>
+                  </tr>
+                </thead>
+                <tbody id="connections-tbody-full">
+                  <tr><td colspan="9" class="empty-state">暂无活动连接</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- 3. 代理节点 -->
+        <section id="tab-proxies" class="view-panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">可用代理节点 (Proxy Nodes)</div>
+                <div class="card-sub">支持 SOCKS5 / HTTP CONNECT / SOCKS4a，新增或删除会自动回写配置文件</div>
+              </div>
+              <div class="toolbar">
+                <button class="btn" onclick="pingAllNodes()" id="btn-ping-all">全部测速</button>
+                <button class="btn btn-primary" onclick="openAddNodeModal()">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                  添加节点
+                </button>
+              </div>
+            </div>
+            <div class="nodes-grid" id="nodes-container">
+              <div class="empty-state">加载节点中...</div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 4. 分流策略 -->
+        <section id="tab-rules" class="view-panel">
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">分流策略规则引擎</div>
+                <div class="card-sub">支持动态启停、顺序调整（上移/下移/置顶）与引用防呆校验</div>
+              </div>
+              <div class="toolbar">
+                <input type="text" class="search-input" id="rule-search" placeholder="搜索规则名、应用或目标..." oninput="renderRules()">
+                <button class="btn btn-primary" onclick="openAddRuleModal()">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                  新建规则
+                </button>
+              </div>
+            </div>
+            <div class="rule-banner">
+              <span>匹配原则：<strong>自顶向下、首次命中生效 (First-Match Wins)</strong>。已停用的规则会被跳过，所有更改即时生效并写入 XML。</span>
+              <span class="mono" id="rules-summary">共 0 条规则</span>
+            </div>
+            <div class="rules-list" id="rules-container">
+              <div class="empty-state">加载规则中...</div>
+            </div>
+            <div class="default-rule-box">
+              <span><strong>Default（默认兜底规则）</strong> · 当上方没有任何启用的规则命中时生效</span>
+              <span class="badge badge-muted" id="rules-default-badge">Direct (直连)</span>
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   </div>
 
-  <!-- 模态框：添加分流规则 -->
-  <div class="modal-overlay" id="modal-rule">
+  <!-- 模态框：添加节点 -->
+  <div class="modal-overlay" id="modal-node" onclick="handleBackdropClick(event, 'modal-node')">
     <div class="modal-box">
-      <div class="modal-title">
-        <span>新建分流规则</span>
-        <span class="modal-close" onclick="closeModal('modal-rule')">&times;</span>
+      <div class="modal-header">
+        <div class="modal-title">添加代理节点</div>
+        <button class="modal-close" onclick="closeModal('modal-node')" aria-label="关闭">&times;</button>
       </div>
       <div class="form-group">
-        <label class="form-label">规则名称</label>
-        <input type="text" class="form-input" id="rule-name" placeholder="例如: WebBrowserProxy">
+        <label class="form-label" for="node-name">节点名称</label>
+        <input type="text" class="form-input" id="node-name" placeholder="例如: HK-Socks-01">
       </div>
-      <div class="form-group">
-        <label class="form-label">应用程序筛选 (分号分隔，支持通配符)</label>
-        <input type="text" class="form-input" id="rule-apps" placeholder="例如: chrome.exe; *edge*.exe; node.exe (留空匹配所有)">
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label" for="node-protocol">代理协议</label>
+          <select class="form-select" id="node-protocol">
+            <option value="SOCKS5">SOCKS5 (推荐)</option>
+            <option value="HTTP">HTTP CONNECT</option>
+            <option value="SOCKS4">SOCKS4 / SOCKS4a</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="node-addr">服务器地址 (Host:Port)</label>
+          <input type="text" class="form-input mono" id="node-addr" placeholder="127.0.0.1:10808">
+        </div>
       </div>
-      <div class="form-group">
-        <label class="form-label">目标地址筛选 (域名/IP/CIDR，分号分隔)</label>
-        <input type="text" class="form-input" id="rule-targets" placeholder="例如: *.github.com; 1.1.1.1/32; localhost (留空匹配所有)">
-      </div>
-      <div class="form-group">
-        <label class="form-label">目标端口筛选 (单端口、逗号或范围)</label>
-        <input type="text" class="form-input" id="rule-ports" placeholder="例如: 80; 443; 8000-8080 (留空匹配所有)">
-      </div>
-      <div class="form-group">
-        <label class="form-label">执行动作</label>
-        <select class="form-select" id="rule-action" onchange="onRuleActionChange()">
-          <option value="Direct">Direct (直连)</option>
-          <option value="Proxy" selected>Proxy (通过代理节点转发)</option>
-          <option value="Block">Block (阻断连接)</option>
-        </select>
-      </div>
-      <div class="form-group" id="group-node-select">
-        <label class="form-label">指定代理节点</label>
-        <select class="form-select" id="rule-node-id">
-          <!-- 动态加载可用节点 -->
-        </select>
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label" for="node-user">认证用户名 (可选)</label>
+          <input type="text" class="form-input" id="node-user" placeholder="留空表示无认证">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="node-pass">认证密码 (可选)</label>
+          <input type="password" class="form-input" id="node-pass" placeholder="留空表示无认证">
+        </div>
       </div>
       <div class="modal-actions">
-        <button class="btn btn-secondary" onclick="closeModal('modal-rule')">取消</button>
-        <button class="btn btn-primary" onclick="submitAddRule()">保存规则</button>
+        <button class="btn" onclick="closeModal('modal-node')">取消</button>
+        <button class="btn btn-primary" id="btn-submit-node" onclick="submitAddNode()">保存节点</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框：新建规则 -->
+  <div class="modal-overlay" id="modal-rule" onclick="handleBackdropClick(event, 'modal-rule')">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div class="modal-title">新建分流规则</div>
+        <button class="modal-close" onclick="closeModal('modal-rule')" aria-label="关闭">&times;</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="rule-name">规则名称</label>
+        <input type="text" class="form-input" id="rule-name" placeholder="例如: BrowserProxy">
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="rule-apps">应用程序筛选 (分号分隔，支持通配符)</label>
+        <input type="text" class="form-input mono" id="rule-apps" placeholder="chrome.exe; *edge*.exe; node.exe">
+        <div class="form-hint">留空表示匹配全部应用进程</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label" for="rule-targets">目标地址筛选 (域名 / IP / CIDR，分号分隔)</label>
+        <input type="text" class="form-input mono" id="rule-targets" placeholder="*.github.com; 1.1.1.1/32; localhost">
+        <div class="form-hint">留空表示匹配全部目标地址</div>
+      </div>
+      <div class="form-grid-2">
+        <div class="form-group">
+          <label class="form-label" for="rule-ports">目标端口筛选</label>
+          <input type="text" class="form-input mono" id="rule-ports" placeholder="80; 443; 8000-8080">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="rule-action">执行动作</label>
+          <select class="form-select" id="rule-action" onchange="onRuleActionChange()">
+            <option value="Proxy" selected>Proxy (代理节点转发)</option>
+            <option value="Direct">Direct (直连放行)</option>
+            <option value="Block">Block (阻断连接)</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-group" id="group-node-select">
+        <label class="form-label" for="rule-node-id">指定代理节点</label>
+        <select class="form-select" id="rule-node-id"></select>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeModal('modal-rule')">取消</button>
+        <button class="btn btn-primary" id="btn-submit-rule" onclick="submitAddRule()">保存规则</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模态框：通用确认弹窗 -->
+  <div class="modal-overlay" id="modal-confirm" onclick="handleBackdropClick(event, 'modal-confirm')">
+    <div class="modal-box" style="width: 400px;">
+      <div class="modal-header">
+        <div class="modal-title" id="confirm-title">确认操作</div>
+        <button class="modal-close" onclick="closeModal('modal-confirm')" aria-label="关闭">&times;</button>
+      </div>
+      <div id="confirm-message" style="color: var(--text-secondary); font-size: 13.5px; line-height: 1.6;"></div>
+      <div class="modal-actions">
+        <button class="btn" onclick="closeModal('modal-confirm')">取消</button>
+        <button class="btn btn-primary" id="confirm-ok-btn">确认</button>
       </div>
     </div>
   </div>
 
   <script>
-    // 全局节点缓存
-    let g_nodes = [];
+    const MAX_HISTORY = 60;
 
-    // 选项卡切换
+    const state = {
+      activeTab: 'dashboard',
+      nodes: [],
+      rules: [],
+      connections: [],
+      system: {},
+      latencies: {}, // { [nodeId]: { status: 'ok'|'warn'|'err'|'testing', text: string } }
+      connFilter: 'ALL',
+      paused: false,
+      failStreak: 0,
+      historyDown: new Array(MAX_HISTORY).fill(0),
+      historyUp: new Array(MAX_HISTORY).fill(0)
+    };
+
+    const TAB_META = {
+      dashboard: { title: '实时概览', sub: '混合协议入站 · Windows 进程四元组追踪 · Fake-IP 防泄漏' },
+      connections: { title: '活跃连接', sub: '实时追踪本地进程出站会话、规则命中与流量统计' },
+      proxies: { title: '代理节点', sub: '管理上游 SOCKS5 / HTTP / SOCKS4a 节点与延迟测速' },
+      rules: { title: '分流策略', sub: '自顶向下规则匹配、动态启停、优先级排序与 XML 持久化' }
+    };
+
+    // 主题初始化
+    function initTheme() {
+      const saved = localStorage.getItem('flowx_theme');
+      const theme = (saved === 'light' || saved === 'dark') ? saved : 'dark';
+      document.documentElement.setAttribute('data-theme', theme);
+    }
+
+    function toggleTheme() {
+      const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+      const next = cur === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('flowx_theme', next);
+    }
+
+    function toggleSidebar() {
+      document.getElementById('sidebar').classList.toggle('open');
+    }
+
     function switchTab(tabId) {
+      state.activeTab = tabId;
       document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.view-content').forEach(el => el.classList.remove('active'));
+      document.querySelectorAll('.view-panel').forEach(el => el.classList.remove('active'));
 
       const navEl = document.getElementById('nav-' + tabId);
       if (navEl) navEl.classList.add('active');
+      const panelEl = document.getElementById('tab-' + tabId);
+      if (panelEl) panelEl.classList.add('active');
 
-      const tabEl = document.getElementById('tab-' + tabId);
-      if (tabEl) tabEl.classList.add('active');
-
-      const titles = {
-        dashboard: '系统实时仪表盘',
-        connections: '活动网络连接追踪',
-        proxies: '代理节点与链路编排',
-        rules: '分流策略规则库'
-      };
-      document.getElementById('view-title').innerText = titles[tabId] || '控制台';
+      const meta = TAB_META[tabId] || TAB_META.dashboard;
+      document.getElementById('view-title').textContent = meta.title;
+      document.getElementById('view-subtitle').textContent = meta.sub;
+      document.getElementById('sidebar').classList.remove('open');
 
       if (tabId === 'proxies') loadNodes();
       if (tabId === 'rules') loadRules();
     }
 
-    // Toast 浮窗提示
     function showToast(msg, type = 'success') {
       const container = document.getElementById('toast-container');
       const toast = document.createElement('div');
       toast.className = `toast toast-${type}`;
-      toast.innerText = msg;
+      toast.textContent = msg;
       container.appendChild(toast);
       setTimeout(() => {
         toast.style.opacity = '0';
-        setTimeout(() => toast.remove(), 300);
-      }, 3000);
+        setTimeout(() => toast.remove(), 260);
+      }, 3200);
     }
 
-    // 格式化函数
     function formatBytes(bytes) {
-      if (bytes < 1024) return bytes + ' B';
-      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-      if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-      return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+      const n = Number(bytes) || 0;
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(2) + ' MB';
+      return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
     }
 
     function formatSpeed(bps) {
       return formatBytes(bps) + '/s';
     }
 
-    // 定时轮询与数据同步
-    async function fetchData() {
-      try {
-        const statsRes = await fetch('/api/stats');
-        if (statsRes.ok) {
-          const stats = await statsRes.json();
-          document.getElementById('val-down-speed').innerText = formatSpeed(stats.current_download_bps || 0);
-          document.getElementById('val-up-speed').innerText = formatSpeed(stats.current_upload_bps || 0);
-          document.getElementById('val-active-conns').innerText = stats.active_connections_count || 0;
-          const total = (stats.total_uploaded_bytes || 0) + (stats.total_downloaded_bytes || 0);
-          document.getElementById('val-total-bytes').innerText = formatBytes(total);
-        }
+    function formatDuration(secs) {
+      const s = Math.max(0, Number(secs) || 0);
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      return [h, m, sec].map(v => String(v).padStart(2, '0')).join(':');
+    }
 
-        const connsRes = await fetch('/api/connections');
-        if (connsRes.ok) {
-          const conns = await connsRes.json();
-          renderConnections(conns);
+    function escapeHtml(str) {
+      if (str === null || str === undefined) return '';
+      return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    async function copyText(text, label) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          ta.remove();
         }
+        showToast(`已复制${label}: ${text}`, 'info');
       } catch (e) {
-        // 后台连接异常处理
+        showToast('复制失败，请手动复制', 'error');
       }
     }
 
-    // 渲染连接列表
-    function renderConnections(conns) {
-      const tbodyPreview = document.getElementById('connections-tbody-preview');
-      const tbodyFull = document.getElementById('connections-tbody-full');
+    function setHealthStatus(online) {
+      const pill = document.getElementById('engine-health');
+      const txt = document.getElementById('engine-health-text');
+      if (online) {
+        pill.classList.remove('offline');
+        txt.textContent = '核心运行中';
+      } else {
+        pill.classList.add('offline');
+        txt.textContent = '核心离线 / 重连中';
+      }
+    }
 
-      if (!conns || conns.length === 0) {
-        tbodyPreview.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 24px;">暂无活动连接</td></tr>';
-        tbodyFull.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">暂无活动连接</td></tr>';
+    // 实时数据轮询
+    async function pollRealtime() {
+      if (state.paused) return;
+      try {
+        const [statsRes, connsRes, sysRes] = await Promise.all([
+          fetch('/api/stats'),
+          fetch('/api/connections'),
+          fetch('/api/system')
+        ]);
+
+        if (!statsRes.ok || !connsRes.ok) {
+          throw new Error('HTTP ' + statsRes.status);
+        }
+
+        state.failStreak = 0;
+        setHealthStatus(true);
+
+        const stats = await statsRes.json();
+        const conns = await connsRes.json();
+        state.connections = Array.isArray(conns) ? conns : [];
+
+        const downBps = stats.current_download_bps || 0;
+        const upBps = stats.current_upload_bps || 0;
+        const totalDown = stats.total_downloaded_bytes || 0;
+        const totalUp = stats.total_uploaded_bytes || 0;
+
+        document.getElementById('val-down-speed').textContent = formatSpeed(downBps);
+        document.getElementById('val-up-speed').textContent = formatSpeed(upBps);
+        document.getElementById('val-total-down').textContent = formatBytes(totalDown);
+        document.getElementById('val-total-up').textContent = formatBytes(totalUp);
+        document.getElementById('val-active-conns').textContent = stats.active_connections_count || 0;
+        document.getElementById('val-total-bytes').textContent = formatBytes(totalDown + totalUp);
+        document.getElementById('nav-count-conns').textContent = stats.active_connections_count || 0;
+
+        state.historyDown.push(downBps);
+        if (state.historyDown.length > MAX_HISTORY) state.historyDown.shift();
+        state.historyUp.push(upBps);
+        if (state.historyUp.length > MAX_HISTORY) state.historyUp.shift();
+        renderChart();
+
+        if (sysRes.ok) {
+          state.system = await sysRes.json();
+          renderSystemInfo();
+        }
+
+        renderConnections();
+      } catch (e) {
+        state.failStreak += 1;
+        if (state.failStreak >= 2) {
+          setHealthStatus(false);
+        }
+      }
+    }
+
+    function renderSystemInfo() {
+      const s = state.system;
+      if (!s || !s.inbound_addr) return;
+      document.getElementById('sys-version').textContent = 'v' + (s.version || '0.1.0');
+      document.getElementById('sidebar-inbound').textContent = s.inbound_addr;
+      document.getElementById('sidebar-uptime').textContent = formatDuration(s.uptime_secs);
+      document.getElementById('sidebar-config').textContent = s.config_path || 'flowx.xml';
+      document.getElementById('info-config-path').textContent = s.config_path || 'flowx.xml';
+      document.getElementById('info-inbound').textContent = s.inbound_addr;
+      document.getElementById('info-dns').textContent = `${s.dns_addr} → ${s.upstream_dns}`;
+      document.getElementById('info-fakeip').textContent = `${s.fake_ip_cidr} (${s.fake_ip_count || 0} 条)`;
+      document.getElementById('info-default-action').textContent = s.default_action || 'Direct (直连)';
+      document.getElementById('val-fakeip-count').textContent = s.fake_ip_count || 0;
+      document.getElementById('val-enabled-rules').textContent = `${s.enabled_rules_count || 0} / ${s.rules_count || 0}`;
+      document.getElementById('rules-default-badge').textContent = s.default_action || 'Direct (直连)';
+      document.getElementById('nav-count-nodes').textContent = s.nodes_count ?? state.nodes.length;
+      document.getElementById('nav-count-rules').textContent = s.rules_count ?? state.rules.length;
+
+      if (Array.isArray(s.inbound_protocols)) {
+        document.getElementById('info-protocols').innerHTML = s.inbound_protocols
+          .map(p => `<span class="badge badge-muted">${escapeHtml(p)}</span>`)
+          .join('');
+      }
+    }
+
+    function renderChart() {
+      const svg = document.getElementById('traffic-chart');
+      const w = 600;
+      const h = 180;
+      const padTop = 18;
+      const padBottom = 8;
+      const plotH = h - padTop - padBottom;
+
+      const maxVal = Math.max(1024, ...state.historyDown, ...state.historyUp);
+      document.getElementById('chart-peak-label').textContent = '峰值: ' + formatSpeed(maxVal);
+
+      const gridLines = [0.25, 0.5, 0.75].map(r => {
+        const y = (padTop + plotH * r).toFixed(1);
+        return `<line x1="0" y1="${y}" x2="${w}" y2="${y}" stroke="currentColor" stroke-opacity="0.08" stroke-dasharray="3 4" />`;
+      }).join('');
+
+      function buildPoints(arr) {
+        const step = w / (arr.length - 1);
+        return arr.map((v, i) => {
+          const x = (i * step).toFixed(1);
+          const y = (padTop + plotH * (1 - Math.min(1, v / maxVal))).toFixed(1);
+          return `${x},${y}`;
+        });
+      }
+
+      const downPts = buildPoints(state.historyDown);
+      const upPts = buildPoints(state.historyUp);
+
+      const downLine = `M ${downPts.join(' L ')}`;
+      const downArea = `${downLine} L ${w},${h} L 0,${h} Z`;
+      const upLine = `M ${upPts.join(' L ')}`;
+      const upArea = `${upLine} L ${w},${h} L 0,${h} Z`;
+
+      svg.innerHTML = `
+        <defs>
+          <linearGradient id="grad-down" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--accent)" stop-opacity="0.28"/>
+            <stop offset="100%" stop-color="var(--accent)" stop-opacity="0.01"/>
+          </linearGradient>
+          <linearGradient id="grad-up" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="var(--green)" stop-opacity="0.22"/>
+            <stop offset="100%" stop-color="var(--green)" stop-opacity="0.01"/>
+          </linearGradient>
+        </defs>
+        ${gridLines}
+        <path d="${downArea}" fill="url(#grad-down)"></path>
+        <path d="${upArea}" fill="url(#grad-up)"></path>
+        <path d="${downLine}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"></path>
+        <path d="${upLine}" fill="none" stroke="var(--green)" stroke-width="1.8" stroke-linejoin="round"></path>
+      `;
+    }
+
+    function actionBadgeClass(action) {
+      if (!action) return 'badge-muted';
+      if (action.includes('Proxy') || action.includes('Chain')) return 'badge-proxy';
+      if (action.includes('Block')) return 'badge-block';
+      return 'badge-direct';
+    }
+
+    function setConnFilter(filter, btn) {
+      state.connFilter = filter;
+      document.querySelectorAll('#conn-action-filter .filter-tab').forEach(el => el.classList.remove('active'));
+      if (btn) btn.classList.add('active');
+      renderConnections();
+    }
+
+    function togglePausePolling() {
+      state.paused = !state.paused;
+      const btn = document.getElementById('pause-poll-btn');
+      btn.textContent = state.paused ? '恢复刷新' : '暂停刷新';
+      btn.classList.toggle('btn-primary', state.paused);
+      if (!state.paused) pollRealtime();
+    }
+
+    function renderConnections() {
+      const conns = state.connections || [];
+      const previewEl = document.getElementById('connections-tbody-preview');
+      const fullEl = document.getElementById('connections-tbody-full');
+
+      if (conns.length === 0) {
+        previewEl.innerHTML = '<tr><td colspan="6" class="empty-state">正在等待本地代理入站流量...</td></tr>';
+      } else {
+        previewEl.innerHTML = conns.slice(0, 8).map(c => `
+          <tr>
+            <td>
+              <div class="proc-cell">
+                <span class="proc-name">${escapeHtml(c.process_name)} <span class="mono" style="color:var(--text-muted); font-size:11px;">#${c.pid}</span></span>
+              </div>
+            </td>
+            <td class="mono">${escapeHtml(c.target)}</td>
+            <td>${escapeHtml(c.rule_name)}</td>
+            <td><span class="badge ${actionBadgeClass(c.action)}">${escapeHtml(c.action)}</span></td>
+            <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_speed_bps)} / ↓${formatSpeed(c.download_speed_bps)}</td>
+            <td class="mono">${c.duration_secs}s</td>
+          </tr>
+        `).join('');
+      }
+
+      const keyword = (document.getElementById('conn-search').value || '').trim().toLowerCase();
+      const filtered = conns.filter(c => {
+        if (state.connFilter === 'PROXY' && !c.action.includes('Proxy') && !c.action.includes('Chain')) return false;
+        if (state.connFilter === 'DIRECT' && !c.action.includes('Direct')) return false;
+        if (state.connFilter === 'BLOCK' && !c.action.includes('Block')) return false;
+        if (keyword) {
+          const hay = `${c.process_name} ${c.process_path} ${c.target} ${c.rule_name} ${c.action}`.toLowerCase();
+          if (!hay.includes(keyword)) return false;
+        }
+        return true;
+      });
+
+      if (filtered.length === 0) {
+        fullEl.innerHTML = '<tr><td colspan="9" class="empty-state">暂无匹配的活动连接</td></tr>';
         return;
       }
 
-      let previewHtml = '';
-      let fullHtml = '';
-
-      conns.forEach(c => {
-        const tagClass = c.action.includes('Proxy') ? 'tag-proxy' : (c.action === 'Block' ? 'tag-block' : 'tag-direct');
-        previewHtml += `
-          <tr>
-            <td><strong>${escapeHtml(c.process_name)}</strong> <span style="color:var(--text-muted); font-size:11px;">#${c.pid}</span></td>
-            <td>${escapeHtml(c.target)}</td>
-            <td><span class="tag ${tagClass}">${escapeHtml(c.action)}</span></td>
-            <td>${formatSpeed(c.upload_speed_bps)}</td>
-            <td>${formatSpeed(c.download_speed_bps)}</td>
-            <td>${c.duration_secs}s</td>
-          </tr>
-        `;
-
-        fullHtml += `
-          <tr>
-            <td>#${c.id}</td>
-            <td><strong>${escapeHtml(c.process_name)}</strong></td>
-            <td style="color:var(--text-muted); font-size:11px;">${escapeHtml(c.process_path)}</td>
-            <td>${escapeHtml(c.target)}</td>
-            <td><span class="tag ${tagClass}">${escapeHtml(c.action)}</span></td>
-            <td>↑${formatBytes(c.uploaded_bytes)} / ↓${formatBytes(c.downloaded_bytes)}</td>
-            <td><button class="btn-action btn-action-danger" onclick="killConnection(${c.id})">断开</button></td>
-          </tr>
-        `;
-      });
-
-      tbodyPreview.innerHTML = previewHtml;
-      tbodyFull.innerHTML = fullHtml;
+      fullEl.innerHTML = filtered.map(c => `
+        <tr>
+          <td class="mono" style="color:var(--text-muted);">#${c.id}</td>
+          <td>
+            <div class="proc-cell">
+              <span class="proc-name">${escapeHtml(c.process_name)} <span class="mono" style="color:var(--text-muted); font-size:11px;">PID ${c.pid}</span></span>
+              <span class="proc-path mono" title="${escapeHtml(c.process_path)}">${escapeHtml(c.process_path)}</span>
+            </div>
+          </td>
+          <td class="mono">${escapeHtml(c.target)}</td>
+          <td>${escapeHtml(c.rule_name)}</td>
+          <td><span class="badge ${actionBadgeClass(c.action)}">${escapeHtml(c.action)}</span></td>
+          <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_speed_bps)}<br>↓${formatSpeed(c.download_speed_bps)}</td>
+          <td class="mono" style="font-size:12px;">↑${formatBytes(c.uploaded_bytes)}<br>↓${formatBytes(c.downloaded_bytes)}</td>
+          <td class="mono">${c.duration_secs}s</td>
+          <td><button class="btn btn-sm btn-danger-ghost" onclick="killConnection(${c.id})">断开</button></td>
+        </tr>
+      `).join('');
     }
 
-    // 断开连接
     async function killConnection(id) {
       try {
         const res = await fetch(`/api/connections/kill?id=${id}`, { method: 'POST' });
         if (res.ok) {
-          showToast(`已断开连接 #${id}`, 'info');
-          fetchData();
+          showToast(`已切断会话 #${id}`, 'info');
+          pollRealtime();
         } else {
           showToast('断开连接失败', 'error');
         }
       } catch (e) {
-        showToast('请求超时或失败: ' + e.message, 'error');
+        showToast('请求失败: ' + e.message, 'error');
       }
     }
 
-    // 模态弹窗控制
-    function openModal(modalId) {
-      document.getElementById(modalId).classList.add('active');
-    }
-
-    function closeModal(modalId) {
-      document.getElementById(modalId).classList.remove('active');
-    }
-
-    function openAddNodeModal() {
-      document.getElementById('node-name').value = '';
-      document.getElementById('node-addr').value = '';
-      document.getElementById('node-user').value = '';
-      document.getElementById('node-pass').value = '';
-      openModal('modal-node');
-    }
-
-    function openAddRuleModal() {
-      document.getElementById('rule-name').value = '';
-      document.getElementById('rule-apps').value = '';
-      document.getElementById('rule-targets').value = '';
-      document.getElementById('rule-ports').value = '';
-      document.getElementById('rule-action').value = 'Proxy';
-      onRuleActionChange();
-      openModal('modal-rule');
-    }
-
-    function onRuleActionChange() {
-      const act = document.getElementById('rule-action').value;
-      const group = document.getElementById('group-node-select');
-      group.style.display = (act === 'Proxy') ? 'block' : 'none';
-      if (act === 'Proxy') {
-        const select = document.getElementById('rule-node-id');
-        select.innerHTML = g_nodes.map(n => `<option value="${n.id}">${escapeHtml(n.name)} (${n.protocol} - ${escapeHtml(n.server_addr)})</option>`).join('');
-      }
-    }
-
-    // 节点管理: 加载节点列表
+    // 节点管理
     async function loadNodes() {
       try {
         const res = await fetch('/api/nodes');
         if (res.ok) {
-          g_nodes = await res.json();
-          renderNodes(g_nodes);
+          state.nodes = await res.json();
+          document.getElementById('nav-count-nodes').textContent = state.nodes.length;
+          renderNodes();
         }
       } catch (e) {
         showToast('加载代理节点失败', 'error');
       }
     }
 
-    let g_nodes = {};
+    function protocolBadgeClass(proto) {
+      if (proto === 'HTTP') return 'badge-http';
+      if (proto === 'SOCKS4') return 'badge-socks4';
+      return 'badge-proxy';
+    }
 
-    function renderNodes(nodes) {
+    function renderNodes() {
       const container = document.getElementById('nodes-container');
-      if (!nodes || nodes.length === 0) {
-        container.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">暂无配置的代理节点，请点击右上角添加</div>';
+      if (!state.nodes || state.nodes.length === 0) {
+        container.innerHTML = '<div class="empty-state" style="grid-column: 1/-1;">暂无配置的代理节点，点击右上角「添加节点」创建</div>';
         return;
       }
 
-      g_nodes = {};
-      nodes.forEach(n => { g_nodes[n.id] = n; });
-
-      container.innerHTML = nodes.map(n => {
-        let tagClass = 'tag-proxy';
-        if (n.protocol === 'HTTP') tagClass = 'tag-http';
-        if (n.protocol === 'SOCKS4') tagClass = 'tag-socks4';
-
+      container.innerHTML = state.nodes.map(n => {
+        const lat = state.latencies[n.id];
+        const latClass = lat ? lat.status : '';
+        const latText = lat ? lat.text : '未测速';
+        const testing = lat && lat.status === 'testing';
         return `
           <div class="node-card" id="node-card-${n.id}">
             <div>
-              <div class="node-header">
-                <strong>${escapeHtml(n.name)}</strong>
-                <span class="tag ${tagClass}">${escapeHtml(n.protocol)}</span>
+              <div class="node-top">
+                <div class="node-title">
+                  <span class="node-id mono">#${n.id}</span>
+                  <span>${escapeHtml(n.name)}</span>
+                </div>
+                <span class="badge ${protocolBadgeClass(n.protocol)}">${escapeHtml(n.protocol)}</span>
               </div>
-              <div class="node-info">
-                服务器地址: ${escapeHtml(n.server_addr)}<br>
-                认证状态: ${n.auth_configured ? '已配置用户名密码' : '无密码'}
+              <div class="node-meta" style="margin-top: 12px;">
+                <div>地址: <span class="mono" style="color:var(--text-primary);">${escapeHtml(n.server_addr)}</span></div>
+                <div>认证: ${n.auth_configured ? '已配置账密' : '无密码认证'}</div>
               </div>
             </div>
-            <div class="node-footer">
-              <span class="latency-pill unknown" id="latency-${n.id}">● 未测速</span>
+            <div class="node-bottom">
+              <span class="latency-pill ${latClass} mono" id="latency-${n.id}">● ${escapeHtml(latText)}</span>
               <div style="display:flex; gap:6px;">
-                <button class="btn-action" onclick="pingNode(${n.id})">测速</button>
-                <button class="btn-action btn-action-danger" onclick="deleteNode(${n.id})">删除</button>
+                <button class="btn btn-sm" onclick="pingNode(${n.id})" ${testing ? 'disabled' : ''}>${testing ? '测速中' : '测速'}</button>
+                <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteNode(${n.id})">删除</button>
               </div>
             </div>
           </div>
@@ -1102,22 +1974,71 @@
       }).join('');
     }
 
-    // 提交添加节点
+    async function pingNode(id, silent = false) {
+      const node = state.nodes.find(n => n.id === id);
+      if (!node) return;
+      state.latencies[id] = { status: 'testing', text: '测速中...' };
+      renderNodes();
+
+      try {
+        const res = await fetch('/api/nodes/ping', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id })
+        });
+        const data = await res.json();
+        if (res.ok && data.ok) {
+          const ms = data.latency_ms;
+          state.latencies[id] = { status: ms < 150 ? 'ok' : 'warn', text: `${ms} ms` };
+          if (!silent) showToast(`[${node.name}] TCP 握手延迟 ${ms} ms`);
+        } else {
+          state.latencies[id] = { status: 'err', text: data.message || data.error || '不可达' };
+          if (!silent) showToast(`[${node.name}] 测速失败: ${data.message || data.error}`, 'error');
+        }
+      } catch (e) {
+        state.latencies[id] = { status: 'err', text: '测速超时' };
+        if (!silent) showToast(`[${node.name}] 测速网络异常`, 'error');
+      } finally {
+        renderNodes();
+      }
+    }
+
+    async function pingAllNodes() {
+      if (state.nodes.length === 0) return;
+      const btn = document.getElementById('btn-ping-all');
+      btn.disabled = true;
+      try {
+        await Promise.all(state.nodes.map(n => pingNode(n.id, true)));
+        showToast(`已完成 ${state.nodes.length} 个节点的延迟探测`, 'info');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function openAddNodeModal() {
+      document.getElementById('node-name').value = '';
+      document.getElementById('node-protocol').value = 'SOCKS5';
+      document.getElementById('node-addr').value = '';
+      document.getElementById('node-user').value = '';
+      document.getElementById('node-pass').value = '';
+      openModal('modal-node');
+      setTimeout(() => document.getElementById('node-name').focus(), 40);
+    }
+
     async function submitAddNode() {
       const name = document.getElementById('node-name').value.trim();
       const protocol = document.getElementById('node-protocol').value;
       const addr = document.getElementById('node-addr').value.trim();
       const user = document.getElementById('node-user').value.trim();
-      const pass = document.getElementById('node-pass').value.trim();
+      const pass = document.getElementById('node-pass').value;
 
       if (!name || !addr) {
-        showToast('请完整填写节点名称与服务器地址', 'error');
+        showToast('请填写节点名称与服务器地址', 'error');
         return;
       }
 
-      const btn = document.querySelector('#modal-node button.btn-primary');
-      if (btn) btn.disabled = true;
-
+      const btn = document.getElementById('btn-submit-node');
+      btn.disabled = true;
       try {
         const res = await fetch('/api/nodes', {
           method: 'POST',
@@ -1130,151 +2051,213 @@
             password: pass || null
           })
         });
-
+        const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          showToast(`代理节点 [${name}] 保存成功`);
+          showToast(`节点 [${name}] 已保存并写入配置`);
           closeModal('modal-node');
-          loadNodes();
+          await loadNodes();
         } else {
-          const err = await res.json().catch(() => ({}));
-          showToast('添加失败: ' + (err.error || '未知错误'), 'error');
+          showToast(data.error || '添加节点失败', 'error');
         }
       } catch (e) {
         showToast('网络请求异常: ' + e.message, 'error');
       } finally {
-        if (btn) btn.disabled = false;
+        btn.disabled = false;
       }
     }
 
-    // 节点测速
-    async function pingNode(id) {
-      const node = g_nodes[id];
-      if (!node) return;
-      const addr = node.server_addr;
-
-      const pill = document.getElementById(`latency-${id}`);
-      if (pill) {
-        pill.className = 'latency-pill unknown';
-        pill.innerHTML = '● 测速中...';
-      }
-
-      const card = document.getElementById(`node-card-${id}`);
-      const btn = card ? card.querySelector('button.btn-action') : null;
-      if (btn) btn.disabled = true;
-
-      try {
-        const res = await fetch('/api/nodes/ping', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id })
-        });
-        const data = await res.json();
-        if (data.ok) {
-          if (pill) {
-            pill.className = 'latency-pill ok';
-            pill.innerHTML = `● ${data.latency_ms} ms`;
+    function confirmDeleteNode(id) {
+      const node = state.nodes.find(n => n.id === id);
+      const label = node ? `#${id} (${node.name})` : `#${id}`;
+      openConfirmModal(
+        '删除代理节点',
+        `确定要删除代理节点 ${label} 吗？若仍有分流规则引用该节点，系统将拦截删除。`,
+        async () => {
+          try {
+            const res = await fetch(`/api/nodes?id=${id}`, { method: 'DELETE' });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok) {
+              delete state.latencies[id];
+              showToast(`已删除节点 #${id}`);
+              await loadNodes();
+            } else {
+              showToast(data.error || '删除节点失败', 'error');
+            }
+          } catch (e) {
+            showToast('请求失败: ' + e.message, 'error');
           }
-          showToast(`[${addr}] 测速成功: ${data.latency_ms} ms`);
-        } else {
-          if (pill) {
-            pill.className = 'latency-pill err';
-            pill.innerHTML = `● ${data.message || '连接失败'}`;
-          }
-          showToast(`[${addr}] 连接超时或失败`, 'error');
         }
-      } catch (e) {
-        if (pill) {
-          pill.className = 'latency-pill err';
-          pill.innerHTML = '● 失败';
-        }
-        showToast('测速网络超时', 'error');
-      } finally {
-        if (btn) btn.disabled = false;
-      }
+      );
     }
 
-    // 删除节点
-    async function deleteNode(id) {
-      if (!confirm(`确认删除代理节点 #${id} 吗？`)) return;
-      try {
-        const res = await fetch(`/api/nodes?id=${id}`, { method: 'DELETE' });
-        if (res.ok) {
-          showToast('节点已删除');
-          loadNodes();
-        } else {
-          const err = await res.json().catch(() => ({}));
-          showToast('删除节点失败: ' + (err.error || '状态码 ' + res.status), 'error');
-        }
-      } catch (e) {
-        showToast('请求失败: ' + e.message, 'error');
-      }
-    }
-
-    // 规则管理: 加载规则列表
+    // 规则管理
     async function loadRules() {
       try {
         const res = await fetch('/api/rules');
         if (res.ok) {
-          const rules = await res.json();
-          renderRules(rules);
+          state.rules = await res.json();
+          document.getElementById('nav-count-rules').textContent = state.rules.length;
+          renderRules();
         }
       } catch (e) {
         showToast('加载规则失败', 'error');
       }
     }
 
-    function renderRules(rules) {
+    function formatRuleActionLabel(r) {
+      if (r.action_type === 'Proxy' && r.node_id) {
+        const node = state.nodes.find(n => n.id === r.node_id);
+        return node ? `Proxy → ${node.name} (#${node.id})` : r.action;
+      }
+      return r.action;
+    }
+
+    function renderRules() {
       const container = document.getElementById('rules-container');
-      if (!rules || rules.length === 0) {
-        container.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--text-muted);">暂无配置的分流规则，请点击右上角新建</div>';
+      const keyword = (document.getElementById('rule-search').value || '').trim().toLowerCase();
+      const total = state.rules.length;
+      const enabledCount = state.rules.filter(r => r.enabled).length;
+      document.getElementById('rules-summary').textContent = `共 ${total} 条 · 已启用 ${enabledCount} 条`;
+
+      const filtered = state.rules
+        .map((r, idx) => ({ r, idx }))
+        .filter(({ r }) => {
+          if (!keyword) return true;
+          const hay = `${r.name} ${r.apps} ${r.targets} ${r.ports} ${r.action}`.toLowerCase();
+          return hay.includes(keyword);
+        });
+
+      if (filtered.length === 0) {
+        container.innerHTML = `<div class="empty-state">${total === 0 ? '暂无分流规则，将全部走默认兜底策略' : '没有匹配的规则'}</div>`;
         return;
       }
 
-      container.innerHTML = rules.map((r, idx) => {
-        let tagClass = 'tag-direct';
-        if (r.action.includes('Proxy')) tagClass = 'tag-proxy';
-        if (r.action.includes('Block')) tagClass = 'tag-block';
+      container.innerHTML = filtered.map(({ r, idx }) => {
+        const conds = [];
+        if (r.apps) conds.push(`<span class="cond-chip" title="${escapeHtml(r.apps)}">应用: <span class="mono">${escapeHtml(r.apps)}</span></span>`);
+        if (r.targets) conds.push(`<span class="cond-chip" title="${escapeHtml(r.targets)}">目标: <span class="mono">${escapeHtml(r.targets)}</span></span>`);
+        if (r.ports) conds.push(`<span class="cond-chip" title="${escapeHtml(r.ports)}">端口: <span class="mono">${escapeHtml(r.ports)}</span></span>`);
+        if (conds.length === 0) conds.push('<span class="cond-chip">匹配所有流量</span>');
 
-        const descParts = [];
-        if (r.apps) descParts.push(`<b>应用:</b> ${escapeHtml(r.apps)}`);
-        if (r.targets) descParts.push(`<b>目标:</b> ${escapeHtml(r.targets)}`);
-        if (r.ports) descParts.push(`<b>端口:</b> ${escapeHtml(r.ports)}`);
-        const descHtml = descParts.length > 0 ? descParts.join(' · ') : '所有应用与目标流量';
+        const isFirst = idx === 0;
+        const isLast = idx === total - 1;
+        const disableReorder = Boolean(keyword);
 
         return `
-          <div class="rule-item">
-            <div class="rule-meta">
-              <span class="rule-title">
-                ${idx + 1}. ${escapeHtml(r.name)}
-              </span>
-              <span class="rule-details">${descHtml}</span>
+          <div class="rule-row ${r.enabled ? '' : 'disabled'}">
+            <div class="rule-row-left">
+              <div class="rule-order mono">#${idx + 1}</div>
+              <div class="rule-info">
+                <div class="rule-name">
+                  <span>${escapeHtml(r.name)}</span>
+                  ${r.enabled ? '' : '<span class="badge badge-muted">已停用</span>'}
+                </div>
+                <div class="rule-conds">${conds.join('')}</div>
+              </div>
             </div>
-            <div class="rule-actions">
-              <span class="tag ${tagClass}">${escapeHtml(r.action)}</span>
-              <button class="btn-action btn-action-danger" onclick="deleteRule(${r.id})">删除</button>
+            <div class="rule-row-right">
+              <span class="badge ${actionBadgeClass(r.action)}">${escapeHtml(formatRuleActionLabel(r))}</span>
+              <label class="switch" title="${r.enabled ? '点击停用' : '点击启用'}">
+                <input type="checkbox" ${r.enabled ? 'checked' : ''} onchange="toggleRule(${r.id}, this.checked)">
+                <span class="slider"></span>
+              </label>
+              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'top')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="置顶">⤒</button>
+              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'up')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="上移">↑</button>
+              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'down')" ${(isLast || disableReorder) ? 'disabled' : ''} title="下移">↓</button>
+              <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteRule(${r.id})">删除</button>
             </div>
           </div>
         `;
       }).join('');
     }
 
-    // 提交添加规则
+    async function toggleRule(id, enabled) {
+      try {
+        const res = await fetch('/api/rules/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, enabled })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          showToast(data.enabled ? '已启用该规则' : '已停用该规则', 'info');
+          await loadRules();
+        } else {
+          showToast(data.error || '切换规则状态失败', 'error');
+          await loadRules();
+        }
+      } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+        await loadRules();
+      }
+    }
+
+    async function moveRule(id, direction) {
+      try {
+        const res = await fetch('/api/rules/move', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id, direction })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          if (data.moved) await loadRules();
+        } else {
+          showToast(data.error || '调整规则顺序失败', 'error');
+        }
+      } catch (e) {
+        showToast('请求失败: ' + e.message, 'error');
+      }
+    }
+
+    async function openAddRuleModal() {
+      if (state.nodes.length === 0) await loadNodes();
+      document.getElementById('rule-name').value = '';
+      document.getElementById('rule-apps').value = '';
+      document.getElementById('rule-targets').value = '';
+      document.getElementById('rule-ports').value = '';
+      document.getElementById('rule-action').value = state.nodes.length > 0 ? 'Proxy' : 'Direct';
+      onRuleActionChange();
+      openModal('modal-rule');
+      setTimeout(() => document.getElementById('rule-name').focus(), 40);
+    }
+
+    function onRuleActionChange() {
+      const act = document.getElementById('rule-action').value;
+      const group = document.getElementById('group-node-select');
+      group.style.display = act === 'Proxy' ? 'block' : 'none';
+      if (act === 'Proxy') {
+        const select = document.getElementById('rule-node-id');
+        if (state.nodes.length === 0) {
+          select.innerHTML = '<option value="">暂无可用代理节点，请先在「代理节点」中添加</option>';
+        } else {
+          select.innerHTML = state.nodes
+            .map(n => `<option value="${n.id}">#${n.id} ${escapeHtml(n.name)} (${escapeHtml(n.protocol)} · ${escapeHtml(n.server_addr)})</option>`)
+            .join('');
+        }
+      }
+    }
+
     async function submitAddRule() {
       const name = document.getElementById('rule-name').value.trim();
       const apps = document.getElementById('rule-apps').value.trim();
       const targets = document.getElementById('rule-targets').value.trim();
       const ports = document.getElementById('rule-ports').value.trim();
       const action = document.getElementById('rule-action').value;
-      const nodeId = parseInt(document.getElementById('rule-node-id').value) || null;
+      const nodeVal = document.getElementById('rule-node-id').value;
+      const nodeId = action === 'Proxy' && nodeVal ? parseInt(nodeVal, 10) : null;
 
       if (!name) {
         showToast('请输入规则名称', 'error');
         return;
       }
+      if (action === 'Proxy' && !nodeId) {
+        showToast('请先添加并选择一个可用的代理节点', 'error');
+        return;
+      }
 
-      const btn = document.querySelector('#modal-rule button.btn-primary');
-      if (btn) btn.disabled = true;
-
+      const btn = document.getElementById('btn-submit-rule');
+      btn.disabled = true;
       try {
         const res = await fetch('/api/rules', {
           method: 'POST',
@@ -1288,55 +2271,82 @@
             node_id: nodeId
           })
         });
-
+        const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          showToast(`分流规则 [${name}] 添加成功`);
+          showToast(`规则 [${name}] 已保存并立即生效`);
           closeModal('modal-rule');
-          loadRules();
+          await loadRules();
         } else {
-          const err = await res.json().catch(() => ({}));
-          showToast('添加失败: ' + (err.error || '未知错误'), 'error');
+          showToast(data.error || '添加规则失败', 'error');
         }
       } catch (e) {
         showToast('请求异常: ' + e.message, 'error');
       } finally {
-        if (btn) btn.disabled = false;
+        btn.disabled = false;
       }
     }
 
-    // 删除规则
-    async function deleteRule(id) {
-      if (!confirm('确认删除该分流规则吗？')) return;
-      try {
-        const res = await fetch(`/api/rules?id=${id}`, { method: 'DELETE' });
-        if (res.ok) {
-          showToast('规则已成功删除');
-          loadRules();
-        } else {
-          const err = await res.json().catch(() => ({}));
-          showToast('删除规则失败: ' + (err.error || '状态码 ' + res.status), 'error');
+    function confirmDeleteRule(id) {
+      const rule = state.rules.find(r => r.id === id);
+      const name = rule ? rule.name : `#${id}`;
+      openConfirmModal(
+        '删除分流规则',
+        `确定要删除分流规则「${name}」吗？删除后将自动更新 flowx.xml。`,
+        async () => {
+          try {
+            const res = await fetch(`/api/rules?id=${id}`, { method: 'DELETE' });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok) {
+              showToast('规则已删除');
+              await loadRules();
+            } else {
+              showToast(data.error || '删除规则失败', 'error');
+            }
+          } catch (e) {
+            showToast('请求失败: ' + e.message, 'error');
+          }
         }
-      } catch (e) {
-        showToast('请求失败: ' + e.message, 'error');
+      );
+    }
+
+    // 模态弹窗与键盘交互
+    function openModal(id) {
+      document.getElementById(id).classList.add('active');
+    }
+
+    function closeModal(id) {
+      document.getElementById(id).classList.remove('active');
+    }
+
+    function handleBackdropClick(e, id) {
+      if (e.target.id === id) closeModal(id);
+    }
+
+    function openConfirmModal(title, message, onConfirm) {
+      document.getElementById('confirm-title').textContent = title;
+      document.getElementById('confirm-message').textContent = message;
+      const btn = document.getElementById('confirm-ok-btn');
+      btn.onclick = async () => {
+        closeModal('modal-confirm');
+        await onConfirm();
+      };
+      openModal('modal-confirm');
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        document.querySelectorAll('.modal-overlay.active').forEach(el => el.classList.remove('active'));
       }
+    });
+
+    async function refreshAll() {
+      await Promise.all([loadNodes(), loadRules(), pollRealtime()]);
     }
 
-    // HTML 转义防 XSS
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-    }
-
-    // 页面初始化
-    loadNodes();
-    loadRules();
-    fetchData();
-    setInterval(fetchData, 1000);
+    initTheme();
+    renderChart();
+    refreshAll();
+    setInterval(pollRealtime, 1000);
   </script>
 </body>
 </html>
