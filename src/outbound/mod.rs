@@ -149,12 +149,15 @@ pub async fn relay_stream_monitored_with_timeout(
 ) -> Result<(u64, u64)> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    if conn.is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!("连接已被管理员手动切断");
+    }
+
     let (mut lr, mut lw) = local.into_split();
     let (mut rr, mut rw) = remote.into_split();
 
     let conn_up = conn.cloned();
     let conn_down = conn.cloned();
-    let cancel_notify = conn.map(|c| c.cancel_notify.clone());
 
     let start = tokio::time::Instant::now();
     // 使用微秒精度记录最近一次任一方向产生有效载荷的时间点
@@ -237,8 +240,12 @@ pub async fn relay_stream_monitored_with_timeout(
             ));
         }
         _ = async {
-            if let Some(ref cancel) = cancel_notify {
-                cancel.notified().await;
+            if let Some(c) = conn {
+                let notified = c.cancel_notify.notified();
+                if c.is_cancelled() {
+                    return;
+                }
+                notified.await;
             } else {
                 std::future::pending::<()>().await;
             }

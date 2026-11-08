@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ pub struct ActiveConnection {
     pub uploaded_bytes: AtomicU64,
     pub downloaded_bytes: AtomicU64,
     pub cancel_notify: Arc<tokio::sync::Notify>,
+    pub cancelled: AtomicBool,
     last_up: AtomicU64,
     last_down: AtomicU64,
     current_up_speed: AtomicU64,
@@ -39,6 +40,10 @@ pub struct ActiveConnection {
 }
 
 impl ActiveConnection {
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     pub fn add_upload(&self, bytes: u64) {
         self.uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -145,6 +150,7 @@ impl ConnectionManager {
             uploaded_bytes: AtomicU64::new(0),
             downloaded_bytes: AtomicU64::new(0),
             cancel_notify: Arc::new(tokio::sync::Notify::new()),
+            cancelled: AtomicBool::new(false),
             last_up: AtomicU64::new(0),
             last_down: AtomicU64::new(0),
             current_up_speed: AtomicU64::new(0),
@@ -173,10 +179,11 @@ impl ConnectionManager {
         }
     }
 
-    /// 向指定的活跃连接发送终止通知
+    /// 向指定的活跃连接发送终止通知（设置状态标志并唤醒等待协程，由 ConnectionGuard 单点负责注销）
     pub fn kill_connection(&self, id: u64) -> bool {
         let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
         if let Some(conn) = conns.get(&id) {
+            conn.cancelled.store(true, Ordering::Release);
             conn.cancel_notify.notify_waiters();
             true
         } else {
@@ -184,9 +191,24 @@ impl ConnectionManager {
         }
     }
 
+    /// O(1) 获取当前活跃连接数，供优雅停机排空阶段零开销轮询
+    pub fn active_count(&self) -> usize {
+        self.connections
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+    }
+
     pub fn list_snapshots(&self) -> Vec<ConnectionSnapshot> {
-        let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
-        let mut list: Vec<ConnectionSnapshot> = conns.values().map(|c| c.snapshot()).collect();
+        // 仅在读锁内克隆 Arc 引用计数，立即释锁后再执行每个连接的快照深拷贝与排序，避免阻塞新连接注册
+        let active_conns: Vec<Arc<ActiveConnection>> = {
+            let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
+            conns.values().map(Arc::clone).collect()
+        };
+        let mut list: Vec<ConnectionSnapshot> = active_conns
+            .into_iter()
+            .map(|c| c.snapshot())
+            .collect();
         list.sort_by_key(|c| std::cmp::Reverse(c.id));
         list
     }
@@ -261,6 +283,7 @@ mod tests {
         assert_eq!(stats_live.total_uploaded_bytes, 1024);
         assert_eq!(stats_live.total_downloaded_bytes, 2048);
 
+        assert_eq!(mgr.active_count(), 1);
         let list = mgr.list_snapshots();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].process_name, "node.exe");
@@ -268,6 +291,7 @@ mod tests {
         assert_eq!(list[0].downloaded_bytes, 2048);
 
         mgr.unregister(conn.id);
+        assert_eq!(mgr.active_count(), 0);
         assert_eq!(mgr.list_snapshots().len(), 0);
 
         let stats = mgr.global_stats();
@@ -298,6 +322,9 @@ mod tests {
 
         let killed = mgr.kill_connection(conn.id);
         assert!(killed);
+        assert!(conn.is_cancelled());
+        // kill_connection 不得提前销毁连接记录，需等待单点守卫 unregister
+        assert_eq!(mgr.active_count(), 1);
 
         let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
         assert!(res.is_ok());

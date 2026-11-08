@@ -229,11 +229,26 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let mut remote_stream = match connect_outbound(&config, &action, &target).await {
-        Ok(s) => s,
-        Err(e) => {
-            inbound::send_failure(&mut local_stream, kind, false).await.ok();
-            return Err(e);
+    let cancel_token = Arc::clone(&active_conn);
+    let mut remote_stream = tokio::select! {
+        res = connect_outbound(&config, &action, &target) => {
+            match res {
+                Ok(s) => s,
+                Err(e) => {
+                    inbound::send_failure(&mut local_stream, kind, false).await.ok();
+                    return Err(e);
+                }
+            }
+        }
+        _ = async {
+            let notified = cancel_token.cancel_notify.notified();
+            if cancel_token.is_cancelled() {
+                return;
+            }
+            notified.await;
+        } => {
+            inbound::send_failure(&mut local_stream, kind, true).await.ok();
+            bail!("连接在建连阶段已被管理员手动切断");
         }
     };
 

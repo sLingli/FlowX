@@ -185,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
     let drain_start = std::time::Instant::now();
     let max_drain_wait = Duration::from_secs(10);
     while drain_start.elapsed() < max_drain_wait {
-        let active = connection_manager.list_snapshots().len();
+        let active = connection_manager.active_count();
         if active == 0 {
             break;
         }

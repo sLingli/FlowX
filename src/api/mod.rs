@@ -506,8 +506,8 @@ async fn handle_api_request(
                         .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
                 });
             if let Some(conn_id) = id {
+                // 仅发送终止通知，连接的注销与残余流量核算统一由调度协程的 ConnectionGuard::drop 单点负责
                 let killed = monitor.kill_connection(conn_id);
-                monitor.unregister(conn_id);
                 (
                     "200 OK",
                     "application/json; charset=utf-8",
@@ -556,17 +556,17 @@ async fn handle_api_request(
                         .and_then(|n| u32::try_from(n).ok())
                 });
             if let Some(node_id) = id {
-                // 级联防呆检查：若当前有任何路由规则指向该代理节点，禁止删除
+                // 级联防呆检查：若当前有任何路由规则或默认兜底动作指向该代理节点，禁止删除
                 let rules = rule_engine.current_rules();
                 let is_referenced = rules.iter().any(|r| match &r.action {
                     Action::Proxy(pid) => *pid == node_id,
                     _ => false,
-                });
+                }) || matches!(rule_engine.default_action, Action::Proxy(pid) if pid == node_id);
                 if is_referenced {
                     (
                         "409 Conflict",
                         "application/json; charset=utf-8",
-                        r#"{"error":"节点正被路由规则引用，禁止删除。请先修改或删除关联规则"}"#.to_string(),
+                        r#"{"error":"节点正被路由规则或默认兜底动作引用，禁止删除。请先修改或删除关联配置"}"#.to_string(),
                     )
                 } else {
                     let removed = {
@@ -1298,5 +1298,83 @@ mod tests {
         assert!(!reloaded.rules[1].enabled);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// P1-1 & P1-3 回归测试：
+    /// 1) 节点被 rule_engine.default_action 引用时禁止删除 (409 Conflict)
+    /// 2) /api/connections/kill 仅发出终止通知，不提前注销活跃连接
+    #[tokio::test]
+    async fn test_delete_node_checks_default_action_and_kill_preserves_raii_guard() {
+        let mut nodes_map = HashMap::new();
+        nodes_map.insert(
+            101,
+            ProxyNodeEntry {
+                id: 101,
+                name: "Default-GW".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: "10.0.0.99:1080".into(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new("10.0.0.99:1080")),
+            },
+        );
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let active = mgr.register(
+            "app.exe".into(),
+            "C:/app.exe".into(),
+            4321,
+            "example.org:443".into(),
+            "Default".into(),
+            "Proxy(101)".into(),
+        );
+
+        // 显式规则列表为空，仅 default_action 指向节点 101
+        let re = Arc::new(RuleEngine::new(vec![], Action::Proxy(101)));
+        let nodes = Arc::new(RwLock::new(nodes_map));
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&mgr), re, nodes);
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx).await });
+        let _keep_tx = tx;
+        let port = addr.port();
+
+        // 1. 删除被 default_action 引用的节点必须返回 409 Conflict
+        let del_body = r#"{"id":101}"#;
+        let del_resp = raw_http(
+            addr,
+            &format!(
+                "DELETE /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                del_body.len(),
+                del_body
+            ),
+        )
+        .await;
+        assert!(
+            del_resp.starts_with("HTTP/1.1 409 Conflict"),
+            "被 default_action 引用的节点必须禁止删除: {}",
+            del_resp
+        );
+
+        // 2. 切断活跃连接仅触发 cancel 状态与唤醒通知，由连接守卫负责最终注销
+        let kill_body = format!(r#"{{"id":{}}}"#, active.id);
+        let kill_resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/connections/kill HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                kill_body.len(),
+                kill_body
+            ),
+        )
+        .await;
+        assert!(kill_resp.contains("\"killed\":true"));
+        assert!(active.is_cancelled());
+        assert_eq!(mgr.active_count(), 1, "API 不得绕过 ConnectionGuard 提前注销连接");
+
+        mgr.unregister(active.id);
+        assert_eq!(mgr.active_count(), 0);
     }
 }
