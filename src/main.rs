@@ -151,19 +151,34 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 7. 启动周期性内存 GC 维护任务（每 30 秒自动清理过期 Fake-IP 与进程缓存）
+    // 7. 启动周期性内存 GC 维护任务（每 3 秒通过 blocking 线程池异步清理过期 Fake-IP 与进程缓存，避免阻塞 Tokio Worker）
     let pool_gc = Arc::clone(&fake_ip_pool);
     let tracker_gc = Arc::clone(&process_tracker);
     let mut rx_gc = shutdown_rx.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let cleaned_ips = pool_gc.cleanup_expired();
-                    tracker_gc.cleanup_expired();
-                    if cleaned_ips > 0 {
-                        tracing::debug!("[GC 维护] 定期回收了 {} 个过期的 Fake-IP 映射", cleaned_ips);
+                    let pool_task = Arc::clone(&pool_gc);
+                    let tracker_task = Arc::clone(&tracker_gc);
+                    if let Ok((cleaned_ips, cleaned_conns, cleaned_pids)) =
+                        tokio::task::spawn_blocking(move || {
+                            let cleaned_ips = pool_task.cleanup_expired();
+                            let (cleaned_conns, cleaned_pids) = tracker_task.cleanup_expired();
+                            (cleaned_ips, cleaned_conns, cleaned_pids)
+                        })
+                        .await
+                        && (cleaned_ips > 0 || cleaned_conns > 0 || cleaned_pids > 0)
+                    {
+                        tracing::debug!(
+                            "[GC 维护] 定期回收过期条目: Fake-IP={}, 进程连接={}, PID={}",
+                            cleaned_ips,
+                            cleaned_conns,
+                            cleaned_pids
+                        );
                     }
                 }
                 _ = rx_gc.changed() => {

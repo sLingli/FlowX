@@ -4,6 +4,9 @@ use std::path::Path;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+/// 缓存写入时触发惰性过期清理的默认条目阈值
+const LAZY_EVICT_THRESHOLD: usize = 512;
+
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
     pub pid: u32,
@@ -17,16 +20,44 @@ pub struct ProcessTracker {
     pid_cache: RwLock<HashMap<u32, (ProcessInfo, Instant)>>,
     conn_ttl: Duration,
     pid_ttl: Duration,
+    lazy_evict_threshold: usize,
 }
 
 impl ProcessTracker {
     pub fn new() -> Self {
+        Self::with_ttls(Duration::from_millis(1000), Duration::from_secs(10))
+    }
+
+    pub fn with_ttls(conn_ttl: Duration, pid_ttl: Duration) -> Self {
         Self {
             conn_cache: RwLock::new(HashMap::new()),
             pid_cache: RwLock::new(HashMap::new()),
-            conn_ttl: Duration::from_millis(1000), // 连接映射缓存 1 秒
-            pid_ttl: Duration::from_secs(10),      // 进程路径缓存 10 秒
+            conn_ttl,
+            pid_ttl,
+            lazy_evict_threshold: LAZY_EVICT_THRESHOLD,
         }
+    }
+
+    #[cfg(test)]
+    fn with_evict_threshold(mut self, threshold: usize) -> Self {
+        self.lazy_evict_threshold = threshold;
+        self
+    }
+
+    fn cache_pid_entry(&self, pid: u32, info: &ProcessInfo, now: Instant) {
+        let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
+        if pid_guard.len() >= self.lazy_evict_threshold {
+            pid_guard.retain(|_, (_, expire)| *expire > now);
+        }
+        pid_guard.insert(pid, (info.clone(), now + self.pid_ttl));
+    }
+
+    fn cache_conn_entry(&self, client: SocketAddr, info: ProcessInfo, now: Instant) {
+        let mut conn_guard = self.conn_cache.write().unwrap_or_else(|e| e.into_inner());
+        if conn_guard.len() >= self.lazy_evict_threshold {
+            conn_guard.retain(|_, (_, expire)| *expire > now);
+        }
+        conn_guard.insert(client, (info, now + self.conn_ttl));
     }
 
     /// 根据 TCP 连接四元组查询发起连接的进程信息 (PID, 绝对路径, 进程名)
@@ -69,17 +100,13 @@ impl ProcessTracker {
                     .unwrap_or("Unknown")
                     .to_string();
                 let info = ProcessInfo { pid, path, name };
-                let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
-                pid_guard.insert(pid, (info.clone(), now + self.pid_ttl));
+                self.cache_pid_entry(pid, &info, now);
                 info
             }
         };
 
-        // 5. 写入连接级缓存
-        {
-            let mut conn_guard = self.conn_cache.write().unwrap_or_else(|e| e.into_inner());
-            conn_guard.insert(client, (info.clone(), now + self.conn_ttl));
-        }
+        // 5. 写入连接级缓存（超阈值时触发惰性剔除）
+        self.cache_conn_entry(client, info.clone(), now);
 
         Some(info)
     }
@@ -109,17 +136,41 @@ impl ProcessTracker {
             .flatten()
     }
 
-    /// 清理过期的连接与 PID 缓存项
-    pub fn cleanup_expired(&self) {
+    /// 清理过期的连接与 PID 缓存项；若读锁探测无过期条目则直接跳过写锁，返回 `(conn清理数, pid清理数)`
+    pub fn cleanup_expired(&self) -> (usize, usize) {
         let now = Instant::now();
-        {
-            let mut conn_guard = self.conn_cache.write().unwrap_or_else(|e| e.into_inner());
-            conn_guard.retain(|_, (_, expire)| *expire > now);
-        }
-        {
-            let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
-            pid_guard.retain(|_, (_, expire)| *expire > now);
-        }
+
+        let cleaned_conns = {
+            let has_expired = {
+                let guard = self.conn_cache.read().unwrap_or_else(|e| e.into_inner());
+                guard.values().any(|(_, expire)| *expire <= now)
+            };
+            if has_expired {
+                let mut conn_guard = self.conn_cache.write().unwrap_or_else(|e| e.into_inner());
+                let before = conn_guard.len();
+                conn_guard.retain(|_, (_, expire)| *expire > now);
+                before.saturating_sub(conn_guard.len())
+            } else {
+                0
+            }
+        };
+
+        let cleaned_pids = {
+            let has_expired = {
+                let guard = self.pid_cache.read().unwrap_or_else(|e| e.into_inner());
+                guard.values().any(|(_, expire)| *expire <= now)
+            };
+            if has_expired {
+                let mut pid_guard = self.pid_cache.write().unwrap_or_else(|e| e.into_inner());
+                let before = pid_guard.len();
+                pid_guard.retain(|_, (_, expire)| *expire > now);
+                before.saturating_sub(pid_guard.len())
+            } else {
+                0
+            }
+        };
+
+        (cleaned_conns, cleaned_pids)
     }
 }
 
@@ -271,5 +322,35 @@ mod tests {
         let tracker = ProcessTracker::new();
         let info = tracker.find_by_connection(peer, server).expect("应能定位到当前进程");
         assert_eq!(info.pid, std::process::id());
+    }
+
+    #[test]
+    fn test_lazy_eviction_and_cleanup_expired() {
+        let tracker = ProcessTracker::with_ttls(Duration::from_millis(40), Duration::from_millis(40))
+            .with_evict_threshold(3);
+
+        let dummy = ProcessInfo {
+            pid: 10,
+            path: "a.exe".into(),
+            name: "a.exe".into(),
+        };
+        let t0 = Instant::now();
+        tracker.cache_conn_entry("127.0.0.1:1001".parse().unwrap(), dummy.clone(), t0);
+        tracker.cache_conn_entry("127.0.0.1:1002".parse().unwrap(), dummy.clone(), t0);
+        tracker.cache_conn_entry("127.0.0.1:1003".parse().unwrap(), dummy.clone(), t0);
+
+        // 等待 TTL 过期后再写入第 4 条（达到阈值 3），应自动惰性清除前 3 条过期记录
+        std::thread::sleep(Duration::from_millis(55));
+        let t1 = Instant::now();
+        tracker.cache_conn_entry("127.0.0.1:1004".parse().unwrap(), dummy.clone(), t1);
+        assert_eq!(tracker.conn_cache.read().unwrap().len(), 1);
+
+        // 等待剩余记录过期并通过 cleanup_expired 清理
+        tracker.cache_pid_entry(10, &dummy, t1);
+        std::thread::sleep(Duration::from_millis(55));
+        let (cleaned_conns, cleaned_pids) = tracker.cleanup_expired();
+        assert_eq!(cleaned_conns, 1);
+        assert_eq!(cleaned_pids, 1);
+        assert_eq!(tracker.cleanup_expired(), (0, 0));
     }
 }
