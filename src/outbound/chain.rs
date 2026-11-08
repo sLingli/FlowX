@@ -21,6 +21,20 @@ impl ProxyNode {
         }
     }
 
+    pub fn auth_credentials(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            ProxyNode::Socks5(c) => match &c.auth {
+                Some((u, p)) => (Some(u.as_str()), Some(p.as_str())),
+                None => (None, None),
+            },
+            ProxyNode::Http(c) => match &c.auth {
+                Some((u, p)) => (Some(u.as_str()), Some(p.as_str())),
+                None => (None, None),
+            },
+            ProxyNode::Socks4(_) => (None, None),
+        }
+    }
+
     /// 在一个既有 TCP 流上执行该节点的隧道握手
     pub async fn handshake(&self, stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
         match self {

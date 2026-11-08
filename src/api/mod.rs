@@ -9,6 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{error, info};
 
+use crate::config::ConfigStore;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::monitor::ConnectionManager;
 use crate::outbound::chain::{parse_target_addr, ProxyNode};
@@ -67,6 +68,7 @@ pub struct ApiServer {
     pub rule_engine: Arc<RuleEngine>,
     pub proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     pub self_ports: Vec<u16>,
+    pub config_store: Option<Arc<ConfigStore>>,
 }
 
 impl ApiServer {
@@ -82,11 +84,17 @@ impl ApiServer {
             rule_engine,
             proxy_nodes,
             self_ports: vec![bind_addr.port()],
+            config_store: None,
         }
     }
 
     pub fn with_self_ports(mut self, self_ports: Vec<u16>) -> Self {
         self.self_ports = self_ports;
+        self
+    }
+
+    pub fn with_config_store(mut self, store: Arc<ConfigStore>) -> Self {
+        self.config_store = Some(store);
         self
     }
 
@@ -132,6 +140,7 @@ impl ApiServer {
             let rule_engine = Arc::clone(&self.rule_engine);
             let proxy_nodes = Arc::clone(&self.proxy_nodes);
             let self_ports_clone = Arc::clone(&self_ports);
+            let config_store = self.config_store.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = tokio::time::timeout(
@@ -143,6 +152,7 @@ impl ApiServer {
                         monitor,
                         rule_engine,
                         proxy_nodes,
+                        config_store,
                     ),
                 )
                 .await
@@ -293,6 +303,7 @@ async fn handle_api_request(
     monitor: Arc<ConnectionManager>,
     rule_engine: Arc<RuleEngine>,
     proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
+    config_store: Option<Arc<ConfigStore>>,
 ) -> Result<()> {
     let req_bytes = match read_full_http_request(&mut stream).await {
         Ok(b) => b,
@@ -460,7 +471,13 @@ async fn handle_api_request(
                 "application/json; charset=utf-8",
                 r#"{"error":"无效的节点请求体"}"#.to_string(),
             ),
-            Ok(req) => handle_add_node(req, &proxy_nodes, &self_ports),
+            Ok(req) => {
+                let res = handle_add_node(req, &proxy_nodes, &self_ports);
+                if res.0 == "200 OK" {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                }
+                res
+            }
         },
         ("DELETE", "/api/nodes") => {
             let id: Option<u32> = parse_query_param(query, "id")
@@ -485,8 +502,12 @@ async fn handle_api_request(
                         r#"{"error":"节点正被路由规则引用，禁止删除。请先修改或删除关联规则"}"#.to_string(),
                     )
                 } else {
-                    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-                    if nodes_guard.remove(&node_id).is_some() {
+                    let removed = {
+                        let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+                        nodes_guard.remove(&node_id).is_some()
+                    };
+                    if removed {
+                        persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                         ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
                     } else {
                         ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"代理节点不存在"}"#.to_string())
@@ -532,7 +553,13 @@ async fn handle_api_request(
                 "application/json; charset=utf-8",
                 r#"{"error":"无效的规则请求体"}"#.to_string(),
             ),
-            Ok(req) => handle_add_rule(req, &rule_engine, &proxy_nodes),
+            Ok(req) => {
+                let res = handle_add_rule(req, &rule_engine, &proxy_nodes);
+                if res.0 == "200 OK" {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                }
+                res
+            }
         },
         ("DELETE", "/api/rules") => {
             let id: Option<u64> = parse_query_param(query, "id")
@@ -545,6 +572,7 @@ async fn handle_api_request(
             if let Some(rule_id) = id {
                 let ok = rule_engine.delete_rule(rule_id);
                 if ok {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                     ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
                 } else {
                     ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"路由规则不存在"}"#.to_string())
@@ -757,6 +785,22 @@ fn handle_add_rule(
     ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, id))
 }
 
+fn persist_config(
+    config_store: Option<&ConfigStore>,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    rule_engine: &RuleEngine,
+) {
+    if let Some(store) = config_store
+        && let Err(e) = store.save_runtime(proxy_nodes, rule_engine)
+    {
+        error!(
+            "[配置中心] 自动持久化配置文件 ({}) 失败: {:#}",
+            store.path().display(),
+            e
+        );
+    }
+}
+
 async fn send_http_response(
     stream: &mut TcpStream,
     status: &str,
@@ -947,5 +991,46 @@ mod tests {
         )
         .await;
         assert!(ping_ssrf.starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn test_api_mutates_and_persists_xml() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("flowx_api_persist_{}.xml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = Arc::new(ConfigStore::new(&path));
+        let (rt, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(rt.rules, rt.default_action));
+        let nodes = Arc::new(RwLock::new(rt.proxy_nodes));
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_self_ports(vec![40001, 40080, 1053])
+            .with_config_store(Arc::clone(&store));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx).await });
+
+        let port = addr.port();
+        let add_node_body = r#"{"name":"HK-Test","protocol":"HTTP","server_addr":"10.0.0.2:8080"}"#;
+        let resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                add_node_body.len(),
+                add_node_body
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "resp: {}", resp);
+
+        let (reloaded, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
+        assert_eq!(reloaded.proxy_nodes.len(), 2);
+        assert!(reloaded.proxy_nodes.values().any(|n| n.name == "HK-Test" && n.protocol == "HTTP"));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

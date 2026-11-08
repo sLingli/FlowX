@@ -11,18 +11,32 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use anyhow::Context;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::api::ApiServer;
+use crate::config::ConfigStore;
 use crate::dns::server::DnsServer;
 use crate::dns::FakeIpPool;
-use crate::interceptor::dispatcher::{DispatcherConfig, ProxyNodeEntry, StreamDispatcher};
+use crate::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
 use crate::interceptor::process::ProcessTracker;
 use crate::monitor::ConnectionManager;
-use crate::outbound::chain::ProxyNode;
-use crate::outbound::socks5::Socks5Client;
-use crate::router::{Action, Rule, RuleEngine};
+use crate::router::RuleEngine;
+
+fn resolve_config_path() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--config"
+            && let Some(path) = args.next()
+        {
+            return path;
+        } else if let Some(path) = arg.strip_prefix("--config=") {
+            return path.to_string();
+        }
+    }
+    std::env::var("FLOWX_CONFIG").unwrap_or_else(|_| "flowx.xml".to_string())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,52 +50,42 @@ async fn main() -> anyhow::Result<()> {
     info!("          FlowX - 现代化透明网络代理与进程分流系统           ");
     info!("============================================================");
 
-    // 2. 初始化核心组件
+    // 2. 初始化核心组件与端口规划
     let fake_ip_pool = Arc::new(FakeIpPool::new_default());
     let process_tracker = Arc::new(ProcessTracker::new());
     let connection_manager = Arc::new(ConnectionManager::new());
 
-    // 3. 配置默认代理节点与路由规则
-    let mut proxy_nodes = HashMap::new();
-    // 注册示范 SOCKS5 节点 (Node 101: 127.0.0.1:10808)
-    proxy_nodes.insert(
-        101,
-        ProxyNodeEntry {
-            id: 101,
-            name: "Node-101 (主节点)".to_string(),
-            protocol: "SOCKS5".to_string(),
-            server_addr: "127.0.0.1:10808".to_string(),
-            username: None,
-            client: ProxyNode::Socks5(Socks5Client::new("127.0.0.1:10808")),
-        },
-    );
-    let proxy_nodes = Arc::new(RwLock::new(proxy_nodes));
-    let proxy_chains = Arc::new(HashMap::new());
-
-    // 默认内置分流规则 (自顶向下匹配，带 Fail-Closed 约束保护)
-    let rules = vec![
-        Rule::from_raw(
-            "LocalBypass",
-            true,
-            None,
-            Some("127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16"),
-            None,
-            Action::Direct,
-        ),
-        Rule::from_raw(
-            "DevProxy",
-            true,
-            Some("node.exe; *chrome*.exe; *git*.exe; *antigravity*.exe"),
-            None,
-            None,
-            Action::Proxy(101),
-        ),
-    ];
-    let rule_engine = Arc::new(RuleEngine::new(rules, Action::Direct));
-
-    // 4. Fail-Fast 端口绑定阶段（确保核心服务端口可用，若被占用立即明确报错）
     let dns_bind: SocketAddr = "127.0.0.1:1053".parse()?;
     let upstream_dns: SocketAddr = "223.5.5.5:53".parse()?;
+    let dispatcher_bind: SocketAddr = "127.0.0.1:40001".parse()?;
+    let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
+    let self_ports = vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()];
+
+    // 3. 从 XML 配置文件加载代理节点与路由规则（缺失时自动生成默认配置）
+    let config_path = resolve_config_path();
+    let config_store = Arc::new(ConfigStore::new(&config_path));
+    let (runtime_profile, created_default) = config_store
+        .load_or_init(&self_ports)
+        .with_context(|| format!("加载配置文件失败: {}", config_path))?;
+    if created_default {
+        info!("[配置中心] 未检测到配置文件，已生成默认配置: {}", config_path);
+    } else {
+        info!(
+            "[配置中心] 已加载配置文件 {} ({} 个代理节点, {} 条路由规则)",
+            config_path,
+            runtime_profile.proxy_nodes.len(),
+            runtime_profile.rules.len()
+        );
+    }
+
+    let proxy_nodes = Arc::new(RwLock::new(runtime_profile.proxy_nodes));
+    let proxy_chains = Arc::new(HashMap::new());
+    let rule_engine = Arc::new(RuleEngine::new(
+        runtime_profile.rules,
+        runtime_profile.default_action,
+    ));
+
+    // 4. Fail-Fast 端口绑定阶段（确保核心服务端口可用，若被占用立即明确报错）
     let dns_server = DnsServer::new(
         dns_bind,
         Arc::clone(&fake_ip_pool),
@@ -90,9 +94,6 @@ async fn main() -> anyhow::Result<()> {
     );
     let dns_socket = dns_server.bind().await?;
 
-    let dispatcher_bind: SocketAddr = "127.0.0.1:40001".parse()?;
-    let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
-    let self_ports = vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()];
     let dispatcher = StreamDispatcher::new(DispatcherConfig {
         bind_addr: dispatcher_bind,
         tracker: Arc::clone(&process_tracker),
@@ -111,7 +112,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&rule_engine),
         Arc::clone(&proxy_nodes),
     )
-    .with_self_ports(self_ports);
+    .with_self_ports(self_ports)
+    .with_config_store(Arc::clone(&config_store));
     let api_listener = api_server.bind().await?;
 
     // 5. 初始化全局优雅停机广播通知通道

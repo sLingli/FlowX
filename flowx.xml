@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Profile version="1">
+  <DefaultAction type="Direct"/>
+  <ProxyList>
+    <Proxy id="101" type="SOCKS5">
+      <Name>Node-101 (主节点)</Name>
+      <Address>127.0.0.1</Address>
+      <Port>10808</Port>
+    </Proxy>
+  </ProxyList>
+  <RuleList>
+    <Rule enabled="true">
+      <Name>LocalBypass</Name>
+      <Targets>127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16</Targets>
+      <Action type="Direct"/>
+    </Rule>
+    <Rule enabled="true">
+      <Name>DevProxy</Name>
+      <Applications>node.exe; *chrome*.exe; *git*.exe; *antigravity*.exe</Applications>
+      <Action type="Proxy">101</Action>
+    </Rule>
+  </RuleList>
+</Profile>
