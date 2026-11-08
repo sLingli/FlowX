@@ -70,17 +70,13 @@ impl ProxyChain {
         let mut visited = std::collections::HashSet::new();
         for node in &self.nodes {
             let addr = node.server_addr();
-            if !visited.insert(addr.to_string()) {
+            let target = parse_target_addr(addr)
+                .with_context(|| format!("代理链 [{}] 包含无效节点地址: {}", self.name, addr))?;
+            if !visited.insert(target.clone()) {
                 bail!("代理链 [{}] 包含重复节点，存在循环依赖: {}", self.name, addr);
             }
-            if let Ok(target) = parse_target_addr(addr) {
-                let is_loopback = match &target {
-                    TargetAddr::Ip(ip) => ip.ip().is_loopback(),
-                    TargetAddr::Domain(h, _) => h == "localhost" || h == "127.0.0.1" || h == "::1",
-                };
-                if is_loopback && forbidden_ports.contains(&target.port()) {
-                    bail!("代理链 [{}] 节点指向自身服务端口，已被拦截防回环: {}", self.name, addr);
-                }
+            if target.is_loopback_or_unspecified() && forbidden_ports.contains(&target.port()) {
+                bail!("代理链 [{}] 节点指向自身服务端口，已被拦截防回环: {}", self.name, addr);
             }
         }
         Ok(())
@@ -155,16 +151,7 @@ impl ProxyChain {
 }
 
 pub fn parse_target_addr(addr_str: &str) -> Result<TargetAddr> {
-    if let Ok(socket_addr) = addr_str.parse() {
-        return Ok(TargetAddr::Ip(socket_addr));
-    }
-    if let Some((host, port_str)) = addr_str.split_once(':') {
-        let port = port_str
-            .parse::<u16>()
-            .with_context(|| format!("非法端口号: {}", port_str))?;
-        return Ok(TargetAddr::Domain(host.to_string(), port));
-    }
-    bail!("无法解析代理地址: {}", addr_str)
+    TargetAddr::parse_authority(addr_str, None, false)
 }
 
 #[cfg(test)]
@@ -184,9 +171,28 @@ mod tests {
         // 校验循环检测机制
         assert!(chain.validate_loop(&[40001]).is_ok());
 
-        let loop_chain = ProxyChain::new("Loop-Chain")
-            .add_node(ProxyNode::Socks5(Socks5Client::new("127.0.0.1:40001")));
-        assert!(loop_chain.validate_loop(&[40001]).is_err());
+        for self_addr in [
+            "127.0.0.1:40001",
+            "0.0.0.0:40001",
+            "[::1]:40001",
+            "[::]:40001",
+            "LocalHost:40001",
+            "sub.localhost:40001",
+        ] {
+            let loop_chain = ProxyChain::new("Loop-Chain")
+                .add_node(ProxyNode::Socks5(Socks5Client::new(self_addr)));
+            assert!(
+                loop_chain.validate_loop(&[40001]).is_err(),
+                "回环地址 {} 应被代理链防回环机制拦截",
+                self_addr
+            );
+        }
+
+        // 大小写变体的重复域名节点同样视为环路
+        let dup_chain = ProxyChain::new("Dup-Chain")
+            .add_node(ProxyNode::Socks5(Socks5Client::new("Proxy.Example.com:1080")))
+            .add_node(ProxyNode::Http(HttpConnectClient::new("proxy.example.com:1080")));
+        assert!(dup_chain.validate_loop(&[40001]).is_err());
     }
 
     #[test]
@@ -195,8 +201,17 @@ mod tests {
         assert_eq!(target_ip.port(), 8080);
         assert_eq!(target_ip.host_string(), "127.0.0.1");
 
-        let target_domain = parse_target_addr("example.com:443").unwrap();
+        let target_v6 = parse_target_addr("[2001:db8::1]:1080").unwrap();
+        assert_eq!(target_v6.port(), 1080);
+        assert_eq!(target_v6.host_string(), "2001:db8::1");
+
+        let target_domain = parse_target_addr("Example.COM:443").unwrap();
         assert_eq!(target_domain.port(), 443);
         assert_eq!(target_domain.host_string(), "example.com");
+
+        assert!(parse_target_addr("example.com:0").is_err());
+        assert!(parse_target_addr("bad host:443").is_err());
+        assert!(parse_target_addr("user@127.0.0.1:1080").is_err());
+        assert!(parse_target_addr("no-port.example.com").is_err());
     }
 }

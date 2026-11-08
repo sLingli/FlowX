@@ -330,48 +330,12 @@ fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// 解析 `host:port` / `[v6]:port` 形式的 authority；`default_port` 为 None 时端口必填
 pub fn parse_authority(authority: &str, default_port: Option<u16>) -> Result<TargetAddr> {
-    // 去除可能携带的 userinfo（user:pass@host）
-    let authority = authority.rsplit('@').next().unwrap_or(authority);
-
-    let (host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
-        let Some(end) = rest.find(']') else { bail!("IPv6 地址缺少右方括号: {}", authority) };
-        let host = &rest[..end];
-        let after = &rest[end + 1..];
-        let port = match after.strip_prefix(':') {
-            Some(p) => Some(p),
-            None if after.is_empty() => None,
-            None => bail!("非法 authority: {}", authority),
-        };
-        (host, port)
-    } else {
-        match authority.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (authority, None),
-        }
-    };
-
-    let port = match port_str {
-        Some(p) => p.parse::<u16>().with_context(|| format!("非法端口号: {}", p))?,
-        None => default_port.with_context(|| format!("缺少端口号: {}", authority))?,
-    };
-    if port == 0 {
-        bail!("目标端口不能为 0");
-    }
-    make_target(host, port)
+    TargetAddr::parse_authority(authority, default_port, true)
 }
 
 /// 由主机字符串构造目标地址：IP 字面量转为 Ip，否则校验为合法域名
 fn make_target(host: &str, port: u16) -> Result<TargetAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(TargetAddr::Ip(SocketAddr::new(ip, port)));
-    }
-    let valid = !host.is_empty()
-        && host.len() <= 253
-        && host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_');
-    if !valid {
-        bail!("非法目标主机名: {:?}", host);
-    }
-    Ok(TargetAddr::Domain(host.to_ascii_lowercase(), port))
+    TargetAddr::from_host_port(host, port)
 }
 
 #[cfg(test)]

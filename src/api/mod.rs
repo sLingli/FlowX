@@ -17,7 +17,6 @@ use crate::outbound::chain::{parse_target_addr, ProxyNode};
 use crate::outbound::http::HttpConnectClient;
 use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
-use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -751,13 +750,7 @@ fn handle_add_node(
         );
     }
 
-    let is_loopback = match &target_parsed {
-        TargetAddr::Ip(ip) => ip.ip().is_loopback() || ip.ip().is_unspecified(),
-        TargetAddr::Domain(h, _) => {
-            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
-        }
-    };
-    if is_loopback && self_ports.contains(&target_parsed.port()) {
+    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
         return (
             "400 Bad Request",
             ct,

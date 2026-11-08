@@ -317,13 +317,7 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
     let server_addr = format_host_port(address, item.port);
     let target_parsed = parse_target_addr(&server_addr)
         .with_context(|| format!("节点 #{} 地址格式无效: {}", item.id, server_addr))?;
-    let is_loopback = match &target_parsed {
-        TargetAddr::Ip(ip) => ip.ip().is_loopback() || ip.ip().is_unspecified(),
-        TargetAddr::Domain(h, _) => {
-            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1"
-        }
-    };
-    if is_loopback && self_ports.contains(&target_parsed.port()) {
+    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
         bail!("节点 #{} 地址指向 FlowX 自身服务端口: {}", item.id, server_addr);
     }
 

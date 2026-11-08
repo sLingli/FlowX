@@ -125,15 +125,8 @@ fn is_self_target(target: &TargetAddr, server_addr: &SocketAddr, self_ports: &[u
     if !self_ports.contains(&target.port()) {
         return false;
     }
-    match target {
-        TargetAddr::Ip(addr) => {
-            let ip = addr.ip();
-            ip.is_loopback() || ip.is_unspecified() || ip == server_addr.ip()
-        }
-        TargetAddr::Domain(host, _) => {
-            host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost")
-        }
-    }
+    target.is_loopback_or_unspecified()
+        || matches!(target, TargetAddr::Ip(addr) if addr.ip() == server_addr.ip())
 }
 
 async fn handle_connection(

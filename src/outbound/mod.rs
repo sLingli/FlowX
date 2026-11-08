@@ -11,13 +11,108 @@ pub mod http;
 pub mod socks4;
 pub mod socks5;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TargetAddr {
     Ip(SocketAddr),
     Domain(String, u16),
 }
 
+fn is_loopback_or_unspecified_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        }
+    }
+}
+
+fn is_loopback_domain(host: &str) -> bool {
+    let h = host.trim_end_matches('.');
+    h.eq_ignore_ascii_case("localhost")
+        || (h.len() > 10 && h[h.len() - 10..].eq_ignore_ascii_case(".localhost"))
+        || h == "127.0.0.1"
+        || h == "::1"
+}
+
 impl TargetAddr {
+    /// 由主机名/IP 字面量与非零端口构造统一校验的 `TargetAddr`
+    pub fn from_host_port(host: &str, port: u16) -> Result<Self> {
+        if port == 0 {
+            anyhow::bail!("目标端口不能为 0");
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(TargetAddr::Ip(SocketAddr::new(ip, port)));
+        }
+        let valid = !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_');
+        if !valid {
+            anyhow::bail!("非法目标主机名: {:?}", host);
+        }
+        Ok(TargetAddr::Domain(host.to_ascii_lowercase(), port))
+    }
+
+    /// 统一解析 `host:port` 或 `[ipv6]:port` 形式的 authority；
+    /// `default_port` 为 `None` 时端口必填；`allow_userinfo` 控制是否允许剥离 `user@`
+    pub fn parse_authority(
+        authority: &str,
+        default_port: Option<u16>,
+        allow_userinfo: bool,
+    ) -> Result<Self> {
+        let authority = if allow_userinfo {
+            authority.rsplit('@').next().unwrap_or(authority)
+        } else if authority.contains('@') {
+            anyhow::bail!("目标地址不允许包含 userinfo (@): {}", authority);
+        } else {
+            authority
+        };
+
+        let (host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
+            let Some(end) = rest.find(']') else {
+                anyhow::bail!("IPv6 地址缺少右方括号: {}", authority);
+            };
+            let host = &rest[..end];
+            let after = &rest[end + 1..];
+            let port = match after.strip_prefix(':') {
+                Some(p) => Some(p),
+                None if after.is_empty() => None,
+                None => anyhow::bail!("非法 authority: {}", authority),
+            };
+            (host, port)
+        } else {
+            let (host, port_opt) = match authority.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (authority, None),
+            };
+            if host.contains(':') {
+                anyhow::bail!("IPv6 地址请使用 [addr]:port 格式: {}", authority);
+            }
+            (host, port_opt)
+        };
+
+        let port = match port_str {
+            Some(p) => p
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("非法端口号: {}", p))?,
+            None => default_port.ok_or_else(|| anyhow::anyhow!("缺少端口号: {}", authority))?,
+        };
+        Self::from_host_port(host, port)
+    }
+
+    /// 判断目标是否指向本地回环或未指定地址（如 `127.0.0.1`、`::1`、`0.0.0.0`、`::`、`localhost`、`*.localhost`）
+    pub fn is_loopback_or_unspecified(&self) -> bool {
+        match self {
+            TargetAddr::Ip(addr) => is_loopback_or_unspecified_ip(addr.ip()),
+            TargetAddr::Domain(host, _) => is_loopback_domain(host),
+        }
+    }
+
     pub fn port(&self) -> u16 {
         match self {
             TargetAddr::Ip(addr) => addr.port(),
