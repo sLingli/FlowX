@@ -175,8 +175,18 @@ async fn main() -> anyhow::Result<()> {
     info!("[退出] 接收到退出信号，正在通知各子系统停止接收流量...");
     let _ = shutdown_tx.send(true);
 
-    // 预留 500ms 宽限时间让正在传输的活跃连接完成挥手
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 优雅排空：注销演示连接并等待正在传输的活跃连接完成挥手（最多等待 10 秒）
+    connection_manager.unregister(_demo_conn.id);
+    let drain_start = std::time::Instant::now();
+    let max_drain_wait = Duration::from_secs(10);
+    while drain_start.elapsed() < max_drain_wait {
+        let active = connection_manager.list_snapshots().len();
+        if active == 0 {
+            break;
+        }
+        info!("[退出] 正在等待 {} 个活跃连接排空挥手...", active);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     info!("[退出] FlowX 核心引擎已安全退出");
 
     Ok(())

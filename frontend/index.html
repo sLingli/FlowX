@@ -1061,12 +1061,17 @@
       }
     }
 
+    let g_nodes = {};
+
     function renderNodes(nodes) {
       const container = document.getElementById('nodes-container');
       if (!nodes || nodes.length === 0) {
         container.innerHTML = '<div style="grid-column: 1/-1; text-align: center; padding: 40px; color: var(--text-muted);">暂无配置的代理节点，请点击右上角添加</div>';
         return;
       }
+
+      g_nodes = {};
+      nodes.forEach(n => { g_nodes[n.id] = n; });
 
       container.innerHTML = nodes.map(n => {
         let tagClass = 'tag-proxy';
@@ -1078,7 +1083,7 @@
             <div>
               <div class="node-header">
                 <strong>${escapeHtml(n.name)}</strong>
-                <span class="tag ${tagClass}">${n.protocol}</span>
+                <span class="tag ${tagClass}">${escapeHtml(n.protocol)}</span>
               </div>
               <div class="node-info">
                 服务器地址: ${escapeHtml(n.server_addr)}<br>
@@ -1088,7 +1093,7 @@
             <div class="node-footer">
               <span class="latency-pill unknown" id="latency-${n.id}">● 未测速</span>
               <div style="display:flex; gap:6px;">
-                <button class="btn-action" onclick="pingNode(${n.id}, '${escapeHtml(n.server_addr)}')">测速</button>
+                <button class="btn-action" onclick="pingNode(${n.id})">测速</button>
                 <button class="btn-action btn-action-danger" onclick="deleteNode(${n.id})">删除</button>
               </div>
             </div>
@@ -1110,6 +1115,9 @@
         return;
       }
 
+      const btn = document.querySelector('#modal-node button.btn-primary');
+      if (btn) btn.disabled = true;
+
       try {
         const res = await fetch('/api/nodes', {
           method: 'POST',
@@ -1128,19 +1136,31 @@
           closeModal('modal-node');
           loadNodes();
         } else {
-          const err = await res.json();
+          const err = await res.json().catch(() => ({}));
           showToast('添加失败: ' + (err.error || '未知错误'), 'error');
         }
       } catch (e) {
         showToast('网络请求异常: ' + e.message, 'error');
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
     // 节点测速
-    async function pingNode(id, addr) {
+    async function pingNode(id) {
+      const node = g_nodes[id];
+      if (!node) return;
+      const addr = node.server_addr;
+
       const pill = document.getElementById(`latency-${id}`);
-      pill.className = 'latency-pill unknown';
-      pill.innerHTML = '● 测速中...';
+      if (pill) {
+        pill.className = 'latency-pill unknown';
+        pill.innerHTML = '● 测速中...';
+      }
+
+      const card = document.getElementById(`node-card-${id}`);
+      const btn = card ? card.querySelector('button.btn-action') : null;
+      if (btn) btn.disabled = true;
 
       try {
         const res = await fetch('/api/nodes/ping', {
@@ -1150,18 +1170,26 @@
         });
         const data = await res.json();
         if (data.ok) {
-          pill.className = 'latency-pill ok';
-          pill.innerHTML = `● ${data.latency_ms} ms`;
+          if (pill) {
+            pill.className = 'latency-pill ok';
+            pill.innerHTML = `● ${data.latency_ms} ms`;
+          }
           showToast(`[${addr}] 测速成功: ${data.latency_ms} ms`);
         } else {
-          pill.className = 'latency-pill err';
-          pill.innerHTML = `● ${data.message || '连接失败'}`;
+          if (pill) {
+            pill.className = 'latency-pill err';
+            pill.innerHTML = `● ${data.message || '连接失败'}`;
+          }
           showToast(`[${addr}] 连接超时或失败`, 'error');
         }
       } catch (e) {
-        pill.className = 'latency-pill err';
-        pill.innerHTML = '● 失败';
+        if (pill) {
+          pill.className = 'latency-pill err';
+          pill.innerHTML = '● 失败';
+        }
         showToast('测速网络超时', 'error');
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
@@ -1174,7 +1202,8 @@
           showToast('节点已删除');
           loadNodes();
         } else {
-          showToast('删除节点失败', 'error');
+          const err = await res.json().catch(() => ({}));
+          showToast('删除节点失败: ' + (err.error || '状态码 ' + res.status), 'error');
         }
       } catch (e) {
         showToast('请求失败: ' + e.message, 'error');
@@ -1243,6 +1272,9 @@
         return;
       }
 
+      const btn = document.querySelector('#modal-rule button.btn-primary');
+      if (btn) btn.disabled = true;
+
       try {
         const res = await fetch('/api/rules', {
           method: 'POST',
@@ -1262,11 +1294,13 @@
           closeModal('modal-rule');
           loadRules();
         } else {
-          const err = await res.json();
+          const err = await res.json().catch(() => ({}));
           showToast('添加失败: ' + (err.error || '未知错误'), 'error');
         }
       } catch (e) {
         showToast('请求异常: ' + e.message, 'error');
+      } finally {
+        if (btn) btn.disabled = false;
       }
     }
 
@@ -1279,7 +1313,8 @@
           showToast('规则已成功删除');
           loadRules();
         } else {
-          showToast('删除规则失败', 'error');
+          const err = await res.json().catch(() => ({}));
+          showToast('删除规则失败: ' + (err.error || '状态码 ' + res.status), 'error');
         }
       } catch (e) {
         showToast('请求失败: ' + e.message, 'error');

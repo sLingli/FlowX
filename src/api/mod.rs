@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,10 +11,11 @@ use tracing::{error, info};
 
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::monitor::ConnectionManager;
-use crate::outbound::chain::ProxyNode;
+use crate::outbound::chain::{parse_target_addr, ProxyNode};
 use crate::outbound::http::HttpConnectClient;
 use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
+use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,6 +41,13 @@ pub struct AddNodeRequest {
 #[derive(Debug, Deserialize)]
 pub struct PingNodeRequest {
     pub addr: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PingResponse {
+    pub ok: bool,
+    pub latency_ms: u64,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,19 +127,60 @@ impl ApiServer {
     }
 }
 
+async fn read_full_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
+    let mut buffer = Vec::with_capacity(4096);
+    let mut temp = [0u8; 2048];
+    const MAX_REQUEST_SIZE: usize = 1024 * 1024; // 1MB 上限防 DoS
+
+    loop {
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&temp[..n]);
+        if buffer.len() > MAX_REQUEST_SIZE {
+            bail!("HTTP 请求体超出 1MB 上限");
+        }
+
+        if let Some(header_end) = find_header_end(&buffer) {
+            let header_str = String::from_utf8_lossy(&buffer[..header_end]);
+            let content_length = parse_content_length(&header_str).unwrap_or(0);
+            let total_needed = header_end + content_length;
+            if buffer.len() >= total_needed {
+                break;
+            }
+        }
+    }
+
+    Ok(buffer)
+}
+
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length") {
+                return v.trim().parse().ok();
+            }
+    }
+    None
+}
+
 async fn handle_api_request(
     mut stream: TcpStream,
     monitor: Arc<ConnectionManager>,
     rule_engine: Arc<RuleEngine>,
     proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
 ) -> Result<()> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
+    let req_bytes = read_full_http_request(&mut stream).await?;
+    if req_bytes.is_empty() {
         return Ok(());
     }
 
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let request = String::from_utf8_lossy(&req_bytes);
     let first_line = request.lines().next().unwrap_or_default();
     let parts: Vec<&str> = first_line.split_whitespace().collect();
 
@@ -143,8 +192,8 @@ async fn handle_api_request(
     let path_and_query = parts[1];
     let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
 
-    let body_start = request.find("\r\n\r\n").map(|idx| idx + 4).unwrap_or(n);
-    let req_body = if body_start < n { &request[body_start..] } else { "" };
+    let body_start = request.find("\r\n\r\n").map(|idx| idx + 4).unwrap_or(req_bytes.len());
+    let req_body = if body_start < req_bytes.len() { &request[body_start..] } else { "" };
 
     let (status, content_type, body) = match (method, path) {
         ("OPTIONS", _) => ("204 No Content", "text/plain", String::new()),
@@ -196,38 +245,53 @@ async fn handle_api_request(
         }
         ("POST", "/api/nodes") => {
             if let Ok(req) = serde_json::from_str::<AddNodeRequest>(req_body) {
-                let client = match req.protocol.to_uppercase().as_str() {
-                    "HTTP" => {
-                        let mut c = HttpConnectClient::new(&req.server_addr);
-                        if let (Some(u), Some(p)) = (&req.username, &req.password)
-                            && !u.is_empty() { c = c.with_auth(u.clone(), p.clone()); }
-                        ProxyNode::Http(c)
+                match parse_target_addr(&req.server_addr) {
+                    Err(_) => {
+                        ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"节点服务器地址格式无效，应为 IP:Port 或 Host:Port"}"#.to_string())
                     }
-                    "SOCKS4" => {
-                        let mut c = Socks4Client::new(&req.server_addr);
-                        if let Some(u) = &req.username
-                            && !u.is_empty() { c = c.with_user_id(u.clone()); }
-                        ProxyNode::Socks4(c)
-                    }
-                    _ => {
-                        let mut c = Socks5Client::new(&req.server_addr);
-                        if let (Some(u), Some(p)) = (&req.username, &req.password)
-                            && !u.is_empty() { c = c.with_auth(u.clone(), p.clone()); }
-                        ProxyNode::Socks5(c)
-                    }
-                };
+                    Ok(target_parsed) => {
+                        let is_loopback = match &target_parsed {
+                            TargetAddr::Ip(ip) => ip.ip().is_loopback(),
+                            TargetAddr::Domain(h, _) => h == "localhost" || h == "127.0.0.1" || h == "::1",
+                        };
+                        if is_loopback && (target_parsed.port() == 40001 || target_parsed.port() == 40080) {
+                            ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"节点地址不能指向 FlowX 自身拦截或服务端口"}"#.to_string())
+                        } else {
+                            let client = match req.protocol.to_uppercase().as_str() {
+                                "HTTP" => {
+                                    let mut c = HttpConnectClient::new(&req.server_addr);
+                                    if let (Some(u), Some(p)) = (&req.username, &req.password)
+                                        && !u.is_empty() { c = c.with_auth(u.clone(), p.clone()); }
+                                    ProxyNode::Http(c)
+                                }
+                                "SOCKS4" => {
+                                    let mut c = Socks4Client::new(&req.server_addr);
+                                    if let Some(u) = &req.username
+                                        && !u.is_empty() { c = c.with_user_id(u.clone()); }
+                                    ProxyNode::Socks4(c)
+                                }
+                                _ => {
+                                    let mut c = Socks5Client::new(&req.server_addr);
+                                    if let (Some(u), Some(p)) = (&req.username, &req.password)
+                                        && !u.is_empty() { c = c.with_auth(u.clone(), p.clone()); }
+                                    ProxyNode::Socks5(c)
+                                }
+                            };
 
-                let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-                let new_id = nodes_guard.keys().max().copied().unwrap_or(100) + 1;
-                nodes_guard.insert(new_id, ProxyNodeEntry {
-                    id: new_id,
-                    name: req.name,
-                    protocol: req.protocol.to_uppercase(),
-                    server_addr: req.server_addr,
-                    username: req.username,
-                    client,
-                });
-                ("200 OK", "application/json; charset=utf-8", format!(r#"{{"ok":true,"id":{}}}"#, new_id))
+                            let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+                            let new_id = nodes_guard.keys().max().copied().unwrap_or(100) + 1;
+                            nodes_guard.insert(new_id, ProxyNodeEntry {
+                                id: new_id,
+                                name: req.name,
+                                protocol: req.protocol.to_uppercase(),
+                                server_addr: req.server_addr,
+                                username: req.username,
+                                client,
+                            });
+                            ("200 OK", "application/json; charset=utf-8", format!(r#"{{"ok":true,"id":{}}}"#, new_id))
+                        }
+                    }
+                }
             } else {
                 ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"无效的节点请求体"}"#.to_string())
             }
@@ -265,7 +329,12 @@ async fn handle_api_request(
                 });
             if let Some(addr) = target_addr {
                 let (ok, ms, msg) = ping_address(&addr).await;
-                let resp = format!(r#"{{"ok":{},"latency_ms":{},"message":"{}"}}"#, ok, ms, msg);
+                let ping_res = PingResponse {
+                    ok,
+                    latency_ms: ms,
+                    message: msg,
+                };
+                let resp = serde_json_to_string(&ping_res);
                 ("200 OK", "application/json; charset=utf-8", resp)
             } else {
                 ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少节点测试地址"}"#.to_string())

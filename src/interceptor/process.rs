@@ -154,7 +154,7 @@ fn get_pid_by_local_port(target_port: u16) -> Option<u32> {
             }
 
             // 使用 u32 数组分配缓冲区以严格保证 4 字节指针对齐，避免 UB
-            let u32_elements = (size as usize + 512 + 3) / 4;
+            let u32_elements = (size as usize + 512).div_ceil(4);
             let mut buffer: Vec<u32> = vec![0u32; u32_elements];
             let mut actual_size = (u32_elements * 4) as u32;
 
