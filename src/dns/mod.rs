@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 pub mod server;
 
 /// Fake-IP 线程安全分配池与双向映射表
+#[derive(Debug)]
 pub struct FakeIpPool {
     min: u32,
     max: u32,
@@ -13,6 +14,7 @@ pub struct FakeIpPool {
     ttl: Duration,
 }
 
+#[derive(Debug)]
 struct PoolState {
     current: u32,
     ip_to_domain: HashMap<Ipv4Addr, (String, Instant)>,
@@ -119,6 +121,16 @@ impl FakeIpPool {
     pub fn is_fake_ip(&self, ip: &Ipv4Addr) -> bool {
         let raw = u32::from(*ip);
         raw >= self.min && raw <= self.max
+    }
+
+    /// 返回当前池中映射条目数
+    pub fn len(&self) -> usize {
+        let state = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        state.ip_to_domain.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// 清理池中全部已过期的映射条目

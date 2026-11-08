@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,6 +10,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::config::ConfigStore;
+use crate::dns::FakeIpPool;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::monitor::ConnectionManager;
 use crate::outbound::chain::{parse_target_addr, ProxyNode};
@@ -62,6 +63,46 @@ pub struct AddRuleRequest {
     pub node_id: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ToggleRuleRequest {
+    pub id: u64,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoveRuleRequest {
+    pub id: u64,
+    pub direction: String, // "up" | "down" | "top" | "bottom"
+}
+
+#[derive(Debug, Clone)]
+pub struct SystemRuntimeContext {
+    pub inbound_addr: SocketAddr,
+    pub dns_addr: SocketAddr,
+    pub upstream_dns: SocketAddr,
+    pub api_addr: SocketAddr,
+    pub fake_ip_pool: Arc<FakeIpPool>,
+    pub started_at: Instant,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SystemInfoResponse {
+    pub version: &'static str,
+    pub inbound_addr: String,
+    pub inbound_protocols: Vec<&'static str>,
+    pub dns_addr: String,
+    pub upstream_dns: String,
+    pub api_addr: String,
+    pub config_path: String,
+    pub fake_ip_cidr: &'static str,
+    pub fake_ip_count: usize,
+    pub uptime_secs: u64,
+    pub default_action: String,
+    pub nodes_count: usize,
+    pub rules_count: usize,
+    pub enabled_rules_count: usize,
+}
+
 pub struct ApiServer {
     pub bind_addr: SocketAddr,
     pub monitor: Arc<ConnectionManager>,
@@ -69,6 +110,8 @@ pub struct ApiServer {
     pub proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     pub self_ports: Vec<u16>,
     pub config_store: Option<Arc<ConfigStore>>,
+    pub runtime_context: Option<Arc<SystemRuntimeContext>>,
+    started_at: Instant,
 }
 
 impl ApiServer {
@@ -85,6 +128,8 @@ impl ApiServer {
             proxy_nodes,
             self_ports: vec![bind_addr.port()],
             config_store: None,
+            runtime_context: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -95,6 +140,11 @@ impl ApiServer {
 
     pub fn with_config_store(mut self, store: Arc<ConfigStore>) -> Self {
         self.config_store = Some(store);
+        self
+    }
+
+    pub fn with_runtime_context(mut self, ctx: Arc<SystemRuntimeContext>) -> Self {
+        self.runtime_context = Some(ctx);
         self
     }
 
@@ -141,6 +191,8 @@ impl ApiServer {
             let proxy_nodes = Arc::clone(&self.proxy_nodes);
             let self_ports_clone = Arc::clone(&self_ports);
             let config_store = self.config_store.clone();
+            let runtime_context = self.runtime_context.clone();
+            let started_at = self.started_at;
 
             tokio::spawn(async move {
                 if let Err(e) = tokio::time::timeout(
@@ -153,6 +205,8 @@ impl ApiServer {
                         rule_engine,
                         proxy_nodes,
                         config_store,
+                        runtime_context,
+                        started_at,
                     ),
                 )
                 .await
@@ -296,6 +350,7 @@ fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_api_request(
     mut stream: TcpStream,
     actual_port: u16,
@@ -304,6 +359,8 @@ async fn handle_api_request(
     rule_engine: Arc<RuleEngine>,
     proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     config_store: Option<Arc<ConfigStore>>,
+    runtime_context: Option<Arc<SystemRuntimeContext>>,
+    started_at: Instant,
 ) -> Result<()> {
     let req_bytes = match read_full_http_request(&mut stream).await {
         Ok(b) => b,
@@ -422,6 +479,17 @@ async fn handle_api_request(
             "application/json; charset=utf-8",
             r#"{"status":"ok","engine":"FlowX"}"#.to_string(),
         ),
+        ("GET", "/api/system") => {
+            let info = build_system_info(
+                actual_port,
+                runtime_context.as_deref(),
+                config_store.as_deref(),
+                &proxy_nodes,
+                &rule_engine,
+                started_at,
+            );
+            ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&info))
+        }
         ("GET", "/api/stats") => {
             let stats = monitor.global_stats();
             ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&stats))
@@ -559,6 +627,65 @@ async fn handle_api_request(
                     persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                 }
                 res
+            }
+        },
+        ("POST", "/api/rules/toggle") => match serde_json::from_str::<ToggleRuleRequest>(req_body) {
+            Err(_) => (
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                r#"{"error":"无效的规则启停请求体"}"#.to_string(),
+            ),
+            Ok(req) => match rule_engine.toggle_rule(req.id, req.enabled) {
+                Some(enabled) => {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    (
+                        "200 OK",
+                        "application/json; charset=utf-8",
+                        format!(r#"{{"ok":true,"enabled":{}}}"#, enabled),
+                    )
+                }
+                None => (
+                    "404 Not Found",
+                    "application/json; charset=utf-8",
+                    r#"{"error":"路由规则不存在"}"#.to_string(),
+                ),
+            },
+        },
+        ("POST", "/api/rules/move") => match serde_json::from_str::<MoveRuleRequest>(req_body) {
+            Err(_) => (
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                r#"{"error":"无效的规则排序请求体"}"#.to_string(),
+            ),
+            Ok(req) => {
+                if !matches!(
+                    req.direction.trim().to_ascii_lowercase().as_str(),
+                    "up" | "down" | "top" | "bottom"
+                ) {
+                    (
+                        "400 Bad Request",
+                        "application/json; charset=utf-8",
+                        r#"{"error":"排序方向仅支持 up / down / top / bottom"}"#.to_string(),
+                    )
+                } else {
+                    match rule_engine.move_rule(req.id, &req.direction) {
+                        Some(changed) => {
+                            if changed {
+                                persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                            }
+                            (
+                                "200 OK",
+                                "application/json; charset=utf-8",
+                                format!(r#"{{"ok":true,"moved":{}}}"#, changed),
+                            )
+                        }
+                        None => (
+                            "404 Not Found",
+                            "application/json; charset=utf-8",
+                            r#"{"error":"路由规则不存在"}"#.to_string(),
+                        ),
+                    }
+                }
             }
         },
         ("DELETE", "/api/rules") => {
@@ -783,6 +910,68 @@ fn handle_add_rule(
     let id = rule.id;
     rule_engine.add_rule(rule);
     ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, id))
+}
+
+fn build_system_info(
+    actual_port: u16,
+    runtime_ctx: Option<&SystemRuntimeContext>,
+    config_store: Option<&ConfigStore>,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    rule_engine: &RuleEngine,
+    started_at: Instant,
+) -> SystemInfoResponse {
+    let nodes_count = proxy_nodes
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    let rules = rule_engine.current_rules();
+    let rules_count = rules.len();
+    let enabled_rules_count = rules.iter().filter(|r| r.enabled).count();
+    let default_action = match &rule_engine.default_action {
+        Action::Direct => "Direct (直连)".to_string(),
+        Action::Block => "Block (阻断)".to_string(),
+        Action::Proxy(id) => format!("Proxy (节点-{})", id),
+        Action::Chain(id) => format!("Chain (链路-{})", id),
+    };
+
+    let (inbound_addr, dns_addr, upstream_dns, api_addr, fake_ip_count, uptime_secs) =
+        match runtime_ctx {
+            Some(ctx) => (
+                ctx.inbound_addr.to_string(),
+                ctx.dns_addr.to_string(),
+                ctx.upstream_dns.to_string(),
+                ctx.api_addr.to_string(),
+                ctx.fake_ip_pool.len(),
+                ctx.started_at.elapsed().as_secs(),
+            ),
+            None => (
+                "127.0.0.1:40001".to_string(),
+                "127.0.0.1:1053".to_string(),
+                "223.5.5.5:53".to_string(),
+                format!("127.0.0.1:{}", actual_port),
+                0,
+                started_at.elapsed().as_secs(),
+            ),
+        };
+
+    SystemInfoResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        inbound_addr,
+        inbound_protocols: vec!["SOCKS5", "SOCKS4a", "HTTP", "HTTP CONNECT"],
+        dns_addr,
+        upstream_dns,
+        api_addr,
+        config_path: config_store
+            .map(|s| s.path().display().to_string())
+            .unwrap_or_else(|| "仅内存模式".to_string()),
+        fake_ip_cidr: "198.18.0.0/15",
+        fake_ip_count,
+        uptime_secs,
+        default_action,
+        nodes_count,
+        rules_count,
+        enabled_rules_count,
+    }
 }
 
 fn persist_config(
@@ -1010,8 +1199,9 @@ mod tests {
             .with_config_store(Arc::clone(&store));
         let listener = srv.bind().await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (_tx, rx) = watch::channel(false);
+        let (tx, rx) = watch::channel(false);
         tokio::spawn(async move { srv.run(listener, rx).await });
+        let _keep_tx = tx;
 
         let port = addr.port();
         let add_node_body = r#"{"name":"HK-Test","protocol":"HTTP","server_addr":"10.0.0.2:8080"}"#;
@@ -1030,6 +1220,89 @@ mod tests {
         let (reloaded, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
         assert_eq!(reloaded.proxy_nodes.len(), 2);
         assert!(reloaded.proxy_nodes.values().any(|n| n.name == "HK-Test" && n.protocol == "HTTP"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_api_system_and_rule_toggle_move() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("flowx_api_rule_ops_{}.xml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = Arc::new(ConfigStore::new(&path));
+        let (rt, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
+        let rule1_id = rt.rules[0].id;
+        let rule2_id = rt.rules[1].id;
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(rt.rules, rt.default_action));
+        let nodes = Arc::new(RwLock::new(rt.proxy_nodes));
+        let fake_pool = Arc::new(FakeIpPool::new_default());
+        fake_pool.allocate("example.com");
+
+        let sys_ctx = Arc::new(SystemRuntimeContext {
+            inbound_addr: "127.0.0.1:40001".parse().unwrap(),
+            dns_addr: "127.0.0.1:1053".parse().unwrap(),
+            upstream_dns: "223.5.5.5:53".parse().unwrap(),
+            api_addr: "127.0.0.1:40080".parse().unwrap(),
+            fake_ip_pool: fake_pool,
+            started_at: Instant::now(),
+        });
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_self_ports(vec![40001, 40080, 1053])
+            .with_config_store(Arc::clone(&store))
+            .with_runtime_context(sys_ctx);
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx).await });
+        let _keep_tx = tx;
+        let port = addr.port();
+
+        // 1. 系统信息端点
+        let sys_resp = raw_http(
+            addr,
+            &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        )
+        .await;
+        assert!(sys_resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(sys_resp.contains("\"fake_ip_count\":1"));
+        assert!(sys_resp.contains("\"rules_count\":2"));
+
+        // 2. 停用规则 1 并验证持久化
+        let toggle_body = format!(r#"{{"id":{},"enabled":false}}"#, rule1_id);
+        let toggle_resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/rules/toggle HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                toggle_body.len(),
+                toggle_body
+            ),
+        )
+        .await;
+        assert!(toggle_resp.contains("\"enabled\":false"));
+
+        // 3. 将规则 2 上移到顶部并验证持久化
+        let move_body = format!(r#"{{"id":{},"direction":"up"}}"#, rule2_id);
+        let move_resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/rules/move HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                move_body.len(),
+                move_body
+            ),
+        )
+        .await;
+        assert!(move_resp.contains("\"moved\":true"));
+
+        let (reloaded, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
+        assert_eq!(reloaded.rules[0].name, "DevProxy");
+        assert_eq!(reloaded.rules[1].name, "LocalBypass");
+        assert!(!reloaded.rules[1].enabled);
 
         let _ = std::fs::remove_file(&path);
     }

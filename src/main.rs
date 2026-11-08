@@ -10,12 +10,12 @@ pub mod router;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use anyhow::Context;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use crate::api::ApiServer;
+use crate::api::{ApiServer, SystemRuntimeContext};
 use crate::config::ConfigStore;
 use crate::dns::server::DnsServer;
 use crate::dns::FakeIpPool;
@@ -106,6 +106,15 @@ async fn main() -> anyhow::Result<()> {
     });
     let dispatcher_listener = dispatcher.bind().await?;
 
+    let runtime_context = Arc::new(SystemRuntimeContext {
+        inbound_addr: dispatcher_bind,
+        dns_addr: dns_bind,
+        upstream_dns,
+        api_addr: api_bind,
+        fake_ip_pool: Arc::clone(&fake_ip_pool),
+        started_at: Instant::now(),
+    });
+
     let api_server = ApiServer::new(
         api_bind,
         Arc::clone(&connection_manager),
@@ -113,7 +122,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&proxy_nodes),
     )
     .with_self_ports(self_ports)
-    .with_config_store(Arc::clone(&config_store));
+    .with_config_store(Arc::clone(&config_store))
+    .with_runtime_context(runtime_context);
     let api_listener = api_server.bind().await?;
 
     // 5. 初始化全局优雅停机广播通知通道

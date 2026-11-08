@@ -33,6 +33,8 @@ pub struct RuleView {
     pub targets: String,
     pub ports: String,
     pub action: String,
+    pub action_type: String,
+    pub node_id: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,11 +117,11 @@ impl RuleEngine {
         rules
             .iter()
             .map(|r| {
-                let action_desc = match &r.action {
-                    Action::Direct => "Direct (直连)".to_string(),
-                    Action::Block => "Block (阻断)".to_string(),
-                    Action::Proxy(id) => format!("Proxy (节点-{})", id),
-                    Action::Chain(id) => format!("Chain (链路-{})", id),
+                let (action_desc, action_type, node_id) = match &r.action {
+                    Action::Direct => ("Direct (直连)".to_string(), "Direct".to_string(), None),
+                    Action::Block => ("Block (阻断)".to_string(), "Block".to_string(), None),
+                    Action::Proxy(id) => (format!("Proxy (节点-{})", id), "Proxy".to_string(), Some(*id)),
+                    Action::Chain(id) => (format!("Chain (链路-{})", id), "Chain".to_string(), Some(*id)),
                 };
                 RuleView {
                     id: r.id,
@@ -129,6 +131,8 @@ impl RuleEngine {
                     targets: r.targets_raw.clone(),
                     ports: r.ports_raw.clone(),
                     action: action_desc,
+                    action_type,
+                    node_id,
                 }
             })
             .collect()
@@ -151,6 +155,52 @@ impl RuleEngine {
         } else {
             false
         }
+    }
+
+    /// 切换或显式设置指定规则的启用状态，返回更新后的启用状态；若规则不存在返回 None
+    pub fn toggle_rule(&self, rule_id: u64, enabled: Option<bool>) -> Option<bool> {
+        let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        let mut new_rules = (**guard).clone();
+        let target = new_rules.iter_mut().find(|r| r.id == rule_id)?;
+        let next = enabled.unwrap_or(!target.enabled);
+        target.enabled = next;
+        *guard = Arc::new(new_rules);
+        Some(next)
+    }
+
+    /// 调整规则顺序 (支持 "up" / "down" / "top" / "bottom")；
+    /// 返回 Some(true) 表示位置发生变化，Some(false) 表示已在边界无需移动，None 表示规则不存在
+    pub fn move_rule(&self, rule_id: u64, direction: &str) -> Option<bool> {
+        let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        let mut new_rules = (**guard).clone();
+        let idx = new_rules.iter().position(|r| r.id == rule_id)?;
+        let len = new_rules.len();
+        let changed = match direction.trim().to_ascii_lowercase().as_str() {
+            "up" if idx > 0 => {
+                new_rules.swap(idx, idx - 1);
+                true
+            }
+            "down" if idx + 1 < len => {
+                new_rules.swap(idx, idx + 1);
+                true
+            }
+            "top" if idx > 0 => {
+                let item = new_rules.remove(idx);
+                new_rules.insert(0, item);
+                true
+            }
+            "bottom" if idx + 1 < len => {
+                let item = new_rules.remove(idx);
+                new_rules.push(item);
+                true
+            }
+            "up" | "down" | "top" | "bottom" => false,
+            _ => return None,
+        };
+        if changed {
+            *guard = Arc::new(new_rules);
+        }
+        Some(changed)
     }
 
     /// 按照自顶向下顺序对流量进行求值匹配 (First Match Wins)，基于不可变快照零锁争用
@@ -319,5 +369,31 @@ mod tests {
         assert_eq!(engine.list_rules_view().len(), 1);
         assert_eq!(engine.list_rules_view()[0].id, id2);
         assert!(!engine.delete_rule(id1));
+    }
+
+    #[test]
+    fn test_rule_toggle_and_reorder() {
+        let r1 = Rule::from_raw("First", true, None, None, None, Action::Direct);
+        let r2 = Rule::from_raw("Second", true, None, None, None, Action::Block);
+        let r3 = Rule::from_raw("Third", true, None, None, None, Action::Direct);
+        let (id1, id2, id3) = (r1.id, r2.id, r3.id);
+
+        let engine = RuleEngine::new(vec![r1, r2, r3], Action::Direct);
+
+        assert_eq!(engine.toggle_rule(id2, None), Some(false));
+        assert!(!engine.list_rules_view()[1].enabled);
+        assert_eq!(engine.toggle_rule(id2, Some(true)), Some(true));
+        assert!(engine.list_rules_view()[1].enabled);
+        assert_eq!(engine.toggle_rule(999999, None), None);
+
+        // First 已经在顶部，up 返回 Some(false)
+        assert_eq!(engine.move_rule(id1, "up"), Some(false));
+        assert_eq!(engine.move_rule(id3, "up"), Some(true));
+        let ids: Vec<u64> = engine.list_rules_view().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec![id1, id3, id2]);
+
+        assert_eq!(engine.move_rule(id2, "top"), Some(true));
+        let ids2: Vec<u64> = engine.list_rules_view().into_iter().map(|v| v.id).collect();
+        assert_eq!(ids2, vec![id2, id1, id3]);
     }
 }
