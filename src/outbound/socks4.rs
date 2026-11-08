@@ -49,6 +49,9 @@ impl Socks4Client {
         if self.user_id.contains('\0') {
             bail!("SOCKS4 user_id 包含非法的空字符 (\\0)");
         }
+        if self.user_id.len() > 255 {
+            bail!("SOCKS4 user_id 长度超过 255 字节上限: {}", self.user_id.len());
+        }
 
         let mut req = Vec::new();
         req.push(0x04); // VN: 4
@@ -70,6 +73,9 @@ impl Socks4Client {
             TargetAddr::Domain(domain, _) => {
                 if domain.contains('\0') {
                     bail!("SOCKS4 目标域名包含非法的空字符 (\\0): {}", domain);
+                }
+                if domain.len() > 255 {
+                    bail!("SOCKS4a 目标域名长度超过 255 字节上限: {}", domain.len());
                 }
                 // SOCKS4a 域名远程解析扩展: IP 设为 0.0.0.1
                 req.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);

@@ -30,6 +30,7 @@ pub struct ActiveConnection {
     pub start_time: Instant,
     pub uploaded_bytes: AtomicU64,
     pub downloaded_bytes: AtomicU64,
+    pub cancel_notify: Arc<tokio::sync::Notify>,
     last_up: AtomicU64,
     last_down: AtomicU64,
     current_up_speed: AtomicU64,
@@ -143,6 +144,7 @@ impl ConnectionManager {
             start_time: now,
             uploaded_bytes: AtomicU64::new(0),
             downloaded_bytes: AtomicU64::new(0),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
             last_up: AtomicU64::new(0),
             last_down: AtomicU64::new(0),
             current_up_speed: AtomicU64::new(0),
@@ -171,6 +173,17 @@ impl ConnectionManager {
         }
     }
 
+    /// 向指定的活跃连接发送终止通知
+    pub fn kill_connection(&self, id: u64) -> bool {
+        let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(conn) = conns.get(&id) {
+            conn.cancel_notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn list_snapshots(&self) -> Vec<ConnectionSnapshot> {
         let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
         conns.values().map(|c| c.snapshot()).collect()
@@ -179,20 +192,17 @@ impl ConnectionManager {
     pub fn global_stats(&self) -> GlobalTrafficStats {
         let now = Instant::now();
 
-        // 实时汇总：已关闭连接流量 + 当前活跃连接传输量（避免大文件传输中途统计为 0）
-        let (active_up, active_down, active_count) = {
+        // 实时汇总：已关闭连接流量 + 当前活跃连接传输量（在读锁内读取避免与 unregister 产生时序空隙）
+        let (total_up, total_down, active_count) = {
             let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
-            let mut up = 0u64;
-            let mut down = 0u64;
+            let mut up = self.closed_uploaded.load(Ordering::Relaxed);
+            let mut down = self.closed_downloaded.load(Ordering::Relaxed);
             for c in conns.values() {
                 up += c.uploaded_bytes.load(Ordering::Relaxed);
                 down += c.downloaded_bytes.load(Ordering::Relaxed);
             }
             (up, down, conns.len())
         };
-
-        let total_up = self.closed_uploaded.load(Ordering::Relaxed) + active_up;
-        let total_down = self.closed_downloaded.load(Ordering::Relaxed) + active_down;
 
         let mut tick_guard = self.last_tick.write().unwrap_or_else(|e| e.into_inner());
         let elapsed = now.duration_since(*tick_guard).as_secs_f64();
@@ -261,5 +271,36 @@ mod tests {
         let stats = mgr.global_stats();
         assert_eq!(stats.total_uploaded_bytes, 1024);
         assert_eq!(stats.total_downloaded_bytes, 2048);
+    }
+
+    #[tokio::test]
+    async fn test_connection_kill_notification() {
+        let mgr = ConnectionManager::new();
+        let conn = mgr.register(
+            "curl.exe".into(),
+            "C:/curl.exe".into(),
+            5678,
+            "1.1.1.1:80".into(),
+            "Direct".into(),
+            "Direct".into(),
+        );
+
+        let notify = conn.cancel_notify.clone();
+        let handle = tokio::spawn(async move {
+            notify.notified().await;
+            true
+        });
+
+        // 让出时间片确保等待任务已挂载至 Notify 队列
+        tokio::task::yield_now().await;
+
+        let killed = mgr.kill_connection(conn.id);
+        assert!(killed);
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(res.is_ok());
+        assert!(res.unwrap().unwrap());
+
+        assert!(!mgr.kill_connection(9999));
     }
 }

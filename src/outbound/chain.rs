@@ -72,63 +72,71 @@ impl ProxyChain {
         Ok(())
     }
 
-    /// 通过代理链建立到达最终目标的多跳隧道
+    /// 通过代理链建立到达最终目标的多跳隧道（带单跳连接超时与全链路超时控制）
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
         if self.nodes.is_empty() {
             bail!("代理链 '{}' 中未包含任何代理节点", self.name);
         }
 
-        // 1. 与第一跳建立基础 TCP 连接
-        let first_node = &self.nodes[0];
-        let mut stream = TcpStream::connect(first_node.server_addr())
-            .await
-            .with_context(|| {
-                format!(
-                    "代理链 [{}] 首节点连接失败: {}",
-                    self.name,
-                    first_node.server_addr()
-                )
-            })?;
+        const HOP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        const CHAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-        // 2. 依次遍历并向每一跳发起握手，要求其 CONNECT 下一跳代理地址
-        for i in 0..self.nodes.len() {
-            let is_last = i == self.nodes.len() - 1;
-            let current_node = &self.nodes[i];
+        tokio::time::timeout(CHAIN_TOTAL_TIMEOUT, async {
+            // 1. 与第一跳建立基础 TCP 连接
+            let first_node = &self.nodes[0];
+            let mut stream = tokio::time::timeout(HOP_CONNECT_TIMEOUT, TcpStream::connect(first_node.server_addr()))
+                .await
+                .map_err(|_| anyhow::anyhow!("代理链 [{}] 首节点连接超时 ({:?}): {}", self.name, HOP_CONNECT_TIMEOUT, first_node.server_addr()))?
+                .with_context(|| {
+                    format!(
+                        "代理链 [{}] 首节点连接失败: {}",
+                        self.name,
+                        first_node.server_addr()
+                    )
+                })?;
 
-            if is_last {
-                // 最后一跳：要求其连接最终目标
-                stream = current_node
-                    .handshake(stream, target)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "代理链 [{}] 终节点 ({}) 连接目标失败: {}:{}",
-                            self.name,
-                            current_node.server_addr(),
-                            target.host_string(),
-                            target.port()
-                        )
-                    })?;
-            } else {
-                // 中间跳：要求当前节点连接下一跳代理
-                let next_node = &self.nodes[i + 1];
-                let next_target = parse_target_addr(next_node.server_addr())?;
+            // 2. 依次遍历并向每一跳发起握手，要求其 CONNECT 下一跳代理地址
+            for i in 0..self.nodes.len() {
+                let is_last = i == self.nodes.len() - 1;
+                let current_node = &self.nodes[i];
 
-                stream = current_node
-                    .handshake(stream, &next_target)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "代理链 [{}] 节点 {} 连接下一跳 {} 失败",
-                            self.name,
-                            current_node.server_addr(),
-                            next_node.server_addr()
-                        )
-                    })?;
+                if is_last {
+                    // 最后一跳：要求其连接最终目标
+                    stream = current_node
+                        .handshake(stream, target)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "代理链 [{}] 终节点 ({}) 连接目标失败: {}:{}",
+                                self.name,
+                                current_node.server_addr(),
+                                target.host_string(),
+                                target.port()
+                            )
+                        })?;
+                } else {
+                    // 中间跳：要求当前节点连接下一跳代理
+                    let next_node = &self.nodes[i + 1];
+                    let next_target = parse_target_addr(next_node.server_addr())?;
+
+                    stream = current_node
+                        .handshake(stream, &next_target)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "代理链 [{}] 节点 {} 连接下一跳 {} 失败",
+                                self.name,
+                                current_node.server_addr(),
+                                next_node.server_addr()
+                            )
+                        })?;
+                }
             }
-        }
 
-        Ok(stream)
+            Ok(stream)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("代理链 [{}] 级联连接总耗时超过 {:?}", self.name, CHAIN_TOTAL_TIMEOUT))?
     }
 }
 

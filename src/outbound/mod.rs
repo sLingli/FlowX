@@ -33,7 +33,7 @@ impl TargetAddr {
     }
 }
 
-/// 全双工透明流中继对拷（带实时流量监视）
+/// 全双工透明流中继对拷（带实时流量监视与主动熔断切断支持）
 pub async fn relay_stream_monitored(
     local: TcpStream,
     remote: TcpStream,
@@ -43,11 +43,21 @@ pub async fn relay_stream_monitored(
     let (mut rr, mut rw) = remote.into_split();
 
     let conn_up = conn.cloned();
+    let conn_down = conn.cloned();
+    let cancel_notify = conn.map(|c| c.cancel_notify.clone());
+
+    const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
     let up_task = async move {
         let mut buf = [0u8; 16384];
         let mut total_up = 0u64;
         loop {
-            let n = lr.read(&mut buf).await?;
+            let res = tokio::time::timeout(RELAY_IDLE_TIMEOUT, lr.read(&mut buf)).await;
+            let n = match res {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "上传通道空闲超时")),
+            };
             if n == 0 {
                 rw.shutdown().await.ok();
                 break;
@@ -61,12 +71,16 @@ pub async fn relay_stream_monitored(
         Ok::<u64, std::io::Error>(total_up)
     };
 
-    let conn_down = conn.cloned();
     let down_task = async move {
         let mut buf = [0u8; 16384];
         let mut total_down = 0u64;
         loop {
-            let n = rr.read(&mut buf).await?;
+            let res = tokio::time::timeout(RELAY_IDLE_TIMEOUT, rr.read(&mut buf)).await;
+            let n = match res {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "下载通道空闲超时")),
+            };
             if n == 0 {
                 lw.shutdown().await.ok();
                 break;
@@ -80,10 +94,23 @@ pub async fn relay_stream_monitored(
         Ok::<u64, std::io::Error>(total_down)
     };
 
-    let (up_res, down_res) = tokio::join!(up_task, down_task);
-    let up = up_res?;
-    let down = down_res?;
-    Ok((up, down))
+    tokio::select! {
+        res = async {
+            tokio::try_join!(up_task, down_task)
+        } => {
+            let (up, down) = res?;
+            Ok((up, down))
+        }
+        _ = async {
+            if let Some(ref cancel) = cancel_notify {
+                cancel.notified().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            anyhow::bail!("连接已被管理员手动切断");
+        }
+    }
 }
 
 pub async fn relay_stream(local: TcpStream, remote: TcpStream) -> Result<(u64, u64)> {

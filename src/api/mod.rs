@@ -175,8 +175,9 @@ async fn handle_api_request(
                         .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
                 });
             if let Some(conn_id) = id {
+                let killed = monitor.kill_connection(conn_id);
                 monitor.unregister(conn_id);
-                ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
+                ("200 OK", "application/json; charset=utf-8", format!(r#"{{"ok":true,"killed":{}}}"#, killed))
             } else {
                 ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少连接ID"}"#.to_string())
             }
