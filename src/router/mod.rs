@@ -1,11 +1,14 @@
 use std::net::IpAddr;
-use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use glob::Pattern;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use self::parser::DomainMatcher;
 
 pub mod parser;
+
+static NEXT_RULE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
@@ -23,7 +26,7 @@ pub struct PortRange {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuleView {
-    pub id: usize,
+    pub id: u64,
     pub name: String,
     pub enabled: bool,
     pub apps: String,
@@ -34,6 +37,7 @@ pub struct RuleView {
 
 #[derive(Debug, Clone)]
 pub struct Rule {
+    pub id: u64,
     pub name: String,
     pub enabled: bool,
     pub apps_raw: String,
@@ -55,6 +59,7 @@ impl Rule {
         ports_raw: Option<&str>,
         action: Action,
     ) -> Self {
+        let id = NEXT_RULE_ID.fetch_add(1, Ordering::Relaxed);
         let application_patterns = apps_raw.and_then(parser::parse_applications);
 
         let (target_domains, target_subnets) = targets_raw
@@ -64,6 +69,7 @@ impl Rule {
         let ports = ports_raw.and_then(parser::parse_ports);
 
         Self {
+            id,
             name: name.into(),
             enabled,
             apps_raw: apps_raw.unwrap_or_default().to_string(),
@@ -87,24 +93,28 @@ pub struct RouteContext<'a> {
 }
 
 pub struct RuleEngine {
-    pub rules: RwLock<Vec<Rule>>,
+    rules: RwLock<Arc<Vec<Rule>>>,
     pub default_action: Action,
 }
 
 impl RuleEngine {
     pub fn new(rules: Vec<Rule>, default_action: Action) -> Self {
         Self {
-            rules: RwLock::new(rules),
+            rules: RwLock::new(Arc::new(rules)),
             default_action,
         }
     }
 
+    pub fn current_rules(&self) -> Arc<Vec<Rule>> {
+        let guard = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(&*guard)
+    }
+
     pub fn list_rules_view(&self) -> Vec<RuleView> {
-        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        let rules = self.current_rules();
         rules
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
+            .map(|r| {
                 let action_desc = match &r.action {
                     Action::Direct => "Direct (直连)".to_string(),
                     Action::Block => "Block (阻断)".to_string(),
@@ -112,7 +122,7 @@ impl RuleEngine {
                     Action::Chain(id) => format!("Chain (链路-{})", id),
                 };
                 RuleView {
-                    id: i,
+                    id: r.id,
                     name: r.name.clone(),
                     enabled: r.enabled,
                     apps: r.apps_raw.clone(),
@@ -125,23 +135,27 @@ impl RuleEngine {
     }
 
     pub fn add_rule(&self, rule: Rule) {
-        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
-        rules.push(rule);
+        let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        let mut new_rules = (**guard).clone();
+        new_rules.push(rule);
+        *guard = Arc::new(new_rules);
     }
 
-    pub fn delete_rule(&self, index: usize) -> bool {
-        let mut rules = self.rules.write().unwrap_or_else(|e| e.into_inner());
-        if index < rules.len() {
-            rules.remove(index);
+    pub fn delete_rule(&self, rule_id: u64) -> bool {
+        let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        let before_len = guard.len();
+        let new_rules: Vec<Rule> = (**guard).iter().filter(|r| r.id != rule_id).cloned().collect();
+        if new_rules.len() < before_len {
+            *guard = Arc::new(new_rules);
             true
         } else {
             false
         }
     }
 
-    /// 按照自顶向下顺序对流量进行求值匹配 (First Match Wins)，带 Fail-Closed 约束保护
+    /// 按照自顶向下顺序对流量进行求值匹配 (First Match Wins)，基于不可变快照零锁争用
     pub fn evaluate(&self, ctx: &RouteContext) -> (Action, String) {
-        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        let rules = self.current_rules();
         for rule in rules.iter() {
             if !rule.enabled {
                 continue;
@@ -286,5 +300,24 @@ mod tests {
         let (action_other, rule_name_other) = engine.evaluate(&ctx_other);
         assert_eq!(action_other, Action::Block);
         assert_eq!(rule_name_other, "Default");
+    }
+
+    #[test]
+    fn test_rule_view_and_deletion() {
+        let r1 = Rule::from_raw("RuleA", true, None, None, None, Action::Direct);
+        let id1 = r1.id;
+        let r2 = Rule::from_raw("RuleB", true, None, None, None, Action::Block);
+        let id2 = r2.id;
+
+        let engine = RuleEngine::new(vec![r1, r2], Action::Direct);
+        let views = engine.list_rules_view();
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, id1);
+        assert_eq!(views[1].id, id2);
+
+        assert!(engine.delete_rule(id1));
+        assert_eq!(engine.list_rules_view().len(), 1);
+        assert_eq!(engine.list_rules_view()[0].id, id2);
+        assert!(!engine.delete_rule(id1));
     }
 }

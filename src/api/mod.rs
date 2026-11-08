@@ -240,9 +240,19 @@ async fn handle_api_request(
                         .and_then(|v| v.get("id").and_then(|i| i.as_u64()).map(|n| n as u32))
                 });
             if let Some(node_id) = id {
-                let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-                nodes_guard.remove(&node_id);
-                ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
+                // 级联防呆检查：若当前有任何路由规则指向该代理节点，禁止删除
+                let rules = rule_engine.current_rules();
+                let is_referenced = rules.iter().any(|r| match &r.action {
+                    Action::Proxy(pid) => *pid == node_id,
+                    _ => false,
+                });
+                if is_referenced {
+                    ("409 Conflict", "application/json; charset=utf-8", r#"{"error":"节点正被路由规则引用，禁止删除。请先修改或删除关联规则"}"#.to_string())
+                } else {
+                    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+                    nodes_guard.remove(&node_id);
+                    ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
+                }
             } else {
                 ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少节点ID"}"#.to_string())
             }
@@ -288,18 +298,18 @@ async fn handle_api_request(
             }
         }
         ("DELETE", "/api/rules") => {
-            let id: Option<usize> = parse_query_param(query, "id")
+            let id: Option<u64> = parse_query_param(query, "id")
                 .and_then(|v| v.parse().ok())
                 .or_else(|| {
                     serde_json::from_str::<serde_json::Value>(req_body).ok()
-                        .and_then(|v| v.get("id").and_then(|i| i.as_u64()).map(|n| n as usize))
+                        .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
                 });
-            if let Some(rule_idx) = id {
-                let ok = rule_engine.delete_rule(rule_idx);
+            if let Some(rule_id) = id {
+                let ok = rule_engine.delete_rule(rule_id);
                 let resp = format!(r#"{{"ok":{}}}"#, ok);
                 ("200 OK", "application/json; charset=utf-8", resp)
             } else {
-                ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少规则索引"}"#.to_string())
+                ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少规则ID"}"#.to_string())
             }
         }
         _ => ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"Not Found"}"#.to_string()),
