@@ -1565,6 +1565,11 @@
       connFilter: 'ALL',
       paused: false,
       failStreak: 0,
+      pollInFlight: false,
+      pollTimerId: null,
+      ruleReorderLocked: false,
+      busyRuleIds: {},
+      busyConnIds: {},
       historyDown: new Array(MAX_HISTORY).fill(0),
       historyUp: new Array(MAX_HISTORY).fill(0)
     };
@@ -1687,14 +1692,28 @@
       }
     }
 
-    // 实时数据轮询
+    // 实时数据轮询（非重入设计，配合超时中止防止网络卡顿/休眠唤醒期间请求堆积）
+    async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+      if (typeof AbortController === 'undefined') {
+        return fetch(url, options);
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, { ...options, signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
     async function pollRealtime() {
-      if (state.paused) return;
+      if (state.paused || state.pollInFlight) return;
+      state.pollInFlight = true;
       try {
         const [statsRes, connsRes, sysRes] = await Promise.all([
-          fetch('/api/stats'),
-          fetch('/api/connections'),
-          fetch('/api/system')
+          fetchWithTimeout('/api/stats'),
+          fetchWithTimeout('/api/connections'),
+          fetchWithTimeout('/api/system')
         ]);
 
         if (!statsRes.ok || !connsRes.ok) {
@@ -1707,6 +1726,12 @@
         const stats = await statsRes.json();
         const conns = await connsRes.json();
         state.connections = Array.isArray(conns) ? conns : [];
+
+        // 清理已从活跃表中注销的连接忙碌标记
+        const liveIds = new Set(state.connections.map(c => c.id));
+        for (const k of Object.keys(state.busyConnIds)) {
+          if (!liveIds.has(Number(k))) delete state.busyConnIds[k];
+        }
 
         const downRate = stats.current_download_bytes_per_sec || 0;
         const upRate = stats.current_upload_bytes_per_sec || 0;
@@ -1738,7 +1763,21 @@
         if (state.failStreak >= 2) {
           setHealthStatus(false);
         }
+      } finally {
+        state.pollInFlight = false;
       }
+    }
+
+    function schedulePoll() {
+      if (state.pollTimerId !== null) {
+        clearTimeout(state.pollTimerId);
+        state.pollTimerId = null;
+      }
+      state.pollTimerId = setTimeout(async () => {
+        state.pollTimerId = null;
+        await pollRealtime();
+        schedulePoll();
+      }, 1000);
     }
 
     function renderSystemInfo() {
@@ -1837,7 +1876,9 @@
       const btn = document.getElementById('pause-poll-btn');
       btn.textContent = state.paused ? '恢复刷新' : '暂停刷新';
       btn.classList.toggle('btn-primary', state.paused);
-      if (!state.paused) pollRealtime();
+      if (!state.paused) {
+        pollRealtime().then(schedulePoll);
+      }
     }
 
     function renderConnections() {
@@ -1881,7 +1922,9 @@
         return;
       }
 
-      fullEl.innerHTML = filtered.map(c => `
+      fullEl.innerHTML = filtered.map(c => {
+        const killing = Boolean(state.busyConnIds[c.id]);
+        return `
         <tr>
           <td class="mono" style="color:var(--text-muted);">#${c.id}</td>
           <td>
@@ -1896,22 +1939,29 @@
           <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)}<br>↓${formatSpeed(c.download_bytes_per_sec)}</td>
           <td class="mono" style="font-size:12px;">↑${formatBytes(c.uploaded_bytes)}<br>↓${formatBytes(c.downloaded_bytes)}</td>
           <td class="mono">${c.duration_secs}s</td>
-          <td><button class="btn btn-sm btn-danger-ghost" onclick="killConnection(${c.id})">断开</button></td>
+          <td><button class="btn btn-sm btn-danger-ghost" onclick="killConnection(${c.id})" ${killing ? 'disabled' : ''}>${killing ? '断开中' : '断开'}</button></td>
         </tr>
-      `).join('');
+      `;
+      }).join('');
     }
 
     async function killConnection(id) {
+      if (state.busyConnIds[id]) return;
+      state.busyConnIds[id] = true;
+      renderConnections();
       try {
         const res = await fetch(`/api/connections/kill?id=${id}`, { method: 'POST' });
         if (res.ok) {
           showToast(`已切断会话 #${id}`, 'info');
-          pollRealtime();
+          await pollRealtime();
         } else {
           showToast('断开连接失败', 'error');
         }
       } catch (e) {
         showToast('请求失败: ' + e.message, 'error');
+      } finally {
+        delete state.busyConnIds[id];
+        renderConnections();
       }
     }
 
@@ -2141,7 +2191,9 @@
 
         const isFirst = idx === 0;
         const isLast = idx === total - 1;
-        const disableReorder = Boolean(keyword);
+        const isBusy = Boolean(state.busyRuleIds[r.id]);
+        const disableRowOps = isBusy || state.ruleReorderLocked;
+        const disableReorder = Boolean(keyword) || disableRowOps;
 
         return `
           <div class="rule-row ${r.enabled ? '' : 'disabled'}">
@@ -2158,13 +2210,13 @@
             <div class="rule-row-right">
               <span class="badge ${actionBadgeClass(r.action)}">${escapeHtml(formatRuleActionLabel(r))}</span>
               <label class="switch" title="${r.enabled ? '点击停用' : '点击启用'}">
-                <input type="checkbox" ${r.enabled ? 'checked' : ''} onchange="toggleRule(${r.id}, this.checked)">
+                <input type="checkbox" ${r.enabled ? 'checked' : ''} ${disableRowOps ? 'disabled' : ''} onchange="toggleRule(${r.id}, this.checked)">
                 <span class="slider"></span>
               </label>
               <button class="btn btn-sm" onclick="moveRule(${r.id}, 'top')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="置顶">⤒</button>
               <button class="btn btn-sm" onclick="moveRule(${r.id}, 'up')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="上移">↑</button>
               <button class="btn btn-sm" onclick="moveRule(${r.id}, 'down')" ${(isLast || disableReorder) ? 'disabled' : ''} title="下移">↓</button>
-              <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteRule(${r.id})">删除</button>
+              <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteRule(${r.id})" ${disableRowOps ? 'disabled' : ''}>删除</button>
             </div>
           </div>
         `;
@@ -2172,6 +2224,9 @@
     }
 
     async function toggleRule(id, enabled) {
+      if (state.busyRuleIds[id] || state.ruleReorderLocked) return;
+      state.busyRuleIds[id] = true;
+      renderRules();
       try {
         const res = await fetch('/api/rules/toggle', {
           method: 'POST',
@@ -2181,18 +2236,23 @@
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
           showToast(data.enabled ? '已启用该规则' : '已停用该规则', 'info');
-          await loadRules();
         } else {
           showToast(data.error || '切换规则状态失败', 'error');
-          await loadRules();
         }
       } catch (e) {
         showToast('请求失败: ' + e.message, 'error');
+      } finally {
+        delete state.busyRuleIds[id];
+        renderRules();
         await loadRules();
       }
     }
 
     async function moveRule(id, direction) {
+      if (state.ruleReorderLocked || state.busyRuleIds[id]) return;
+      state.ruleReorderLocked = true;
+      state.busyRuleIds[id] = true;
+      renderRules();
       try {
         const res = await fetch('/api/rules/move', {
           method: 'POST',
@@ -2200,13 +2260,16 @@
           body: JSON.stringify({ id, direction })
         });
         const data = await res.json().catch(() => ({}));
-        if (res.ok) {
-          if (data.moved) await loadRules();
-        } else {
+        if (!res.ok) {
           showToast(data.error || '调整规则顺序失败', 'error');
         }
       } catch (e) {
         showToast('请求失败: ' + e.message, 'error');
+      } finally {
+        state.ruleReorderLocked = false;
+        delete state.busyRuleIds[id];
+        renderRules();
+        await loadRules();
       }
     }
 
@@ -2343,10 +2406,12 @@
       await Promise.all([loadNodes(), loadRules(), pollRealtime()]);
     }
 
-    initTheme();
-    renderChart();
-    refreshAll();
-    setInterval(pollRealtime, 1000);
+    (async function bootstrap() {
+      initTheme();
+      renderChart();
+      await refreshAll();
+      schedulePoll();
+    })();
   </script>
 </body>
 </html>
