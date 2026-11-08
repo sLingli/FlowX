@@ -157,16 +157,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 演示：注入一条初始连通性监视会话
-    let _demo_conn = connection_manager.register(
-        "flowx.exe".into(),
-        std::env::current_exe()?.to_string_lossy().to_string(),
-        std::process::id(),
-        "api.github.com:443".into(),
-        "DevProxy".into(),
-        "Proxy(101)".into(),
-    );
-
     info!("[就绪] 控制台已就绪，请在浏览器中访问: http://127.0.0.1:40080");
     info!("[就绪] 按 Ctrl+C 可安全停止 FlowX 核心引擎");
 
@@ -175,8 +165,7 @@ async fn main() -> anyhow::Result<()> {
     info!("[退出] 接收到退出信号，正在通知各子系统停止接收流量...");
     let _ = shutdown_tx.send(true);
 
-    // 优雅排空：注销演示连接并等待正在传输的活跃连接完成挥手（最多等待 10 秒）
-    connection_manager.unregister(_demo_conn.id);
+    // 优雅排空：等待正在传输的活跃连接完成挥手（最多等待 10 秒）
     let drain_start = std::time::Instant::now();
     let max_drain_wait = Duration::from_secs(10);
     while drain_start.elapsed() < max_drain_wait {
