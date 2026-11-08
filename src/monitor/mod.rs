@@ -186,7 +186,9 @@ impl ConnectionManager {
 
     pub fn list_snapshots(&self) -> Vec<ConnectionSnapshot> {
         let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
-        conns.values().map(|c| c.snapshot()).collect()
+        let mut list: Vec<ConnectionSnapshot> = conns.values().map(|c| c.snapshot()).collect();
+        list.sort_by_key(|c| std::cmp::Reverse(c.id));
+        list
     }
 
     pub fn global_stats(&self) -> GlobalTrafficStats {

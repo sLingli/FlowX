@@ -1166,7 +1166,7 @@
         const res = await fetch('/api/nodes/ping', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ addr })
+          body: JSON.stringify({ id })
         });
         const data = await res.json();
         if (data.ok) {

@@ -92,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
 
     let dispatcher_bind: SocketAddr = "127.0.0.1:40001".parse()?;
     let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
+    let self_ports = vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()];
     let dispatcher = StreamDispatcher::new(DispatcherConfig {
         bind_addr: dispatcher_bind,
         tracker: Arc::clone(&process_tracker),
@@ -100,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
         monitor: Arc::clone(&connection_manager),
         proxy_nodes: Arc::clone(&proxy_nodes),
         proxy_chains: Arc::clone(&proxy_chains),
-        self_ports: vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()],
+        self_ports: self_ports.clone(),
     });
     let dispatcher_listener = dispatcher.bind().await?;
 
@@ -109,7 +110,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&connection_manager),
         Arc::clone(&rule_engine),
         Arc::clone(&proxy_nodes),
-    );
+    )
+    .with_self_ports(self_ports);
     let api_listener = api_server.bind().await?;
 
     // 5. 初始化全局优雅停机广播通知通道
