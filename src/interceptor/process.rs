@@ -82,6 +82,33 @@ impl ProcessTracker {
         self.find_by_local_port(addr.port())
     }
 
+    /// 异步非阻塞查询进程信息：快路径读锁命中直接返回，未命中则交付 spawn_blocking 避免阻塞 Tokio 调度线程
+    pub async fn find_by_local_port_async(self: &std::sync::Arc<Self>, local_port: u16) -> Option<ProcessInfo> {
+        let now = Instant::now();
+
+        // 1. 读锁查询端口短期缓存 (非阻塞快路径)
+        {
+            let cache = self.port_cache.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((info, expire)) = cache.get(&local_port)
+                && *expire > now {
+                    return Some(info.clone());
+                }
+        }
+
+        // 2. 慢路径：交由 spawn_blocking 执行 Win32 阻塞调用
+        let tracker = std::sync::Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            tracker.find_by_local_port(local_port)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    pub async fn find_by_addr_async(self: &std::sync::Arc<Self>, addr: &SocketAddr) -> Option<ProcessInfo> {
+        self.find_by_local_port_async(addr.port()).await
+    }
+
     /// 清理过期的端口与 PID 缓存项
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
@@ -126,11 +153,14 @@ fn get_pid_by_local_port(target_port: u16) -> Option<u32> {
                 return None;
             }
 
-            // 预留少量余量，防止两次调用间隙新增连接
-            let mut buffer: Vec<u8> = vec![0; (size as usize) + 512];
+            // 使用 u32 数组分配缓冲区以严格保证 4 字节指针对齐，避免 UB
+            let u32_elements = (size as usize + 512 + 3) / 4;
+            let mut buffer: Vec<u32> = vec![0u32; u32_elements];
+            let mut actual_size = (u32_elements * 4) as u32;
+
             let ret = GetExtendedTcpTable(
                 buffer.as_mut_ptr() as *mut _,
-                &mut size,
+                &mut actual_size,
                 0,
                 AF_INET as u32,
                 TCP_TABLE_OWNER_PID_ALL,

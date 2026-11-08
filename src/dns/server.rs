@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use anyhow::{bail, Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch, Semaphore};
 use tracing::{debug, error, info, warn};
 use super::FakeIpPool;
 
@@ -83,10 +84,15 @@ impl DnsPacketParser {
         let qclass = u16::from_be_bytes([buf[offset + 2], buf[offset + 3]]);
         let raw_len = offset + 4;
 
+        let name = domain_parts.join(".");
+        if name.is_empty() {
+            bail!("DNS 查询域名为空 (Root Query)");
+        }
+
         Ok((
             tx_id,
             DnsQuestion {
-                name: domain_parts.join("."),
+                name,
                 qtype,
                 qclass,
                 raw_len,
@@ -147,6 +153,7 @@ pub struct DnsServer {
     pub pool: Arc<FakeIpPool>,
     pub upstream_dns: SocketAddr,
     pub block_ipv6: bool,
+    concurrency_limit: Arc<Semaphore>,
 }
 
 impl DnsServer {
@@ -161,6 +168,7 @@ impl DnsServer {
             pool,
             upstream_dns,
             block_ipv6,
+            concurrency_limit: Arc::new(Semaphore::new(5000)),
         }
     }
 
@@ -173,9 +181,47 @@ impl DnsServer {
         Ok(Arc::new(socket))
     }
 
-    /// 启动异步 UDP DNS 监听循环（支持优雅停机与多任务并发）
+    /// 启动异步 UDP DNS 监听循环（支持优雅停机、并发信号量限制与上游多路复用）
     pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut buf = [0u8; 1500];
+
+        // 绑定单个复用的上游 DNS 转发客户端，杜绝反复 bind 耗尽临时端口
+        let upstream_client = Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("绑定 DNS 上游客户端套接字失败")?,
+        );
+        let pending_queries: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // 启动后台上游 DNS 响应多路复用接收循环
+        let uc = Arc::clone(&upstream_client);
+        let pq = Arc::clone(&pending_queries);
+        let mut shutdown_rx_upstream = shutdown_rx.clone();
+        tokio::spawn(async move {
+            let mut up_buf = [0u8; 1500];
+            loop {
+                tokio::select! {
+                    res = uc.recv_from(&mut up_buf) => {
+                        match res {
+                            Ok((n, _)) if n >= 2 => {
+                                let tx_id = u16::from_be_bytes([up_buf[0], up_buf[1]]);
+                                if let Some(sender) = pq.lock().unwrap().remove(&tx_id) {
+                                    let _ = sender.send(up_buf[..n].to_vec());
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!("[DNS 引擎] 上游响应接收异常: {}", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx_upstream.changed() => break,
+                }
+            }
+        });
+
         loop {
             let (len, peer) = tokio::select! {
                 res = socket.recv_from(&mut buf) => {
@@ -193,13 +239,24 @@ impl DnsServer {
                 }
             };
 
+            let permit = match self.concurrency_limit.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    warn!("[DNS 引擎] 丢弃超出并发限制 (5000) 的 DNS 查询请求");
+                    continue;
+                }
+            };
+
             let query_bytes = buf[..len].to_vec();
             let socket_clone = socket.clone();
             let pool_clone = self.pool.clone();
             let upstream_dns = self.upstream_dns;
             let block_ipv6 = self.block_ipv6;
+            let uc_clone = Arc::clone(&upstream_client);
+            let pq_clone = Arc::clone(&pending_queries);
 
             tokio::spawn(async move {
+                let _permit = permit;
                 match DnsPacketParser::parse_question(&query_bytes) {
                     Ok((tx_id, question)) => {
                         debug!(
@@ -231,18 +288,19 @@ impl DnsServer {
                             return;
                         }
 
-                        // 3. 其它类型查询转向上游 DNS 进行代理解析（异步并发，不阻塞主循环）
-                        if let Ok(upstream_socket) = UdpSocket::bind("0.0.0.0:0").await {
-                            let _ = upstream_socket.send_to(&query_bytes, upstream_dns).await;
-                            let mut upstream_buf = [0u8; 1500];
-                            if let Ok(Ok(n)) = tokio::time::timeout(
-                                std::time::Duration::from_secs(2),
-                                upstream_socket.recv(&mut upstream_buf),
-                            )
-                            .await
-                            {
-                                let _ = socket_clone.send_to(&upstream_buf[..n], peer).await;
+                        // 3. 其它类型查询转向上游 DNS 进行代理解析（单套接字多路复用，不耗尽临时端口）
+                        let (tx, rx) = oneshot::channel();
+                        {
+                            pq_clone.lock().unwrap().insert(tx_id, tx);
+                        }
+                        if uc_clone.send_to(&query_bytes, upstream_dns).await.is_ok() {
+                            if let Ok(Ok(resp_bytes)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+                                let _ = socket_clone.send_to(&resp_bytes, peer).await;
+                            } else {
+                                pq_clone.lock().unwrap().remove(&tx_id);
                             }
+                        } else {
+                            pq_clone.lock().unwrap().remove(&tx_id);
                         }
                     }
                     Err(e) => {
@@ -300,5 +358,9 @@ mod tests {
         query_long.push(0);
         query_long.extend_from_slice(&[0, 1, 0, 1]);
         assert!(DnsPacketParser::parse_question(&query_long).is_err());
+
+        // 测试空域名 (Root Query) 被拒绝
+        let query_empty = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 1, 0, 1];
+        assert!(DnsPacketParser::parse_question(&query_empty).is_err());
     }
 }

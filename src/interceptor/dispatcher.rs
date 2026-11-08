@@ -117,8 +117,8 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     config: Arc<DispatcherConfig>,
 ) -> Result<()> {
-    // 1. 通过源端口逆向追踪调用方进程
-    let proc_info = config.tracker.find_by_addr(&peer_addr);
+    // 1. 通过源端口逆向追踪调用方进程（异步非阻塞）
+    let proc_info = config.tracker.find_by_addr_async(&peer_addr).await;
     let proc_name = proc_info.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Unknown".to_string());
     let proc_path = proc_info.as_ref().map(|p| p.path.clone()).unwrap_or_else(|| "Unknown".to_string());
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
