@@ -72,7 +72,7 @@ flowchart TD
 - **二级 TTL 缓存**：结合 1 秒连接缓存与 10 秒 PID 路径缓存，并通过 `spawn_blocking` 隔离 Win32 阻塞调用，避免阻塞 Tokio 调度线程。
 
 ### 2.3 DNS 拦截与 Fake-IP 机制 (`src/dns/mod.rs`, `src/dns/server.rs`)
-- **本地 DNS 服务**：监听 `127.0.0.1:1053`，默认开启 `AAAA` 空应答以防止 IPv6 流量旁路泄漏；其余查询通过复用的上游 UDP 套接字转发至 `223.5.5.5:53`。
+- **本地 DNS 服务**：监听 `127.0.0.1:1053`，默认拦截阻断 `AAAA`（Type 28）、`SVCB`（Type 64）与 `HTTPS`（Type 65）查询并回复空 NOERROR 应答，防止 IPv6 泄漏与 `ipv4hint` 绕过 Fake-IP；其余查询通过独立内部事务 ID 映射器并校源自上游 IP 后，复用 UDP 套接字转发至 `223.5.5.5:53`。
 - **Fake-IP 滑动续期**：为 `A` 查询从 `198.18.0.0/15` 分配虚拟 IP 并维护双向映射；在 `allocate()` / `restore()` 命中活跃域名时自动滑动续期 TTL，防止活跃会话中途丢失域名映射。
 
 ### 2.4 多维规则路由引擎 (`src/router/mod.rs`, `src/router/parser.rs`)
@@ -82,8 +82,8 @@ flowchart TD
 
 ### 2.5 多协议出站与代理链 (`src/outbound/`)
 - **协议支持**：`DirectOutbound`（10 秒建连超时保护）、`Socks5Client`（RFC 1928/1929 账密认证）、`HttpConnectClient`（Basic 认证与 CRLF 注入校验）、`Socks4Client`（含 SOCKS4a 域名扩展）。
-- **多跳代理链 (`ProxyChain`)**：支持在已有隧道流上递归握手串联多跳节点，具备循环检测与单跳/全链路超时控制。
-- **流量监视中继**：全双工对拷内置 120 秒空闲超时与实时手动熔断切断通知（`Notify`）。
+- **多跳代理链 (`ProxyChain`)**：支持在已有隧道流上递归握手串联多跳节点，具备统一地址规范校验、未指定地址/大小写不敏感循环检测与单跳/全链路超时控制。
+- **流量监视中继**：全双工对拷采用双向同时静默 120 秒空闲超时与半关闭持续传输支持，并具备实时手动熔断切断通知。
 
 ### 2.6 配置持久化与同源加固控制台 (`src/config/mod.rs`, `src/api/mod.rs`, `frontend/index.html`)
 - **XML 配置 (`flowx.xml`)**：支持通过 `--config <路径>` 或环境变量 `FLOWX_CONFIG` 指定配置文件，缺省自动生成默认 `flowx.xml`；Web API 修改节点或规则后串行化原子写回磁盘（临时文件写入 + `rename` 替换）。
