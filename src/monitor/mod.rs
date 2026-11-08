@@ -15,8 +15,8 @@ pub struct ConnectionSnapshot {
     pub duration_secs: u64,
     pub uploaded_bytes: u64,
     pub downloaded_bytes: u64,
-    pub upload_speed_bps: u64,
-    pub download_speed_bps: u64,
+    pub upload_bytes_per_sec: u64,
+    pub download_bytes_per_sec: u64,
 }
 
 pub struct ActiveConnection {
@@ -83,8 +83,8 @@ impl ActiveConnection {
             duration_secs: now.duration_since(self.start_time).as_secs(),
             uploaded_bytes: up,
             downloaded_bytes: down,
-            upload_speed_bps: self.current_up_speed.load(Ordering::Relaxed),
-            download_speed_bps: self.current_down_speed.load(Ordering::Relaxed),
+            upload_bytes_per_sec: self.current_up_speed.load(Ordering::Relaxed),
+            download_bytes_per_sec: self.current_down_speed.load(Ordering::Relaxed),
         }
     }
 }
@@ -106,8 +106,8 @@ pub struct ConnectionManager {
 pub struct GlobalTrafficStats {
     pub total_uploaded_bytes: u64,
     pub total_downloaded_bytes: u64,
-    pub current_upload_bps: u64,
-    pub current_download_bps: u64,
+    pub current_upload_bytes_per_sec: u64,
+    pub current_download_bytes_per_sec: u64,
     pub active_connections_count: usize,
 }
 
@@ -234,19 +234,19 @@ impl ConnectionManager {
         if elapsed >= 0.5 {
             let last_up = self.last_total_up.swap(total_up, Ordering::Relaxed);
             let last_down = self.last_total_down.swap(total_down, Ordering::Relaxed);
-            let up_bps = ((total_up.saturating_sub(last_up) as f64) / elapsed) as u64;
-            let down_bps = ((total_down.saturating_sub(last_down) as f64) / elapsed) as u64;
+            let up_bytes_per_sec = ((total_up.saturating_sub(last_up) as f64) / elapsed) as u64;
+            let down_bytes_per_sec = ((total_down.saturating_sub(last_down) as f64) / elapsed) as u64;
 
-            self.current_up_speed.store(up_bps, Ordering::Relaxed);
-            self.current_down_speed.store(down_bps, Ordering::Relaxed);
+            self.current_up_speed.store(up_bytes_per_sec, Ordering::Relaxed);
+            self.current_down_speed.store(down_bytes_per_sec, Ordering::Relaxed);
             *tick_guard = now;
         }
 
         GlobalTrafficStats {
             total_uploaded_bytes: total_up,
             total_downloaded_bytes: total_down,
-            current_upload_bps: self.current_up_speed.load(Ordering::Relaxed),
-            current_download_bps: self.current_down_speed.load(Ordering::Relaxed),
+            current_upload_bytes_per_sec: self.current_up_speed.load(Ordering::Relaxed),
+            current_download_bytes_per_sec: self.current_down_speed.load(Ordering::Relaxed),
             active_connections_count: active_count,
         }
     }
@@ -289,6 +289,14 @@ mod tests {
         assert_eq!(list[0].process_name, "node.exe");
         assert_eq!(list[0].uploaded_bytes, 1024);
         assert_eq!(list[0].downloaded_bytes, 2048);
+
+        // 校验速率字段统一使用 bytes_per_sec，消除 bps 单位歧义
+        let stats_json = serde_json::to_string(&stats_live).unwrap();
+        assert!(stats_json.contains("current_upload_bytes_per_sec"));
+        assert!(stats_json.contains("current_download_bytes_per_sec"));
+        let snap_json = serde_json::to_string(&list[0]).unwrap();
+        assert!(snap_json.contains("upload_bytes_per_sec"));
+        assert!(snap_json.contains("download_bytes_per_sec"));
 
         mgr.unregister(conn.id);
         assert_eq!(mgr.active_count(), 0);

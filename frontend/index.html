@@ -1633,8 +1633,8 @@
       return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
     }
 
-    function formatSpeed(bps) {
-      return formatBytes(bps) + '/s';
+    function formatSpeed(bytesPerSec) {
+      return formatBytes(bytesPerSec) + '/s';
     }
 
     function formatDuration(secs) {
@@ -1708,22 +1708,22 @@
         const conns = await connsRes.json();
         state.connections = Array.isArray(conns) ? conns : [];
 
-        const downBps = stats.current_download_bps || 0;
-        const upBps = stats.current_upload_bps || 0;
+        const downRate = stats.current_download_bytes_per_sec || 0;
+        const upRate = stats.current_upload_bytes_per_sec || 0;
         const totalDown = stats.total_downloaded_bytes || 0;
         const totalUp = stats.total_uploaded_bytes || 0;
 
-        document.getElementById('val-down-speed').textContent = formatSpeed(downBps);
-        document.getElementById('val-up-speed').textContent = formatSpeed(upBps);
+        document.getElementById('val-down-speed').textContent = formatSpeed(downRate);
+        document.getElementById('val-up-speed').textContent = formatSpeed(upRate);
         document.getElementById('val-total-down').textContent = formatBytes(totalDown);
         document.getElementById('val-total-up').textContent = formatBytes(totalUp);
         document.getElementById('val-active-conns').textContent = stats.active_connections_count || 0;
         document.getElementById('val-total-bytes').textContent = formatBytes(totalDown + totalUp);
         document.getElementById('nav-count-conns').textContent = stats.active_connections_count || 0;
 
-        state.historyDown.push(downBps);
+        state.historyDown.push(downRate);
         if (state.historyDown.length > MAX_HISTORY) state.historyDown.shift();
-        state.historyUp.push(upBps);
+        state.historyUp.push(upRate);
         if (state.historyUp.length > MAX_HISTORY) state.historyUp.shift();
         renderChart();
 
@@ -1858,7 +1858,7 @@
             <td class="mono">${escapeHtml(c.target)}</td>
             <td>${escapeHtml(c.rule_name)}</td>
             <td><span class="badge ${actionBadgeClass(c.action)}">${escapeHtml(c.action)}</span></td>
-            <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_speed_bps)} / ↓${formatSpeed(c.download_speed_bps)}</td>
+            <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)} / ↓${formatSpeed(c.download_bytes_per_sec)}</td>
             <td class="mono">${c.duration_secs}s</td>
           </tr>
         `).join('');
@@ -1893,7 +1893,7 @@
           <td class="mono">${escapeHtml(c.target)}</td>
           <td>${escapeHtml(c.rule_name)}</td>
           <td><span class="badge ${actionBadgeClass(c.action)}">${escapeHtml(c.action)}</span></td>
-          <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_speed_bps)}<br>↓${formatSpeed(c.download_speed_bps)}</td>
+          <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)}<br>↓${formatSpeed(c.download_bytes_per_sec)}</td>
           <td class="mono" style="font-size:12px;">↑${formatBytes(c.uploaded_bytes)}<br>↓${formatBytes(c.downloaded_bytes)}</td>
           <td class="mono">${c.duration_secs}s</td>
           <td><button class="btn btn-sm btn-danger-ghost" onclick="killConnection(${c.id})">断开</button></td>
