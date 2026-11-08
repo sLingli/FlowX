@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod dns;
+pub mod inbound;
 pub mod interceptor;
 pub mod monitor;
 pub mod outbound;
@@ -90,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     let dns_socket = dns_server.bind().await?;
 
     let dispatcher_bind: SocketAddr = "127.0.0.1:40001".parse()?;
+    let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
     let dispatcher = StreamDispatcher::new(DispatcherConfig {
         bind_addr: dispatcher_bind,
         tracker: Arc::clone(&process_tracker),
@@ -98,10 +100,10 @@ async fn main() -> anyhow::Result<()> {
         monitor: Arc::clone(&connection_manager),
         proxy_nodes: Arc::clone(&proxy_nodes),
         proxy_chains: Arc::clone(&proxy_chains),
+        self_ports: vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()],
     });
     let dispatcher_listener = dispatcher.bind().await?;
 
-    let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
     let api_server = ApiServer::new(
         api_bind,
         Arc::clone(&connection_manager),

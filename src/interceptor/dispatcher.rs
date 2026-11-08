@@ -1,18 +1,24 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use anyhow::{bail, Context, Result};
+use std::time::Duration;
+use anyhow::{anyhow, bail, Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tracing::{error, info, warn};
 
 use crate::dns::FakeIpPool;
+use crate::inbound::{self, InboundRequest};
 use crate::interceptor::process::ProcessTracker;
 use crate::monitor::ConnectionManager;
 use crate::outbound::chain::{ProxyChain, ProxyNode};
 use crate::outbound::direct::DirectOutbound;
 use crate::outbound::{relay_stream_monitored, TargetAddr};
 use crate::router::{Action, RouteContext, RuleEngine};
+
+/// 入站协议握手的最长等待时间（防止慢速握手占满并发名额）
+const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct ProxyNodeEntry {
@@ -33,6 +39,8 @@ pub struct DispatcherConfig {
     pub monitor: Arc<ConnectionManager>,
     pub proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     pub proxy_chains: Arc<HashMap<u32, ProxyChain>>,
+    /// FlowX 自身占用的服务端口（入站 / API / DNS），用于拦截指向自身的回环请求
+    pub self_ports: Vec<u16>,
 }
 
 pub struct StreamDispatcher {
@@ -52,15 +60,15 @@ impl StreamDispatcher {
     pub async fn bind(&self) -> Result<TcpListener> {
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
-            .with_context(|| format!("绑定透明流调度端口失败 ({})", self.config.bind_addr))?;
+            .with_context(|| format!("绑定混合代理入站端口失败 ({})", self.config.bind_addr))?;
         info!(
-            "[调度核心] FlowX 本地流调度服务已在 {} 绑定待命",
+            "[调度核心] 混合代理入站 (SOCKS5 / SOCKS4a / HTTP) 已在 {} 绑定待命",
             self.config.bind_addr
         );
         Ok(listener)
     }
 
-    /// 启动本地透明连接调度监听服务（支持优雅停机）
+    /// 启动本地入站连接调度监听服务（支持优雅停机）
     pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         loop {
             let (local_stream, peer_addr) = tokio::select! {
@@ -92,7 +100,7 @@ impl StreamDispatcher {
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(e) = handle_connection(local_stream, peer_addr, config).await {
-                    warn!("[调度核心] 连接中继结束或异常: {}", e);
+                    warn!("[调度核心] 连接中继结束或异常: {:#}", e);
                 }
             });
         }
@@ -112,39 +120,79 @@ impl Drop for ConnectionGuard {
     }
 }
 
+/// 判断目标是否指向 FlowX 自身的服务端口（防止自连回环）
+fn is_self_target(target: &TargetAddr, server_addr: &SocketAddr, self_ports: &[u16]) -> bool {
+    if !self_ports.contains(&target.port()) {
+        return false;
+    }
+    match target {
+        TargetAddr::Ip(addr) => {
+            let ip = addr.ip();
+            ip.is_loopback() || ip.is_unspecified() || ip == server_addr.ip()
+        }
+        TargetAddr::Domain(host, _) => {
+            host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+    }
+}
+
 async fn handle_connection(
-    local_stream: TcpStream,
+    mut local_stream: TcpStream,
     peer_addr: SocketAddr,
     config: Arc<DispatcherConfig>,
 ) -> Result<()> {
-    // 1. 通过 TCP 四元组逆向追踪调用方进程（异步非阻塞）
     let server_addr = local_stream.local_addr()?;
+
+    // 1. 解析入站代理协议握手，取得客户端真实请求的目标地址
+    let InboundRequest { kind, target, pending } =
+        tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, inbound::read_request(&mut local_stream))
+            .await
+            .map_err(|_| anyhow!("入站握手超时 ({:?})，来源 {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
+
+    // 2. 通过 TCP 四元组逆向追踪调用方进程（异步非阻塞）
     let proc_info = config.tracker.find_by_connection_async(peer_addr, server_addr).await;
     let proc_name = proc_info.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Unknown".to_string());
     let proc_path = proc_info.as_ref().map(|p| p.path.clone()).unwrap_or_else(|| "Unknown".to_string());
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
 
-    // 2. 获取原始目标 (若经由 Fake-IP 虚拟化，尝试逆向还原原始域名)
-    let dest_addr = local_stream.local_addr()?;
-    let mut restored_domain: Option<String> = None;
-
-    if let IpAddr::V4(v4) = dest_addr.ip()
-        && config.fake_ip_pool.is_fake_ip(&v4) {
-            restored_domain = config.fake_ip_pool.restore(&v4);
-        }
-
-    let target = match &restored_domain {
-        Some(domain) => TargetAddr::Domain(domain.clone(), dest_addr.port()),
-        None => TargetAddr::Ip(dest_addr),
+    // 3. 若目标为 Fake-IP，逆向还原原始域名（防止 DNS 泄漏，将域名交给上游代理解析）
+    let target = match &target {
+        TargetAddr::Ip(addr) => match addr.ip() {
+            IpAddr::V4(v4) if config.fake_ip_pool.is_fake_ip(&v4) => match config.fake_ip_pool.restore(&v4) {
+                Some(domain) => TargetAddr::Domain(domain, addr.port()),
+                None => {
+                    inbound::send_failure(&mut local_stream, kind, false).await.ok();
+                    bail!("Fake-IP {} 的域名映射已过期或不存在", v4);
+                }
+            },
+            _ => target,
+        },
+        TargetAddr::Domain(..) => target,
     };
 
-    // 3. 构建路由上下文并提交规则引擎决策
+    // 4. 回环防护：拒绝指向 FlowX 自身服务端口的请求
+    if is_self_target(&target, &server_addr, &config.self_ports) {
+        inbound::send_failure(&mut local_stream, kind, true).await.ok();
+        bail!(
+            "拒绝回环请求: {} (PID {}) 试图经由 FlowX 访问其自身端口 {}:{}",
+            proc_name,
+            pid,
+            target.host_string(),
+            target.port()
+        );
+    }
+
+    // 5. 构建路由上下文并提交规则引擎决策
+    let (target_host, target_ip) = match &target {
+        TargetAddr::Ip(addr) => (None, Some(addr.ip())),
+        TargetAddr::Domain(host, _) => (Some(host.as_str()), None),
+    };
     let ctx = RouteContext {
         process_path: Some(&proc_path),
         process_name: Some(&proc_name),
-        target_host: restored_domain.as_deref(),
-        target_ip: Some(dest_addr.ip()),
-        target_port: dest_addr.port(),
+        target_host,
+        target_ip,
+        target_port: target.port(),
     };
 
     let (action, rule_name) = config.rule_engine.evaluate(&ctx);
@@ -157,7 +205,8 @@ async fn handle_connection(
     };
 
     info!(
-        "[路由命中] 进程: {} (PID: {}) -> 目标: {}:{} => 规则: {} => 动作: {}",
+        "[路由命中] [{}] 进程: {} (PID: {}) -> 目标: {}:{} => 规则: {} => 动作: {}",
+        kind.as_str(),
         proc_name,
         pid,
         target.host_string(),
@@ -166,14 +215,14 @@ async fn handle_connection(
         action_str
     );
 
-    // 4. 注册到连接监视器并使用 RAII 守卫
+    // 6. 注册到连接监视器并使用 RAII 守卫
     let active_conn = config.monitor.register(
         proc_name,
         proc_path,
         pid,
         format!("{}:{}", target.host_string(), target.port()),
         rule_name,
-        action_str,
+        action_str.clone(),
     );
 
     let _guard = ConnectionGuard {
@@ -181,64 +230,146 @@ async fn handle_connection(
         monitor: Arc::clone(&config.monitor),
     };
 
-    // 5. 根据执行动作分发并全双工对拷（带实时流量监视）
+    // 7. 按动作建立出站连接
+    if action == Action::Block {
+        inbound::send_failure(&mut local_stream, kind, true).await.ok();
+        return Ok(());
+    }
+
+    let mut remote_stream = match connect_outbound(&config, &action, &target).await {
+        Ok(s) => s,
+        Err(e) => {
+            inbound::send_failure(&mut local_stream, kind, false).await.ok();
+            return Err(e);
+        }
+    };
+
+    // 8. 回复客户端隧道就绪，并转发握手阶段已缓存的数据
+    inbound::send_success(&mut local_stream, kind).await?;
+    if !pending.is_empty() {
+        remote_stream.write_all(&pending).await?;
+        active_conn.add_upload(pending.len() as u64);
+    }
+
+    // 9. 全双工对拷（带实时流量监视）
+    let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
+    info!(
+        "[中继完成] [{}] {}:{} 上传: {} B, 下载: {} B",
+        action_str,
+        target.host_string(),
+        target.port(),
+        up + pending.len() as u64,
+        down
+    );
+    Ok(())
+}
+
+async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &TargetAddr) -> Result<TcpStream> {
     match action {
-        Action::Block => {
-            drop(local_stream);
-            Ok(())
-        }
-        Action::Direct => {
-            let remote_stream = DirectOutbound::connect(&target).await?;
-            let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
-            info!(
-                "[直连完成] {}:{} 上传: {} B, 下载: {} B",
-                target.host_string(),
-                target.port(),
-                up,
-                down
-            );
-            Ok(())
-        }
+        Action::Block => bail!("连接已被规则阻断"),
+        Action::Direct => DirectOutbound::connect(target).await,
         Action::Proxy(node_id) => {
             let client = {
                 let nodes_guard = config.proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-                match nodes_guard.get(&node_id) {
+                match nodes_guard.get(node_id) {
                     Some(e) => e.client.clone(),
                     None => bail!("规则指定了不存在的代理节点 ID: {}", node_id),
                 }
             };
-            let remote_stream = match &client {
-                ProxyNode::Socks5(s) => s.connect(&target).await?,
-                ProxyNode::Http(h) => h.connect(&target).await?,
-                ProxyNode::Socks4(s) => s.connect(&target).await?,
-            };
-            let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
-            info!(
-                "[代理完成] [{}] 目标 {}:{} 上传: {} B, 下载: {} B",
-                node_id,
-                target.host_string(),
-                target.port(),
-                up,
-                down
-            );
-            Ok(())
+            match &client {
+                ProxyNode::Socks5(s) => s.connect(target).await,
+                ProxyNode::Http(h) => h.connect(target).await,
+                ProxyNode::Socks4(s) => s.connect(target).await,
+            }
         }
         Action::Chain(chain_id) => {
-            let chain = match config.proxy_chains.get(&chain_id) {
+            let chain = match config.proxy_chains.get(chain_id) {
                 Some(c) => c,
                 None => bail!("规则指定了不存在的代理链 ID: {}", chain_id),
             };
-            let remote_stream = chain.connect(&target).await?;
-            let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
-            info!(
-                "[代理链完成] [{}] 目标 {}:{} 上传: {} B, 下载: {} B",
-                chain_id,
-                target.host_string(),
-                target.port(),
-                up,
-                down
-            );
-            Ok(())
+            chain.connect(target).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn test_config(bind: SocketAddr, rules: Vec<crate::router::Rule>) -> DispatcherConfig {
+        DispatcherConfig {
+            bind_addr: bind,
+            tracker: Arc::new(ProcessTracker::new()),
+            fake_ip_pool: Arc::new(FakeIpPool::new_default()),
+            rule_engine: Arc::new(RuleEngine::new(rules, Action::Direct)),
+            monitor: Arc::new(ConnectionManager::new()),
+            proxy_nodes: Arc::new(RwLock::new(HashMap::new())),
+            proxy_chains: Arc::new(HashMap::new()),
+            self_ports: vec![bind.port()],
+        }
+    }
+
+    #[test]
+    fn test_is_self_target() {
+        let server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let ports = [40001, 40080];
+        assert!(is_self_target(&TargetAddr::Ip("127.0.0.1:40001".parse().unwrap()), &server, &ports));
+        assert!(is_self_target(&TargetAddr::Ip("0.0.0.0:40080".parse().unwrap()), &server, &ports));
+        assert!(is_self_target(&TargetAddr::Domain("LocalHost".into(), 40080), &server, &ports));
+        assert!(!is_self_target(&TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()), &server, &ports));
+        assert!(!is_self_target(&TargetAddr::Domain("example.com".into(), 40001), &server, &ports));
+    }
+
+    /// 端到端：经由 SOCKS5 入站直连到本地回显服务，验证目标解析、隧道建立与数据中继
+    #[tokio::test]
+    async fn test_socks5_direct_relay_end_to_end() {
+        let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = echo.accept().await.unwrap();
+            let mut buf = [0u8; 5];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&buf).await.unwrap();
+        });
+
+        let dispatcher = StreamDispatcher::new(test_config("127.0.0.1:0".parse().unwrap(), vec![]));
+        let listener = dispatcher.bind().await.unwrap();
+        let inbound_addr = listener.local_addr().unwrap();
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { dispatcher.run(listener, rx).await });
+
+        let mut c = TcpStream::connect(inbound_addr).await.unwrap();
+        c.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut r = [0u8; 2];
+        c.read_exact(&mut r).await.unwrap();
+        let mut req = vec![0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1];
+        req.extend_from_slice(&echo_addr.port().to_be_bytes());
+        c.write_all(&req).await.unwrap();
+        let mut reply = [0u8; 10];
+        c.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0x00, "SOCKS5 应答应为成功");
+
+        c.write_all(b"hello").await.unwrap();
+        let mut echoed = [0u8; 5];
+        c.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"hello");
+    }
+
+    /// 回环防护：经由入站请求 FlowX 自身入站端口必须被拒绝，而不是无限自连
+    #[tokio::test]
+    async fn test_self_loop_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let inbound_addr = listener.local_addr().unwrap();
+        let dispatcher = StreamDispatcher::new(test_config(inbound_addr, vec![]));
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { dispatcher.run(listener, rx).await });
+
+        let mut c = TcpStream::connect(inbound_addr).await.unwrap();
+        let req = format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", inbound_addr.port());
+        c.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = vec![0u8; 128];
+        let n = c.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"));
     }
 }
