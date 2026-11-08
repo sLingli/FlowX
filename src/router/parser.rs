@@ -17,7 +17,11 @@ impl DomainMatcher {
             return None;
         }
         if let Some(stripped) = s.strip_prefix("*.") {
-            Some(DomainMatcher::Suffix(stripped.to_string()))
+            if stripped.is_empty() {
+                None
+            } else {
+                Some(DomainMatcher::Suffix(stripped.to_string()))
+            }
         } else if s.contains('*') || s.contains('?') || s.contains('[') {
             Pattern::new(&s).ok().map(DomainMatcher::Pattern)
         } else {
@@ -26,13 +30,30 @@ impl DomainMatcher {
     }
 
     pub fn matches(&self, host: &str) -> bool {
-        let host_lower = host.to_lowercase();
         match self {
-            DomainMatcher::Exact(exact) => host_lower == *exact,
+            DomainMatcher::Exact(exact) => host.eq_ignore_ascii_case(exact),
             DomainMatcher::Suffix(suffix) => {
-                host_lower == *suffix || host_lower.ends_with(&format!(".{}", suffix))
+                // 无堆分配的两段式零拷贝域名后缀比对：匹配 apex 域自身或 `<sub.><suffix>`
+                let suffix_bytes = suffix.as_bytes();
+                let host_bytes = host.as_bytes();
+                if host_bytes.len() == suffix_bytes.len() {
+                    host_bytes.eq_ignore_ascii_case(suffix_bytes)
+                } else if host_bytes.len() > suffix_bytes.len() + 1 {
+                    let split = host_bytes.len() - suffix_bytes.len();
+                    host_bytes[split - 1] == b'.'
+                        && host_bytes[split..].eq_ignore_ascii_case(suffix_bytes)
+                } else {
+                    false
+                }
             }
-            DomainMatcher::Pattern(pat) => pat.matches(&host_lower),
+            DomainMatcher::Pattern(pat) => {
+                if !host.bytes().any(|b| b.is_ascii_uppercase()) {
+                    pat.matches(host)
+                } else {
+                    let host_lower = host.to_lowercase();
+                    pat.matches(&host_lower)
+                }
+            }
         }
     }
 }
@@ -62,16 +83,48 @@ pub fn parse_applications(raw: &str) -> Option<Vec<Pattern>> {
     Some(patterns) // 即使为空也是 Some(vec![])，实现 Fail-Closed
 }
 
-/// 展开环境变量（如 %ComputerName%）
-fn expand_env_vars(input: &str) -> String {
-    let mut result = input.to_string();
-    if result.to_lowercase().contains("%computername%") {
-        let computer_name = std::env::var("COMPUTERNAME")
-            .unwrap_or_else(|_| "localhost".to_string());
-        result = result.replace("%COMPUTERNAME%", &computer_name)
-            .replace("%computername%", &computer_name);
+/// 大小写不敏感替换纯 ASCII 占位符（利用 ASCII 字节在 UTF-8 中绝不与多字节序列重叠的性质确保切片安全）
+fn replace_ascii_placeholder_ignore_case(input: &str, placeholder: &str, value: &str) -> String {
+    debug_assert!(placeholder.is_ascii());
+    let p_bytes = placeholder.as_bytes();
+    let in_bytes = input.as_bytes();
+    if p_bytes.is_empty() || in_bytes.len() < p_bytes.len() {
+        return input.to_string();
     }
-    result
+
+    let mut out: Option<String> = None;
+    let mut last_copied = 0;
+    let mut i = 0;
+    while i + p_bytes.len() <= in_bytes.len() {
+        if in_bytes[i..i + p_bytes.len()].eq_ignore_ascii_case(p_bytes) {
+            let buf = out.get_or_insert_with(|| String::with_capacity(input.len()));
+            buf.push_str(&input[last_copied..i]);
+            buf.push_str(value);
+            i += p_bytes.len();
+            last_copied = i;
+        } else {
+            i += 1;
+        }
+    }
+
+    match out {
+        Some(mut buf) => {
+            buf.push_str(&input[last_copied..]);
+            buf
+        }
+        None => input.to_string(),
+    }
+}
+
+/// 展开环境变量（不区分大小写识别 %ComputerName% / %COMPUTERNAME% 等占位符）
+fn expand_env_vars(input: &str) -> String {
+    if !input.as_bytes().windows(b"%computername%".len()).any(|w| w.eq_ignore_ascii_case(b"%computername%")) {
+        return input.to_string();
+    }
+    let computer_name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "localhost".to_string());
+    replace_ascii_placeholder_ignore_case(input, "%computername%", &computer_name)
 }
 
 /// 解析以分号分隔的目标主机（支持 IP, CIDR 子网与域名预编译匹配器）
@@ -221,5 +274,38 @@ mod tests {
         assert!(pats[0].matches("node.exe"));
         assert!(pats[1].matches("google-chrome.exe"));
         assert!(pats[2].matches("c:/program files/app/app.exe"));
+    }
+
+    #[test]
+    fn test_expand_env_vars_case_insensitive() {
+        let expected_host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "localhost".to_string());
+        let expanded = expand_env_vars("localhost; %ComputerName%; %computername%; %COMPUTERNAME%");
+        assert!(!expanded.to_lowercase().contains("%computername%"));
+        assert!(expanded.contains(&expected_host));
+
+        // 验证 parse_targets 能正确将默认配置中的 %ComputerName% 展开成当前主机域名匹配器
+        let (domains, _) = parse_targets("%ComputerName%; *.Local");
+        let domains = domains.unwrap();
+        assert!(domains[0].matches(&expected_host));
+        assert!(domains[1].matches("nas.local"));
+        assert!(!domains[1].matches("notlocal"));
+    }
+
+    #[test]
+    fn test_zero_alloc_domain_matcher() {
+        let suffix = DomainMatcher::parse("*.Google.COM").unwrap();
+        assert!(suffix.matches("google.com"));
+        assert!(suffix.matches("Google.Com"));
+        assert!(suffix.matches("a.b.GOOGLE.com"));
+        assert!(!suffix.matches("notgoogle.com"));
+        assert!(!suffix.matches(".google.com"));
+        assert!(!suffix.matches("google.com.evil.org"));
+
+        let exact = DomainMatcher::parse("Api.GitHub.com").unwrap();
+        assert!(exact.matches("api.github.com"));
+        assert!(exact.matches("API.GITHUB.COM"));
+        assert!(!exact.matches("v2.api.github.com"));
     }
 }
