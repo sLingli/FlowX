@@ -30,27 +30,27 @@ impl Socks4Client {
         tokio::time::timeout(DEFAULT_TIMEOUT, async {
             let stream = TcpStream::connect(&self.proxy_addr)
                 .await
-                .with_context(|| format!("连接 SOCKS4 代理节点失败: {}", self.proxy_addr))?;
+                .with_context(|| format!("Failed to connect to SOCKS4 proxy: {}", self.proxy_addr))?;
 
             self.handshake(stream, target).await
         })
         .await
-        .map_err(|_| anyhow::anyhow!("连接 SOCKS4 代理超时 ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
+        .map_err(|_| anyhow::anyhow!("SOCKS4 connection timed out ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
     }
 
     pub async fn handshake(&self, mut stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
         tokio::time::timeout(DEFAULT_TIMEOUT, self.handshake_internal(&mut stream, target))
             .await
-            .map_err(|_| anyhow::anyhow!("SOCKS4 握手超时 ({:?})", DEFAULT_TIMEOUT))??;
+            .map_err(|_| anyhow::anyhow!("SOCKS4 handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
         Ok(stream)
     }
 
     async fn handshake_internal(&self, stream: &mut TcpStream, target: &TargetAddr) -> Result<()> {
         if self.user_id.contains('\0') {
-            bail!("SOCKS4 user_id 包含非法的空字符 (\\0)");
+            bail!("SOCKS4 user_id contains invalid null byte (\\0)");
         }
         if self.user_id.len() > 255 {
-            bail!("SOCKS4 user_id 长度超过 255 字节上限: {}", self.user_id.len());
+            bail!("SOCKS4 user_id length exceeds 255 bytes limit: {}", self.user_id.len());
         }
 
         let mut req = Vec::new();
@@ -62,22 +62,22 @@ impl Socks4Client {
 
         match target {
             TargetAddr::Ip(SocketAddr::V4(v4)) => {
-                // 标准 SOCKS4
+                // Standard SOCKS4
                 req.extend_from_slice(&v4.ip().octets());
                 req.extend_from_slice(self.user_id.as_bytes());
                 req.push(0x00);
             }
             TargetAddr::Ip(SocketAddr::V6(_)) => {
-                bail!("SOCKS4 协议不支持 IPv6 目标地址");
+                bail!("SOCKS4 protocol does not support IPv6 target addresses");
             }
             TargetAddr::Domain(domain, _) => {
                 if domain.contains('\0') {
-                    bail!("SOCKS4 目标域名包含非法的空字符 (\\0): {}", domain);
+                    bail!("SOCKS4 target domain contains invalid null byte (\\0): {}", domain);
                 }
                 if domain.len() > 255 {
-                    bail!("SOCKS4a 目标域名长度超过 255 字节上限: {}", domain.len());
+                    bail!("SOCKS4a target domain length exceeds 255 bytes limit: {}", domain.len());
                 }
-                // SOCKS4a 域名远程解析扩展: IP 设为 0.0.0.1
+                // SOCKS4a domain extension: IP set to 0.0.0.1
                 req.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                 req.extend_from_slice(self.user_id.as_bytes());
                 req.push(0x00);
@@ -88,23 +88,23 @@ impl Socks4Client {
 
         stream.write_all(&req).await?;
 
-        // 读取响应: 8 字节 (VN, CD, DSTPORT, DSTIP)
+        // Read response: 8 bytes (VN, CD, DSTPORT, DSTIP)
         let mut reply = [0u8; 8];
         stream.read_exact(&mut reply).await?;
 
-        // reply[0] 应为 0x00 (RFC/标准协议实现) 或 0x04
+        // reply[0] should be 0x00 (RFC standard) or 0x04
         if reply[0] != 0x00 && reply[0] != 0x04 {
-            bail!("无效的 SOCKS4 应答版本: 0x{:02x}", reply[0]);
+            bail!("Invalid SOCKS4 reply version: 0x{:02x}", reply[0]);
         }
 
         if reply[1] != 0x5A {
             let reason = match reply[1] {
-                0x5B => "请求被拒绝或失败 (91: Request rejected or failed)",
-                0x5C => "无法连接客户端的 identd (92: Rejected: identd unreachable)",
-                0x5D => "identd 返回的用户不匹配 (93: Rejected: user mismatch)",
-                _code => "未知错误码",
+                0x5B => "Request rejected or failed (91)",
+                0x5C => "Cannot connect to identd on client (92)",
+                0x5D => "Identd reported user mismatch (93)",
+                _code => "Unknown error code",
             };
-            bail!("SOCKS4 代理连接失败: {} (code: 0x{:02x})", reason, reply[1]);
+            bail!("SOCKS4 proxy connection failed: {} (code: 0x{:02x})", reason, reply[1]);
         }
 
         Ok(())

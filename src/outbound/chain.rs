@@ -65,59 +65,59 @@ impl ProxyChain {
         self
     }
 
-    /// 校验代理链节点是否存在回环死锁风险
+    /// Validate proxy chain nodes for loopback and circular dependency risks
     pub fn validate_loop(&self, forbidden_ports: &[u16]) -> Result<()> {
         let mut visited = std::collections::HashSet::new();
         for node in &self.nodes {
             let addr = node.server_addr();
             let target = parse_target_addr(addr)
-                .with_context(|| format!("代理链 [{}] 包含无效节点地址: {}", self.name, addr))?;
+                .with_context(|| format!("Proxy chain [{}] contains invalid node address: {}", self.name, addr))?;
             if !visited.insert(target.clone()) {
-                bail!("代理链 [{}] 包含重复节点，存在循环依赖: {}", self.name, addr);
+                bail!("Proxy chain [{}] contains duplicate node, circular dependency detected: {}", self.name, addr);
             }
             if target.is_loopback_or_unspecified() && forbidden_ports.contains(&target.port()) {
-                bail!("代理链 [{}] 节点指向自身服务端口，已被拦截防回环: {}", self.name, addr);
+                bail!("Proxy chain [{}] node points to internal service port, blocked to prevent loop: {}", self.name, addr);
             }
         }
         Ok(())
     }
 
-    /// 通过代理链建立到达最终目标的多跳隧道（带单跳连接超时与全链路超时控制）
+    /// Establish multi-hop tunnel to final target through proxy chain (with single-hop timeout and overall chain timeout)
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
         if self.nodes.is_empty() {
-            bail!("代理链 '{}' 中未包含任何代理节点", self.name);
+            bail!("Proxy chain '{}' does not contain any proxy nodes", self.name);
         }
 
         const HOP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const CHAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         tokio::time::timeout(CHAIN_TOTAL_TIMEOUT, async {
-            // 1. 与第一跳建立基础 TCP 连接
+            // 1. Establish basic TCP connection with first hop
             let first_node = &self.nodes[0];
             let mut stream = tokio::time::timeout(HOP_CONNECT_TIMEOUT, TcpStream::connect(first_node.server_addr()))
                 .await
-                .map_err(|_| anyhow::anyhow!("代理链 [{}] 首节点连接超时 ({:?}): {}", self.name, HOP_CONNECT_TIMEOUT, first_node.server_addr()))?
+                .map_err(|_| anyhow::anyhow!("Proxy chain [{}] first node connection timed out ({:?}): {}", self.name, HOP_CONNECT_TIMEOUT, first_node.server_addr()))?
                 .with_context(|| {
                     format!(
-                        "代理链 [{}] 首节点连接失败: {}",
+                        "Proxy chain [{}] first node connection failed: {}",
                         self.name,
                         first_node.server_addr()
                     )
                 })?;
 
-            // 2. 依次遍历并向每一跳发起握手，要求其 CONNECT 下一跳代理地址
+            // 2. Iterate and handshake through each hop, requesting CONNECT to next hop
             for i in 0..self.nodes.len() {
                 let is_last = i == self.nodes.len() - 1;
                 let current_node = &self.nodes[i];
 
                 if is_last {
-                    // 最后一跳：要求其连接最终目标
+                    // Last hop: connect to final target
                     stream = current_node
                         .handshake(stream, target)
                         .await
                         .with_context(|| {
                             format!(
-                                "代理链 [{}] 终节点 ({}) 连接目标失败: {}:{}",
+                                "Proxy chain [{}] final node ({}) failed to connect to target: {}:{}",
                                 self.name,
                                 current_node.server_addr(),
                                 target.host_string(),
@@ -125,7 +125,7 @@ impl ProxyChain {
                             )
                         })?;
                 } else {
-                    // 中间跳：要求当前节点连接下一跳代理
+                    // Intermediate hop: connect to next proxy node
                     let next_node = &self.nodes[i + 1];
                     let next_target = parse_target_addr(next_node.server_addr())?;
 
@@ -134,7 +134,7 @@ impl ProxyChain {
                         .await
                         .with_context(|| {
                             format!(
-                                "代理链 [{}] 节点 {} 连接下一跳 {} 失败",
+                                "Proxy chain [{}] node {} failed to connect to next hop {}",
                                 self.name,
                                 current_node.server_addr(),
                                 next_node.server_addr()
@@ -146,7 +146,7 @@ impl ProxyChain {
             Ok(stream)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("代理链 [{}] 级联连接总耗时超过 {:?}", self.name, CHAIN_TOTAL_TIMEOUT))?
+        .map_err(|_| anyhow::anyhow!("Proxy chain [{}] total connection time exceeded {:?}", self.name, CHAIN_TOTAL_TIMEOUT))?
     }
 }
 
@@ -168,7 +168,7 @@ mod tests {
         assert_eq!(chain.nodes[0].server_addr(), "127.0.0.1:10808");
         assert_eq!(chain.nodes[1].server_addr(), "10.0.0.1:8080");
 
-        // 校验循环检测机制
+        // Verify loop detection mechanism
         assert!(chain.validate_loop(&[40001]).is_ok());
 
         for self_addr in [
@@ -183,12 +183,12 @@ mod tests {
                 .add_node(ProxyNode::Socks5(Socks5Client::new(self_addr)));
             assert!(
                 loop_chain.validate_loop(&[40001]).is_err(),
-                "回环地址 {} 应被代理链防回环机制拦截",
+                "Loopback address {} should be intercepted by loop prevention",
                 self_addr
             );
         }
 
-        // 大小写变体的重复域名节点同样视为环路
+        // Duplicate domain with case variation should also be detected as loop
         let dup_chain = ProxyChain::new("Dup-Chain")
             .add_node(ProxyNode::Socks5(Socks5Client::new("Proxy.Example.com:1080")))
             .add_node(ProxyNode::Http(HttpConnectClient::new("proxy.example.com:1080")));

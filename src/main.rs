@@ -1,6 +1,7 @@
 pub mod api;
 pub mod config;
 pub mod dns;
+pub mod i18n;
 pub mod inbound;
 pub mod interceptor;
 pub mod monitor;
@@ -47,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("============================================================");
-    info!("          FlowX - 现代化透明网络代理与进程分流系统           ");
+    info!("     FlowX - Modern Transparent Proxy & Process Routing Engine      ");
     info!("============================================================");
 
     // 2. 初始化核心组件与端口规划
@@ -66,12 +67,12 @@ async fn main() -> anyhow::Result<()> {
     let config_store = Arc::new(ConfigStore::new(&config_path));
     let (runtime_profile, created_default) = config_store
         .load_or_init(&self_ports)
-        .with_context(|| format!("加载配置文件失败: {}", config_path))?;
+        .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
     if created_default {
-        info!("[配置中心] 未检测到配置文件，已生成默认配置: {}", config_path);
+        info!("[Config] No configuration file found, generated default profile: {}", config_path);
     } else {
         info!(
-            "[配置中心] 已加载配置文件 {} ({} 个代理节点, {} 条路由规则)",
+            "[Config] Loaded profile {} ({} proxy nodes, {} routing rules)",
             config_path,
             runtime_profile.proxy_nodes.len(),
             runtime_profile.rules.len()
@@ -133,21 +134,21 @@ async fn main() -> anyhow::Result<()> {
     let rx1 = shutdown_rx.clone();
     tokio::spawn(async move {
         if let Err(e) = dns_server.run(dns_socket, rx1).await {
-            tracing::error!("[DNS 模块] DNS 服务异常退出: {}", e);
+            tracing::error!("[DNS] DNS service exited unexpectedly: {}", e);
         }
     });
 
     let rx2 = shutdown_rx.clone();
     tokio::spawn(async move {
         if let Err(e) = dispatcher.run(dispatcher_listener, rx2).await {
-            tracing::error!("[调度中心] 透明流调度服务异常退出: {}", e);
+            tracing::error!("[Dispatcher] Transparent stream dispatcher exited unexpectedly: {}", e);
         }
     });
 
     let rx3 = shutdown_rx.clone();
     tokio::spawn(async move {
         if let Err(e) = api_server.run(api_listener, rx3).await {
-            tracing::error!("[Web 控制台] API 服务异常退出: {}", e);
+            tracing::error!("[API] Web console API service exited unexpectedly: {}", e);
         }
     });
 
@@ -174,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
                         && (cleaned_ips > 0 || cleaned_conns > 0 || cleaned_pids > 0)
                     {
                         tracing::debug!(
-                            "[GC 维护] 定期回收过期条目: Fake-IP={}, 进程连接={}, PID={}",
+                            "[GC] Periodic expired entry collection: Fake-IP={}, Connections={}, PID={}",
                             cleaned_ips,
                             cleaned_conns,
                             cleaned_pids
@@ -188,12 +189,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("[就绪] 控制台已就绪，请在浏览器中访问: http://127.0.0.1:40080");
-    info!("[就绪] 按 Ctrl+C 可安全停止 FlowX 核心引擎");
+    info!("[Ready] Web console ready at: http://127.0.0.1:40080");
+    info!("[Ready] Press Ctrl+C to stop FlowX core");
 
     // 8. 监听操作系统 Ctrl+C 信号并执行优雅停机
     tokio::signal::ctrl_c().await?;
-    info!("[退出] 接收到退出信号，正在通知各子系统停止接收流量...");
+    info!("[Shutdown] Received shutdown signal, stopping inbound traffic...");
     let _ = shutdown_tx.send(true);
 
     // 优雅排空：等待正在传输的活跃连接完成挥手（最多等待 10 秒）
@@ -204,10 +205,10 @@ async fn main() -> anyhow::Result<()> {
         if active == 0 {
             break;
         }
-        info!("[退出] 正在等待 {} 个活跃连接排空挥手...", active);
+        info!("[Shutdown] Waiting for {} active connections to drain...", active);
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    info!("[退出] FlowX 核心引擎已安全退出");
+    info!("[Shutdown] FlowX core stopped cleanly");
 
     Ok(())
 }

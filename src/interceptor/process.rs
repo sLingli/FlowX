@@ -93,11 +93,12 @@ impl ProcessTracker {
             Some(info) => info,
             None => {
                 // 4. PID 缓存未命中，调用 Windows API 查询可执行文件完整路径
-                let path = get_process_image_path(pid).unwrap_or_else(|| "Unknown".to_string());
+                let path = get_process_image_path(pid)
+                    .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
                 let name = Path::new(&path)
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("Unknown")
+                    .unwrap_or(crate::i18n::UNKNOWN_PROCESS)
                     .to_string();
                 let info = ProcessInfo { pid, path, name };
                 self.cache_pid_entry(pid, &info, now);
@@ -312,7 +313,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn test_find_own_process_by_connection() {
-        // 建立一条真实回环连接，验证可以通过四元组精确定位到当前测试进程
+        // Establish a loopback connection and verify finding current process via 4-tuple
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let server = listener.local_addr().unwrap();
         let client_stream = std::net::TcpStream::connect(server).unwrap();
@@ -320,7 +321,7 @@ mod tests {
         assert_eq!(peer, client_stream.local_addr().unwrap());
 
         let tracker = ProcessTracker::new();
-        let info = tracker.find_by_connection(peer, server).expect("应能定位到当前进程");
+        let info = tracker.find_by_connection(peer, server).expect("Should locate current process");
         assert_eq!(info.pid, std::process::id());
     }
 

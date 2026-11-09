@@ -51,12 +51,12 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut first = [0u8; 1];
-    stream.read_exact(&mut first).await.context("读取入站协议首字节失败")?;
+    stream.read_exact(&mut first).await.context("Failed to read first inbound byte")?;
     match first[0] {
         0x05 => read_socks5(stream).await,
         0x04 => read_socks4(stream).await,
         b'A'..=b'Z' => read_http(stream, first[0]).await,
-        other => bail!("无法识别的入站协议 (首字节 0x{:02x})", other),
+        other => bail!("Unrecognized inbound protocol (first byte 0x{:02x})", other),
     }
 }
 
@@ -116,19 +116,19 @@ where
 
     if !methods.contains(&0x00) {
         stream.write_all(&[0x05, 0xFF]).await.ok();
-        bail!("SOCKS5 客户端未提供 NO AUTH 认证方式");
+        bail!("SOCKS5 client did not offer NO AUTH authentication method");
     }
     stream.write_all(&[0x05, 0x00]).await?;
 
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
     if header[0] != 0x05 {
-        bail!("SOCKS5 请求版本错误: 0x{:02x}", header[0]);
+        bail!("SOCKS5 invalid version: 0x{:02x}", header[0]);
     }
     if header[1] != 0x01 {
         // 0x07: Command not supported (BIND / UDP ASSOCIATE 暂不支持)
         stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
-        bail!("SOCKS5 不支持的命令: 0x{:02x}", header[1]);
+        bail!("SOCKS5 unsupported command: 0x{:02x}", header[1]);
     }
 
     let target = match header[3] {
@@ -154,12 +154,12 @@ where
             stream.read_exact(&mut domain).await?;
             let mut port = [0u8; 2];
             stream.read_exact(&mut port).await?;
-            let host = String::from_utf8(domain).context("SOCKS5 目标域名不是合法 UTF-8")?;
+            let host = String::from_utf8(domain).context("SOCKS5 target domain is not valid UTF-8")?;
             make_target(&host, u16::from_be_bytes(port))?
         }
         other => {
             stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
-            bail!("SOCKS5 不支持的地址类型: 0x{:02x}", other);
+            bail!("SOCKS5 unsupported address type: 0x{:02x}", other);
         }
     };
 
@@ -178,19 +178,19 @@ where
     stream.read_exact(&mut header).await?;
     if header[0] != 0x01 {
         stream.write_all(&[0x00, 0x5B, 0, 0, 0, 0, 0, 0]).await.ok();
-        bail!("SOCKS4 不支持的命令: 0x{:02x}", header[0]);
+        bail!("SOCKS4 unsupported command: 0x{:02x}", header[0]);
     }
     let port = u16::from_be_bytes([header[1], header[2]]);
     let ip = Ipv4Addr::new(header[3], header[4], header[5], header[6]);
 
     // USERID（以 NUL 结尾，忽略内容）
-    read_nul_terminated(stream, 255).await.context("读取 SOCKS4 USERID 失败")?;
+    read_nul_terminated(stream, 255).await.context("Failed to read SOCKS4 USERID")?;
 
     // SOCKS4a：DSTIP 为 0.0.0.x (x != 0) 时，USERID 之后紧跟以 NUL 结尾的域名
     let o = ip.octets();
     let target = if o[0] == 0 && o[1] == 0 && o[2] == 0 && o[3] != 0 {
-        let domain = read_nul_terminated(stream, 255).await.context("读取 SOCKS4a 域名失败")?;
-        let host = String::from_utf8(domain).context("SOCKS4a 目标域名不是合法 UTF-8")?;
+        let domain = read_nul_terminated(stream, 255).await.context("Failed to read SOCKS4a domain")?;
+        let host = String::from_utf8(domain).context("SOCKS4a target domain is not valid UTF-8")?;
         make_target(&host, port)?
     } else {
         TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port))
@@ -211,7 +211,7 @@ where
             return Ok(out);
         }
         if out.len() >= max {
-            bail!("字段长度超出上限 {} 字节", max);
+            bail!("Field length exceeds {} bytes limit", max);
         }
         out.push(b[0]);
     }
@@ -235,11 +235,11 @@ where
         }
         if buf.len() > MAX_HTTP_HEADER {
             reply_http_error(stream, "431 Request Header Fields Too Large").await;
-            bail!("HTTP 请求头超出 {} 字节上限", MAX_HTTP_HEADER);
+            bail!("HTTP headers exceed {} bytes limit", MAX_HTTP_HEADER);
         }
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            bail!("HTTP 请求头尚未结束连接即关闭");
+            bail!("Connection closed before HTTP headers ended");
         }
         buf.extend_from_slice(&tmp[..n]);
     };
@@ -249,16 +249,16 @@ where
 
     let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
     let request_line = lines.next().unwrap_or_default();
-    let request_line = std::str::from_utf8(request_line).context("HTTP 请求行不是合法 UTF-8")?;
+    let request_line = std::str::from_utf8(request_line).context("HTTP request line is not valid UTF-8")?;
     let mut parts = request_line.split(' ');
     let (Some(method), Some(uri), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         reply_http_error(stream, "400 Bad Request").await;
-        bail!("HTTP 请求行格式错误: {:?}", request_line);
+        bail!("Malformed HTTP request line: {:?}", request_line);
     };
     if !version.starts_with("HTTP/1.") {
         reply_http_error(stream, "505 HTTP Version Not Supported").await;
-        bail!("不支持的 HTTP 版本: {}", version);
+        bail!("Unsupported HTTP version: {}", version);
     }
 
     if method.eq_ignore_ascii_case("CONNECT") {
@@ -275,7 +275,7 @@ where
     // 明文代理请求必须使用绝对 URI：http://host[:port]/path
     let Some(rest) = strip_prefix_ignore_case(uri, "http://") else {
         reply_http_error(stream, "400 Bad Request").await;
-        bail!("HTTP 代理请求未使用 http:// 绝对 URI: {}", uri);
+        bail!("HTTP proxy request must use http:// absolute URI: {}", uri);
     };
     let (authority, path) = match rest.find('/') {
         Some(idx) => (&rest[..idx], &rest[idx..]),

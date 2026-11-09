@@ -39,10 +39,10 @@ fn is_loopback_domain(host: &str) -> bool {
 }
 
 impl TargetAddr {
-    /// 由主机名/IP 字面量与非零端口构造统一校验的 `TargetAddr`
+    /// Construct validated `TargetAddr` from hostname/IP literal and non-zero port
     pub fn from_host_port(host: &str, port: u16) -> Result<Self> {
         if port == 0 {
-            anyhow::bail!("目标端口不能为 0");
+            anyhow::bail!("Target port cannot be 0");
         }
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return Ok(TargetAddr::Ip(SocketAddr::new(ip, port)));
@@ -53,13 +53,13 @@ impl TargetAddr {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_');
         if !valid {
-            anyhow::bail!("非法目标主机名: {:?}", host);
+            anyhow::bail!("Invalid target hostname: {:?}", host);
         }
         Ok(TargetAddr::Domain(host.to_ascii_lowercase(), port))
     }
 
-    /// 统一解析 `host:port` 或 `[ipv6]:port` 形式的 authority；
-    /// `default_port` 为 `None` 时端口必填；`allow_userinfo` 控制是否允许剥离 `user@`
+    /// Parse authority in `host:port` or `[ipv6]:port` format;
+    /// `default_port` is required if port is missing; `allow_userinfo` controls stripping of `user@`
     pub fn parse_authority(
         authority: &str,
         default_port: Option<u16>,
@@ -68,21 +68,21 @@ impl TargetAddr {
         let authority = if allow_userinfo {
             authority.rsplit('@').next().unwrap_or(authority)
         } else if authority.contains('@') {
-            anyhow::bail!("目标地址不允许包含 userinfo (@): {}", authority);
+            anyhow::bail!("Target address must not contain userinfo (@): {}", authority);
         } else {
             authority
         };
 
         let (host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
             let Some(end) = rest.find(']') else {
-                anyhow::bail!("IPv6 地址缺少右方括号: {}", authority);
+                anyhow::bail!("IPv6 address missing closing bracket: {}", authority);
             };
             let host = &rest[..end];
             let after = &rest[end + 1..];
             let port = match after.strip_prefix(':') {
                 Some(p) => Some(p),
                 None if after.is_empty() => None,
-                None => anyhow::bail!("非法 authority: {}", authority),
+                None => anyhow::bail!("Invalid authority: {}", authority),
             };
             (host, port)
         } else {
@@ -91,7 +91,7 @@ impl TargetAddr {
                 None => (authority, None),
             };
             if host.contains(':') {
-                anyhow::bail!("IPv6 地址请使用 [addr]:port 格式: {}", authority);
+                anyhow::bail!("For IPv6 addresses, please use [addr]:port format: {}", authority);
             }
             (host, port_opt)
         };
@@ -99,8 +99,8 @@ impl TargetAddr {
         let port = match port_str {
             Some(p) => p
                 .parse::<u16>()
-                .map_err(|_| anyhow::anyhow!("非法端口号: {}", p))?,
-            None => default_port.ok_or_else(|| anyhow::anyhow!("缺少端口号: {}", authority))?,
+                .map_err(|_| anyhow::anyhow!("Invalid port number: {}", p))?,
+            None => default_port.ok_or_else(|| anyhow::anyhow!("Missing port number: {}", authority))?,
         };
         Self::from_host_port(host, port)
     }
@@ -150,7 +150,7 @@ pub async fn relay_stream_monitored_with_timeout(
     use std::sync::atomic::{AtomicU64, Ordering};
 
     if conn.is_some_and(|c| c.is_cancelled()) {
-        anyhow::bail!("连接已被管理员手动切断");
+        anyhow::bail!("Connection aborted by administrator");
     }
 
     let (mut lr, mut lw) = local.into_split();
@@ -160,7 +160,7 @@ pub async fn relay_stream_monitored_with_timeout(
     let conn_down = conn.cloned();
 
     let start = tokio::time::Instant::now();
-    // 使用微秒精度记录最近一次任一方向产生有效载荷的时间点
+    // Track microsecond timestamp of the most recent payload activity in either direction
     let last_activity_us = Arc::new(AtomicU64::new(0));
     let last_up = Arc::clone(&last_activity_us);
     let last_down = Arc::clone(&last_activity_us);
@@ -236,7 +236,7 @@ pub async fn relay_stream_monitored_with_timeout(
         _ = idle_watchdog => {
             anyhow::bail!(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("双向通道均空闲超过 {:?}，连接已超时关闭", idle_timeout),
+                format!("Both directions idle for {:?}, connection timed out", idle_timeout),
             ));
         }
         _ = async {
@@ -250,7 +250,7 @@ pub async fn relay_stream_monitored_with_timeout(
                 std::future::pending::<()>().await;
             }
         } => {
-            anyhow::bail!("连接已被管理员手动切断");
+            anyhow::bail!("Connection aborted by administrator");
         }
     }
 }
@@ -317,16 +317,16 @@ mod tests {
         }
         assert_eq!(downloaded.len(), 6 * b"chunk-data".len());
 
-        // 客户端收到服务端 EOF 后再关闭写端完成双向收尾
+        // Client shuts down write side after receiving EOF from server to complete graceful termination
         client_w.shutdown().await.unwrap();
         server_task.await.unwrap();
 
-        let (up, down) = relay_handle.await.unwrap().expect("单向持续传输期间不应因另一侧静默而超时");
+        let (up, down) = relay_handle.await.unwrap().expect("Unidirectional active transfer should not time out while other side is silent");
         assert_eq!(up, 23);
         assert_eq!(down, 60);
     }
 
-    /// P0-1 回归测试 2：客户端先半关闭 (EOF)，服务端继续跨多个空闲周期正常发送至完成
+    /// P0-1 Regression Test 2: Client half-closes (EOF), server continues sending across multiple idle intervals to completion
     #[tokio::test]
     async fn test_relay_supports_half_close_continuation() {
         let (client_app, local_relay) = tcp_pair().await;
@@ -362,12 +362,12 @@ mod tests {
         client_r.read_to_end(&mut reply).await.unwrap();
         assert_eq!(&reply, b"pongpongpongpong");
 
-        let (up, down) = relay_handle.await.unwrap().expect("半关闭后对向持续数据流应完整成功");
+        let (up, down) = relay_handle.await.unwrap().expect("Opposite direction data stream after half-close should complete successfully");
         assert_eq!(up, 4);
         assert_eq!(down, 16);
     }
 
-    /// P0-1 回归测试 3：当且仅当双向同时静默超过超时阈值时才触发空闲超时
+    /// P0-1 Regression Test 3: Idle timeout triggered if and only if both directions are silent beyond threshold
     #[tokio::test]
     async fn test_relay_times_out_when_both_sides_idle() {
         let (_client_app, local_relay) = tcp_pair().await;
@@ -381,6 +381,6 @@ mod tests {
         )
         .await;
 
-        assert!(res.is_err(), "双向长期完全静默应触发超时清理");
+        assert!(res.is_err(), "Prolonged mutual silence should trigger idle timeout cleanup");
     }
 }

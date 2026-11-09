@@ -21,24 +21,24 @@ pub struct DnsPacketParser;
 impl DnsPacketParser {
     pub fn parse_question(buf: &[u8]) -> Result<(u16, DnsQuestion)> {
         if buf.len() < 12 {
-            bail!("DNS 报文过短 (小于头部 12 字节)");
+            bail!("DNS packet too short (less than 12 bytes header)");
         }
 
-        // 检查 QR 标志位: 第 2 字节最高位 (bit 7) 必须为 0 (Query)
+        // Check QR flag: byte 2 bit 7 must be 0 (Query)
         if (buf[2] & 0x80) != 0 {
-            bail!("DNS 报文不是标准查询 (QR != 0)");
+            bail!("DNS packet is not a standard query (QR != 0)");
         }
 
-        // 检查 Opcode: 第 2 字节 bits 3-6 必须为 0 (Standard Query)
+        // Check Opcode: byte 2 bits 3-6 must be 0 (Standard Query)
         let opcode = (buf[2] >> 3) & 0x0F;
         if opcode != 0 {
-            bail!("不受支持的 DNS 操作码 (Opcode != 0): {}", opcode);
+            bail!("Unsupported DNS opcode (Opcode != 0): {}", opcode);
         }
 
         let tx_id = u16::from_be_bytes([buf[0], buf[1]]);
         let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
         if qdcount == 0 {
-            bail!("DNS 查询未包含任何 Question 条目");
+            bail!("DNS query does not contain any Question entries");
         }
 
         let mut offset = 12;
@@ -54,30 +54,30 @@ impl DnsPacketParser {
                 break;
             }
             if (len & 0xC0) != 0 {
-                bail!("DNS 查询域名中包含不受支持的指针压缩标签");
+                bail!("DNS query domain contains unsupported compressed pointer label");
             }
             if len > 63 {
-                bail!("DNS 报文域名标签长度超出 RFC 1035 上限 63 字节: {}", len);
+                bail!("DNS domain label length exceeds RFC 1035 limit of 63 bytes: {}", len);
             }
             if offset + len > buf.len() {
-                bail!("DNS 报文域名标签长度超出数据包边界");
+                bail!("DNS domain label length exceeds packet boundary");
             }
             total_domain_len += len + 1;
             if total_domain_len > 255 {
-                bail!("DNS 域名总长度超出 RFC 1035 上限 253 字节");
+                bail!("DNS total domain length exceeds RFC 1035 limit of 253 bytes");
             }
             let label = std::str::from_utf8(&buf[offset..offset + len])
-                .context("DNS 域名包含非 UTF-8 字符")?;
+                .context("DNS domain contains non-UTF-8 characters")?;
             domain_parts.push(label.to_string());
             offset += len;
         }
 
         if !terminated {
-            bail!("DNS 域名解析未遇到根空标签 (0x00) 即结束");
+            bail!("DNS domain parsing did not terminate with root null label (0x00)");
         }
 
         if offset + 4 > buf.len() {
-            bail!("DNS Question 缺少 QTYPE 或 QCLASS 字段");
+            bail!("DNS Question missing QTYPE or QCLASS fields");
         }
 
         let qtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
@@ -86,7 +86,7 @@ impl DnsPacketParser {
 
         let name = domain_parts.join(".");
         if name.is_empty() {
-            bail!("DNS 查询域名为空 (Root Query)");
+            bail!("DNS query domain is empty (Root Query)");
         }
 
         Ok((
@@ -239,20 +239,20 @@ impl DnsServer {
         }
     }
 
-    /// 同步绑定套接字（Fail-Fast 检查端口占用）
+    /// Synchronously bind socket (Fail-Fast port check)
     pub async fn bind(&self) -> Result<Arc<UdpSocket>> {
         let socket = UdpSocket::bind(self.bind_addr)
             .await
-            .with_context(|| format!("绑定 DNS 服务套接字失败 ({})", self.bind_addr))?;
-        info!("[DNS 引擎] 本地 DNS 劫持与防泄漏服务已在 {} 绑定", self.bind_addr);
+            .with_context(|| format!("Failed to bind DNS server socket ({})", self.bind_addr))?;
+        info!("[DNS Engine] Local DNS hijack and leak-prevention service bound on {}", self.bind_addr);
         Ok(Arc::new(socket))
     }
 
-    /// 启动异步 UDP DNS 监听循环（支持优雅停机、并发信号量限制与上游多路复用）
+    /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and upstream multiplexing)
     pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut buf = [0u8; 1500];
 
-        // 绑定单个复用的上游 DNS 转发客户端（按上游地址族匹配 IPv4 / IPv6），杜绝反复 bind 耗尽临时端口
+        // Bind single multiplexed upstream DNS client socket matching address family
         let upstream_bind = if self.upstream_dns.is_ipv6() {
             "[::]:0"
         } else {
@@ -261,12 +261,12 @@ impl DnsServer {
         let upstream_client = Arc::new(
             UdpSocket::bind(upstream_bind)
                 .await
-                .context("绑定 DNS 上游客户端套接字失败")?,
+                .context("Failed to bind upstream DNS client socket")?,
         );
         let pending_queries: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
-        // 启动后台上游 DNS 响应多路复用接收循环
+        // Start background upstream DNS response multiplexing receiver loop
         let uc = Arc::clone(&upstream_client);
         let pq = Arc::clone(&pending_queries);
         let expected_upstream = normalize_socket_addr(self.upstream_dns);
@@ -280,7 +280,7 @@ impl DnsServer {
                             Ok((n, src_addr)) if n >= 2 => {
                                 if normalize_socket_addr(src_addr) != expected_upstream {
                                     warn!(
-                                        "[DNS 引擎] 丢弃非指定上游源地址 {} 返回的响应包 (期望 {})",
+                                        "[DNS Engine] Dropped response packet from unexpected upstream source address {} (expected {})",
                                         src_addr, expected_upstream
                                     );
                                     continue;
@@ -296,10 +296,10 @@ impl DnsServer {
                             }
                             Ok(_) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                                debug!("[DNS 引擎] 上游 UDP 端点暂不可达: {}", e);
+                                debug!("[DNS Engine] Upstream UDP endpoint temporarily unreachable: {}", e);
                             }
                             Err(e) => {
-                                error!("[DNS 引擎] 上游响应接收异常: {}", e);
+                                error!("[DNS Engine] Upstream response receive error: {}", e);
                                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             }
                         }
@@ -315,13 +315,13 @@ impl DnsServer {
                     match res {
                         Ok(r) => r,
                         Err(e) => {
-                            error!("[DNS 引擎] 接收 UDP DNS 数据包失败: {}", e);
+                            error!("[DNS Engine] Failed to receive UDP DNS packet: {}", e);
                             continue;
                         }
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    info!("[DNS 引擎] 接收到退出信号，安全停止 DNS 监听");
+                    info!("[DNS Engine] Shutdown signal received, stopping DNS listener");
                     break;
                 }
             };
@@ -329,7 +329,7 @@ impl DnsServer {
             let permit = match self.concurrency_limit.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!("[DNS 引擎] 丢弃超出并发限制 (5000) 的 DNS 查询请求");
+                    warn!("[DNS Engine] Dropped DNS query exceeding concurrency limit (5000)");
                     continue;
                 }
             };
@@ -347,12 +347,11 @@ impl DnsServer {
                 match DnsPacketParser::parse_question(&query_bytes) {
                     Ok((client_tx_id, question)) => {
                         debug!(
-                            "[DNS 查询] 来源: {}, 域名: {}, QType: {}",
+                            "[DNS Query] Client: {}, Domain: {}, QType: {}",
                             peer, question.name, question.qtype
                         );
 
-                        // 1. 开启防泄露模式时，阻断 AAAA (28) 以及现代浏览器的 SVCB (64) / HTTPS (65) 记录查询，
-                        //    防止域名明文泄露给公网 DNS 或因 ipv4hint 绕过 Fake-IP 与分流规则
+                        // 1. In anti-leak mode, block AAAA (28), SVCB (64), and HTTPS (65) queries
                         if block_ipv6 && matches!(question.qtype, 28 | 64 | 65) {
                             let empty_resp = DnsPacketParser::build_empty_response(
                                 client_tx_id,
@@ -363,7 +362,7 @@ impl DnsServer {
                             return;
                         }
 
-                        // 2. 若为 A (IPv4) 查询，分配 Fake-IP 并应答
+                        // 2. For A (IPv4) queries, allocate Fake-IP and respond
                         if question.qtype == 1 && question.qclass == 1 {
                             let fake_ip = pool_clone.allocate(&question.name);
                             let resp = DnsPacketParser::build_a_response(
@@ -376,11 +375,10 @@ impl DnsServer {
                             return;
                         }
 
-                        // 3. 其它类型查询转向上游 DNS 进行代理解析：
-                        //    使用独立的内部事务 ID 防止多客户端同 TxID 串包，响应后还原客户端原始 TxID
+                        // 3. Forward other queries to upstream DNS with isolated internal TxID
                         let (tx, rx) = oneshot::channel();
                         let Some(internal_tx_id) = allocate_internal_tx_id(&pq_clone, tx) else {
-                            warn!("[DNS 引擎] 上游 DNS 事务 ID 映射表已满，丢弃查询: {}", question.name);
+                            warn!("[DNS Engine] Upstream transaction ID mapping table full, dropping query: {}", question.name);
                             return;
                         };
                         let mut pending_guard = PendingQueryGuard::new(internal_tx_id, Arc::clone(&pq_clone));
@@ -399,7 +397,7 @@ impl DnsServer {
                         }
                     }
                     Err(e) => {
-                        warn!("[DNS 引擎] 解析 DNS 请求报文失败: {}", e);
+                        warn!("[DNS Engine] Failed to parse DNS query packet: {}", e);
                     }
                 }
             });
@@ -504,10 +502,10 @@ mod tests {
             assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // ANCOUNT=0
         }
 
-        assert_eq!(upstream_hits.load(Ordering::Relaxed), 0, "SVCB/HTTPS/AAAA 查询绝不应透传至公网 DNS");
+        assert_eq!(upstream_hits.load(Ordering::Relaxed), 0, "SVCB/HTTPS/AAAA queries must not leak to public DNS");
     }
 
-    /// P0-2 回归测试：相同客户端 TxID 并发透传上游时通过内部事务 ID 隔离防止串包，并拒绝伪造源地址响应
+    /// P0-2 Regression Test: Concurrent upstream queries with same client TxID isolated by internal TxID, rejecting spoofed responses
     #[tokio::test]
     async fn test_dns_upstream_txid_isolation_and_source_verification() {
         let mock_upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -524,7 +522,7 @@ mod tests {
 
                 let id1 = u16::from_be_bytes([buf1[0], buf1[1]]);
                 let id2 = u16::from_be_bytes([buf2[0], buf2[1]]);
-                assert_ne!(id1, id2, "即使客户端使用相同 TxID，转发至上游的内部事务 ID 也必须不同");
+                assert_ne!(id1, id2, "Internal transaction IDs forwarded to upstream must be distinct even with identical client TxID");
 
                 // 构造一个来自错误源地址的伪造响应（复刻 id1），应被接收器直接丢弃
                 let mut spoof_resp = vec![0u8; n1];
@@ -595,9 +593,9 @@ mod tests {
         let p2 = &r2[..len2];
         assert!(!p1.windows(7).any(|w| w == b"SPOOFED"));
         assert!(!p2.windows(7).any(|w| w == b"SPOOFED"));
-        assert!(p1.windows(9).any(|w| w == b"ANS-ALPHA"), "客户端 1 必须收到 alpha 响应");
-        assert!(!p1.windows(9).any(|w| w == b"ANS-BETA!"), "客户端 1 不应收到 beta 响应");
-        assert!(p2.windows(9).any(|w| w == b"ANS-BETA!"), "客户端 2 必须收到 beta 响应");
-        assert!(!p2.windows(9).any(|w| w == b"ANS-ALPHA"), "客户端 2 不应收到 alpha 响应");
+        assert!(p1.windows(9).any(|w| w == b"ANS-ALPHA"), "Client 1 must receive alpha response");
+        assert!(!p1.windows(9).any(|w| w == b"ANS-BETA!"), "Client 1 must not receive beta response");
+        assert!(p2.windows(9).any(|w| w == b"ANS-BETA!"), "Client 2 must receive beta response");
+        assert!(!p2.windows(9).any(|w| w == b"ANS-ALPHA"), "Client 2 must not receive alpha response");
     }
 }

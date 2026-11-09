@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FlowX — 透明网络代理与进程分流控制台</title>
+  <title id="app-title">FlowX</title>
   <style>
     :root, [data-theme="dark"] {
       --bg-canvas: #090d14;
@@ -88,13 +88,13 @@
 
     .num { font-variant-numeric: tabular-nums; }
 
-    /* 整体壳层 */
+    /* Application Shell */
     .app-shell {
       display: flex;
       min-height: 100vh;
     }
 
-    /* 侧边栏 */
+    /* Sidebar */
     .sidebar {
       width: 244px;
       background: var(--bg-sidebar);
@@ -271,7 +271,7 @@
       background: var(--accent-soft);
     }
 
-    /* 主工作区 */
+    /* Main Area */
     .main-area {
       flex: 1;
       min-width: 0;
@@ -375,7 +375,7 @@
     .view-panel.active { display: block; animation: fadeIn 0.16s ease-out; }
     @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
 
-    /* 通用按钮 */
+    /* Generic Buttons */
     .btn {
       display: inline-flex;
       align-items: center;
@@ -440,7 +440,7 @@
       border-radius: 8px;
     }
 
-    /* 统计卡片网格 */
+    /* KPI Stat Cards Grid */
     .kpi-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -494,7 +494,7 @@
       color: var(--text-muted);
     }
 
-    /* 仪表盘第二行：图表 + 系统信息 */
+    /* Dashboard Row 2: Chart & System Info */
     .dash-split {
       display: grid;
       grid-template-columns: minmax(0, 1.65fr) minmax(300px, 1fr);
@@ -576,7 +576,7 @@
       border-radius: 6px;
     }
 
-    /* 系统信息键值对 */
+    /* System Info KV List */
     .kv-list {
       display: flex;
       flex-direction: column;
@@ -610,7 +610,7 @@
       margin-top: 12px;
     }
 
-    /* 过滤栏 */
+    /* Section */
     .toolbar {
       display: flex;
       align-items: center;
@@ -658,7 +658,7 @@
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
     }
 
-    /* 表格 */
+    /* Section */
     .table-wrap {
       overflow-x: auto;
       border: 1px solid var(--border);
@@ -707,7 +707,7 @@
       white-space: nowrap;
     }
 
-    /* 标签 */
+    /* Section */
     .badge {
       display: inline-flex;
       align-items: center;
@@ -727,7 +727,7 @@
     .badge-socks4 { background: var(--amber-soft); color: var(--amber); border-color: var(--amber-border); }
     .badge-muted { background: var(--bg-elevated); color: var(--text-secondary); border-color: var(--border); }
 
-    /* 节点卡片 */
+    /* Node Cards */
     .nodes-grid {
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
@@ -805,7 +805,7 @@
     .latency-pill.warn { color: var(--amber); }
     .latency-pill.err { color: var(--red); }
 
-    /* 规则列表 */
+    /* Rule List */
     .rule-banner {
       display: flex;
       align-items: center;
@@ -910,7 +910,7 @@
       flex-wrap: wrap;
     }
 
-    /* 开关控件 */
+    /* Toggle Controls */
     .switch {
       position: relative;
       display: inline-block;
@@ -965,7 +965,7 @@
       color: var(--text-secondary);
     }
 
-    /* 空状态 */
+    /* Empty States */
     .empty-state {
       text-align: center;
       padding: 40px 20px;
@@ -973,7 +973,7 @@
       font-size: 13px;
     }
 
-    /* 模态框 */
+    /* Modals */
     .modal-overlay {
       position: fixed;
       inset: 0;
@@ -1102,7 +1102,7 @@
       to { transform: translateX(0); opacity: 1; }
     }
 
-    /* 响应式 */
+    /* Responsive Breakpoints */
     @media (max-width: 1080px) {
       .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .dash-split { grid-template-columns: 1fr; }
@@ -1130,7 +1130,7 @@
   <div class="toast-container" id="toast-container"></div>
 
   <div class="app-shell">
-    <!-- 侧边栏 -->
+    <!-- Sidebar -->
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brand-logo">
@@ -1140,7 +1140,7 @@
         </div>
         <div class="brand-text">
           <div class="brand-name">FlowX <span class="brand-ver" id="sys-version">v0.1.0</span></div>
-          <div class="brand-sub">进程级透明代理引擎</div>
+          <div class="brand-sub" data-i18n="brand_sub">Transparent Proxy Engine</div>
         </div>
       </div>
 
@@ -1148,27 +1148,27 @@
         <button class="nav-item active" id="nav-dashboard" onclick="switchTab('dashboard')">
           <span class="nav-item-left">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect></svg>
-            实时概览
+            <span data-i18n="nav_dashboard">Overview</span>
           </span>
         </button>
         <button class="nav-item" id="nav-connections" onclick="switchTab('connections')">
           <span class="nav-item-left">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
-            活跃连接
+            <span data-i18n="nav_connections">Connections</span>
           </span>
           <span class="nav-count mono" id="nav-count-conns">0</span>
         </button>
         <button class="nav-item" id="nav-proxies" onclick="switchTab('proxies')">
           <span class="nav-item-left">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg>
-            代理节点
+            <span data-i18n="nav_proxies">Proxy Nodes</span>
           </span>
           <span class="nav-count mono" id="nav-count-nodes">0</span>
         </button>
         <button class="nav-item" id="nav-rules" onclick="switchTab('rules')">
           <span class="nav-item-left">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>
-            分流策略
+            <span data-i18n="nav_rules">Routing Rules</span>
           </span>
           <span class="nav-count mono" id="nav-count-rules">0</span>
         </button>
@@ -1177,97 +1177,100 @@
       <div class="sidebar-footer">
         <div class="inbound-chip">
           <div class="inbound-chip-label">
-            <span>混合代理入站</span>
-            <span>SOCKS / HTTP</span>
+            <span data-i18n="sidebar_mixed_inbound">Mixed Inbound</span>
+            <span data-i18n="sidebar_inbound_proto">SOCKS / HTTP</span>
           </div>
           <div class="inbound-chip-val">
             <span class="mono" id="sidebar-inbound">127.0.0.1:40001</span>
-            <button class="copy-mini" onclick="copyText(state.system.inbound_addr || '127.0.0.1:40001', '代理地址')">复制</button>
+            <button class="copy-mini" onclick="copyProxyAddr()" data-i18n="sidebar_copy">Copy</button>
           </div>
         </div>
         <div class="inbound-chip">
           <div class="inbound-chip-label">
-            <span>运行时长</span>
+            <span data-i18n="sidebar_uptime">Uptime</span>
             <span class="mono" id="sidebar-uptime">00:00:00</span>
           </div>
           <div class="inbound-chip-label">
-            <span>配置文件</span>
+            <span data-i18n="sidebar_config">Config Profile</span>
             <span class="mono" id="sidebar-config">flowx.xml</span>
           </div>
         </div>
       </div>
     </aside>
 
-    <!-- 主内容区 -->
+    <!-- Main Content Area -->
     <div class="main-area">
       <header class="topbar">
         <div class="topbar-left">
-          <button class="mobile-menu-btn" onclick="toggleSidebar()" aria-label="菜单">
+          <button class="mobile-menu-btn" onclick="toggleSidebar()" aria-label="Menu" data-i18n-aria-label="aria_menu">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
           </button>
           <div>
-            <div class="page-title" id="view-title">实时概览</div>
-            <div class="page-subtitle" id="view-subtitle">混合协议入站 · Windows 进程四元组追踪 · Fake-IP 防泄漏</div>
+            <div class="page-title" id="view-title">Overview</div>
+            <div class="page-subtitle" id="view-subtitle">Mixed Inbound · Windows Process Tracking · Fake-IP DNS</div>
           </div>
         </div>
         <div class="topbar-right">
           <div class="health-pill" id="engine-health">
             <span class="health-dot"></span>
-            <span id="engine-health-text">核心运行中</span>
+            <span id="engine-health-text" data-i18n="health_online">Core Online</span>
           </div>
-          <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" title="切换浅色/深色主题">
+          <button class="btn icon-btn" onclick="toggleLanguage()" id="lang-btn" data-i18n-title="lang_toggle_title" title="Switch Language">
+            <span id="lang-label" style="font-size: 11.5px; font-weight: 700; font-family: ui-monospace, monospace;">EN</span>
+          </button>
+          <button class="btn icon-btn" onclick="toggleTheme()" id="theme-btn" data-i18n-title="theme_toggle_title" title="Toggle Light/Dark Theme">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
           </button>
           <button class="btn" onclick="refreshAll()">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
-            立即刷新
+            <span data-i18n="btn_refresh">Refresh Now</span>
           </button>
         </div>
       </header>
 
       <div class="content-wrap">
-        <!-- 1. 实时概览 -->
+        <!-- 1. Dashboard -->
         <section id="tab-dashboard" class="view-panel active">
           <div class="kpi-grid">
             <div class="kpi-card">
               <div class="kpi-head">
-                <span>实时下载速率</span>
+                <span data-i18n="kpi_down_speed">Live Download</span>
                 <span class="kpi-icon down">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="5" x2="12" y2="19"></line><polyline points="19 12 12 19 5 12"></polyline></svg>
                 </span>
               </div>
               <div class="kpi-value mono" id="val-down-speed">0 B/s</div>
-              <div class="kpi-sub">累计下行 <span class="mono" id="val-total-down">0 B</span></div>
+              <div class="kpi-sub"><span data-i18n="kpi_total_down">Total Inbound</span> <span class="mono" id="val-total-down">0 B</span></div>
             </div>
             <div class="kpi-card">
               <div class="kpi-head">
-                <span>实时上传速率</span>
+                <span data-i18n="kpi_up_speed">Live Upload</span>
                 <span class="kpi-icon up">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
                 </span>
               </div>
               <div class="kpi-value mono" id="val-up-speed">0 B/s</div>
-              <div class="kpi-sub">累计上行 <span class="mono" id="val-total-up">0 B</span></div>
+              <div class="kpi-sub"><span data-i18n="kpi_total_up">Total Outbound</span> <span class="mono" id="val-total-up">0 B</span></div>
             </div>
             <div class="kpi-card">
               <div class="kpi-head">
-                <span>活跃 TCP 会话</span>
+                <span data-i18n="kpi_active_conns">Active Sessions</span>
                 <span class="kpi-icon conns">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
                 </span>
               </div>
               <div class="kpi-value mono" id="val-active-conns">0</div>
-              <div class="kpi-sub">启用规则 <span class="mono" id="val-enabled-rules">0 / 0</span></div>
+              <div class="kpi-sub"><span data-i18n="kpi_enabled_rules">Active Rules</span> <span class="mono" id="val-enabled-rules">0 / 0</span></div>
             </div>
             <div class="kpi-card">
               <div class="kpi-head">
-                <span>总吞吐流量</span>
+                <span data-i18n="kpi_total_traffic">Total Throughput</span>
                 <span class="kpi-icon total">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path></svg>
                 </span>
               </div>
               <div class="kpi-value mono" id="val-total-bytes">0 B</div>
-              <div class="kpi-sub">Fake-IP 缓存 <span class="mono" id="val-fakeip-count">0</span> 条</div>
+              <div class="kpi-sub"><span data-i18n="kpi_fakeip_cache">Fake-IP Cache</span> <span class="mono" id="val-fakeip-count">0</span> <span data-i18n="kpi_items_unit">entries</span></div>
             </div>
           </div>
 
@@ -1275,16 +1278,16 @@
             <div class="card">
               <div class="card-header">
                 <div>
-                  <div class="card-title">实时吞吐趋势（最近 60 秒）</div>
-                  <div class="card-sub">每秒采样一次，真实反映活跃中继链路上下行带宽</div>
+                  <div class="card-title" data-i18n="chart_title">Throughput Trend (Last 60s)</div>
+                  <div class="card-sub" data-i18n="chart_sub">1-second sampling reflecting upstream/downstream bandwidth in real-time</div>
                 </div>
                 <div class="chart-legend">
-                  <span><span class="legend-dot" style="background: var(--accent);"></span>下行</span>
-                  <span><span class="legend-dot" style="background: var(--green);"></span>上行</span>
+                  <span><span class="legend-dot" style="background: var(--accent);"></span><span data-i18n="chart_down">Download</span></span>
+                  <span><span class="legend-dot" style="background: var(--green);"></span><span data-i18n="chart_up">Upload</span></span>
                 </div>
               </div>
               <div class="chart-wrap">
-                <span class="chart-peak mono" id="chart-peak-label">峰值: 0 B/s</span>
+                <span class="chart-peak mono" id="chart-peak-label">Peak: 0 B/s</span>
                 <svg class="chart-svg" id="traffic-chart" viewBox="0 0 600 180" preserveAspectRatio="none"></svg>
               </div>
             </div>
@@ -1292,27 +1295,27 @@
             <div class="card">
               <div class="card-header">
                 <div>
-                  <div class="card-title">引擎运行参数与接入点</div>
-                  <div class="card-sub">配置持久化文件: <span class="mono" id="info-config-path">flowx.xml</span></div>
+                  <div class="card-title" data-i18n="sys_info_title">Engine Parameters & Endpoints</div>
+                  <div class="card-sub"><span data-i18n="sys_info_config_file">Config Profile: </span><span class="mono" id="info-config-path">flowx.xml</span></div>
                 </div>
-                <button class="btn btn-sm" onclick="copyText('http://' + (state.system.inbound_addr || '127.0.0.1:40001'), 'HTTP 代理 URL')">复制代理</button>
+                <button class="btn btn-sm" onclick="copyProxyUrl()" data-i18n="btn_copy_proxy">Copy URL</button>
               </div>
               <div class="kv-list">
                 <div class="kv-row">
-                  <span class="kv-key">混合代理入站</span>
+                  <span class="kv-key" data-i18n="sys_kv_inbound">Mixed Inbound</span>
                   <span class="kv-val mono" id="info-inbound">127.0.0.1:40001</span>
                 </div>
                 <div class="kv-row">
-                  <span class="kv-key">本地 DNS / 上游</span>
+                  <span class="kv-key" data-i18n="sys_kv_dns">Local DNS / Upstream</span>
                   <span class="kv-val mono" id="info-dns">127.0.0.1:1053 → 223.5.5.5:53</span>
                 </div>
                 <div class="kv-row">
-                  <span class="kv-key">Fake-IP 保留网段</span>
-                  <span class="kv-val mono" id="info-fakeip">198.18.0.0/15 (0 条)</span>
+                  <span class="kv-key" data-i18n="sys_kv_fakeip">Fake-IP Subnet</span>
+                  <span class="kv-val mono" id="info-fakeip">198.18.0.0/15 (0 entries)</span>
                 </div>
                 <div class="kv-row">
-                  <span class="kv-key">兜底默认策略</span>
-                  <span class="kv-val" id="info-default-action">Direct (直连)</span>
+                  <span class="kv-key" data-i18n="sys_kv_default_action">Default Fallback</span>
+                  <span class="kv-val" id="info-default-action" data-i18n="filter_direct">Direct</span>
                 </div>
               </div>
               <div class="proto-chips" id="info-protocols">
@@ -1327,121 +1330,121 @@
           <div class="card">
             <div class="card-header">
               <div>
-                <div class="card-title">最新活跃连接</div>
-                <div class="card-sub">仅展示最近 8 条会话，完整追踪请前往「活跃连接」</div>
+                <div class="card-title" data-i18n="preview_conns_title">Recent Active Connections</div>
+                <div class="card-sub" data-i18n="preview_conns_sub">Showing latest 8 sessions, visit 「Connections」 for complete inspection</div>
               </div>
-              <button class="btn btn-sm" onclick="switchTab('connections')">查看全部</button>
+              <button class="btn btn-sm" onclick="switchTab('connections')" data-i18n="btn_view_all">View All</button>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>进程 (PID)</th>
-                    <th>目标主机 / 域名</th>
-                    <th>命中规则</th>
-                    <th>动作</th>
-                    <th>上行 / 下行速率</th>
-                    <th>时长</th>
+                    <th data-i18n="th_proc_pid">Process (PID)</th>
+                    <th data-i18n="th_target">Target Host / Domain</th>
+                    <th data-i18n="th_rule">Matched Rule</th>
+                    <th data-i18n="th_action">Action</th>
+                    <th data-i18n="th_speed">Upload / Download Rate</th>
+                    <th data-i18n="th_duration">Duration</th>
                   </tr>
                 </thead>
                 <tbody id="connections-tbody-preview">
-                  <tr><td colspan="6" class="empty-state">正在等待本地代理入站流量...</td></tr>
+                  <tr><td colspan="6" class="empty-state" data-i18n="preview_waiting">Waiting for inbound proxy traffic...</td></tr>
                 </tbody>
               </table>
             </div>
           </div>
         </section>
 
-        <!-- 2. 活跃连接 -->
+        <!-- 2. Connections -->
         <section id="tab-connections" class="view-panel">
           <div class="card">
             <div class="card-header">
               <div>
-                <div class="card-title">全量活动网络连接跟踪</div>
-                <div class="card-sub">按连接 ID 倒序排列，支持按进程、目标域名或动作过滤与手动切断</div>
+                <div class="card-title" data-i18n="conns_title">All Active Connection Tracker</div>
+                <div class="card-sub" data-i18n="conns_sub">Sorted by Connection ID desc, supports filtering by process, destination or action</div>
               </div>
               <div class="toolbar">
-                <input type="text" class="search-input" id="conn-search" placeholder="过滤进程名、目标地址或规则..." oninput="renderConnections()">
+                <input type="text" class="search-input" id="conn-search" data-i18n-placeholder="search_conns_ph" placeholder="Filter by process, target address, or rule..." oninput="renderConnections()">
                 <div class="filter-tabs" id="conn-action-filter">
-                  <button class="filter-tab active" data-filter="ALL" onclick="setConnFilter('ALL', this)">全部</button>
-                  <button class="filter-tab" data-filter="PROXY" onclick="setConnFilter('PROXY', this)">代理</button>
-                  <button class="filter-tab" data-filter="DIRECT" onclick="setConnFilter('DIRECT', this)">直连</button>
-                  <button class="filter-tab" data-filter="BLOCK" onclick="setConnFilter('BLOCK', this)">阻断</button>
+                  <button class="filter-tab active" data-filter="ALL" onclick="setConnFilter('ALL', this)" data-i18n="filter_all">All</button>
+                  <button class="filter-tab" data-filter="PROXY" onclick="setConnFilter('PROXY', this)" data-i18n="filter_proxy">Proxy</button>
+                  <button class="filter-tab" data-filter="DIRECT" onclick="setConnFilter('DIRECT', this)" data-i18n="filter_direct">Direct</button>
+                  <button class="filter-tab" data-filter="BLOCK" onclick="setConnFilter('BLOCK', this)" data-i18n="filter_block">Block</button>
                 </div>
-                <button class="btn btn-sm" id="pause-poll-btn" onclick="togglePausePolling()">暂停刷新</button>
+                <button class="btn btn-sm" id="pause-poll-btn" onclick="togglePausePolling()" data-i18n="btn_pause_poll">Pause Refresh</button>
               </div>
             </div>
             <div class="table-wrap">
               <table>
                 <thead>
                   <tr>
-                    <th>ID</th>
-                    <th>进程与可执行路径</th>
-                    <th>目标地址</th>
-                    <th>命中规则</th>
-                    <th>动作</th>
-                    <th>实时速率</th>
-                    <th>累计流量</th>
-                    <th>时长</th>
-                    <th>操作</th>
+                    <th data-i18n="th_id">ID</th>
+                    <th data-i18n="th_proc_path">Process & Executable Path</th>
+                    <th data-i18n="th_target">Target Address</th>
+                    <th data-i18n="th_rule">Matched Rule</th>
+                    <th data-i18n="th_action">Action</th>
+                    <th data-i18n="th_speed">Live Speed</th>
+                    <th data-i18n="th_traffic">Total Traffic</th>
+                    <th data-i18n="th_duration">Duration</th>
+                    <th data-i18n="th_actions">Actions</th>
                   </tr>
                 </thead>
                 <tbody id="connections-tbody-full">
-                  <tr><td colspan="9" class="empty-state">暂无活动连接</td></tr>
+                  <tr><td colspan="9" class="empty-state" data-i18n="conns_empty">No active connections</td></tr>
                 </tbody>
               </table>
             </div>
           </div>
         </section>
 
-        <!-- 3. 代理节点 -->
+        <!-- 3. Proxies -->
         <section id="tab-proxies" class="view-panel">
           <div class="card">
             <div class="card-header">
               <div>
-                <div class="card-title">可用代理节点 (Proxy Nodes)</div>
-                <div class="card-sub">支持 SOCKS5 / HTTP CONNECT / SOCKS4a，新增或删除会自动回写配置文件</div>
+                <div class="card-title" data-i18n="proxies_title">Available Proxy Nodes</div>
+                <div class="card-sub" data-i18n="proxies_sub">Supports SOCKS5 / HTTP CONNECT / SOCKS4a, mutations persist to config file</div>
               </div>
               <div class="toolbar">
-                <button class="btn" onclick="pingAllNodes()" id="btn-ping-all">全部测速</button>
+                <button class="btn" onclick="pingAllNodes()" id="btn-ping-all" data-i18n="btn_ping_all">Ping All</button>
                 <button class="btn btn-primary" onclick="openAddNodeModal()">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                  添加节点
+                  <span data-i18n="btn_add_node">Add Node</span>
                 </button>
               </div>
             </div>
             <div class="nodes-grid" id="nodes-container">
-              <div class="empty-state">加载节点中...</div>
+              <div class="empty-state" data-i18n="nodes_loading">Loading proxy nodes...</div>
             </div>
           </div>
         </section>
 
-        <!-- 4. 分流策略 -->
+        <!-- 4. Rules -->
         <section id="tab-rules" class="view-panel">
           <div class="card">
             <div class="card-header">
               <div>
-                <div class="card-title">分流策略规则引擎</div>
-                <div class="card-sub">支持动态启停、顺序调整（上移/下移/置顶）与引用防呆校验</div>
+                <div class="card-title" data-i18n="rules_title">Routing Rule Engine</div>
+                <div class="card-sub" data-i18n="rules_sub">Supports dynamic toggling, priority ordering (up/down/top) & constraint validation</div>
               </div>
               <div class="toolbar">
-                <input type="text" class="search-input" id="rule-search" placeholder="搜索规则名、应用或目标..." oninput="renderRules()">
+                <input type="text" class="search-input" id="rule-search" data-i18n-placeholder="search_rules_ph" placeholder="Search rule name, app, or target..." oninput="renderRules()">
                 <button class="btn btn-primary" onclick="openAddRuleModal()">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                  新建规则
+                  <span data-i18n="btn_add_rule">New Rule</span>
                 </button>
               </div>
             </div>
             <div class="rule-banner">
-              <span>匹配原则：<strong>自顶向下、首次命中生效 (First-Match Wins)</strong>。已停用的规则会被跳过，所有更改即时生效并写入 XML。</span>
-              <span class="mono" id="rules-summary">共 0 条规则</span>
+              <span data-i18n-html="rule_banner_desc">Matching Principle: <strong>Top-down, First-Match Wins</strong>. Disabled rules are skipped; changes apply immediately and persist to XML.</span>
+              <span class="mono" id="rules-summary">0 rules total</span>
             </div>
             <div class="rules-list" id="rules-container">
-              <div class="empty-state">加载规则中...</div>
+              <div class="empty-state" data-i18n="rules_loading">Loading rules...</div>
             </div>
             <div class="default-rule-box">
-              <span><strong>Default（默认兜底规则）</strong> · 当上方没有任何启用的规则命中时生效</span>
-              <span class="badge badge-muted" id="rules-default-badge">Direct (直连)</span>
+              <span data-i18n="default_rule_desc">Default (Fallback Action) · Applied when no enabled rule above matches</span>
+              <span class="badge badge-muted" id="rules-default-badge" data-i18n="filter_direct">Direct</span>
             </div>
           </div>
         </section>
@@ -1449,119 +1452,528 @@
     </div>
   </div>
 
-  <!-- 模态框：添加节点 -->
+  <!-- Modal: Add Node -->
   <div class="modal-overlay" id="modal-node" onclick="handleBackdropClick(event, 'modal-node')">
     <div class="modal-box">
       <div class="modal-header">
-        <div class="modal-title">添加代理节点</div>
-        <button class="modal-close" onclick="closeModal('modal-node')" aria-label="关闭">&times;</button>
+        <div class="modal-title" data-i18n="modal_add_node_title">Add Proxy Node</div>
+        <button class="modal-close" onclick="closeModal('modal-node')" aria-label="Close" data-i18n-aria-label="aria_close">&times;</button>
       </div>
       <div class="form-group">
-        <label class="form-label" for="node-name">节点名称</label>
-        <input type="text" class="form-input" id="node-name" placeholder="例如: HK-Socks-01">
+        <label class="form-label" for="node-name" data-i18n="form_node_name">Node Name</label>
+        <input type="text" class="form-input" id="node-name" data-i18n-placeholder="form_node_name_ph" placeholder="e.g. HK-Socks-01">
       </div>
       <div class="form-grid-2">
         <div class="form-group">
-          <label class="form-label" for="node-protocol">代理协议</label>
+          <label class="form-label" for="node-protocol" data-i18n="form_node_protocol">Proxy Protocol</label>
           <select class="form-select" id="node-protocol">
-            <option value="SOCKS5">SOCKS5 (推荐)</option>
-            <option value="HTTP">HTTP CONNECT</option>
-            <option value="SOCKS4">SOCKS4 / SOCKS4a</option>
+            <option value="SOCKS5" data-i18n="opt_proto_socks5">SOCKS5 (Recommended)</option>
+            <option value="HTTP" data-i18n="opt_proto_http">HTTP CONNECT</option>
+            <option value="SOCKS4" data-i18n="opt_proto_socks4">SOCKS4 / SOCKS4a</option>
           </select>
         </div>
         <div class="form-group">
-          <label class="form-label" for="node-addr">服务器地址 (Host:Port)</label>
-          <input type="text" class="form-input mono" id="node-addr" placeholder="127.0.0.1:10808">
+          <label class="form-label" for="node-addr" data-i18n="form_node_addr">Server Address (Host:Port)</label>
+          <input type="text" class="form-input mono" id="node-addr" data-i18n-placeholder="form_node_addr_ph" placeholder="127.0.0.1:10808">
         </div>
       </div>
       <div class="form-grid-2">
         <div class="form-group">
-          <label class="form-label" for="node-user">认证用户名 (可选)</label>
-          <input type="text" class="form-input" id="node-user" placeholder="留空表示无认证">
+          <label class="form-label" for="node-user" data-i18n="form_node_user">Auth Username (Optional)</label>
+          <input type="text" class="form-input" id="node-user" data-i18n-placeholder="form_node_user_ph" placeholder="Leave empty for no authentication">
         </div>
         <div class="form-group">
-          <label class="form-label" for="node-pass">认证密码 (可选)</label>
-          <input type="password" class="form-input" id="node-pass" placeholder="留空表示无认证">
+          <label class="form-label" for="node-pass" data-i18n="form_node_pass">Auth Password (Optional)</label>
+          <input type="password" class="form-input" id="node-pass" data-i18n-placeholder="form_node_pass_ph" placeholder="Leave empty for no authentication">
         </div>
       </div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeModal('modal-node')">取消</button>
-        <button class="btn btn-primary" id="btn-submit-node" onclick="submitAddNode()">保存节点</button>
+        <button class="btn" onclick="closeModal('modal-node')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" id="btn-submit-node" onclick="submitAddNode()" data-i18n="btn_save_node">Save Node</button>
       </div>
     </div>
   </div>
 
-  <!-- 模态框：新建规则 -->
+  <!-- Modal: Add Rule -->
   <div class="modal-overlay" id="modal-rule" onclick="handleBackdropClick(event, 'modal-rule')">
     <div class="modal-box">
       <div class="modal-header">
-        <div class="modal-title">新建分流规则</div>
-        <button class="modal-close" onclick="closeModal('modal-rule')" aria-label="关闭">&times;</button>
+        <div class="modal-title" data-i18n="modal_add_rule_title">Create Routing Rule</div>
+        <button class="modal-close" onclick="closeModal('modal-rule')" aria-label="Close" data-i18n-aria-label="aria_close">&times;</button>
       </div>
       <div class="form-group">
-        <label class="form-label" for="rule-name">规则名称</label>
-        <input type="text" class="form-input" id="rule-name" placeholder="例如: BrowserProxy">
+        <label class="form-label" for="rule-name" data-i18n="form_rule_name">Rule Name</label>
+        <input type="text" class="form-input" id="rule-name" data-i18n-placeholder="form_rule_name_ph" placeholder="e.g. BrowserProxy">
       </div>
       <div class="form-group">
-        <label class="form-label" for="rule-apps">应用程序筛选 (分号分隔，支持通配符)</label>
-        <input type="text" class="form-input mono" id="rule-apps" placeholder="chrome.exe; *edge*.exe; node.exe">
-        <div class="form-hint">留空表示匹配全部应用进程</div>
+        <label class="form-label" for="rule-apps" data-i18n="form_rule_apps">Application Filter (Semicolon-separated, wildcards supported)</label>
+        <input type="text" class="form-input mono" id="rule-apps" data-i18n-placeholder="form_rule_apps_ph" placeholder="chrome.exe; *edge*.exe; node.exe">
+        <div class="form-hint" data-i18n="form_rule_apps_hint">Leave empty to match all processes</div>
       </div>
       <div class="form-group">
-        <label class="form-label" for="rule-targets">目标地址筛选 (域名 / IP / CIDR，分号分隔)</label>
-        <input type="text" class="form-input mono" id="rule-targets" placeholder="*.github.com; 1.1.1.1/32; localhost">
-        <div class="form-hint">留空表示匹配全部目标地址</div>
+        <label class="form-label" for="rule-targets" data-i18n="form_rule_targets">Target Address Filter (Domain / IP / CIDR, semicolon-separated)</label>
+        <input type="text" class="form-input mono" id="rule-targets" data-i18n-placeholder="form_rule_targets_ph" placeholder="*.github.com; 1.1.1.1/32; localhost">
+        <div class="form-hint" data-i18n="form_rule_targets_hint">Leave empty to match all target destinations</div>
       </div>
       <div class="form-grid-2">
         <div class="form-group">
-          <label class="form-label" for="rule-ports">目标端口筛选</label>
-          <input type="text" class="form-input mono" id="rule-ports" placeholder="80; 443; 8000-8080">
+          <label class="form-label" for="rule-ports" data-i18n="form_rule_ports">Target Port Filter</label>
+          <input type="text" class="form-input mono" id="rule-ports" data-i18n-placeholder="form_rule_ports_ph" placeholder="80; 443; 8000-8080">
         </div>
         <div class="form-group">
-          <label class="form-label" for="rule-action">执行动作</label>
+          <label class="form-label" for="rule-action" data-i18n="form_rule_action">Action</label>
           <select class="form-select" id="rule-action" onchange="onRuleActionChange()">
-            <option value="Proxy" selected>Proxy (代理节点转发)</option>
-            <option value="Direct">Direct (直连放行)</option>
-            <option value="Block">Block (阻断连接)</option>
+            <option value="Proxy" selected data-i18n="opt_action_proxy">Proxy (Forward via Node)</option>
+            <option value="Direct" data-i18n="opt_action_direct">Direct (Bypass)</option>
+            <option value="Block" data-i18n="opt_action_block">Block (Drop)</option>
           </select>
         </div>
       </div>
       <div class="form-group" id="group-node-select">
-        <label class="form-label" for="rule-node-id">指定代理节点</label>
+        <label class="form-label" for="rule-node-id" data-i18n="form_rule_node">Target Proxy Node</label>
         <select class="form-select" id="rule-node-id"></select>
       </div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeModal('modal-rule')">取消</button>
-        <button class="btn btn-primary" id="btn-submit-rule" onclick="submitAddRule()">保存规则</button>
+        <button class="btn" onclick="closeModal('modal-rule')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" id="btn-submit-rule" onclick="submitAddRule()" data-i18n="btn_save_rule">Save Rule</button>
       </div>
     </div>
   </div>
 
-  <!-- 模态框：通用确认弹窗 -->
+  <!-- Section：Section Modal Confirm -->
   <div class="modal-overlay" id="modal-confirm" onclick="handleBackdropClick(event, 'modal-confirm')">
     <div class="modal-box" style="width: 400px;">
       <div class="modal-header">
-        <div class="modal-title" id="confirm-title">确认操作</div>
-        <button class="modal-close" onclick="closeModal('modal-confirm')" aria-label="关闭">&times;</button>
+        <div class="modal-title" id="confirm-title" data-i18n="modal_confirm_title">Confirm Action</div>
+        <button class="modal-close" onclick="closeModal('modal-confirm')" aria-label="Close" data-i18n-aria-label="aria_close">&times;</button>
       </div>
       <div id="confirm-message" style="color: var(--text-secondary); font-size: 13.5px; line-height: 1.6;"></div>
       <div class="modal-actions">
-        <button class="btn" onclick="closeModal('modal-confirm')">取消</button>
-        <button class="btn btn-primary" id="confirm-ok-btn">确认</button>
+        <button class="btn" onclick="closeModal('modal-confirm')" data-i18n="btn_cancel">Cancel</button>
+        <button class="btn btn-primary" id="confirm-ok-btn" data-i18n="btn_confirm">Confirm</button>
       </div>
     </div>
   </div>
-
   <script>
     const MAX_HISTORY = 60;
 
+    const I18N_DICTS = {
+      'zh-CN': {
+        app_title: 'FlowX — 进程级透明代理与网络分流控制台',
+        brand_sub: '进程级透明代理引擎',
+        nav_dashboard: '实时概览',
+        nav_connections: '活跃连接',
+        nav_proxies: '代理节点',
+        nav_rules: '分流策略',
+
+        sidebar_mixed_inbound: '混合代理入站',
+        sidebar_inbound_proto: 'SOCKS / HTTP',
+        sidebar_copy: '复制',
+        sidebar_uptime: '运行时长',
+        sidebar_config: '配置文件',
+
+        topbar_title_dashboard: '实时概览',
+        topbar_sub_dashboard: '混合协议入站 · Windows 进程四元组追踪 · Fake-IP 防泄漏',
+        topbar_title_connections: '活跃连接',
+        topbar_sub_connections: '实时追踪本地进程出站会话、规则命中与流量统计',
+        topbar_title_proxies: '代理节点',
+        topbar_sub_proxies: '管理上游 SOCKS5 / HTTP / SOCKS4a 节点与延迟测速',
+        topbar_title_rules: '分流策略',
+        topbar_sub_rules: '自顶向下规则匹配、动态启停、优先级排序与 XML 持久化',
+
+        health_online: '核心运行中',
+        health_offline: '核心离线 / 重连中',
+        theme_toggle_title: '切换浅色/深色主题',
+        lang_toggle_title: '切换语言 (Switch Language)',
+        aria_menu: '菜单',
+        aria_close: '关闭',
+        btn_refresh: '立即刷新',
+
+        kpi_down_speed: '实时下载速率',
+        kpi_total_down: '累计下行',
+        kpi_up_speed: '实时上传速率',
+        kpi_total_up: '累计上行',
+        kpi_active_conns: '活跃 TCP 会话',
+        kpi_enabled_rules: '启用规则',
+        kpi_total_traffic: '总吞吐流量',
+        kpi_fakeip_cache: 'Fake-IP 缓存',
+        kpi_items_unit: '条',
+
+        chart_title: '实时吞吐趋势（最近 60 秒）',
+        chart_sub: '每秒采样一次，真实反映活跃中继链路上下行带宽',
+        chart_down: '下行',
+        chart_up: '上行',
+        chart_peak: '峰值: {speed}',
+
+        sys_info_title: '引擎运行参数与接入点',
+        sys_info_config_file: '配置持久化文件: ',
+        btn_copy_proxy: '复制代理',
+        sys_kv_inbound: '混合代理入站',
+        sys_kv_dns: '本地 DNS / 上游',
+        sys_kv_fakeip: 'Fake-IP 保留网段',
+        sys_kv_default_action: '兜底默认策略',
+
+        preview_conns_title: '最新活跃连接',
+        preview_conns_sub: '仅展示最近 8 条会话，完整追踪请前往「活跃连接」',
+        btn_view_all: '查看全部',
+        preview_waiting: '正在等待本地代理入站流量...',
+
+        th_proc_pid: '进程 (PID)',
+        th_target: '目标主机 / 域名',
+        th_rule: '命中规则',
+        th_action: '动作',
+        th_speed: '上行 / 下行速率',
+        th_duration: '时长',
+        th_id: 'ID',
+        th_proc_path: '进程与可执行路径',
+        th_traffic: '累计流量',
+        th_actions: '操作',
+
+        conns_title: '全量活动网络连接跟踪',
+        conns_sub: '按连接 ID 倒序排列，支持按进程、目标域名或动作过滤与手动切断',
+        search_conns_ph: '过滤进程名、目标地址或规则...',
+        filter_all: '全部',
+        filter_proxy: '代理',
+        filter_direct: '直连',
+        filter_block: '阻断',
+        btn_pause_poll: '暂停刷新',
+        btn_resume_poll: '恢复刷新',
+        conns_empty: '暂无活动连接',
+        conns_empty_filtered: '暂无匹配的活动连接',
+        label_pid: 'PID',
+        value_seconds: '{n} 秒',
+        btn_kill: '断开',
+        btn_killing: '断开中',
+
+        proxies_title: '可用代理节点 (Proxy Nodes)',
+        proxies_sub: '支持 SOCKS5 / HTTP CONNECT / SOCKS4a，新增或删除会自动回写配置文件',
+        btn_ping_all: '全部测速',
+        btn_add_node: '添加节点',
+        nodes_empty: '暂无配置的代理节点，点击右上角「添加节点」创建',
+        nodes_loading: '加载节点中...',
+        node_addr_label: '地址: ',
+        node_auth_label: '认证: ',
+        node_auth_yes: '已配置账密',
+        node_auth_no: '无密码认证',
+        node_latency_untested: '未测速',
+        node_latency_testing: '测速中...',
+        node_latency_unreachable: '不可达',
+        btn_ping: '测速',
+        btn_delete: '删除',
+
+        rules_title: '分流策略规则引擎',
+        rules_sub: '支持动态启停、顺序调整（上移/下移/置顶）与引用防呆校验',
+        search_rules_ph: '搜索规则名、应用或目标...',
+        btn_add_rule: '新建规则',
+        rule_banner_desc: '匹配原则：<strong>自顶向下、首次命中生效 (First-Match Wins)</strong>。已停用的规则会被跳过，所有更改即时生效并写入 XML。',
+        rules_summary: '共 {total} 条 · 已启用 {enabled} 条',
+        rules_empty: '暂无分流规则，将全部走默认兜底策略',
+        rules_empty_filtered: '没有匹配的规则',
+        rules_loading: '加载规则中...',
+        cond_app: '应用: ',
+        cond_target: '目标: ',
+        cond_port: '端口: ',
+        cond_all: '匹配所有流量',
+        badge_disabled: '已停用',
+        title_click_disable: '点击停用',
+        title_click_enable: '点击启用',
+        btn_top: '⤒',
+        btn_top_title: '置顶',
+        btn_up: '↑',
+        btn_up_title: '上移',
+        btn_down: '↓',
+        btn_down_title: '下移',
+        default_rule_desc: 'Default（默认兜底规则） · 当上方没有任何启用的规则命中时生效',
+        action_proxy_to: 'Proxy → {name} (#{id})',
+
+        modal_add_node_title: '添加代理节点',
+        form_node_name: '节点名称',
+        form_node_name_ph: '例如: HK-Socks-01',
+        form_node_protocol: '代理协议',
+        opt_proto_socks5: 'SOCKS5 (推荐)',
+        opt_proto_http: 'HTTP CONNECT',
+        opt_proto_socks4: 'SOCKS4 / SOCKS4a',
+        form_node_addr: '服务器地址 (Host:Port)',
+        form_node_addr_ph: '127.0.0.1:10808',
+        form_node_user: '认证用户名 (可选)',
+        form_node_user_ph: '留空表示无认证',
+        form_node_pass: '认证密码 (可选)',
+        form_node_pass_ph: '留空表示无认证',
+        btn_cancel: '取消',
+        btn_save_node: '保存节点',
+
+        modal_add_rule_title: '新建分流规则',
+        form_rule_name: '规则名称',
+        form_rule_name_ph: '例如: BrowserProxy',
+        form_rule_apps: '应用程序筛选 (分号分隔，支持通配符)',
+        form_rule_apps_ph: 'chrome.exe; *edge*.exe; node.exe',
+        form_rule_apps_hint: '留空表示匹配全部应用进程',
+        form_rule_targets: '目标地址筛选 (域名 / IP / CIDR，分号分隔)',
+        form_rule_targets_ph: '*.github.com; 1.1.1.1/32; localhost',
+        form_rule_targets_hint: '留空表示匹配全部目标地址',
+        form_rule_ports: '目标端口筛选',
+        form_rule_ports_ph: '80; 443; 8000-8080',
+        form_rule_action: '执行动作',
+        opt_action_proxy: 'Proxy (代理节点转发)',
+        opt_action_direct: 'Direct (直连放行)',
+        opt_action_block: 'Block (阻断连接)',
+        form_rule_node: '指定代理节点',
+        opt_rule_no_nodes: '暂无可用代理节点，请先在「代理节点」中添加',
+        btn_save_rule: '保存规则',
+
+        modal_confirm_title: '确认操作',
+        btn_confirm: '确认',
+        confirm_delete_node_title: '删除代理节点',
+        confirm_delete_node_msg: '确定要删除代理节点 {label} 吗？若仍有分流规则引用该节点，系统将拦截删除。',
+        confirm_delete_rule_title: '删除分流规则',
+        confirm_delete_rule_msg: '确定要删除分流规则「{name}」吗？删除后将自动更新 flowx.xml。',
+
+        toast_copy_success: '已复制{label}: {text}',
+        toast_copy_fail: '复制失败，请手动复制',
+        toast_proxy_addr_label: '代理地址',
+        toast_proxy_url_label: 'HTTP 代理 URL',
+        toast_conn_killed: '已切断会话 #{id}',
+        toast_conn_kill_fail: '断开连接失败',
+        toast_req_fail: '请求失败: {error}',
+        toast_err_timeout: '请求超时',
+        toast_err_network: '网络异常，无法连接本地服务',
+        toast_err_unknown: '未知错误',
+        toast_load_nodes_fail: '加载代理节点失败',
+        toast_ping_handshake: '[{name}] TCP 握手延迟 {ms} ms',
+        toast_ping_fail: '[{name}] 测速失败: {error}',
+        toast_ping_timeout: '测速超时',
+        toast_ping_network_err: '[{name}] 测速网络异常',
+        toast_ping_all_done: '已完成 {count} 个节点的延迟探测',
+        toast_node_required: '请填写节点名称与服务器地址',
+        toast_node_saved: '节点 [{name}] 已保存并写入配置',
+        toast_node_add_fail: '添加节点失败',
+        toast_node_deleted: '已删除节点 #{id}',
+        toast_node_del_fail: '删除节点失败',
+        toast_load_rules_fail: '加载规则失败',
+        toast_rule_enabled: '已启用该规则',
+        toast_rule_disabled: '已停用该规则',
+        toast_rule_toggle_fail: '切换规则状态失败',
+        toast_rule_move_fail: '调整规则顺序失败',
+        toast_rule_name_required: '请输入规则名称',
+        toast_rule_node_required: '请先添加并选择一个可用的代理节点',
+        toast_rule_saved: '规则 [{name}] 已保存并立即生效',
+        toast_rule_add_fail: '添加规则失败',
+        toast_rule_deleted: '规则已删除',
+        toast_rule_del_fail: '删除规则失败'
+      },
+      'en-US': {
+        app_title: 'FlowX — Transparent Proxy & Process Routing Console',
+        brand_sub: 'Transparent Proxy Engine',
+        nav_dashboard: 'Overview',
+        nav_connections: 'Connections',
+        nav_proxies: 'Proxy Nodes',
+        nav_rules: 'Routing Rules',
+
+        sidebar_mixed_inbound: 'Mixed Inbound',
+        sidebar_inbound_proto: 'SOCKS / HTTP',
+        sidebar_copy: 'Copy',
+        sidebar_uptime: 'Uptime',
+        sidebar_config: 'Config Profile',
+
+        topbar_title_dashboard: 'Overview',
+        topbar_sub_dashboard: 'Mixed Inbound · Windows Process Tracking · Fake-IP DNS',
+        topbar_title_connections: 'Active Connections',
+        topbar_sub_connections: 'Real-time outbound session tracking, rule evaluation & traffic monitoring',
+        topbar_title_proxies: 'Proxy Nodes',
+        topbar_sub_proxies: 'Manage upstream SOCKS5 / HTTP / SOCKS4a nodes & latency diagnostics',
+        topbar_title_rules: 'Routing Rules',
+        topbar_sub_rules: 'Top-down evaluation, dynamic toggle, priority reordering & XML persistence',
+
+        health_online: 'Core Online',
+        health_offline: 'Core Offline / Reconnecting',
+        theme_toggle_title: 'Toggle Light/Dark Theme',
+        lang_toggle_title: 'Switch Language / 切换语言',
+        aria_menu: 'Menu',
+        aria_close: 'Close',
+        btn_refresh: 'Refresh Now',
+
+        kpi_down_speed: 'Live Download',
+        kpi_total_down: 'Total Inbound',
+        kpi_up_speed: 'Live Upload',
+        kpi_total_up: 'Total Outbound',
+        kpi_active_conns: 'Active Sessions',
+        kpi_enabled_rules: 'Active Rules',
+        kpi_total_traffic: 'Total Throughput',
+        kpi_fakeip_cache: 'Fake-IP Cache',
+        kpi_items_unit: 'entries',
+
+        chart_title: 'Throughput Trend (Last 60s)',
+        chart_sub: '1-second sampling reflecting upstream/downstream bandwidth in real-time',
+        chart_down: 'Download',
+        chart_up: 'Upload',
+        chart_peak: 'Peak: {speed}',
+
+        sys_info_title: 'Engine Parameters & Endpoints',
+        sys_info_config_file: 'Config Profile: ',
+        btn_copy_proxy: 'Copy URL',
+        sys_kv_inbound: 'Mixed Inbound',
+        sys_kv_dns: 'Local DNS / Upstream',
+        sys_kv_fakeip: 'Fake-IP Subnet',
+        sys_kv_default_action: 'Default Fallback',
+
+        preview_conns_title: 'Recent Active Connections',
+        preview_conns_sub: 'Showing latest 8 sessions, visit 「Connections」 for complete inspection',
+        btn_view_all: 'View All',
+        preview_waiting: 'Waiting for inbound proxy traffic...',
+
+        th_proc_pid: 'Process (PID)',
+        th_target: 'Target Host / Domain',
+        th_rule: 'Matched Rule',
+        th_action: 'Action',
+        th_speed: 'Upload / Download Rate',
+        th_duration: 'Duration',
+        th_id: 'ID',
+        th_proc_path: 'Executable Path',
+        th_traffic: 'Total Traffic',
+        th_actions: 'Actions',
+
+        conns_title: 'All Active Connection Tracker',
+        conns_sub: 'Sorted by Connection ID desc, supports filtering by process, destination or action',
+        search_conns_ph: 'Filter by process, target address, or rule...',
+        filter_all: 'All',
+        filter_proxy: 'Proxy',
+        filter_direct: 'Direct',
+        filter_block: 'Block',
+        btn_pause_poll: 'Pause Refresh',
+        btn_resume_poll: 'Resume Refresh',
+        conns_empty: 'No active connections',
+        conns_empty_filtered: 'No matching active connections',
+        btn_kill: 'Kill',
+        btn_killing: 'Killing...',
+        label_pid: 'PID',
+        value_seconds: '{n}s',
+
+        proxies_title: 'Available Proxy Nodes',
+        proxies_sub: 'Supports SOCKS5 / HTTP CONNECT / SOCKS4a, mutations persist to config file',
+        btn_ping_all: 'Ping All',
+        btn_add_node: 'Add Node',
+        nodes_empty: 'No proxy nodes configured. Click 「Add Node」 to create one',
+        nodes_loading: 'Loading proxy nodes...',
+        node_addr_label: 'Address: ',
+        node_auth_label: 'Auth: ',
+        node_auth_yes: 'Credentials configured',
+        node_auth_no: 'No authentication',
+        node_latency_untested: 'Untested',
+        node_latency_testing: 'Testing...',
+        node_latency_unreachable: 'Unreachable',
+        btn_ping: 'Ping',
+        btn_delete: 'Delete',
+
+        rules_title: 'Routing Rule Engine',
+        rules_sub: 'Supports dynamic toggling, priority ordering (up/down/top) & constraint validation',
+        search_rules_ph: 'Search rule name, app, or target...',
+        btn_add_rule: 'New Rule',
+        rule_banner_desc: 'Matching Principle: <strong>Top-down, First-Match Wins</strong>. Disabled rules are skipped; changes apply immediately and persist to XML.',
+        rules_summary: '{total} rules total · {enabled} enabled',
+        rules_empty: 'No routing rules configured. All traffic falls back to default action',
+        rules_empty_filtered: 'No matching rules',
+        rules_loading: 'Loading rules...',
+        cond_app: 'App: ',
+        cond_target: 'Target: ',
+        cond_port: 'Port: ',
+        cond_all: 'Match all traffic',
+        badge_disabled: 'Disabled',
+        title_click_disable: 'Click to disable',
+        title_click_enable: 'Click to enable',
+        btn_top: '⤒',
+        btn_top_title: 'Move to Top',
+        btn_up: '↑',
+        btn_up_title: 'Move Up',
+        btn_down: '↓',
+        btn_down_title: 'Move Down',
+        default_rule_desc: 'Default (Fallback Action) · Applied when no enabled rule above matches',
+        action_proxy_to: 'Proxy → {name} (#{id})',
+
+        modal_add_node_title: 'Add Proxy Node',
+        form_node_name: 'Node Name',
+        form_node_name_ph: 'e.g. HK-Socks-01',
+        form_node_protocol: 'Proxy Protocol',
+        opt_proto_socks5: 'SOCKS5 (Recommended)',
+        opt_proto_http: 'HTTP CONNECT',
+        opt_proto_socks4: 'SOCKS4 / SOCKS4a',
+        form_node_addr: 'Server Address (Host:Port)',
+        form_node_addr_ph: '127.0.0.1:10808',
+        form_node_user: 'Auth Username (Optional)',
+        form_node_user_ph: 'Leave empty for no authentication',
+        form_node_pass: 'Auth Password (Optional)',
+        form_node_pass_ph: 'Leave empty for no authentication',
+        btn_cancel: 'Cancel',
+        btn_save_node: 'Save Node',
+
+        modal_add_rule_title: 'Create Routing Rule',
+        form_rule_name: 'Rule Name',
+        form_rule_name_ph: 'e.g. BrowserProxy',
+        form_rule_apps: 'Application Filter (Semicolon-separated, wildcards supported)',
+        form_rule_apps_ph: 'chrome.exe; *edge*.exe; node.exe',
+        form_rule_apps_hint: 'Leave empty to match all processes',
+        form_rule_targets: 'Target Address Filter (Domain / IP / CIDR, semicolon-separated)',
+        form_rule_targets_ph: '*.github.com; 1.1.1.1/32; localhost',
+        form_rule_targets_hint: 'Leave empty to match all target destinations',
+        form_rule_ports: 'Target Port Filter',
+        form_rule_ports_ph: '80; 443; 8000-8080',
+        form_rule_action: 'Action',
+        opt_action_proxy: 'Proxy (Forward via Node)',
+        opt_action_direct: 'Direct (Bypass)',
+        opt_action_block: 'Block (Drop)',
+        form_rule_node: 'Target Proxy Node',
+        opt_rule_no_nodes: 'No proxy nodes available, please add one in 「Proxy Nodes」 first',
+        btn_save_rule: 'Save Rule',
+
+        modal_confirm_title: 'Confirm Action',
+        btn_confirm: 'Confirm',
+        confirm_delete_node_title: 'Delete Proxy Node',
+        confirm_delete_node_msg: 'Are you sure you want to delete proxy node {label}? If active routing rules reference this node, deletion will be blocked.',
+        confirm_delete_rule_title: 'Delete Routing Rule',
+        confirm_delete_rule_msg: 'Are you sure you want to delete routing rule "{name}"? flowx.xml will be updated automatically.',
+
+        toast_copy_success: 'Copied {label}: {text}',
+        toast_copy_fail: 'Failed to copy, please copy manually',
+        toast_proxy_addr_label: 'Proxy Address',
+        toast_proxy_url_label: 'HTTP Proxy URL',
+        toast_conn_killed: 'Terminated session #{id}',
+        toast_conn_kill_fail: 'Failed to disconnect session',
+        toast_req_fail: 'Request failed: {error}',
+        toast_err_timeout: 'Request timed out',
+        toast_err_network: 'Network error, unable to reach local service',
+        toast_err_unknown: 'Unknown error',
+        toast_load_nodes_fail: 'Failed to load proxy nodes',
+        toast_ping_handshake: '[{name}] TCP handshake latency: {ms} ms',
+        toast_ping_fail: '[{name}] Ping failed: {error}',
+        toast_ping_timeout: 'Ping timed out',
+        toast_ping_network_err: '[{name}] Ping network error',
+        toast_ping_all_done: 'Completed latency probes for {count} nodes',
+        toast_node_required: 'Please provide both node name and server address',
+        toast_node_saved: 'Node [{name}] saved and written to configuration',
+        toast_node_add_fail: 'Failed to add node',
+        toast_node_deleted: 'Deleted node #{id}',
+        toast_node_del_fail: 'Failed to delete node',
+        toast_load_rules_fail: 'Failed to load rules',
+        toast_rule_enabled: 'Rule enabled',
+        toast_rule_disabled: 'Rule disabled',
+        toast_rule_toggle_fail: 'Failed to toggle rule state',
+        toast_rule_move_fail: 'Failed to adjust rule priority',
+        toast_rule_name_required: 'Rule name is required',
+        toast_rule_node_required: 'Please select an available proxy node first',
+        toast_rule_saved: 'Rule [{name}] saved and applied',
+        toast_rule_add_fail: 'Failed to add rule',
+        toast_rule_deleted: 'Rule deleted',
+        toast_rule_del_fail: 'Failed to delete rule'
+      }
+    };
+
     const state = {
+      lang: 'en-US',
       activeTab: 'dashboard',
       nodes: [],
       rules: [],
       connections: [],
       system: {},
-      latencies: {}, // { [nodeId]: { status: 'ok'|'warn'|'err'|'testing', text: string } }
+      latencies: {},
       connFilter: 'ALL',
       paused: false,
       failStreak: 0,
@@ -1574,14 +1986,111 @@
       historyUp: new Array(MAX_HISTORY).fill(0)
     };
 
-    const TAB_META = {
-      dashboard: { title: '实时概览', sub: '混合协议入站 · Windows 进程四元组追踪 · Fake-IP 防泄漏' },
-      connections: { title: '活跃连接', sub: '实时追踪本地进程出站会话、规则命中与流量统计' },
-      proxies: { title: '代理节点', sub: '管理上游 SOCKS5 / HTTP / SOCKS4a 节点与延迟测速' },
-      rules: { title: '分流策略', sub: '自顶向下规则匹配、动态启停、优先级排序与 XML 持久化' }
-    };
+    function getLocale() {
+      const saved = localStorage.getItem('flowx_lang');
+      if (saved === 'zh-CN' || saved === 'en-US') return saved;
+      const navLang = (navigator.language || '').toLowerCase();
+      return navLang.startsWith('zh') ? 'zh-CN' : 'en-US';
+    }
 
-    // 主题初始化
+    function t(key, params = {}) {
+      const locale = state.lang || getLocale();
+      const dict = I18N_DICTS[locale] || I18N_DICTS['en-US'];
+      let text = dict[key] || (I18N_DICTS['en-US'] && I18N_DICTS['en-US'][key]) || key;
+      for (const [k, v] of Object.entries(params)) {
+        text = text.replaceAll(`{${k}}`, String(v));
+      }
+      return text;
+    }
+
+    // 将浏览器网络异常映射为本地化文案，避免中文界面里出现 "Failed to fetch" 等英文
+    function netErrText(e) {
+      if (e && e.name === 'AbortError') return t('toast_err_timeout');
+      if (e instanceof TypeError || (e && e.name === 'TypeError')) return t('toast_err_network');
+      const msg = e && e.message ? String(e.message) : '';
+      return msg || t('toast_err_unknown');
+    }
+
+    // 节点测速结果只保存结构化状态，展示文案在渲染时按当前语言生成
+    function latencyText(lat) {
+      if (!lat) return t('node_latency_untested');
+      if (lat.status === 'testing') return t('node_latency_testing');
+      if (lat.status === 'err') return lat.error || t('node_latency_unreachable');
+      return `${lat.ms} ms`;
+    }
+
+    function updateTabMeta() {
+      const tabId = state.activeTab || 'dashboard';
+      const titleKey = `topbar_title_${tabId}`;
+      const subKey = `topbar_sub_${tabId}`;
+      const titleEl = document.getElementById('view-title');
+      const subEl = document.getElementById('view-subtitle');
+      if (titleEl) titleEl.textContent = t(titleKey);
+      if (subEl) subEl.textContent = t(subKey);
+      document.title = t('app_title');
+    }
+
+    function applyLanguage(lang) {
+      state.lang = lang;
+      document.documentElement.lang = lang;
+      localStorage.setItem('flowx_lang', lang);
+
+      const langLabel = document.getElementById('lang-label');
+      if (langLabel) langLabel.textContent = lang === 'zh-CN' ? 'EN' : 'ZH';
+
+      document.querySelectorAll('[data-i18n]').forEach(el => {
+        const key = el.getAttribute('data-i18n');
+        const txt = t(key);
+        if (txt) el.textContent = txt;
+      });
+
+      // 允许个别文案携带排版标记（如 <strong>），仅用于内置字典，不接受用户输入
+      document.querySelectorAll('[data-i18n-html]').forEach(el => {
+        const key = el.getAttribute('data-i18n-html');
+        const html = t(key);
+        if (html) el.innerHTML = html;
+      });
+
+      document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
+        const key = el.getAttribute('data-i18n-placeholder');
+        const txt = t(key);
+        if (txt) el.placeholder = txt;
+      });
+
+      document.querySelectorAll('[data-i18n-title]').forEach(el => {
+        const key = el.getAttribute('data-i18n-title');
+        const txt = t(key);
+        if (txt) el.title = txt;
+      });
+
+      document.querySelectorAll('[data-i18n-aria-label]').forEach(el => {
+        const key = el.getAttribute('data-i18n-aria-label');
+        const txt = t(key);
+        if (txt) el.setAttribute('aria-label', txt);
+      });
+
+      updateTabMeta();
+      renderSystemInfo();
+      renderConnections();
+      renderNodes();
+      renderRules();
+      // 规则动作描述、节点测速错误等文案由后端按请求语言生成，切换语言后需重新拉取
+      if (state.system && state.system.inbound_addr) {
+        loadNodes();
+        loadRules();
+      }
+      const pauseBtn = document.getElementById('pause-poll-btn');
+      if (pauseBtn) {
+        pauseBtn.textContent = state.paused ? t('btn_resume_poll') : t('btn_pause_poll');
+      }
+    }
+
+    function toggleLanguage() {
+      const cur = state.lang || getLocale();
+      const next = cur === 'zh-CN' ? 'en-US' : 'zh-CN';
+      applyLanguage(next);
+    }
+
     function initTheme() {
       const saved = localStorage.getItem('flowx_theme');
       const theme = (saved === 'light' || saved === 'dark') ? saved : 'dark';
@@ -1609,9 +2118,7 @@
       const panelEl = document.getElementById('tab-' + tabId);
       if (panelEl) panelEl.classList.add('active');
 
-      const meta = TAB_META[tabId] || TAB_META.dashboard;
-      document.getElementById('view-title').textContent = meta.title;
-      document.getElementById('view-subtitle').textContent = meta.sub;
+      updateTabMeta();
       document.getElementById('sidebar').classList.remove('open');
 
       if (tabId === 'proxies') loadNodes();
@@ -1674,10 +2181,18 @@
           document.execCommand('copy');
           ta.remove();
         }
-        showToast(`已复制${label}: ${text}`, 'info');
+        showToast(t('toast_copy_success', { label, text }), 'info');
       } catch (e) {
-        showToast('复制失败，请手动复制', 'error');
+        showToast(t('toast_copy_fail'), 'error');
       }
+    }
+
+    function copyProxyAddr() {
+      copyText(state.system.inbound_addr || '127.0.0.1:40001', t('toast_proxy_addr_label'));
+    }
+
+    function copyProxyUrl() {
+      copyText('http://' + (state.system.inbound_addr || '127.0.0.1:40001'), t('toast_proxy_url_label'));
     }
 
     function setHealthStatus(online) {
@@ -1685,22 +2200,27 @@
       const txt = document.getElementById('engine-health-text');
       if (online) {
         pill.classList.remove('offline');
-        txt.textContent = '核心运行中';
+        txt.textContent = t('health_online');
       } else {
         pill.classList.add('offline');
-        txt.textContent = '核心离线 / 重连中';
+        txt.textContent = t('health_offline');
       }
     }
 
-    // 实时数据轮询（非重入设计，配合超时中止防止网络卡顿/休眠唤醒期间请求堆积）
     async function fetchWithTimeout(url, options = {}, timeoutMs = 4000) {
+      const opts = { ...options };
+      opts.headers = { ...(opts.headers || {}) };
+      if (!opts.headers['Accept-Language']) {
+        opts.headers['Accept-Language'] = state.lang || getLocale();
+      }
+
       if (typeof AbortController === 'undefined') {
-        return fetch(url, options);
+        return fetch(url, opts);
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        return await fetch(url, { ...options, signal: controller.signal });
+        return await fetch(url, { ...opts, signal: controller.signal });
       } finally {
         clearTimeout(timer);
       }
@@ -1727,7 +2247,6 @@
         const conns = await connsRes.json();
         state.connections = Array.isArray(conns) ? conns : [];
 
-        // 清理已从活跃表中注销的连接忙碌标记
         const liveIds = new Set(state.connections.map(c => c.id));
         for (const k of Object.keys(state.busyConnIds)) {
           if (!liveIds.has(Number(k))) delete state.busyConnIds[k];
@@ -1790,11 +2309,11 @@
       document.getElementById('info-config-path').textContent = s.config_path || 'flowx.xml';
       document.getElementById('info-inbound').textContent = s.inbound_addr;
       document.getElementById('info-dns').textContent = `${s.dns_addr} → ${s.upstream_dns}`;
-      document.getElementById('info-fakeip').textContent = `${s.fake_ip_cidr} (${s.fake_ip_count || 0} 条)`;
-      document.getElementById('info-default-action').textContent = s.default_action || 'Direct (直连)';
+      document.getElementById('info-fakeip').textContent = `${s.fake_ip_cidr} (${s.fake_ip_count || 0} ${t('kpi_items_unit')})`;
+      document.getElementById('info-default-action').textContent = s.default_action || t('filter_direct');
       document.getElementById('val-fakeip-count').textContent = s.fake_ip_count || 0;
       document.getElementById('val-enabled-rules').textContent = `${s.enabled_rules_count || 0} / ${s.rules_count || 0}`;
-      document.getElementById('rules-default-badge').textContent = s.default_action || 'Direct (直连)';
+      document.getElementById('rules-default-badge').textContent = s.default_action || t('filter_direct');
       document.getElementById('nav-count-nodes').textContent = s.nodes_count ?? state.nodes.length;
       document.getElementById('nav-count-rules').textContent = s.rules_count ?? state.rules.length;
 
@@ -1814,7 +2333,7 @@
       const plotH = h - padTop - padBottom;
 
       const maxVal = Math.max(1024, ...state.historyDown, ...state.historyUp);
-      document.getElementById('chart-peak-label').textContent = '峰值: ' + formatSpeed(maxVal);
+      document.getElementById('chart-peak-label').textContent = t('chart_peak', { speed: formatSpeed(maxVal) });
 
       const gridLines = [0.25, 0.5, 0.75].map(r => {
         const y = (padTop + plotH * r).toFixed(1);
@@ -1858,9 +2377,11 @@
     }
 
     function actionBadgeClass(action) {
-      if (!action) return 'badge-muted';
-      if (action.includes('Proxy') || action.includes('Chain')) return 'badge-proxy';
-      if (action.includes('Block')) return 'badge-block';
+      // 优先使用机器可读的 action_type（如 "Proxy"），回退时从本地化文案中提取英文前缀
+      const type = String(action || '').split(/[ (（]/)[0];
+      if (!type) return 'badge-muted';
+      if (type === 'Proxy' || type === 'Chain') return 'badge-proxy';
+      if (type === 'Block') return 'badge-block';
       return 'badge-direct';
     }
 
@@ -1874,7 +2395,7 @@
     function togglePausePolling() {
       state.paused = !state.paused;
       const btn = document.getElementById('pause-poll-btn');
-      btn.textContent = state.paused ? '恢复刷新' : '暂停刷新';
+      btn.textContent = state.paused ? t('btn_resume_poll') : t('btn_pause_poll');
       btn.classList.toggle('btn-primary', state.paused);
       if (!state.paused) {
         pollRealtime().then(schedulePoll);
@@ -1887,7 +2408,7 @@
       const fullEl = document.getElementById('connections-tbody-full');
 
       if (conns.length === 0) {
-        previewEl.innerHTML = '<tr><td colspan="6" class="empty-state">正在等待本地代理入站流量...</td></tr>';
+        previewEl.innerHTML = `<tr><td colspan="6" class="empty-state">${escapeHtml(t('preview_waiting'))}</td></tr>`;
       } else {
         previewEl.innerHTML = conns.slice(0, 8).map(c => `
           <tr>
@@ -1898,18 +2419,19 @@
             </td>
             <td class="mono">${escapeHtml(c.target)}</td>
             <td>${escapeHtml(c.rule_name)}</td>
-            <td><span class="badge ${actionBadgeClass(c.action)}">${escapeHtml(c.action)}</span></td>
+            <td><span class="badge ${actionBadgeClass(c.action_type || c.action)}">${escapeHtml(c.action)}</span></td>
             <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)} / ↓${formatSpeed(c.download_bytes_per_sec)}</td>
-            <td class="mono">${c.duration_secs}s</td>
+            <td class="mono">${escapeHtml(t('value_seconds', { n: c.duration_secs }))}</td>
           </tr>
         `).join('');
       }
 
       const keyword = (document.getElementById('conn-search').value || '').trim().toLowerCase();
       const filtered = conns.filter(c => {
-        if (state.connFilter === 'PROXY' && !c.action.includes('Proxy') && !c.action.includes('Chain')) return false;
-        if (state.connFilter === 'DIRECT' && !c.action.includes('Direct')) return false;
-        if (state.connFilter === 'BLOCK' && !c.action.includes('Block')) return false;
+        const act = c.action_type || c.action || '';
+        if (state.connFilter === 'PROXY' && !act.includes('Proxy') && !act.includes('Chain')) return false;
+        if (state.connFilter === 'DIRECT' && !act.includes('Direct')) return false;
+        if (state.connFilter === 'BLOCK' && !act.includes('Block')) return false;
         if (keyword) {
           const hay = `${c.process_name} ${c.process_path} ${c.target} ${c.rule_name} ${c.action}`.toLowerCase();
           if (!hay.includes(keyword)) return false;
@@ -1918,7 +2440,8 @@
       });
 
       if (filtered.length === 0) {
-        fullEl.innerHTML = '<tr><td colspan="9" class="empty-state">暂无匹配的活动连接</td></tr>';
+        const msg = conns.length === 0 ? t('conns_empty') : t('conns_empty_filtered');
+        fullEl.innerHTML = `<tr><td colspan="9" class="empty-state">${escapeHtml(msg)}</td></tr>`;
         return;
       }
 
@@ -1929,17 +2452,17 @@
           <td class="mono" style="color:var(--text-muted);">#${c.id}</td>
           <td>
             <div class="proc-cell">
-              <span class="proc-name">${escapeHtml(c.process_name)} <span class="mono" style="color:var(--text-muted); font-size:11px;">PID ${c.pid}</span></span>
+              <span class="proc-name">${escapeHtml(c.process_name)} <span class="mono" style="color:var(--text-muted); font-size:11px;">${escapeHtml(t('label_pid'))} ${c.pid}</span></span>
               <span class="proc-path mono" title="${escapeHtml(c.process_path)}">${escapeHtml(c.process_path)}</span>
             </div>
           </td>
           <td class="mono">${escapeHtml(c.target)}</td>
           <td>${escapeHtml(c.rule_name)}</td>
-          <td><span class="badge ${actionBadgeClass(c.action)}">${escapeHtml(c.action)}</span></td>
+          <td><span class="badge ${actionBadgeClass(c.action_type || c.action)}">${escapeHtml(c.action)}</span></td>
           <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)}<br>↓${formatSpeed(c.download_bytes_per_sec)}</td>
           <td class="mono" style="font-size:12px;">↑${formatBytes(c.uploaded_bytes)}<br>↓${formatBytes(c.downloaded_bytes)}</td>
-          <td class="mono">${c.duration_secs}s</td>
-          <td><button class="btn btn-sm btn-danger-ghost" onclick="killConnection(${c.id})" ${killing ? 'disabled' : ''}>${killing ? '断开中' : '断开'}</button></td>
+          <td class="mono">${escapeHtml(t('value_seconds', { n: c.duration_secs }))}</td>
+          <td><button class="btn btn-sm btn-danger-ghost" onclick="killConnection(${c.id})" ${killing ? 'disabled' : ''}>${killing ? escapeHtml(t('btn_killing')) : escapeHtml(t('btn_kill'))}</button></td>
         </tr>
       `;
       }).join('');
@@ -1950,32 +2473,36 @@
       state.busyConnIds[id] = true;
       renderConnections();
       try {
-        const res = await fetch(`/api/connections/kill?id=${id}`, { method: 'POST' });
+        const res = await fetchWithTimeout(`/api/connections/kill?id=${id}`, { method: 'POST' });
+        const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          showToast(`已切断会话 #${id}`, 'info');
+          showToast(t('toast_conn_killed', { id }), 'info');
           await pollRealtime();
         } else {
-          showToast('断开连接失败', 'error');
+          showToast(data.error || t('toast_conn_kill_fail'), 'error');
         }
       } catch (e) {
-        showToast('请求失败: ' + e.message, 'error');
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
         delete state.busyConnIds[id];
         renderConnections();
       }
     }
 
-    // 节点管理
+    // Section Nodes
     async function loadNodes() {
       try {
-        const res = await fetch('/api/nodes');
-        if (res.ok) {
-          state.nodes = await res.json();
+        const res = await fetchWithTimeout('/api/nodes');
+        const data = await res.json().catch(() => null);
+        if (res.ok && Array.isArray(data)) {
+          state.nodes = data;
           document.getElementById('nav-count-nodes').textContent = state.nodes.length;
           renderNodes();
+        } else if (!res.ok) {
+          showToast((data && data.error) || t('toast_load_nodes_fail'), 'error');
         }
       } catch (e) {
-        showToast('加载代理节点失败', 'error');
+        showToast(t('toast_load_nodes_fail'), 'error');
       }
     }
 
@@ -1988,14 +2515,14 @@
     function renderNodes() {
       const container = document.getElementById('nodes-container');
       if (!state.nodes || state.nodes.length === 0) {
-        container.innerHTML = '<div class="empty-state" style="grid-column: 1/-1;">暂无配置的代理节点，点击右上角「添加节点」创建</div>';
+        container.innerHTML = `<div class="empty-state" style="grid-column: 1/-1;">${escapeHtml(t('nodes_empty'))}</div>`;
         return;
       }
 
       container.innerHTML = state.nodes.map(n => {
         const lat = state.latencies[n.id];
         const latClass = lat ? lat.status : '';
-        const latText = lat ? lat.text : '未测速';
+        const latText = latencyText(lat);
         const testing = lat && lat.status === 'testing';
         return `
           <div class="node-card" id="node-card-${n.id}">
@@ -2008,15 +2535,15 @@
                 <span class="badge ${protocolBadgeClass(n.protocol)}">${escapeHtml(n.protocol)}</span>
               </div>
               <div class="node-meta" style="margin-top: 12px;">
-                <div>地址: <span class="mono" style="color:var(--text-primary);">${escapeHtml(n.server_addr)}</span></div>
-                <div>认证: ${n.auth_configured ? '已配置账密' : '无密码认证'}</div>
+                <div>${escapeHtml(t('node_addr_label'))}<span class="mono" style="color:var(--text-primary);">${escapeHtml(n.server_addr)}</span></div>
+                <div>${escapeHtml(t('node_auth_label'))}${n.auth_configured ? escapeHtml(t('node_auth_yes')) : escapeHtml(t('node_auth_no'))}</div>
               </div>
             </div>
             <div class="node-bottom">
               <span class="latency-pill ${latClass} mono" id="latency-${n.id}">● ${escapeHtml(latText)}</span>
               <div style="display:flex; gap:6px;">
-                <button class="btn btn-sm" onclick="pingNode(${n.id})" ${testing ? 'disabled' : ''}>${testing ? '测速中' : '测速'}</button>
-                <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteNode(${n.id})">删除</button>
+                <button class="btn btn-sm" onclick="pingNode(${n.id})" ${testing ? 'disabled' : ''}>${testing ? escapeHtml(t('node_latency_testing')) : escapeHtml(t('btn_ping'))}</button>
+                <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteNode(${n.id})">${escapeHtml(t('btn_delete'))}</button>
               </div>
             </div>
           </div>
@@ -2027,11 +2554,11 @@
     async function pingNode(id, silent = false) {
       const node = state.nodes.find(n => n.id === id);
       if (!node) return;
-      state.latencies[id] = { status: 'testing', text: '测速中...' };
+      state.latencies[id] = { status: 'testing' };
       renderNodes();
 
       try {
-        const res = await fetch('/api/nodes/ping', {
+        const res = await fetchWithTimeout('/api/nodes/ping', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id })
@@ -2039,15 +2566,16 @@
         const data = await res.json();
         if (res.ok && data.ok) {
           const ms = data.latency_ms;
-          state.latencies[id] = { status: ms < 150 ? 'ok' : 'warn', text: `${ms} ms` };
-          if (!silent) showToast(`[${node.name}] TCP 握手延迟 ${ms} ms`);
+          state.latencies[id] = { status: ms < 150 ? 'ok' : 'warn', ms };
+          if (!silent) showToast(t('toast_ping_handshake', { name: node.name, ms }));
         } else {
-          state.latencies[id] = { status: 'err', text: data.message || data.error || '不可达' };
-          if (!silent) showToast(`[${node.name}] 测速失败: ${data.message || data.error}`, 'error');
+          const errText = data.message || data.error || t('node_latency_unreachable');
+          state.latencies[id] = { status: 'err', error: errText };
+          if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: errText }), 'error');
         }
       } catch (e) {
-        state.latencies[id] = { status: 'err', text: '测速超时' };
-        if (!silent) showToast(`[${node.name}] 测速网络异常`, 'error');
+        state.latencies[id] = { status: 'err', error: t('toast_ping_timeout') };
+        if (!silent) showToast(t('toast_ping_network_err', { name: node.name }), 'error');
       } finally {
         renderNodes();
       }
@@ -2059,7 +2587,7 @@
       btn.disabled = true;
       try {
         await Promise.all(state.nodes.map(n => pingNode(n.id, true)));
-        showToast(`已完成 ${state.nodes.length} 个节点的延迟探测`, 'info');
+        showToast(t('toast_ping_all_done', { count: state.nodes.length }), 'info');
       } finally {
         btn.disabled = false;
       }
@@ -2083,14 +2611,14 @@
       const pass = document.getElementById('node-pass').value;
 
       if (!name || !addr) {
-        showToast('请填写节点名称与服务器地址', 'error');
+        showToast(t('toast_node_required'), 'error');
         return;
       }
 
       const btn = document.getElementById('btn-submit-node');
       btn.disabled = true;
       try {
-        const res = await fetch('/api/nodes', {
+        const res = await fetchWithTimeout('/api/nodes', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2103,14 +2631,14 @@
         });
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          showToast(`节点 [${name}] 已保存并写入配置`);
+          showToast(t('toast_node_saved', { name }));
           closeModal('modal-node');
           await loadNodes();
         } else {
-          showToast(data.error || '添加节点失败', 'error');
+          showToast(data.error || t('toast_node_add_fail'), 'error');
         }
       } catch (e) {
-        showToast('网络请求异常: ' + e.message, 'error');
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
         btn.disabled = false;
       }
@@ -2120,44 +2648,47 @@
       const node = state.nodes.find(n => n.id === id);
       const label = node ? `#${id} (${node.name})` : `#${id}`;
       openConfirmModal(
-        '删除代理节点',
-        `确定要删除代理节点 ${label} 吗？若仍有分流规则引用该节点，系统将拦截删除。`,
+        t('confirm_delete_node_title'),
+        t('confirm_delete_node_msg', { label }),
         async () => {
           try {
-            const res = await fetch(`/api/nodes?id=${id}`, { method: 'DELETE' });
+            const res = await fetchWithTimeout(`/api/nodes?id=${id}`, { method: 'DELETE' });
             const data = await res.json().catch(() => ({}));
             if (res.ok) {
               delete state.latencies[id];
-              showToast(`已删除节点 #${id}`);
+              showToast(t('toast_node_deleted', { id }));
               await loadNodes();
             } else {
-              showToast(data.error || '删除节点失败', 'error');
+              showToast(data.error || t('toast_node_del_fail'), 'error');
             }
           } catch (e) {
-            showToast('请求失败: ' + e.message, 'error');
+            showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
           }
         }
       );
     }
 
-    // 规则管理
+    // Section Rules
     async function loadRules() {
       try {
-        const res = await fetch('/api/rules');
-        if (res.ok) {
-          state.rules = await res.json();
+        const res = await fetchWithTimeout('/api/rules');
+        const data = await res.json().catch(() => null);
+        if (res.ok && Array.isArray(data)) {
+          state.rules = data;
           document.getElementById('nav-count-rules').textContent = state.rules.length;
           renderRules();
+        } else if (!res.ok) {
+          showToast((data && data.error) || t('toast_load_rules_fail'), 'error');
         }
       } catch (e) {
-        showToast('加载规则失败', 'error');
+        showToast(t('toast_load_rules_fail'), 'error');
       }
     }
 
     function formatRuleActionLabel(r) {
       if (r.action_type === 'Proxy' && r.node_id) {
         const node = state.nodes.find(n => n.id === r.node_id);
-        return node ? `Proxy → ${node.name} (#${node.id})` : r.action;
+        if (node) return t('action_proxy_to', { name: node.name, id: node.id });
       }
       return r.action;
     }
@@ -2167,7 +2698,7 @@
       const keyword = (document.getElementById('rule-search').value || '').trim().toLowerCase();
       const total = state.rules.length;
       const enabledCount = state.rules.filter(r => r.enabled).length;
-      document.getElementById('rules-summary').textContent = `共 ${total} 条 · 已启用 ${enabledCount} 条`;
+      document.getElementById('rules-summary').textContent = t('rules_summary', { total, enabled: enabledCount });
 
       const filtered = state.rules
         .map((r, idx) => ({ r, idx }))
@@ -2178,16 +2709,16 @@
         });
 
       if (filtered.length === 0) {
-        container.innerHTML = `<div class="empty-state">${total === 0 ? '暂无分流规则，将全部走默认兜底策略' : '没有匹配的规则'}</div>`;
+        container.innerHTML = `<div class="empty-state">${total === 0 ? escapeHtml(t('rules_empty')) : escapeHtml(t('rules_empty_filtered'))}</div>`;
         return;
       }
 
       container.innerHTML = filtered.map(({ r, idx }) => {
         const conds = [];
-        if (r.apps) conds.push(`<span class="cond-chip" title="${escapeHtml(r.apps)}">应用: <span class="mono">${escapeHtml(r.apps)}</span></span>`);
-        if (r.targets) conds.push(`<span class="cond-chip" title="${escapeHtml(r.targets)}">目标: <span class="mono">${escapeHtml(r.targets)}</span></span>`);
-        if (r.ports) conds.push(`<span class="cond-chip" title="${escapeHtml(r.ports)}">端口: <span class="mono">${escapeHtml(r.ports)}</span></span>`);
-        if (conds.length === 0) conds.push('<span class="cond-chip">匹配所有流量</span>');
+        if (r.apps) conds.push(`<span class="cond-chip" title="${escapeHtml(r.apps)}">${escapeHtml(t('cond_app'))}<span class="mono">${escapeHtml(r.apps)}</span></span>`);
+        if (r.targets) conds.push(`<span class="cond-chip" title="${escapeHtml(r.targets)}">${escapeHtml(t('cond_target'))}<span class="mono">${escapeHtml(r.targets)}</span></span>`);
+        if (r.ports) conds.push(`<span class="cond-chip" title="${escapeHtml(r.ports)}">${escapeHtml(t('cond_port'))}<span class="mono">${escapeHtml(r.ports)}</span></span>`);
+        if (conds.length === 0) conds.push(`<span class="cond-chip">${escapeHtml(t('cond_all'))}</span>`);
 
         const isFirst = idx === 0;
         const isLast = idx === total - 1;
@@ -2202,21 +2733,21 @@
               <div class="rule-info">
                 <div class="rule-name">
                   <span>${escapeHtml(r.name)}</span>
-                  ${r.enabled ? '' : '<span class="badge badge-muted">已停用</span>'}
+                  ${r.enabled ? '' : `<span class="badge badge-muted">${escapeHtml(t('badge_disabled'))}</span>`}
                 </div>
                 <div class="rule-conds">${conds.join('')}</div>
               </div>
             </div>
             <div class="rule-row-right">
-              <span class="badge ${actionBadgeClass(r.action)}">${escapeHtml(formatRuleActionLabel(r))}</span>
-              <label class="switch" title="${r.enabled ? '点击停用' : '点击启用'}">
+              <span class="badge ${actionBadgeClass(r.action_type || r.action)}">${escapeHtml(formatRuleActionLabel(r))}</span>
+              <label class="switch" title="${r.enabled ? escapeHtml(t('title_click_disable')) : escapeHtml(t('title_click_enable'))}">
                 <input type="checkbox" ${r.enabled ? 'checked' : ''} ${disableRowOps ? 'disabled' : ''} onchange="toggleRule(${r.id}, this.checked)">
                 <span class="slider"></span>
               </label>
-              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'top')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="置顶">⤒</button>
-              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'up')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="上移">↑</button>
-              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'down')" ${(isLast || disableReorder) ? 'disabled' : ''} title="下移">↓</button>
-              <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteRule(${r.id})" ${disableRowOps ? 'disabled' : ''}>删除</button>
+              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'top')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="${escapeHtml(t('btn_top_title'))}">${t('btn_top')}</button>
+              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'up')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="${escapeHtml(t('btn_up_title'))}">${t('btn_up')}</button>
+              <button class="btn btn-sm" onclick="moveRule(${r.id}, 'down')" ${(isLast || disableReorder) ? 'disabled' : ''} title="${escapeHtml(t('btn_down_title'))}">${t('btn_down')}</button>
+              <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteRule(${r.id})" ${disableRowOps ? 'disabled' : ''}>${escapeHtml(t('btn_delete'))}</button>
             </div>
           </div>
         `;
@@ -2228,19 +2759,19 @@
       state.busyRuleIds[id] = true;
       renderRules();
       try {
-        const res = await fetch('/api/rules/toggle', {
+        const res = await fetchWithTimeout('/api/rules/toggle', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id, enabled })
         });
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          showToast(data.enabled ? '已启用该规则' : '已停用该规则', 'info');
+          showToast(data.enabled ? t('toast_rule_enabled') : t('toast_rule_disabled'), 'info');
         } else {
-          showToast(data.error || '切换规则状态失败', 'error');
+          showToast(data.error || t('toast_rule_toggle_fail'), 'error');
         }
       } catch (e) {
-        showToast('请求失败: ' + e.message, 'error');
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
         delete state.busyRuleIds[id];
         renderRules();
@@ -2254,17 +2785,17 @@
       state.busyRuleIds[id] = true;
       renderRules();
       try {
-        const res = await fetch('/api/rules/move', {
+        const res = await fetchWithTimeout('/api/rules/move', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id, direction })
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          showToast(data.error || '调整规则顺序失败', 'error');
+          showToast(data.error || t('toast_rule_move_fail'), 'error');
         }
       } catch (e) {
-        showToast('请求失败: ' + e.message, 'error');
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
         state.ruleReorderLocked = false;
         delete state.busyRuleIds[id];
@@ -2292,7 +2823,7 @@
       if (act === 'Proxy') {
         const select = document.getElementById('rule-node-id');
         if (state.nodes.length === 0) {
-          select.innerHTML = '<option value="">暂无可用代理节点，请先在「代理节点」中添加</option>';
+          select.innerHTML = `<option value="">${escapeHtml(t('opt_rule_no_nodes'))}</option>`;
         } else {
           select.innerHTML = state.nodes
             .map(n => `<option value="${n.id}">#${n.id} ${escapeHtml(n.name)} (${escapeHtml(n.protocol)} · ${escapeHtml(n.server_addr)})</option>`)
@@ -2311,18 +2842,18 @@
       const nodeId = action === 'Proxy' && nodeVal ? parseInt(nodeVal, 10) : null;
 
       if (!name) {
-        showToast('请输入规则名称', 'error');
+        showToast(t('toast_rule_name_required'), 'error');
         return;
       }
       if (action === 'Proxy' && !nodeId) {
-        showToast('请先添加并选择一个可用的代理节点', 'error');
+        showToast(t('toast_rule_node_required'), 'error');
         return;
       }
 
       const btn = document.getElementById('btn-submit-rule');
       btn.disabled = true;
       try {
-        const res = await fetch('/api/rules', {
+        const res = await fetchWithTimeout('/api/rules', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -2336,14 +2867,14 @@
         });
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
-          showToast(`规则 [${name}] 已保存并立即生效`);
+          showToast(t('toast_rule_saved', { name }));
           closeModal('modal-rule');
           await loadRules();
         } else {
-          showToast(data.error || '添加规则失败', 'error');
+          showToast(data.error || t('toast_rule_add_fail'), 'error');
         }
       } catch (e) {
-        showToast('请求异常: ' + e.message, 'error');
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
         btn.disabled = false;
       }
@@ -2353,26 +2884,26 @@
       const rule = state.rules.find(r => r.id === id);
       const name = rule ? rule.name : `#${id}`;
       openConfirmModal(
-        '删除分流规则',
-        `确定要删除分流规则「${name}」吗？删除后将自动更新 flowx.xml。`,
+        t('confirm_delete_rule_title'),
+        t('confirm_delete_rule_msg', { name }),
         async () => {
           try {
-            const res = await fetch(`/api/rules?id=${id}`, { method: 'DELETE' });
+            const res = await fetchWithTimeout(`/api/rules?id=${id}`, { method: 'DELETE' });
             const data = await res.json().catch(() => ({}));
             if (res.ok) {
-              showToast('规则已删除');
+              showToast(t('toast_rule_deleted'));
               await loadRules();
             } else {
-              showToast(data.error || '删除规则失败', 'error');
+              showToast(data.error || t('toast_rule_del_fail'), 'error');
             }
           } catch (e) {
-            showToast('请求失败: ' + e.message, 'error');
+            showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
           }
         }
       );
     }
 
-    // 模态弹窗与键盘交互
+    // Section Modals
     function openModal(id) {
       document.getElementById(id).classList.add('active');
     }
@@ -2408,6 +2939,8 @@
 
     (async function bootstrap() {
       initTheme();
+      const initialLang = getLocale();
+      applyLanguage(initialLang);
       renderChart();
       await refreshAll();
       schedulePoll();

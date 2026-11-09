@@ -10,12 +10,48 @@ pub mod parser;
 
 static NEXT_RULE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 未命中任何规则、走兜底动作时使用的规则名标记。
+///
+/// 该值是机器可读的内部标记（会随连接快照进入 `/api/connections`），
+/// 展示层需要按当前语言替换为 `action.default_rule`，不应直接把该常量当作文案输出。
+pub const DEFAULT_RULE_NAME: &str = "Default";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Direct,
     Block,
     Proxy(u32),
     Chain(u32),
+}
+
+impl Action {
+    /// 机器可读的动作类型（保持英文，供 API/前端做分支判断，不参与 i18n）
+    pub fn type_str(&self) -> &'static str {
+        match self {
+            Action::Direct => "Direct",
+            Action::Block => "Block",
+            Action::Proxy(_) => "Proxy",
+            Action::Chain(_) => "Chain",
+        }
+    }
+
+    /// 动作引用的代理节点/链路 ID；`Direct` 与 `Block` 返回 None
+    pub fn target_id(&self) -> Option<u32> {
+        match self {
+            Action::Proxy(id) | Action::Chain(id) => Some(*id),
+            Action::Direct | Action::Block => None,
+        }
+    }
+
+    /// 由机器可读类型与目标 ID 还原动作，用于在展示层按语言格式化
+    pub fn from_parts(type_str: &str, target_id: Option<u32>) -> Self {
+        match type_str {
+            "Block" => Action::Block,
+            "Proxy" => Action::Proxy(target_id.unwrap_or_default()),
+            "Chain" => Action::Chain(target_id.unwrap_or_default()),
+            _ => Action::Direct,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,15 +149,20 @@ impl RuleEngine {
     }
 
     pub fn list_rules_view(&self) -> Vec<RuleView> {
+        self.list_rules_view_with_locale(crate::i18n::Locale::Zh)
+    }
+
+    pub fn list_rules_view_with_locale(&self, locale: crate::i18n::Locale) -> Vec<RuleView> {
         let rules = self.current_rules();
         rules
             .iter()
             .map(|r| {
-                let (action_desc, action_type, node_id) = match &r.action {
-                    Action::Direct => ("Direct (直连)".to_string(), "Direct".to_string(), None),
-                    Action::Block => ("Block (阻断)".to_string(), "Block".to_string(), None),
-                    Action::Proxy(id) => (format!("Proxy (节点-{})", id), "Proxy".to_string(), Some(*id)),
-                    Action::Chain(id) => (format!("Chain (链路-{})", id), "Chain".to_string(), Some(*id)),
+                let action_desc = format_action_desc(&r.action, locale);
+                let (action_type, node_id) = match &r.action {
+                    Action::Direct => ("Direct".to_string(), None),
+                    Action::Block => ("Block".to_string(), None),
+                    Action::Proxy(id) => ("Proxy".to_string(), Some(*id)),
+                    Action::Chain(id) => ("Chain".to_string(), Some(*id)),
                 };
                 RuleView {
                     id: r.id,
@@ -285,7 +326,16 @@ impl RuleEngine {
             return (rule.action.clone(), rule.name.clone());
         }
 
-        (self.default_action.clone(), "Default".to_string())
+        (self.default_action.clone(), DEFAULT_RULE_NAME.to_string())
+    }
+}
+
+pub fn format_action_desc(action: &Action, locale: crate::i18n::Locale) -> String {
+    match action {
+        Action::Direct => crate::i18n::t(locale, "action.direct").to_string(),
+        Action::Block => crate::i18n::t(locale, "action.block").to_string(),
+        Action::Proxy(id) => crate::i18n::t(locale, "action.proxy_prefix").replace("{}", &id.to_string()),
+        Action::Chain(id) => crate::i18n::t(locale, "action.chain_prefix").replace("{}", &id.to_string()),
     }
 }
 

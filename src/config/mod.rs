@@ -97,7 +97,7 @@ impl ProfileConfig {
         let mut buf = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let mut ser = quick_xml::se::Serializer::new(&mut buf);
         ser.indent(' ', 2);
-        self.serialize(ser).context("序列化 ProfileConfig 到 XML 失败")?;
+        self.serialize(ser).context("Failed to serialize ProfileConfig to XML")?;
         buf.push('\n');
         Ok(buf)
     }
@@ -114,7 +114,7 @@ impl ProfileConfig {
                 proxies: vec![ProxyItem {
                     id: 101,
                     proxy_type: "SOCKS5".to_string(),
-                    name: Some("Node-101 (主节点)".to_string()),
+                    name: Some("Node-101 (Primary)".to_string()),
                     address: "127.0.0.1".to_string(),
                     port: 10808,
                     username: None,
@@ -158,7 +158,7 @@ impl ProfileConfig {
         if let Some(list) = self.proxy_list {
             for item in list.proxies {
                 if proxy_nodes.contains_key(&item.id) {
-                    bail!("配置文件中存在重复的代理节点 ID: {}", item.id);
+                    bail!("Duplicate proxy node ID in configuration: {}", item.id);
                 }
                 let entry = build_proxy_entry(item, self_ports)?;
                 proxy_nodes.insert(entry.id, entry);
@@ -175,10 +175,10 @@ impl ProfileConfig {
             for item in list.rules {
                 let name = item.name.trim();
                 if name.is_empty() {
-                    bail!("配置文件中存在空名称的路由规则");
+                    bail!("Configuration contains a routing rule with an empty name");
                 }
                 let action = parse_action(&item.action, &proxy_nodes)
-                    .with_context(|| format!("规则 [{}] 的动作配置无效", name))?;
+                    .with_context(|| format!("Invalid action configuration for rule [{}]", name))?;
                 let apps = item.applications.as_deref().map(str::trim).filter(|s| !s.is_empty());
                 let targets = item.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
                 let ports = item.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -273,17 +273,17 @@ fn parse_action(item: &RuleActionItem, proxy_nodes: &HashMap<u32, ProxyNodeEntry
         "PROXY" => {
             let id = item
                 .value
-                .context("Proxy 动作缺少节点 ID")?;
+                .context("Proxy action missing node ID")?;
             if !proxy_nodes.contains_key(&id) {
-                bail!("引用了不存在的代理节点 ID: {}", id);
+                bail!("Referenced non-existent proxy node ID: {}", id);
             }
             Ok(Action::Proxy(id))
         }
         "CHAIN" => {
-            let id = item.value.context("Chain 动作缺少代理链 ID")?;
+            let id = item.value.context("Chain action missing chain ID")?;
             Ok(Action::Chain(id))
         }
-        other => bail!("不支持的规则动作类型: {}", other),
+        other => bail!("Unsupported rule action type: {}", other),
     }
 }
 
@@ -308,17 +308,17 @@ fn split_server_addr(server_addr: &str) -> (String, u16) {
 fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEntry> {
     let proto = item.proxy_type.trim().to_ascii_uppercase();
     if !matches!(proto.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
-        bail!("节点 #{} 使用了不受支持的代理协议: {}", item.id, item.proxy_type);
+        bail!("Node #{} uses unsupported proxy protocol: {}", item.id, item.proxy_type);
     }
     let address = item.address.trim();
     if address.is_empty() || item.port == 0 {
-        bail!("节点 #{} 地址或端口无效", item.id);
+        bail!("Node #{} address or port is invalid", item.id);
     }
     let server_addr = format_host_port(address, item.port);
     let target_parsed = parse_target_addr(&server_addr)
-        .with_context(|| format!("节点 #{} 地址格式无效: {}", item.id, server_addr))?;
+        .with_context(|| format!("Node #{} address format is invalid: {}", item.id, server_addr))?;
     if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
-        bail!("节点 #{} 地址指向 FlowX 自身服务端口: {}", item.id, server_addr);
+        bail!("Node #{} address points to FlowX internal service port: {}", item.id, server_addr);
     }
 
     let username = item
@@ -388,9 +388,9 @@ impl ConfigStore {
     pub fn load_or_init(&self, self_ports: &[u16]) -> Result<(RuntimeProfile, bool)> {
         if self.path.exists() {
             let xml = std::fs::read_to_string(&self.path)
-                .with_context(|| format!("读取配置文件失败: {}", self.path.display()))?;
+                .with_context(|| format!("Failed to read configuration file: {}", self.path.display()))?;
             let cfg = ProfileConfig::from_xml(&xml)
-                .with_context(|| format!("解析 XML 配置文件失败: {}", self.path.display()))?;
+                .with_context(|| format!("Failed to parse XML configuration file: {}", self.path.display()))?;
             let runtime = cfg.into_runtime(self_ports)?;
             Ok((runtime, false))
         } else {
@@ -427,9 +427,9 @@ impl ConfigStore {
         tmp_os.push(".tmp");
         let tmp_path = PathBuf::from(tmp_os);
         std::fs::write(&tmp_path, xml.as_bytes())
-            .with_context(|| format!("写入临时配置文件失败: {}", tmp_path.display()))?;
+            .with_context(|| format!("Failed to write temporary configuration file: {}", tmp_path.display()))?;
         std::fs::rename(&tmp_path, &self.path)
-            .with_context(|| format!("原子替换配置文件失败: {}", self.path.display()))?;
+            .with_context(|| format!("Failed to atomically replace configuration file: {}", self.path.display()))?;
         Ok(())
     }
 }
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_config_store_atomic_persistence() {
-        let mut path = std::env::temp_dir();
+        let mut path = std::env::current_dir().unwrap().join("target");
         path.push(format!("flowx_test_{}_{}.xml", std::process::id(), 1));
         let _ = std::fs::remove_file(&path);
 

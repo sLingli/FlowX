@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,6 +11,7 @@ use tracing::{error, info};
 
 use crate::config::ConfigStore;
 use crate::dns::FakeIpPool;
+use crate::i18n::{json_error, t, Locale};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::monitor::ConnectionManager;
 use crate::outbound::chain::{parse_target_addr, ProxyNode};
@@ -50,6 +51,9 @@ pub struct PingResponse {
     pub ok: bool,
     pub latency_ms: u64,
     pub message: String,
+    /// 底层错误的原始信息（不本地化，仅供排障，前端不应直接展示）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,9 +155,9 @@ impl ApiServer {
     pub async fn bind(&self) -> Result<TcpListener> {
         let listener = TcpListener::bind(self.bind_addr)
             .await
-            .with_context(|| format!("绑定 HTTP API 服务端口失败 ({})", self.bind_addr))?;
+            .with_context(|| format!("Failed to bind HTTP API server port ({})", self.bind_addr))?;
         info!(
-            "[API 接口] FlowX 状态与控制 HTTP API 服务已在 http://{} 绑定",
+            "[API] FlowX control and status HTTP API server bound on http://{}",
             listener.local_addr().unwrap_or(self.bind_addr)
         );
         Ok(listener)
@@ -174,13 +178,13 @@ impl ApiServer {
                     match res {
                         Ok(r) => r,
                         Err(e) => {
-                            error!("[API 接口] 接收 HTTP API 请求失败: {}", e);
+                            error!("[API] Failed to accept HTTP API request: {}", e);
                             continue;
                         }
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    info!("[API 接口] 接收到退出信号，停止接收 API 请求");
+                    info!("[API] Received shutdown signal, stopping API server");
                     break;
                 }
             };
@@ -210,7 +214,7 @@ impl ApiServer {
                 )
                 .await
                 {
-                    error!("[API 接口] 处理请求超时或异常: {}", e);
+                    error!("[API] Request processing timed out or failed: {}", e);
                 }
             });
         }
@@ -218,27 +222,38 @@ impl ApiServer {
     }
 }
 
-async fn read_full_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut buffer = Vec::with_capacity(4096);
+async fn read_full_http_request(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+) -> std::result::Result<(), RequestReadError> {
+    buffer.clear();
     let mut temp = [0u8; 2048];
 
     loop {
-        let n = stream.read(&mut temp).await?;
+        let n = match stream.read(&mut temp).await {
+            Ok(n) => n,
+            Err(e) => {
+                // 客户端提前断开等读错误较常见，保留原始错误到 debug 日志，对外只返回本地化文案
+                tracing::debug!("[API] HTTP request read failed: {}", e);
+                return Err(RequestReadError::Io);
+            }
+        };
         if n == 0 {
             break;
         }
         buffer.extend_from_slice(&temp[..n]);
         if buffer.len() > MAX_REQUEST_SIZE {
-            bail!("HTTP 请求体超出 1MB 上限");
+            return Err(RequestReadError::TooLarge);
         }
 
-        if let Some(header_end) = find_header_end(&buffer) {
+        if let Some(header_end) = find_header_end(buffer) {
             let header_str = String::from_utf8_lossy(&buffer[..header_end]);
-            let content_length = parse_content_length(&header_str)?;
+            let content_length =
+                parse_content_length(&header_str).ok_or(RequestReadError::InvalidContentLength)?;
             let total_needed = header_end
                 .checked_add(content_length)
                 .filter(|&t| t <= MAX_REQUEST_SIZE)
-                .context("HTTP 请求体长度超出 1MB 上限")?;
+                .ok_or(RequestReadError::TooLarge)?;
             if buffer.len() >= total_needed {
                 buffer.truncate(total_needed);
                 break;
@@ -246,26 +261,70 @@ async fn read_full_http_request(stream: &mut TcpStream) -> Result<Vec<u8>> {
         }
     }
 
-    Ok(buffer)
+    Ok(())
+}
+
+/// HTTP 请求读取阶段的可分类错误，用于生成本地化且机器可读的错误响应。
+#[derive(Debug)]
+enum RequestReadError {
+    /// 请求体（含头部）超过 1MB 上限
+    TooLarge,
+    /// `Content-Length` 请求头缺失或非法
+    InvalidContentLength,
+    /// 底层套接字读取失败（原始错误已记入 debug 日志）
+    Io,
+}
+
+impl RequestReadError {
+    /// 返回（错误码, i18n 键）
+    fn code_and_key(&self) -> (&'static str, &'static str) {
+        match self {
+            RequestReadError::TooLarge => ("ERR_REQUEST_TOO_LARGE", "error.request_too_large"),
+            RequestReadError::InvalidContentLength => {
+                ("ERR_INVALID_CONTENT_LENGTH", "error.invalid_content_length")
+            }
+            RequestReadError::Io => ("ERR_REQUEST_READ_FAILED", "error.request_read_failed"),
+        }
+    }
+}
+
+/// 在请求头尚未完整解析（或包含非 UTF-8 字节）时，尽力从已读到的字节中提取语言偏好，
+/// 避免 zh 用户在最早期错误上只能拿到英文。
+fn best_effort_locale(buffer: &[u8]) -> Locale {
+    let text = String::from_utf8_lossy(buffer);
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or_default();
+    let query = request_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|target| target.split_once('?'))
+        .map(|(_, q)| q)
+        .unwrap_or("");
+    let mut accept_language = None;
+    for line in lines {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("accept-language")
+        {
+            accept_language = Some(value.trim());
+        }
+    }
+    Locale::from_header_or_query(accept_language, parse_query_param(query, "lang"))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-fn parse_content_length(headers: &str) -> Result<usize> {
+/// 解析 `Content-Length` 请求头；缺失视为 0，格式非法返回 None。
+fn parse_content_length(headers: &str) -> Option<usize> {
     for line in headers.lines() {
         if let Some((k, v)) = line.split_once(':')
             && k.trim().eq_ignore_ascii_case("content-length")
         {
-            let len = v
-                .trim()
-                .parse::<usize>()
-                .context("非法的 Content-Length 请求头")?;
-            return Ok(len);
+            return v.trim().parse::<usize>().ok();
         }
     }
-    Ok(0)
+    Some(0)
 }
 
 fn extract_header<'a>(headers: &[&'a str], target_name: &str) -> Option<&'a str> {
@@ -361,24 +420,26 @@ async fn handle_api_request(
     runtime_context: Option<Arc<SystemRuntimeContext>>,
     started_at: Instant,
 ) -> Result<()> {
-    let req_bytes = match read_full_http_request(&mut stream).await {
-        Ok(b) => b,
-        Err(e) => {
-            let msg = serde_json::json!({ "error": e.to_string() }).to_string();
-            send_http_response(&mut stream, "400 Bad Request", "application/json; charset=utf-8", &msg).await?;
-            return Ok(());
-        }
-    };
+    let mut req_bytes = Vec::with_capacity(4096);
+    if let Err(e) = read_full_http_request(&mut stream, &mut req_bytes).await {
+        let (code, key) = e.code_and_key();
+        let msg = json_error(best_effort_locale(&req_bytes), code, key);
+        send_http_response(&mut stream, "400 Bad Request", "application/json; charset=utf-8", &msg).await?;
+        return Ok(());
+    }
     if req_bytes.is_empty() {
         return Ok(());
     }
+
+    // 协议早期错误（头部不完整/非 UTF-8）同样按 best-effort 语言偏好本地化
+    let locale = best_effort_locale(&req_bytes);
 
     let Some(header_end) = find_header_end(&req_bytes) else {
         send_http_response(
             &mut stream,
             "400 Bad Request",
             "application/json; charset=utf-8",
-            r#"{"error":"HTTP 请求头格式不完整"}"#,
+            &json_error(locale, "ERR_INCOMPLETE_HEADERS", "error.incomplete_headers"),
         )
         .await?;
         return Ok(());
@@ -389,7 +450,7 @@ async fn handle_api_request(
             &mut stream,
             "400 Bad Request",
             "application/json; charset=utf-8",
-            r#"{"error":"HTTP 请求头包含非 UTF-8 字节"}"#,
+            &json_error(locale, "ERR_NON_UTF8_HEADERS", "error.non_utf8_headers"),
         )
         .await?;
         return Ok(());
@@ -408,6 +469,10 @@ async fn handle_api_request(
     let path_and_query = parts[1];
     let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
 
+    let accept_lang = extract_header(&headers, "accept-language");
+    // 只取 lang 查询参数本身，避免把整段 query 交给子串匹配（如 ?keywords=lang=zh 误命中）
+    let locale = Locale::from_header_or_query(accept_lang, parse_query_param(query, "lang"));
+
     // 安全校验 1: Host 头必须为本地回环地址，防止 DNS Rebinding
     let host_ok = extract_header(&headers, "host")
         .is_some_and(|h| is_allowed_host(h, actual_port, false));
@@ -416,7 +481,7 @@ async fn handle_api_request(
             &mut stream,
             "403 Forbidden",
             "application/json; charset=utf-8",
-            r#"{"error":"非法的 Host 请求头，仅允许本地控制台访问"}"#,
+            &json_error(locale, "ERR_FORBIDDEN_HOST", "error.invalid_host"),
         )
         .await?;
         return Ok(());
@@ -430,7 +495,7 @@ async fn handle_api_request(
             &mut stream,
             "403 Forbidden",
             "application/json; charset=utf-8",
-            r#"{"error":"拒绝跨源请求 (Origin 校验失败)"}"#,
+            &json_error(locale, "ERR_FORBIDDEN_ORIGIN", "error.invalid_origin"),
         )
         .await?;
         return Ok(());
@@ -444,7 +509,7 @@ async fn handle_api_request(
             &mut stream,
             "403 Forbidden",
             "application/json; charset=utf-8",
-            r#"{"error":"拒绝跨站 API 请求 (Sec-Fetch-Site)"}"#,
+            &json_error(locale, "ERR_FORBIDDEN_FETCH_SITE", "error.invalid_fetch_site"),
         )
         .await?;
         return Ok(());
@@ -458,7 +523,7 @@ async fn handle_api_request(
             &mut stream,
             "403 Forbidden",
             "application/json; charset=utf-8",
-            r#"{"error":"拒绝跨站变更请求 (Referer 校验失败)"}"#,
+            &json_error(locale, "ERR_FORBIDDEN_REFERER", "error.invalid_referer"),
         )
         .await?;
         return Ok(());
@@ -486,6 +551,7 @@ async fn handle_api_request(
                 &proxy_nodes,
                 &rule_engine,
                 started_at,
+                locale,
             );
             ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&info))
         }
@@ -494,7 +560,10 @@ async fn handle_api_request(
             ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&stats))
         }
         ("GET", "/api/connections") => {
-            let list = monitor.list_snapshots();
+            let mut list = monitor.list_snapshots();
+            for conn in &mut list {
+                localize_connection_view(conn, locale);
+            }
             ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&list))
         }
         ("POST", "/api/connections/kill") => {
@@ -514,7 +583,11 @@ async fn handle_api_request(
                     format!(r#"{{"ok":true,"killed":{}}}"#, killed),
                 )
             } else {
-                ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少连接ID"}"#.to_string())
+                (
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    json_error(locale, "ERR_MISSING_CONN_ID", "error.missing_conn_id"),
+                )
             }
         }
         ("GET", "/api/nodes") => {
@@ -536,10 +609,10 @@ async fn handle_api_request(
             Err(_) => (
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                r#"{"error":"无效的节点请求体"}"#.to_string(),
+                json_error(locale, "ERR_INVALID_NODE_BODY", "error.invalid_node_body"),
             ),
             Ok(req) => {
-                let res = handle_add_node(req, &proxy_nodes, &self_ports);
+                let res = handle_add_node(req, &proxy_nodes, &self_ports, locale);
                 if res.0 == "200 OK" {
                     persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                 }
@@ -566,7 +639,7 @@ async fn handle_api_request(
                     (
                         "409 Conflict",
                         "application/json; charset=utf-8",
-                        r#"{"error":"节点正被路由规则或默认兜底动作引用，禁止删除。请先修改或删除关联配置"}"#.to_string(),
+                        json_error(locale, "ERR_NODE_IN_USE", "error.node_in_use"),
                     )
                 } else {
                     let removed = {
@@ -577,11 +650,19 @@ async fn handle_api_request(
                         persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                         ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
                     } else {
-                        ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"代理节点不存在"}"#.to_string())
+                        (
+                            "404 Not Found",
+                            "application/json; charset=utf-8",
+                            json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
+                        )
                     }
                 }
             } else {
-                ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少节点ID"}"#.to_string())
+                (
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    json_error(locale, "ERR_MISSING_NODE_ID", "error.missing_node_id"),
+                )
             }
         }
         ("POST", "/api/nodes/ping") => {
@@ -596,32 +677,41 @@ async fn handle_api_request(
                     nodes_guard.get(&id).map(|n| n.server_addr.clone())
                 };
                 if let Some(addr) = target_addr {
-                    let (ok, ms, msg) = ping_address(&addr).await;
+                    let (ok, ms, msg, detail) = ping_address(&addr, locale).await;
                     let ping_res = PingResponse {
                         ok,
                         latency_ms: ms,
                         message: msg,
+                        detail,
                     };
                     ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&ping_res))
                 } else {
-                    ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"指定的代理节点不存在"}"#.to_string())
+                    (
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
+                    )
                 }
             } else {
-                ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少有效的节点 ID"}"#.to_string())
+                (
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    json_error(locale, "ERR_MISSING_NODE_ID", "error.missing_node_id"),
+                )
             }
         }
         ("GET", "/api/rules") => {
-            let list = rule_engine.list_rules_view();
+            let list = rule_engine.list_rules_view_with_locale(locale);
             ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&list))
         }
         ("POST", "/api/rules") => match serde_json::from_str::<AddRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                r#"{"error":"无效的规则请求体"}"#.to_string(),
+                json_error(locale, "ERR_INVALID_RULE_BODY", "error.invalid_rule_body"),
             ),
             Ok(req) => {
-                let res = handle_add_rule(req, &rule_engine, &proxy_nodes);
+                let res = handle_add_rule(req, &rule_engine, &proxy_nodes, locale);
                 if res.0 == "200 OK" {
                     persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                 }
@@ -632,7 +722,7 @@ async fn handle_api_request(
             Err(_) => (
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                r#"{"error":"无效的规则启停请求体"}"#.to_string(),
+                json_error(locale, "ERR_INVALID_TOGGLE_BODY", "error.invalid_toggle_body"),
             ),
             Ok(req) => match rule_engine.toggle_rule(req.id, req.enabled) {
                 Some(enabled) => {
@@ -646,7 +736,7 @@ async fn handle_api_request(
                 None => (
                     "404 Not Found",
                     "application/json; charset=utf-8",
-                    r#"{"error":"路由规则不存在"}"#.to_string(),
+                    json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
                 ),
             },
         },
@@ -654,7 +744,7 @@ async fn handle_api_request(
             Err(_) => (
                 "400 Bad Request",
                 "application/json; charset=utf-8",
-                r#"{"error":"无效的规则排序请求体"}"#.to_string(),
+                json_error(locale, "ERR_INVALID_MOVE_BODY", "error.invalid_move_body"),
             ),
             Ok(req) => {
                 if !matches!(
@@ -664,7 +754,7 @@ async fn handle_api_request(
                     (
                         "400 Bad Request",
                         "application/json; charset=utf-8",
-                        r#"{"error":"排序方向仅支持 up / down / top / bottom"}"#.to_string(),
+                        json_error(locale, "ERR_INVALID_MOVE_DIR", "error.invalid_move_direction"),
                     )
                 } else {
                     match rule_engine.move_rule(req.id, &req.direction) {
@@ -681,7 +771,7 @@ async fn handle_api_request(
                         None => (
                             "404 Not Found",
                             "application/json; charset=utf-8",
-                            r#"{"error":"路由规则不存在"}"#.to_string(),
+                            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
                         ),
                     }
                 }
@@ -701,13 +791,25 @@ async fn handle_api_request(
                     persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                     ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
                 } else {
-                    ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"路由规则不存在"}"#.to_string())
+                    (
+                        "404 Not Found",
+                        "application/json; charset=utf-8",
+                        json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
+                    )
                 }
             } else {
-                ("400 Bad Request", "application/json; charset=utf-8", r#"{"error":"缺少规则ID"}"#.to_string())
+                (
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    json_error(locale, "ERR_MISSING_RULE_ID", "error.missing_rule_id"),
+                )
             }
         }
-        _ => ("404 Not Found", "application/json; charset=utf-8", r#"{"error":"Not Found"}"#.to_string()),
+        _ => (
+            "404 Not Found",
+            "application/json; charset=utf-8",
+            json_error(locale, "ERR_NOT_FOUND", "error.not_found"),
+        ),
     };
 
     send_http_response(&mut stream, status, content_type, &body).await?;
@@ -718,11 +820,16 @@ fn handle_add_node(
     req: AddNodeRequest,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     self_ports: &[u16],
+    locale: Locale,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
     let name = req.name.trim().to_string();
     if name.is_empty() {
-        return ("400 Bad Request", ct, r#"{"error":"节点名称不能为空"}"#.to_string());
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
+        );
     }
 
     let protocol = req.protocol.trim().to_ascii_uppercase();
@@ -730,7 +837,7 @@ fn handle_add_node(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"不支持的代理协议，仅支持 SOCKS5 / SOCKS4 / HTTP"}"#.to_string(),
+            json_error(locale, "ERR_UNSUPPORTED_PROTOCOL", "error.unsupported_protocol"),
         );
     }
 
@@ -739,14 +846,14 @@ fn handle_add_node(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"节点服务器地址格式无效，应为 IP:Port 或 Host:Port"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_NODE_ADDR", "error.invalid_node_addr"),
         );
     };
     if target_parsed.port() == 0 || target_parsed.host_string().is_empty() {
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"节点服务器地址或端口无效"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_NODE_PORT", "error.invalid_node_port"),
         );
     }
 
@@ -754,7 +861,7 @@ fn handle_add_node(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"节点地址不能指向 FlowX 自身服务端口"}"#.to_string(),
+            json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
         );
     }
 
@@ -770,7 +877,7 @@ fn handle_add_node(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"代理用户名包含非法字符或超出 255 字节限制"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
         );
     }
     if let Some(p) = &password
@@ -779,7 +886,7 @@ fn handle_add_node(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"代理密码包含非法字符或超出 255 字节限制"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
         );
     }
 
@@ -827,11 +934,16 @@ fn handle_add_rule(
     req: AddRuleRequest,
     rule_engine: &RuleEngine,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    locale: Locale,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
     let name = req.name.trim().to_string();
     if name.is_empty() {
-        return ("400 Bad Request", ct, r#"{"error":"规则名称不能为空"}"#.to_string());
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_RULE_NAME", "error.empty_rule_name"),
+        );
     }
 
     let action = match req.action.trim().to_ascii_uppercase().as_str() {
@@ -842,7 +954,7 @@ fn handle_add_rule(
                 return (
                     "400 Bad Request",
                     ct,
-                    r#"{"error":"Proxy 动作必须指定节点 ID"}"#.to_string(),
+                    json_error(locale, "ERR_MISSING_NODE_FOR_PROXY", "error.missing_node_id_for_proxy"),
                 );
             };
             let exists = {
@@ -853,7 +965,7 @@ fn handle_add_rule(
                 return (
                     "400 Bad Request",
                     ct,
-                    format!(r#"{{"error":"指定的代理节点 #{} 不存在"}}"#, nid),
+                    json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
                 );
             }
             Action::Proxy(nid)
@@ -862,7 +974,7 @@ fn handle_add_rule(
             return (
                 "400 Bad Request",
                 ct,
-                r#"{"error":"无效的规则动作，仅支持 Direct / Block / Proxy"}"#.to_string(),
+                json_error(locale, "ERR_INVALID_RULE_ACTION", "error.invalid_rule_action"),
             );
         }
     };
@@ -879,7 +991,7 @@ fn handle_add_rule(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"应用进程匹配语法无效"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_APP_PATTERN", "error.invalid_app_pattern"),
         );
     }
     if targets_clean.is_some()
@@ -889,14 +1001,14 @@ fn handle_add_rule(
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"目标地址/域名匹配语法无效"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_TARGET_PATTERN", "error.invalid_target_pattern"),
         );
     }
     if ports_clean.is_some() && rule.ports.as_ref().is_some_and(Vec::is_empty) {
         return (
             "400 Bad Request",
             ct,
-            r#"{"error":"端口格式无效，请使用如 80; 443; 8000-8080"}"#.to_string(),
+            json_error(locale, "ERR_INVALID_PORT_FORMAT", "error.invalid_port_format"),
         );
     }
 
@@ -912,6 +1024,7 @@ fn build_system_info(
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     rule_engine: &RuleEngine,
     started_at: Instant,
+    locale: Locale,
 ) -> SystemInfoResponse {
     let nodes_count = proxy_nodes
         .read()
@@ -920,12 +1033,7 @@ fn build_system_info(
     let rules = rule_engine.current_rules();
     let rules_count = rules.len();
     let enabled_rules_count = rules.iter().filter(|r| r.enabled).count();
-    let default_action = match &rule_engine.default_action {
-        Action::Direct => "Direct (直连)".to_string(),
-        Action::Block => "Block (阻断)".to_string(),
-        Action::Proxy(id) => format!("Proxy (节点-{})", id),
-        Action::Chain(id) => format!("Chain (链路-{})", id),
-    };
+    let default_action = crate::router::format_action_desc(&rule_engine.default_action, locale);
 
     let (inbound_addr, dns_addr, upstream_dns, api_addr, fake_ip_count, uptime_secs) =
         match runtime_ctx {
@@ -956,7 +1064,7 @@ fn build_system_info(
         api_addr,
         config_path: config_store
             .map(|s| s.path().display().to_string())
-            .unwrap_or_else(|| "仅内存模式".to_string()),
+            .unwrap_or_else(|| t(locale, "system.memory_mode").to_string()),
         fake_ip_cidr: "198.18.0.0/15",
         fake_ip_count,
         uptime_secs,
@@ -976,7 +1084,7 @@ fn persist_config(
         && let Err(e) = store.save_runtime(proxy_nodes, rule_engine)
     {
         error!(
-            "[配置中心] 自动持久化配置文件 ({}) 失败: {:#}",
+            "[Config] Auto-persisting config file ({}) failed: {:#}",
             store.path().display(),
             e
         );
@@ -1017,17 +1125,43 @@ fn parse_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-async fn ping_address(addr: &str) -> (bool, u64, String) {
+/// 将连接快照中的机器可读字段按请求语言格式化为展示文案。
+///
+/// `action_type` / `action_id` 保持英文机器语义，供前端做分支判断与过滤；
+/// `action` / `rule_name` / 进程占位名才是给人看的多语言文案。
+fn localize_connection_view(conn: &mut crate::monitor::ConnectionSnapshot, locale: Locale) {
+    conn.action = crate::router::format_action_desc(
+        &Action::from_parts(&conn.action_type, conn.action_id),
+        locale,
+    );
+    if conn.rule_name == crate::router::DEFAULT_RULE_NAME {
+        conn.rule_name = t(locale, "action.default_rule").to_string();
+    }
+    if conn.process_name == crate::i18n::UNKNOWN_PROCESS {
+        conn.process_name = t(locale, "label.unknown_process").to_string();
+    }
+    if conn.process_path == crate::i18n::UNKNOWN_PROCESS {
+        conn.process_path = t(locale, "label.unknown_process").to_string();
+    }
+}
+
+async fn ping_address(addr: &str, locale: Locale) -> (bool, u64, String, Option<String>) {
     let start = std::time::Instant::now();
     let res = tokio::time::timeout(Duration::from_millis(2000), TcpStream::connect(addr)).await;
     match res {
         Ok(Ok(stream)) => {
             drop(stream);
             let ms = start.elapsed().as_millis() as u64;
-            (true, ms, format!("{} ms", ms))
+            (true, ms, format!("{} ms", ms), None)
         }
-        Ok(Err(e)) => (false, 0, e.to_string()),
-        Err(_) => (false, 0, "连接超时 (2000ms)".to_string()),
+        // 面向用户的文案本地化；底层 OS 错误串只放进 detail，供排障而不直接展示
+        Ok(Err(e)) => (
+            false,
+            0,
+            t(locale, "error.ping_failed").to_string(),
+            Some(e.to_string()),
+        ),
+        Err(_) => (false, 0, t(locale, "ping.timeout").to_string(), None),
     }
 }
 
@@ -1177,7 +1311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_mutates_and_persists_xml() {
-        let mut path = std::env::temp_dir();
+        let mut path = std::env::current_dir().unwrap().join("target");
         path.push(format!("flowx_api_persist_{}.xml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
@@ -1219,7 +1353,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_system_and_rule_toggle_move() {
-        let mut path = std::env::temp_dir();
+        let mut path = std::env::current_dir().unwrap().join("target");
         path.push(format!("flowx_api_rule_ops_{}.xml", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
@@ -1325,7 +1459,8 @@ mod tests {
             4321,
             "example.org:443".into(),
             "Default".into(),
-            "Proxy(101)".into(),
+            "Proxy".into(),
+            Some(101),
         );
 
         // 显式规则列表为空，仅 default_action 指向节点 101
@@ -1354,7 +1489,7 @@ mod tests {
         .await;
         assert!(
             del_resp.starts_with("HTTP/1.1 409 Conflict"),
-            "被 default_action 引用的节点必须禁止删除: {}",
+            "Node referenced by default_action must not be deleted: {}",
             del_resp
         );
 
@@ -1372,9 +1507,161 @@ mod tests {
         .await;
         assert!(kill_resp.contains("\"killed\":true"));
         assert!(active.is_cancelled());
-        assert_eq!(mgr.active_count(), 1, "API 不得绕过 ConnectionGuard 提前注销连接");
+        assert_eq!(mgr.active_count(), 1, "API must not bypass ConnectionGuard to unregister connections early");
 
         mgr.unregister(active.id);
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_api_i18n_negotiation_and_localized_errors() {
+        let (addr, _nodes, _re, _shutdown_tx) = spawn_test_api().await;
+        let port = addr.port();
+
+        // 1. Accept-Language: zh-CN 返回中文错误与多语言键值
+        let bad_proto_body = r#"{"name":"n1","protocol":"UNKNOWN","server_addr":"1.2.3.4:1080"}"#;
+        let resp_zh = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN,zh;q=0.9\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                bad_proto_body.len(),
+                bad_proto_body
+            ),
+        )
+        .await;
+        assert!(resp_zh.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(resp_zh.contains("不支持的代理协议"));
+        assert!(resp_zh.contains("\"code\":\"ERR_UNSUPPORTED_PROTOCOL\""));
+        assert!(resp_zh.contains("\"key\":\"error.unsupported_protocol\""));
+
+        // 2. Accept-Language: en-US 返回英文错误与多语言键值
+        let resp_en = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US,en;q=0.9\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                bad_proto_body.len(),
+                bad_proto_body
+            ),
+        )
+        .await;
+        assert!(resp_en.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(resp_en.contains("Unsupported proxy protocol"));
+        assert!(resp_en.contains("\"code\":\"ERR_UNSUPPORTED_PROTOCOL\""));
+        assert!(resp_en.contains("\"key\":\"error.unsupported_protocol\""));
+
+        // 3. Query 参数 ?lang=zh 覆盖请求头
+        let resp_query_zh = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes?lang=zh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                bad_proto_body.len(),
+                bad_proto_body
+            ),
+        )
+        .await;
+        assert!(resp_query_zh.contains("不支持的代理协议"));
+
+        // 4. Query 参数 ?lang=en 覆盖请求头
+        let resp_query_en = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes?lang=en HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                bad_proto_body.len(),
+                bad_proto_body
+            ),
+        )
+        .await;
+        assert!(resp_query_en.contains("Unsupported proxy protocol"));
+
+        // 5. System API 返回与语言匹配的动作描述
+        let sys_zh = raw_http(
+            addr,
+            &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\n\r\n", port),
+        )
+        .await;
+        assert!(sys_zh.contains("Direct (直连)"));
+
+        let sys_en = raw_http(
+            addr,
+            &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\n\r\n", port),
+        )
+        .await;
+        assert!(sys_en.contains("\"default_action\":\"Direct\""));
+
+        // 6. 非法 Content-Length 走本地化 + 机器可读错误码（不再泄漏原始错误串）
+        let bad_len_zh = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: abc\r\n\r\n",
+                port
+            ),
+        )
+        .await;
+        assert!(bad_len_zh.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(bad_len_zh.contains("无效的 Content-Length 请求头"));
+        assert!(bad_len_zh.contains("\"code\":\"ERR_INVALID_CONTENT_LENGTH\""));
+        assert!(bad_len_zh.contains("\"key\":\"error.invalid_content_length\""));
+
+        let bad_len_en = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\nContent-Length: abc\r\n\r\n",
+                port
+            ),
+        )
+        .await;
+        assert!(bad_len_en.contains("Invalid Content-Length header"));
+    }
+
+    /// /api/connections 的动作、兜底规则名与未知进程名必须按请求语言本地化，
+    /// 同时保留 action_type / action_id 机器字段供前端过滤。
+    #[tokio::test]
+    async fn test_api_connections_view_is_localized() {
+        let mgr = Arc::new(ConnectionManager::new());
+        mgr.register(
+            "app.exe".into(),
+            "C:/app.exe".into(),
+            4321,
+            "example.org:443".into(),
+            crate::router::DEFAULT_RULE_NAME.into(),
+            "Proxy".into(),
+            Some(101),
+        );
+        let re = Arc::new(RuleEngine::new(vec![], Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), Arc::clone(&mgr), re, nodes);
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx).await });
+        let _keep_tx = tx;
+
+        let zh = raw_http(
+            addr,
+            &format!(
+                "GET /api/connections HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\n\r\n",
+                addr.port()
+            ),
+        )
+        .await;
+        assert!(zh.contains("Proxy (节点-101)"), "zh action should be localized: {zh}");
+        assert!(zh.contains("\"rule_name\":\"默认\""), "zh rule_name should be localized: {zh}");
+        assert!(zh.contains("\"action_type\":\"Proxy\""));
+        assert!(zh.contains("\"action_id\":101"));
+
+        let en = raw_http(
+            addr,
+            &format!(
+                "GET /api/connections HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\n\r\n",
+                addr.port()
+            ),
+        )
+        .await;
+        assert!(en.contains("Proxy (Node-101)"), "en action should be localized: {en}");
+        assert!(en.contains("\"rule_name\":\"Default\""));
     }
 }

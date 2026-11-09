@@ -60,9 +60,9 @@ impl StreamDispatcher {
     pub async fn bind(&self) -> Result<TcpListener> {
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
-            .with_context(|| format!("绑定混合代理入站端口失败 ({})", self.config.bind_addr))?;
+            .with_context(|| format!("Failed to bind mixed inbound port ({})", self.config.bind_addr))?;
         info!(
-            "[调度核心] 混合代理入站 (SOCKS5 / SOCKS4a / HTTP) 已在 {} 绑定待命",
+            "[Dispatcher] Mixed proxy inbound (SOCKS5 / SOCKS4a / HTTP) bound on {}",
             self.config.bind_addr
         );
         Ok(listener)
@@ -76,13 +76,13 @@ impl StreamDispatcher {
                     match res {
                         Ok(r) => r,
                         Err(e) => {
-                            error!("[调度核心] 接受新 TCP 连接失败: {}", e);
+                            error!("[Dispatcher] Failed to accept new TCP connection: {}", e);
                             continue;
                         }
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    info!("[调度核心] 接收到退出信号，停止接受新流");
+                    info!("[Dispatcher] Received shutdown signal, stopping accepting new streams");
                     break;
                 }
             };
@@ -90,7 +90,7 @@ impl StreamDispatcher {
             let permit = match self.concurrency_limit.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!("[调度核心] 活跃连接数超出上限 (10000)，拒绝新连接");
+                    warn!("[Dispatcher] Active connections exceeded limit (10000), rejecting new connection");
                     drop(local_stream);
                     continue;
                 }
@@ -100,7 +100,7 @@ impl StreamDispatcher {
             tokio::spawn(async move {
                 let _permit = permit;
                 if let Err(e) = handle_connection(local_stream, peer_addr, config).await {
-                    warn!("[调度核心] 连接中继结束或异常: {:#}", e);
+                    warn!("[Dispatcher] Relay session closed or error: {:#}", e);
                 }
             });
         }
@@ -136,26 +136,32 @@ async fn handle_connection(
 ) -> Result<()> {
     let server_addr = local_stream.local_addr()?;
 
-    // 1. 解析入站代理协议握手，取得客户端真实请求的目标地址
+    // 1. Parse inbound proxy protocol handshake, obtain client target address
     let InboundRequest { kind, target, pending } =
         tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, inbound::read_request(&mut local_stream))
             .await
-            .map_err(|_| anyhow!("入站握手超时 ({:?})，来源 {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
+            .map_err(|_| anyhow!("Inbound handshake timed out ({:?}), peer {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
 
-    // 2. 通过 TCP 四元组逆向追踪调用方进程（异步非阻塞）
+    // 2. Reverse lookup caller process via TCP 4-tuple (async non-blocking)
     let proc_info = config.tracker.find_by_connection_async(peer_addr, server_addr).await;
-    let proc_name = proc_info.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "Unknown".to_string());
-    let proc_path = proc_info.as_ref().map(|p| p.path.clone()).unwrap_or_else(|| "Unknown".to_string());
+    let proc_name = proc_info
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
+    let proc_path = proc_info
+        .as_ref()
+        .map(|p| p.path.clone())
+        .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
 
-    // 3. 若目标为 Fake-IP，逆向还原原始域名（防止 DNS 泄漏，将域名交给上游代理解析）
+    // 3. If target is Fake-IP, restore original domain (prevent DNS leak, let upstream proxy resolve)
     let target = match &target {
         TargetAddr::Ip(addr) => match addr.ip() {
             IpAddr::V4(v4) if config.fake_ip_pool.is_fake_ip(&v4) => match config.fake_ip_pool.restore(&v4) {
                 Some(domain) => TargetAddr::Domain(domain, addr.port()),
                 None => {
                     inbound::send_failure(&mut local_stream, kind, false).await.ok();
-                    bail!("Fake-IP {} 的域名映射已过期或不存在", v4);
+                    bail!("Fake-IP {} domain mapping expired or does not exist", v4);
                 }
             },
             _ => target,
@@ -163,11 +169,11 @@ async fn handle_connection(
         TargetAddr::Domain(..) => target,
     };
 
-    // 4. 回环防护：拒绝指向 FlowX 自身服务端口的请求
+    // 4. Loop prevention: reject requests targeting FlowX internal service ports
     if is_self_target(&target, &server_addr, &config.self_ports) {
         inbound::send_failure(&mut local_stream, kind, true).await.ok();
         bail!(
-            "拒绝回环请求: {} (PID {}) 试图经由 FlowX 访问其自身端口 {}:{}",
+            "Loopback request rejected: {} (PID {}) attempted to access internal port {}:{}",
             proc_name,
             pid,
             target.host_string(),
@@ -175,7 +181,7 @@ async fn handle_connection(
         );
     }
 
-    // 5. 构建路由上下文并提交规则引擎决策
+    // 5. Build route context and evaluate rules
     let (target_host, target_ip) = match &target {
         TargetAddr::Ip(addr) => (None, Some(addr.ip())),
         TargetAddr::Domain(host, _) => (Some(host.as_str()), None),
@@ -198,7 +204,7 @@ async fn handle_connection(
     };
 
     info!(
-        "[路由命中] [{}] 进程: {} (PID: {}) -> 目标: {}:{} => 规则: {} => 动作: {}",
+        "[Route Match] [{}] Process: {} (PID: {}) -> Target: {}:{} => Rule: {} => Action: {}",
         kind.as_str(),
         proc_name,
         pid,
@@ -209,13 +215,15 @@ async fn handle_connection(
     );
 
     // 6. 注册到连接监视器并使用 RAII 守卫
+    // 注意：连接快照只保存机器可读的 action_type / action_id，展示文案由 API 层按请求语言本地化
     let active_conn = config.monitor.register(
         proc_name,
         proc_path,
         pid,
         format!("{}:{}", target.host_string(), target.port()),
         rule_name,
-        action_str.clone(),
+        action.type_str().to_string(),
+        action.target_id(),
     );
 
     let _guard = ConnectionGuard {
@@ -248,21 +256,21 @@ async fn handle_connection(
             notified.await;
         } => {
             inbound::send_failure(&mut local_stream, kind, true).await.ok();
-            bail!("连接在建连阶段已被管理员手动切断");
+            bail!("Connection aborted by administrator during establishment");
         }
     };
 
-    // 8. 回复客户端隧道就绪，并转发握手阶段已缓存的数据
+    // 8. Reply to client that tunnel is ready, and forward buffered payload from handshake
     inbound::send_success(&mut local_stream, kind).await?;
     if !pending.is_empty() {
         remote_stream.write_all(&pending).await?;
         active_conn.add_upload(pending.len() as u64);
     }
 
-    // 9. 全双工对拷（带实时流量监视）
+    // 9. Full-duplex relay (with live traffic monitoring)
     let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
     info!(
-        "[中继完成] [{}] {}:{} 上传: {} B, 下载: {} B",
+        "[Relay Complete] [{}] {}:{} Upload: {} B, Download: {} B",
         action_str,
         target.host_string(),
         target.port(),
@@ -274,14 +282,14 @@ async fn handle_connection(
 
 async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &TargetAddr) -> Result<TcpStream> {
     match action {
-        Action::Block => bail!("连接已被规则阻断"),
+        Action::Block => bail!("Connection blocked by rule"),
         Action::Direct => DirectOutbound::connect(target).await,
         Action::Proxy(node_id) => {
             let client = {
                 let nodes_guard = config.proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
                 match nodes_guard.get(node_id) {
                     Some(e) => e.client.clone(),
-                    None => bail!("规则指定了不存在的代理节点 ID: {}", node_id),
+                    None => bail!("Rule specifies non-existent proxy node ID: {}", node_id),
                 }
             };
             match &client {
@@ -293,7 +301,7 @@ async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &T
         Action::Chain(chain_id) => {
             let chain = match config.proxy_chains.get(chain_id) {
                 Some(c) => c,
-                None => bail!("规则指定了不存在的代理链 ID: {}", chain_id),
+                None => bail!("Rule specifies non-existent proxy chain ID: {}", chain_id),
             };
             chain.connect(target).await
         }
@@ -356,7 +364,7 @@ mod tests {
         c.write_all(&req).await.unwrap();
         let mut reply = [0u8; 10];
         c.read_exact(&mut reply).await.unwrap();
-        assert_eq!(reply[1], 0x00, "SOCKS5 应答应为成功");
+        assert_eq!(reply[1], 0x00, "SOCKS5 reply should be success");
 
         c.write_all(b"hello").await.unwrap();
         let mut echoed = [0u8; 5];

@@ -11,7 +11,12 @@ pub struct ConnectionSnapshot {
     pub pid: u32,
     pub target: String,
     pub rule_name: String,
+    /// 已本地化的动作展示文案（由 API 层按请求语言格式化后写入）
     pub action: String,
+    /// 机器可读的动作类型（`Direct` / `Block` / `Proxy` / `Chain`），不参与 i18n
+    pub action_type: String,
+    /// 动作引用的代理节点/链路 ID；`Direct` 与 `Block` 为 None
+    pub action_id: Option<u32>,
     pub duration_secs: u64,
     pub uploaded_bytes: u64,
     pub downloaded_bytes: u64,
@@ -26,7 +31,10 @@ pub struct ActiveConnection {
     pub pid: u32,
     pub target: String,
     pub rule_name: String,
-    pub action: String,
+    /// 机器可读的动作类型（`Direct` / `Block` / `Proxy` / `Chain`），不参与 i18n
+    pub action_type: String,
+    /// 动作引用的代理节点/链路 ID；`Direct` 与 `Block` 为 None
+    pub action_id: Option<u32>,
     pub start_time: Instant,
     pub uploaded_bytes: AtomicU64,
     pub downloaded_bytes: AtomicU64,
@@ -79,7 +87,10 @@ impl ActiveConnection {
             pid: self.pid,
             target: self.target.clone(),
             rule_name: self.rule_name.clone(),
-            action: self.action.clone(),
+            // 占位默认值：由 API 层按请求语言重新格式化为本地化文案
+            action: self.action_type.clone(),
+            action_type: self.action_type.clone(),
+            action_id: self.action_id,
             duration_secs: now.duration_since(self.start_time).as_secs(),
             uploaded_bytes: up,
             downloaded_bytes: down,
@@ -126,6 +137,7 @@ impl ConnectionManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register(
         &self,
         process_name: String,
@@ -133,7 +145,8 @@ impl ConnectionManager {
         pid: u32,
         target: String,
         rule_name: String,
-        action: String,
+        action_type: String,
+        action_id: Option<u32>,
     ) -> Arc<ActiveConnection> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
@@ -145,7 +158,8 @@ impl ConnectionManager {
             pid,
             target,
             rule_name,
-            action,
+            action_type,
+            action_id,
             start_time: now,
             uploaded_bytes: AtomicU64::new(0),
             downloaded_bytes: AtomicU64::new(0),
@@ -271,7 +285,8 @@ mod tests {
             1234,
             "api.github.com:443".into(),
             "DevRule".into(),
-            "Proxy(101)".into(),
+            "Proxy".into(),
+            Some(101),
         );
 
         assert_eq!(conn.id, 1);
@@ -317,6 +332,7 @@ mod tests {
             "1.1.1.1:80".into(),
             "Direct".into(),
             "Direct".into(),
+            None,
         );
 
         let notify = conn.cancel_notify.clone();
