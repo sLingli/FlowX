@@ -13,17 +13,50 @@
 ## 快速开始
 
 ```bash
-# 运行引擎（首次运行若无配置文件会自动创建 flowx.xml）
+# 运行后台守护引擎（首次运行若无配置文件会自动创建 flowx.xml）
 cargo run
 
-# 指定自定义配置文件
+# 指定自定义配置文件启动守护引擎
 cargo run -- --config my-profile.xml
 
 # 运行全部单元测试
 cargo test
 ```
 
-启动后在浏览器打开 `http://127.0.0.1:40080` 即可查看实时吞吐图表、活动连接、测速代理节点或调整分流规则。
+启动后在浏览器打开 `http://127.0.0.1:40080` 即可查看实时吞吐图表、活动连接、新增/编辑/测速代理节点、调整分流规则与默认兜底策略，或使用内置「路由规则命中模拟器」干跑测试规则。
+
+### CLI 控制子命令（支持在线热调用与离线 XML 直改）
+
+`flowx` 内置双栖 CLI 子命令，当守护进程运行时自动通过本地 API 实时同步，当守护进程未运行时自动回退为离线读写 `flowx.xml`（所有子命令均支持 `--json` 输出）：
+
+```bash
+# 查看运行状态与统计概览
+flowx status
+
+# 代理节点增删改查与测速
+flowx node list
+flowx node add --name "HK-Socks" --addr "127.0.0.1:10808" --protocol SOCKS5
+flowx node update 101 --name "HK-Main" --addr "127.0.0.1:10809"
+flowx node ping 101
+
+# 分流规则增删改查、启停与优先级排序
+flowx rule list
+flowx rule add --name "GitProxy" --apps "git.exe" --targets "*.github.com" --ports "22; 443" --action Proxy:101
+flowx rule update 2 --targets "*.github.com; *.githubusercontent.com"
+flowx rule toggle 2 --enable
+flowx rule move 2 top
+
+# 查询或修改默认兜底策略
+flowx default
+flowx default Proxy:101
+
+# 干跑模拟流量命中哪条规则并输出逐条匹配轨迹
+flowx sim --app "git.exe" --target "api.github.com:443"
+```
+
+### AI Agent 技能支持
+
+仓库内置了供 AI Agent 调用的技能定义文件 [`skills/flowx/SKILL.md`](skills/flowx/SKILL.md)，涵盖 CLI 子命令、匹配语法规范与标准操作工作流。
 
 ### 命令行代理测试
 
