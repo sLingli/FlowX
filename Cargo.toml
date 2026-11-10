@@ -24,7 +24,8 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 ipnet = "2.9"
 glob = "0.3"
 
-# Windows 原生网络/进程 API 交互
+# Windows 原生网络/进程 API 交互（仅在 Windows 目标平台编译）
+[target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

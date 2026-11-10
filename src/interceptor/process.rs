@@ -77,10 +77,23 @@ impl ProcessTracker {
                 }
         }
 
-        // 2. 缓存未命中，调用 Windows API 精确查找连接归属的 PID
+        // 2. 缓存未命中，调用平台原生接口精确查找连接归属的 PID
+        #[cfg(target_os = "linux")]
+        let pid = {
+            let hint_pids: Vec<u32> = {
+                let p_cache = self.pid_cache.read().unwrap_or_else(|e| e.into_inner());
+                p_cache
+                    .iter()
+                    .filter(|(_, (_, expire))| *expire > now)
+                    .map(|(pid, _)| *pid)
+                    .collect()
+            };
+            get_pid_by_connection_with_hints(client, server, &hint_pids)?
+        };
+        #[cfg(not(target_os = "linux"))]
         let pid = get_pid_by_connection(client, server)?;
 
-        // 3. 查询 PID 级缓存以避免重复调用昂贵的 OpenProcess + QueryFullProcessImageNameW
+        // 3. 查询 PID 级缓存以避免重复调用昂贵的系统级进程路径查询
         let cached = {
             let p_cache = self.pid_cache.read().unwrap_or_else(|e| e.into_inner());
             p_cache
@@ -92,7 +105,7 @@ impl ProcessTracker {
         let info = match cached {
             Some(info) => info,
             None => {
-                // 4. PID 缓存未命中，调用 Windows API 查询可执行文件完整路径
+                // 4. PID 缓存未命中，查询可执行文件完整路径与进程名
                 let path = get_process_image_path(pid)
                     .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
                 let name = Path::new(&path)
@@ -254,7 +267,221 @@ fn get_pid_by_connection(client: SocketAddr, server: SocketAddr) -> Option<u32> 
     None
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn get_pid_by_connection_with_hints(
+    client: SocketAddr,
+    server: SocketAddr,
+    hint_pids: &[u32],
+) -> Option<u32> {
+    let inode = find_socket_inode_linux(client, server)?;
+    find_pid_by_socket_inode_linux(inode, hint_pids)
+}
+
+#[cfg(target_os = "linux")]
+fn find_socket_inode_linux(client: SocketAddr, server: SocketAddr) -> Option<u64> {
+    use std::net::SocketAddrV6;
+
+    match (client, server) {
+        (SocketAddr::V4(client_v4), SocketAddr::V4(server_v4)) => {
+            if let Ok(content) = std::fs::read_to_string("/proc/net/tcp")
+                && let Some(inode) = find_socket_inode_in_proc_tcp(&content, client_v4, server_v4)
+            {
+                return Some(inode);
+            }
+            // 兼容双栈套接字在 /proc/net/tcp6 中以 ::ffff:a.b.c.d 记录 IPv4 连接的情况
+            if let Ok(content6) = std::fs::read_to_string("/proc/net/tcp6") {
+                let c_v6 = SocketAddrV6::new(client_v4.ip().to_ipv6_mapped(), client_v4.port(), 0, 0);
+                let s_v6 = SocketAddrV6::new(server_v4.ip().to_ipv6_mapped(), server_v4.port(), 0, 0);
+                if let Some(inode) = find_socket_inode_in_proc_tcp6(&content6, c_v6, s_v6) {
+                    return Some(inode);
+                }
+            }
+            None
+        }
+        (SocketAddr::V6(client_v6), SocketAddr::V6(server_v6)) => {
+            let content = std::fs::read_to_string("/proc/net/tcp6").ok()?;
+            find_socket_inode_in_proc_tcp6(&content, client_v6, server_v6)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn proc_pid_owns_socket_inode(pid: u32, inode: u64) -> bool {
+    let fd_dir = format!("/proc/{}/fd", pid);
+    let Ok(entries) = std::fs::read_dir(fd_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Ok(target) = std::fs::read_link(entry.path())
+            && let Some(target_str) = target.to_str()
+            && matches_socket_inode(target_str, inode)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn find_pid_by_socket_inode_linux(inode: u64, hint_pids: &[u32]) -> Option<u32> {
+    // 1. 快路径：优先探测已在 PID 缓存中的活跃进程与当前自身进程，避免每次全量遍历 /proc
+    for &pid in hint_pids {
+        if proc_pid_owns_socket_inode(pid, inode) {
+            return Some(pid);
+        }
+    }
+    let self_pid = std::process::id();
+    if !hint_pids.contains(&self_pid) && proc_pid_owns_socket_inode(self_pid, inode) {
+        return Some(self_pid);
+    }
+
+    // 2. 慢路径：遍历 /proc 下所有纯数字 PID 目录
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(pid) = name_str.parse::<u32>() else {
+            continue;
+        };
+        if pid == self_pid || hint_pids.contains(&pid) {
+            continue;
+        }
+        if proc_pid_owns_socket_inode(pid, inode) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// 解析 `/proc/net/tcp` 单列十六进制 `HHHHHHHH:PPPP` 地址（IP 按主机字节序编码，端口按大端编码）
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_ipv4_addr(raw: &str) -> Option<(std::net::Ipv4Addr, u16)> {
+    let (ip_hex, port_hex) = raw.split_once(':')?;
+    if ip_hex.len() != 8 || port_hex.len() != 4 {
+        return None;
+    }
+    let ip_host = u32::from_str_radix(ip_hex, 16).ok()?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    Some((std::net::Ipv4Addr::from(ip_host.to_ne_bytes()), port))
+}
+
+/// 解析 `/proc/net/tcp6` 单列十六进制 `32位Hex:PPPP` 地址（4 个 32-bit 字均按主机字节序编码）
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_net_ipv6_addr(raw: &str) -> Option<(std::net::Ipv6Addr, u16)> {
+    let (ip_hex, port_hex) = raw.split_once(':')?;
+    if ip_hex.len() != 32 || port_hex.len() != 4 {
+        return None;
+    }
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    let mut octets = [0u8; 16];
+    for i in 0..4 {
+        let word_hex = &ip_hex[i * 8..(i + 1) * 8];
+        let word = u32::from_str_radix(word_hex, 16).ok()?;
+        octets[i * 4..(i + 1) * 4].copy_from_slice(&word.to_ne_bytes());
+    }
+    Some((std::net::Ipv6Addr::from(octets), port))
+}
+
+/// 在 `/proc/net/tcp` 文本中按完整四元组 (`local == client && remote == server`) 查找套接字 inode
+#[cfg(any(target_os = "linux", test))]
+fn find_socket_inode_in_proc_tcp(
+    content: &str,
+    client: std::net::SocketAddrV4,
+    server: std::net::SocketAddrV4,
+) -> Option<u64> {
+    let target_local = (*client.ip(), client.port());
+    let target_rem = (*server.ip(), server.port());
+
+    for line in content.lines() {
+        let mut cols = line.split_ascii_whitespace();
+        let _sl = cols.next()?;
+        let Some(local_raw) = cols.next() else {
+            continue;
+        };
+        let Some(rem_raw) = cols.next() else {
+            continue;
+        };
+        if parse_proc_net_ipv4_addr(local_raw) != Some(target_local)
+            || parse_proc_net_ipv4_addr(rem_raw) != Some(target_rem)
+        {
+            continue;
+        }
+        // 列布局: sl(0) local(1) rem(2) st(3) queue(4) tr(5) retrnsmt(6) uid(7) timeout(8) inode(9)
+        if let Some(inode_str) = cols.nth(6)
+            && let Ok(inode) = inode_str.parse::<u64>()
+            && inode > 0
+        {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+/// 在 `/proc/net/tcp6` 文本中按完整四元组 (`local == client && remote == server`) 查找套接字 inode
+#[cfg(any(target_os = "linux", test))]
+fn find_socket_inode_in_proc_tcp6(
+    content: &str,
+    client: std::net::SocketAddrV6,
+    server: std::net::SocketAddrV6,
+) -> Option<u64> {
+    let target_local = (*client.ip(), client.port());
+    let target_rem = (*server.ip(), server.port());
+
+    for line in content.lines() {
+        let mut cols = line.split_ascii_whitespace();
+        let _sl = cols.next()?;
+        let Some(local_raw) = cols.next() else {
+            continue;
+        };
+        let Some(rem_raw) = cols.next() else {
+            continue;
+        };
+        if parse_proc_net_ipv6_addr(local_raw) != Some(target_local)
+            || parse_proc_net_ipv6_addr(rem_raw) != Some(target_rem)
+        {
+            continue;
+        }
+        if let Some(inode_str) = cols.nth(6)
+            && let Ok(inode) = inode_str.parse::<u64>()
+            && inode > 0
+        {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+/// 判断 `/proc/<pid>/fd/*` 符号链接目标是否指向指定套接字 inode（兼容 `socket:[inode]` 与 `[0000]:inode`）
+#[cfg(any(target_os = "linux", test))]
+fn matches_socket_inode(link_target: &str, inode: u64) -> bool {
+    if let Some(rest) = link_target.strip_prefix("socket:[")
+        && let Some(num_str) = rest.strip_suffix(']')
+    {
+        return num_str.parse::<u64>().ok() == Some(inode);
+    }
+    if let Some(rest) = link_target.strip_prefix("[0000]:") {
+        return rest.parse::<u64>().ok() == Some(inode);
+    }
+    false
+}
+
+/// 清理 `/proc/<pid>/exe` 软链读取结果（剥离 Linux 内核对已覆盖二进制附加的 `" (deleted)"` 后缀）
+#[cfg(any(target_os = "linux", test))]
+fn clean_proc_exe_path(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches(['\r', '\n']);
+    trimmed
+        .strip_suffix(" (deleted)")
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn get_pid_by_connection(_client: SocketAddr, _server: SocketAddr) -> Option<u32> {
     None
 }
@@ -291,7 +518,46 @@ fn get_process_image_path(pid: u32) -> Option<String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn get_process_image_path(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return Some("kernel".to_string());
+    }
+
+    // 1. 优先读取 /proc/<pid>/exe 符号链接以获得真实可执行文件绝对路径
+    let exe_link = format!("/proc/{}/exe", pid);
+    if let Ok(path_buf) = std::fs::read_link(&exe_link) {
+        let cleaned = clean_proc_exe_path(&path_buf.to_string_lossy());
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+
+    // 2. 回退：读取 /proc/<pid>/cmdline 的首个 NUL 分隔参数 (argv[0])
+    let cmdline_path = format!("/proc/{}/cmdline", pid);
+    if let Ok(bytes) = std::fs::read(&cmdline_path)
+        && !bytes.is_empty()
+    {
+        let first_arg = bytes.split(|&b| b == 0).next().unwrap_or(&bytes);
+        let arg0 = String::from_utf8_lossy(first_arg).trim().to_string();
+        if !arg0.is_empty() {
+            return Some(arg0);
+        }
+    }
+
+    // 3. 回退：读取 /proc/<pid>/comm 进程短名
+    let comm_path = format!("/proc/{}/comm", pid);
+    if let Ok(comm) = std::fs::read_to_string(&comm_path) {
+        let trimmed = comm.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn get_process_image_path(_pid: u32) -> Option<String> {
     None
 }
@@ -310,7 +576,7 @@ mod tests {
         tracker.cleanup_expired();
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn test_find_own_process_by_connection() {
         // Establish a loopback connection and verify finding current process via 4-tuple
@@ -323,6 +589,69 @@ mod tests {
         let tracker = ProcessTracker::new();
         let info = tracker.find_by_connection(peer, server).expect("Should locate current process");
         assert_eq!(info.pid, std::process::id());
+    }
+
+    #[test]
+    fn test_linux_proc_net_tcp_and_tcp6_parsers() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+        let c_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let s_ip = Ipv4Addr::new(127, 0, 0, 1);
+        let c_port = 54321u16;
+        let s_port = 40001u16;
+
+        let c_hex = format!("{:08X}:{:04X}", u32::from_ne_bytes(c_ip.octets()), c_port);
+        let s_hex = format!("{:08X}:{:04X}", u32::from_ne_bytes(s_ip.octets()), s_port);
+
+        let sample_tcp = format!(
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+               0: {s_hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41001 1 0000000000000000 100 0 0 10 0\n\
+               1: {c_hex} {s_hex} 01 00000000:00000000 00:00000000 00000000  1000        0 987654 1 0000000000000000 20 4 30 10 -1\n"
+        );
+
+        let client_v4 = SocketAddrV4::new(c_ip, c_port);
+        let server_v4 = SocketAddrV4::new(s_ip, s_port);
+        assert_eq!(
+            find_socket_inode_in_proc_tcp(&sample_tcp, client_v4, server_v4),
+            Some(987654)
+        );
+        // 端口不匹配时应返回 None
+        assert_eq!(
+            find_socket_inode_in_proc_tcp(&sample_tcp, SocketAddrV4::new(c_ip, 12345), server_v4),
+            None
+        );
+
+        // 验证 /proc/net/tcp6 解析（含 IPv4-mapped IPv6 地址 ::ffff:127.0.0.1）
+        let v6_ip: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        let oct = v6_ip.octets();
+        let w0 = u32::from_ne_bytes([oct[0], oct[1], oct[2], oct[3]]);
+        let w1 = u32::from_ne_bytes([oct[4], oct[5], oct[6], oct[7]]);
+        let w2 = u32::from_ne_bytes([oct[8], oct[9], oct[10], oct[11]]);
+        let w3 = u32::from_ne_bytes([oct[12], oct[13], oct[14], oct[15]]);
+        let c6_hex = format!("{:08X}{:08X}{:08X}{:08X}:{:04X}", w0, w1, w2, w3, c_port);
+        let s6_hex = format!("{:08X}{:08X}{:08X}{:08X}:{:04X}", w0, w1, w2, w3, s_port);
+
+        let sample_tcp6 = format!(
+            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+               0: {c6_hex} {s6_hex} 01 00000000:00000000 00:00000000 00000000  1000        0 556677 1 0000000000000000 20 4 30 10 -1\n"
+        );
+        let client_v6 = SocketAddrV6::new(v6_ip, c_port, 0, 0);
+        let server_v6 = SocketAddrV6::new(v6_ip, s_port, 0, 0);
+        assert_eq!(
+            find_socket_inode_in_proc_tcp6(&sample_tcp6, client_v6, server_v6),
+            Some(556677)
+        );
+
+        // 验证 socket:[inode] 软链匹配与 (deleted) 路径清洗
+        assert!(matches_socket_inode("socket:[987654]", 987654));
+        assert!(matches_socket_inode("[0000]:987654", 987654));
+        assert!(!matches_socket_inode("socket:[987655]", 987654));
+        assert!(!matches_socket_inode("pipe:[987654]", 987654));
+        assert_eq!(
+            clean_proc_exe_path("/usr/bin/curl (deleted)\n"),
+            "/usr/bin/curl"
+        );
+        assert_eq!(clean_proc_exe_path("/usr/bin/git"), "/usr/bin/git");
     }
 
     #[test]
