@@ -162,6 +162,7 @@ impl Rule {
         }
 
         // 1. 匹配应用程序 (Fail-Closed: 若配置了规则但列表为空，绝不放行)
+        // 同时支持跨平台进程名双向兼容（如规则写 `git.exe` 可匹配 Linux `git`，规则写 `git` 可匹配 Windows `git.exe`）
         if let Some(patterns) = &self.application_patterns {
             if patterns.is_empty() {
                 return Err("app_mismatch");
@@ -169,8 +170,9 @@ impl Rule {
             let mut app_matched = false;
             if let Some(pname) = ctx.process_name {
                 let pname_normalized = pname.to_lowercase().replace('\\', "/");
+                let pname_alt = toggle_exe_suffix(&pname_normalized);
                 for pat in patterns {
-                    if pat.matches(&pname_normalized) {
+                    if pat.matches(&pname_normalized) || pat.matches(&pname_alt) {
                         app_matched = true;
                         break;
                     }
@@ -180,8 +182,9 @@ impl Rule {
                 && let Some(path) = ctx.process_path
             {
                 let path_normalized = path.to_lowercase().replace('\\', "/");
+                let path_alt = toggle_exe_suffix(&path_normalized);
                 for pat in patterns {
-                    if pat.matches(&path_normalized) {
+                    if pat.matches(&path_normalized) || pat.matches(&path_alt) {
                         app_matched = true;
                         break;
                     }
@@ -469,6 +472,17 @@ pub fn format_action_desc(action: &Action, locale: crate::i18n::Locale) -> Strin
     }
 }
 
+/// 生成跨平台 `.exe` 互补候选名（若带 `.exe` 则剥离，若不带 `.exe` 则追加），使 Windows 与 Linux 进程规则天然互通
+fn toggle_exe_suffix(normalized_lower: &str) -> String {
+    if let Some(stem) = normalized_lower.strip_suffix(".exe")
+        && !stem.is_empty()
+    {
+        stem.to_string()
+    } else {
+        format!("{}.exe", normalized_lower)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,5 +699,73 @@ mod tests {
         assert_eq!(sim_miss.action, Action::Block);
         assert_eq!(sim_miss.trace.len(), 5);
         assert!(sim_miss.trace.iter().all(|s| !s.matched));
+    }
+
+    #[test]
+    fn test_cross_platform_exe_suffix_matching() {
+        assert_eq!(toggle_exe_suffix("git.exe"), "git");
+        assert_eq!(toggle_exe_suffix("git"), "git.exe");
+        assert_eq!(toggle_exe_suffix("/usr/bin/git"), "/usr/bin/git.exe");
+
+        // Windows 风格规则 (.exe) 应命中 Linux 无后缀进程
+        let win_rule = Rule::from_raw(
+            "WinStyle",
+            true,
+            Some("node.exe; *chrome*.exe; *git*.exe"),
+            None,
+            None,
+            Action::Proxy(101),
+        );
+        for (name, path) in [
+            ("node", "/usr/bin/node"),
+            ("google-chrome", "/opt/google/chrome/google-chrome"),
+            ("git", "/usr/bin/git"),
+        ] {
+            let ctx = RouteContext {
+                process_path: Some(path),
+                process_name: Some(name),
+                target_host: Some("example.com"),
+                target_ip: None,
+                target_port: 443,
+            };
+            assert!(win_rule.check_match(&ctx).is_ok(), "{name} should match .exe rule");
+        }
+
+        // Linux 风格规则 (无后缀) 应命中 Windows .exe 进程，且路径规则同样双向兼容
+        let linux_rule = Rule::from_raw(
+            "LinuxStyle",
+            true,
+            Some("curl; /usr/bin/wget"),
+            None,
+            None,
+            Action::Direct,
+        );
+        let ctx_win = RouteContext {
+            process_path: Some(r"C:\Windows\System32\curl.exe"),
+            process_name: Some("curl.exe"),
+            target_host: Some("example.com"),
+            target_ip: None,
+            target_port: 443,
+        };
+        assert!(linux_rule.check_match(&ctx_win).is_ok());
+        let ctx_wget = RouteContext {
+            process_path: Some("/usr/bin/wget"),
+            process_name: Some("wget"),
+            target_host: Some("example.com"),
+            target_ip: None,
+            target_port: 80,
+        };
+        assert!(linux_rule.check_match(&ctx_wget).is_ok());
+
+        // 不相关进程不应误命中
+        let ctx_other = RouteContext {
+            process_path: Some("/usr/bin/python3"),
+            process_name: Some("python3"),
+            target_host: Some("example.com"),
+            target_ip: None,
+            target_port: 443,
+        };
+        assert_eq!(win_rule.check_match(&ctx_other), Err("app_mismatch"));
+        assert_eq!(linux_rule.check_match(&ctx_other), Err("app_mismatch"));
     }
 }

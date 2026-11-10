@@ -196,11 +196,14 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("[Ready] Web console ready at: http://127.0.0.1:40080");
-    info!("[Ready] Press Ctrl+C to stop FlowX core");
+    info!("[Ready] Press Ctrl+C (or send SIGTERM) to stop FlowX core");
 
-    // 8. 监听操作系统 Ctrl+C 信号并执行优雅停机
-    tokio::signal::ctrl_c().await?;
-    info!("[Shutdown] Received shutdown signal, stopping inbound traffic...");
+    // 8. 监听操作系统停机信号（Windows Ctrl+C / Unix SIGINT & SIGTERM）并执行优雅停机
+    let sig_name = wait_for_shutdown_signal().await?;
+    info!(
+        "[Shutdown] Received {} signal, stopping inbound traffic...",
+        sig_name
+    );
     let _ = shutdown_tx.send(true);
 
     // 优雅排空：等待正在传输的活跃连接完成挥手（最多等待 10 秒）
@@ -217,4 +220,29 @@ async fn main() -> anyhow::Result<()> {
     info!("[Shutdown] FlowX core stopped cleanly");
 
     Ok(())
+}
+
+async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate())
+            .context("Failed to register SIGTERM signal handler")?;
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                res.context("Failed to listen for SIGINT (Ctrl+C)")?;
+                Ok("SIGINT (Ctrl+C)")
+            }
+            _ = sigterm.recv() => {
+                Ok("SIGTERM")
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to listen for Ctrl+C shutdown signal")?;
+        Ok("Ctrl+C")
+    }
 }

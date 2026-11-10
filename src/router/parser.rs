@@ -116,15 +116,53 @@ fn replace_ascii_placeholder_ignore_case(input: &str, placeholder: &str, value: 
     }
 }
 
-/// 展开环境变量（不区分大小写识别 %ComputerName% / %COMPUTERNAME% 等占位符）
+/// 解析当前主机名（兼容 Windows `COMPUTERNAME`、Unix `HOSTNAME` 以及 Linux `/proc/sys/kernel/hostname` 与 `/etc/hostname`）
+pub fn resolve_local_hostname() -> String {
+    for var in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(val) = std::env::var(var) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(content) = std::fs::read_to_string(path)
+            && let Some(first_line) = content.lines().next()
+        {
+            let trimmed = first_line.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "localhost".to_string()
+}
+
+/// 展开环境变量（不区分大小写识别 %ComputerName% / %HOSTNAME% 等占位符）
 fn expand_env_vars(input: &str) -> String {
-    if !input.as_bytes().windows(b"%computername%".len()).any(|w| w.eq_ignore_ascii_case(b"%computername%")) {
+    let bytes = input.as_bytes();
+    let has_computername = bytes
+        .windows(b"%computername%".len())
+        .any(|w| w.eq_ignore_ascii_case(b"%computername%"));
+    let has_hostname = bytes
+        .windows(b"%hostname%".len())
+        .any(|w| w.eq_ignore_ascii_case(b"%hostname%"));
+
+    if !has_computername && !has_hostname {
         return input.to_string();
     }
-    let computer_name = std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "localhost".to_string());
-    replace_ascii_placeholder_ignore_case(input, "%computername%", &computer_name)
+
+    let host_name = resolve_local_hostname();
+    let mut out = if has_computername {
+        replace_ascii_placeholder_ignore_case(input, "%computername%", &host_name)
+    } else {
+        input.to_string()
+    };
+    if has_hostname {
+        out = replace_ascii_placeholder_ignore_case(&out, "%hostname%", &host_name);
+    }
+    out
 }
 
 /// 解析以分号分隔的目标主机（支持 IP, CIDR 子网与域名预编译匹配器）
@@ -278,19 +316,20 @@ mod tests {
 
     #[test]
     fn test_expand_env_vars_case_insensitive() {
-        let expected_host = std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "localhost".to_string());
-        let expanded = expand_env_vars("localhost; %ComputerName%; %computername%; %COMPUTERNAME%");
+        let expected_host = resolve_local_hostname();
+        assert!(!expected_host.is_empty());
+        let expanded = expand_env_vars("localhost; %ComputerName%; %computername%; %COMPUTERNAME%; %HostName%");
         assert!(!expanded.to_lowercase().contains("%computername%"));
+        assert!(!expanded.to_lowercase().contains("%hostname%"));
         assert!(expanded.contains(&expected_host));
 
         // 验证 parse_targets 能正确将默认配置中的 %ComputerName% 展开成当前主机域名匹配器
-        let (domains, _) = parse_targets("%ComputerName%; *.Local");
+        let (domains, _) = parse_targets("%ComputerName%; *.Local; %HOSTNAME%");
         let domains = domains.unwrap();
         assert!(domains[0].matches(&expected_host));
         assert!(domains[1].matches("nas.local"));
         assert!(!domains[1].matches("notlocal"));
+        assert!(domains[2].matches(&expected_host));
     }
 
     #[test]
