@@ -1282,7 +1282,7 @@
           </button>
           <div>
             <div class="page-title" id="view-title">Overview</div>
-            <div class="page-subtitle" id="view-subtitle">Mixed Inbound · Windows Process Tracking · Fake-IP DNS</div>
+            <div class="page-subtitle" id="view-subtitle">Mixed Inbound · Cross-Platform Process Tracking (Windows / Linux) · Fake-IP DNS</div>
           </div>
         </div>
         <div class="topbar-right">
@@ -1602,7 +1602,7 @@
       <div class="form-group">
         <label class="form-label" for="rule-apps" data-i18n="form_rule_apps">Application Filter (Semicolon-separated, wildcards supported)</label>
         <input type="text" class="form-input mono" id="rule-apps" data-i18n-placeholder="form_rule_apps_ph" placeholder="chrome.exe; *edge*.exe; node.exe">
-        <div class="form-hint" data-i18n="form_rule_apps_hint">Leave empty to match all processes</div>
+        <div class="form-hint" data-i18n="form_rule_apps_hint">Leave empty to match all processes; .exe suffix is cross-platform (git.exe also matches git on Linux)</div>
       </div>
       <div class="form-group">
         <label class="form-label" for="rule-targets" data-i18n="form_rule_targets">Target Address Filter (Domain / IP / CIDR, semicolon-separated)</label>
@@ -1667,7 +1667,7 @@
         sidebar_config: '配置文件',
 
         topbar_title_dashboard: '实时概览',
-        topbar_sub_dashboard: '混合协议入站 · Windows 进程四元组追踪 · Fake-IP 防泄漏',
+        topbar_sub_dashboard: '混合协议入站 · 跨平台进程四元组追踪 (Windows / Linux) · Fake-IP 防泄漏',
         topbar_title_connections: '活跃连接',
         topbar_sub_connections: '实时追踪本地进程出站会话、规则命中与流量统计',
         topbar_title_proxies: '代理节点',
@@ -1783,7 +1783,7 @@
 
         sim_title: '路由规则命中模拟器',
         sim_sub: '输入进程与目标地址，干跑测试命中哪条规则并查看逐条匹配轨迹',
-        sim_proc_ph: '进程名或完整路径 (如 git.exe，留空代表任意)',
+        sim_proc_ph: '进程名或完整路径 (如 git.exe 或 /usr/bin/git，留空代表任意)',
         sim_target_ph: '目标主机或 IP (如 api.github.com:443 或 8.8.8.8)',
         sim_port_ph: '端口 (默认 443)',
         btn_sim_run: '测试命中',
@@ -1820,7 +1820,7 @@
         form_rule_name_ph: '例如: BrowserProxy',
         form_rule_apps: '应用程序筛选 (分号分隔，支持通配符)',
         form_rule_apps_ph: 'chrome.exe; *edge*.exe; node.exe',
-        form_rule_apps_hint: '留空表示匹配全部应用进程',
+        form_rule_apps_hint: '留空表示匹配全部应用进程；.exe 后缀跨平台互通（git.exe 可匹配 Linux 下的 git）',
         form_rule_targets: '目标地址筛选 (域名 / IP / CIDR，分号分隔)',
         form_rule_targets_ph: '*.github.com; 1.1.1.1/32; localhost',
         form_rule_targets_hint: '留空表示匹配全部目标地址',
@@ -1891,7 +1891,7 @@
         sidebar_config: 'Config Profile',
 
         topbar_title_dashboard: 'Overview',
-        topbar_sub_dashboard: 'Mixed Inbound · Windows Process Tracking · Fake-IP DNS',
+        topbar_sub_dashboard: 'Mixed Inbound · Cross-Platform Process Tracking (Windows / Linux) · Fake-IP DNS',
         topbar_title_connections: 'Active Connections',
         topbar_sub_connections: 'Real-time outbound session tracking, rule evaluation & traffic monitoring',
         topbar_title_proxies: 'Proxy Nodes',
@@ -2007,7 +2007,7 @@
 
         sim_title: 'Route Rule Simulator',
         sim_sub: 'Dry-run a process and target destination to inspect which rule matches and why',
-        sim_proc_ph: 'Process name or path (e.g. git.exe, leave empty for any)',
+        sim_proc_ph: 'Process name or path (e.g. git.exe or /usr/bin/git, leave empty for any)',
         sim_target_ph: 'Target host or IP (e.g. api.github.com:443 or 8.8.8.8)',
         sim_port_ph: 'Port (443)',
         btn_sim_run: 'Test Route',
@@ -2044,7 +2044,7 @@
         form_rule_name_ph: 'e.g. BrowserProxy',
         form_rule_apps: 'Application Filter (Semicolon-separated, wildcards supported)',
         form_rule_apps_ph: 'chrome.exe; *edge*.exe; node.exe',
-        form_rule_apps_hint: 'Leave empty to match all processes',
+        form_rule_apps_hint: 'Leave empty to match all processes; .exe suffix is cross-platform (git.exe also matches git on Linux)',
         form_rule_targets: 'Target Address Filter (Domain / IP / CIDR, semicolon-separated)',
         form_rule_targets_ph: '*.github.com; 1.1.1.1/32; localhost',
         form_rule_targets_hint: 'Leave empty to match all target destinations',

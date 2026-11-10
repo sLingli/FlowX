@@ -5,7 +5,7 @@ description: 配置、诊断与管理 FlowX 进程级透明代理与网络分流
 
 # FlowX 进程级分流与代理控制技能指南
 
-FlowX 是一套基于 Rust 构建的进程级透明网络代理与分流引擎，内建双栖 CLI 控制子命令与本地回环 HTTP API。
+FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux）进程级透明网络代理与分流引擎，内建双栖 CLI 控制子命令与本地回环 HTTP API。
 无论是守护进程在线运行中（默认监听 `http://127.0.0.1:40080`），还是守护进程尚未启动（离线直接读写 `flowx.xml`），都优先通过 `flowx` CLI 子命令（携带 `--json`）完成查询、修改与干跑验证。
 
 ---
@@ -96,6 +96,7 @@ flowx rule remove 2 --json
 ```bash
 # 模拟指定进程访问目标主机与端口的路由决策
 flowx sim --app "C:\Program Files\Git\bin\git.exe" --target "api.github.com:443" --json
+flowx sim --app "/usr/bin/git" --target "api.github.com:443" --json
 flowx sim --app "curl.exe" --target "192.168.1.1" --port 80 --json
 ```
 返回的 `trace` 数组会逐条列出每条规则的评估结果：
@@ -120,12 +121,14 @@ flowx conn kill 42 --json
 
 1. **`apps`（应用程序过滤）**：
    - 使用分号 `;` 分隔多个匹配项，大小写不敏感，路径分隔符 `/` 与 `\` 自动归一化；
-   - 支持 `*` 与 `?` 通配符（如 `node.exe; *chrome*.exe; "C:\Program Files\App\*.exe"`）；
+   - 支持 `*` 与 `?` 通配符（如 `node.exe; *chrome*.exe; "C:\Program Files\App\*.exe"; /usr/bin/node`）；
+   - `.exe` 后缀跨平台双向兼容：`git.exe` 同时匹配 Windows `git.exe` 与 Linux `git`，`git` 也可匹配 Windows `git.exe`，因此同一份 `flowx.xml` 可在两个平台复用；
+   - 在 Linux 上按完整路径匹配时使用 `/usr/bin/...` 等 Unix 路径；普通用户运行时只能识别同用户进程，跨用户进程会显示为 `Unknown` 并落入不限制应用的规则；
    - 留空表示不限制应用（匹配所有进程）。
 2. **`targets`（目标地址过滤）**：
    - 使用分号 `;` 分隔多个域名、IPv4/IPv6 地址或 CIDR 子网（如 `127.0.0.1; ::1; 192.168.0.0/16; *.google.com`）；
    - 前缀通配 `*.example.com` 会**同时匹配**根域 `example.com` 与任意子域 `a.b.example.com`；
-   - 支持大小写不敏感展开 `%ComputerName%` 环境变量为当前机器名；
+   - 支持大小写不敏感展开 `%ComputerName%` / `%HOSTNAME%` 为当前机器名（Linux 下读取 `/proc/sys/kernel/hostname` 或 `/etc/hostname`）；
    - 留空表示不限制目标地址。
 3. **`ports`（目标端口过滤）**：
    - 使用分号 `;` 或逗号 `,` 分隔单端口或破折号范围（如 `80; 443; 8000-8080`）；

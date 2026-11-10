@@ -1,6 +1,16 @@
 # FlowX
 
-基于 Rust 异步运行时（Tokio）构建的 Windows 进程级代理与分流引擎，内建混合协议入站、Fake-IP DNS、XML 配置持久化及单文件 Web 控制台。
+基于 Rust 异步运行时（Tokio）构建的跨平台（Windows / Linux）进程级代理与分流引擎，内建混合协议入站、Fake-IP DNS、XML 配置持久化及单文件 Web 控制台。
+
+## 平台支持
+
+| 平台 | 进程四元组追踪 | 停机信号 |
+|---|---|---|
+| Windows | `GetExtendedTcpTable` + `QueryFullProcessImageNameW` | `Ctrl+C` |
+| Linux | `/proc/net/tcp[6]` → socket inode → `/proc/<pid>/fd` → `/proc/<pid>/exe` | `SIGINT` / `SIGTERM`（兼容 `systemctl stop`） |
+
+- **Linux 权限**：默认端口（`1053` / `40001` / `40080`）均大于 1024，普通用户即可运行；普通用户只能识别同一用户下的进程，若需识别其它用户（如 root 或系统服务）发起的连接，请以 `sudo` 运行或为二进制授予 `CAP_SYS_PTRACE` 与 `CAP_DAC_READ_SEARCH` 能力（`sudo setcap cap_sys_ptrace,cap_dac_read_search+ep ./flowx`）。
+- **规则跨平台互通**：应用程序规则中的 `.exe` 后缀双向兼容，`git.exe` 可匹配 Linux 下的 `git`，`git` 也可匹配 Windows 下的 `git.exe`；`%ComputerName%` / `%HOSTNAME%` 在 Linux 下会读取 `/proc/sys/kernel/hostname` 或 `/etc/hostname`。
 
 ## 默认监听端口
 
@@ -65,7 +75,7 @@ curl -x socks5h://127.0.0.1:40001 https://example.com
 curl -x http://127.0.0.1:40001 https://example.com
 ```
 
-在控制台中可以看到发起进程（`curl.exe`）、PID、目标域名、命中的规则及实时速率。
+在控制台中可以看到发起进程（Windows 下为 `curl.exe`，Linux 下为 `curl`）、PID、目标域名、命中的规则及实时速率。
 
 ## 配置文件 (`flowx.xml`)
 

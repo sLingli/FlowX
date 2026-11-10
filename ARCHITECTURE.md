@@ -1,6 +1,6 @@
 # FlowX 核心架构与工程规范 (FlowX Architecture & Engineering Specification)
 
-FlowX 是一套基于 Rust（Edition 2024）构建的进程级透明网络代理与分流引擎。本文档描述当前代码实现的真实系统拓扑、核心模块职责及后续演进路线。
+FlowX 是一套基于 Rust（Edition 2024）构建的跨平台（Windows / Linux）进程级透明网络代理与分流引擎。本文档描述当前代码实现的真实系统拓扑、核心模块职责及后续演进路线。
 
 ---
 
@@ -44,7 +44,7 @@ flowchart TD
     A2 -->|"UDP 53"| DnsServer
     DnsServer --> FakeIpEngine
     MixedInbound --> Dispatcher
-    ProcessTracker -.->|"GetExtendedTcpTable 四元组"| Dispatcher
+    ProcessTracker -.->|"Windows: GetExtendedTcpTable / Linux: /proc/net/tcp[6] 四元组"| Dispatcher
     Dispatcher --> FakeIpEngine
     Dispatcher --> RouterEngine
     Dispatcher --> OutboundMgr
@@ -68,15 +68,16 @@ flowchart TD
 - **自连回环防护**：拒绝目标指向 FlowX 自身服务端口（`40001` / `40080` / `1053`）的请求，杜绝自连死循环。
 
 ### 2.2 进程四元组精确追踪 (`src/interceptor/process.rs`)
-- **四元组匹配**：在 Windows 上调用 `GetExtendedTcpTable` 按完整四元组（`local == client && remote == server`）精确检索归属 PID，再通过 `QueryFullProcessImageNameW` 获取完整可执行路径。
-- **二级 TTL 缓存**：结合 1 秒连接缓存与 10 秒 PID 路径缓存，并通过 `spawn_blocking` 隔离 Win32 阻塞调用，避免阻塞 Tokio 调度线程。
+- **Windows 实现**：调用 `GetExtendedTcpTable` 按完整四元组（`local == client && remote == server`）精确检索归属 PID，再通过 `QueryFullProcessImageNameW` 获取完整可执行路径。
+- **Linux 实现**：解析 `/proc/net/tcp`（及双栈套接字使用的 `/proc/net/tcp6` `::ffff:` 映射地址）按同一四元组定位套接字 inode，扫描 `/proc/<pid>/fd` 中指向 `socket:[inode]` 的描述符得到 PID（优先探测 PID 缓存中的活跃进程，未命中再全量遍历），最后读取 `/proc/<pid>/exe`（自动剥离 ` (deleted)` 后缀），权限不足时依次回退 `cmdline` 与 `comm`。`windows-sys` 仅在 Windows 目标编译，Linux 构建零额外依赖。
+- **二级 TTL 缓存**：结合 1 秒连接缓存与 10 秒 PID 路径缓存，并通过 `spawn_blocking` 隔离阻塞式系统调用与文件系统扫描，避免阻塞 Tokio 调度线程。
 
 ### 2.3 DNS 拦截与 Fake-IP 机制 (`src/dns/mod.rs`, `src/dns/server.rs`)
 - **本地 DNS 服务**：监听 `127.0.0.1:1053`，默认拦截阻断 `AAAA`（Type 28）、`SVCB`（Type 64）与 `HTTPS`（Type 65）查询并回复空 NOERROR 应答，防止 IPv6 泄漏与 `ipv4hint` 绕过 Fake-IP；其余查询通过独立内部事务 ID 映射器并校源自上游 IP 后，复用 UDP 套接字转发至 `223.5.5.5:53`。
 - **Fake-IP 滑动续期**：为 `A` 查询从 `198.18.0.0/15` 分配虚拟 IP 并维护双向映射；在 `allocate()` / `restore()` 命中活跃域名时自动滑动续期 TTL，防止活跃会话中途丢失域名映射。
 
 ### 2.4 多维规则路由引擎 (`src/router/mod.rs`, `src/router/parser.rs`)
-- **多维条件**：支持应用程序名/路径 Glob 通配符（分号分隔）、目标域名通配与 IPv4/IPv6 CIDR 网段、离散端口与端口范围（如 `80; 443; 8000-8080`）。
+- **多维条件**：支持应用程序名/路径 Glob 通配符（分号分隔，`.exe` 后缀跨平台双向兼容）、目标域名通配与 IPv4/IPv6 CIDR 网段、离散端口与端口范围（如 `80; 443; 8000-8080`）；`%ComputerName%` / `%HOSTNAME%` 按 `COMPUTERNAME` → `HOSTNAME` → `/proc/sys/kernel/hostname` → `/etc/hostname` 顺序解析。
 - **动作与顺序**：支持 `Direct`、`Block`、`Proxy(node_id)` 与 `Chain(chain_id)`；采用自顶向下 First-Match Wins 求值与不可变快照 CoW 更新，末尾提供可动态热更新的兜底默认动作（`set_default_action`）。
 - **动态管理与干跑诊断**：支持运行时新增、删除、原地更新（`update_rule`，保留规则 ID、启用状态与优先级顺序）、启停开关（`toggle_rule`）、优先级调整（`move_rule`：`up` / `down` / `top` / `bottom`）以及干跑路由模拟器（`simulate`，输出命中规则与逐条未命中原因轨迹）。
 
@@ -95,6 +96,6 @@ flowchart TD
 
 ## 3. 演进路线（规划中）
 
-- **驱动级透明接管**：集成 `wintun.dll` 或 WinDivert，实现无需业务进程显式配置代理端口的系统级透明流量重定向与 UDP 转发。
+- **驱动级透明接管**：Windows 集成 `wintun.dll` 或 WinDivert，Linux 基于 `nftables` / `iptables` `TPROXY` 或 TUN 设备，实现无需业务进程显式配置代理端口的系统级透明流量重定向与 UDP 转发。
 - **代理链可视化编排**：在 Web 控制台中开放多跳 `ProxyChain` 的创建与管理界面。
 - **桌面壳包装**：可选基于 Tauri 封装为独立桌面托盘应用。
