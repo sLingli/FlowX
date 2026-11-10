@@ -411,7 +411,8 @@ impl ConfigStore {
         let cfg = {
             let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
             let rules = rule_engine.current_rules();
-            ProfileConfig::from_runtime(&nodes_guard, &rules, &rule_engine.default_action)
+            let default_action = rule_engine.default_action();
+            ProfileConfig::from_runtime(&nodes_guard, &rules, &default_action)
         };
         self.write_config_atomic(&cfg)
     }

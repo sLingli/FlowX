@@ -631,10 +631,11 @@ async fn handle_api_request(
             if let Some(node_id) = id {
                 // 级联防呆检查：若当前有任何路由规则或默认兜底动作指向该代理节点，禁止删除
                 let rules = rule_engine.current_rules();
+                let current_default = rule_engine.default_action();
                 let is_referenced = rules.iter().any(|r| match &r.action {
                     Action::Proxy(pid) => *pid == node_id,
                     _ => false,
-                }) || matches!(rule_engine.default_action, Action::Proxy(pid) if pid == node_id);
+                }) || matches!(current_default, Action::Proxy(pid) if pid == node_id);
                 if is_referenced {
                     (
                         "409 Conflict",
@@ -1033,7 +1034,8 @@ fn build_system_info(
     let rules = rule_engine.current_rules();
     let rules_count = rules.len();
     let enabled_rules_count = rules.iter().filter(|r| r.enabled).count();
-    let default_action = crate::router::format_action_desc(&rule_engine.default_action, locale);
+    let current_default = rule_engine.default_action();
+    let default_action = crate::router::format_action_desc(&current_default, locale);
 
     let (inbound_addr, dns_addr, upstream_dns, api_addr, fake_ip_count, uptime_secs) =
         match runtime_ctx {

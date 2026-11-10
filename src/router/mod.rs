@@ -98,6 +98,18 @@ impl Rule {
         action: Action,
     ) -> Self {
         let id = NEXT_RULE_ID.fetch_add(1, Ordering::Relaxed);
+        Self::from_raw_with_id(id, name, enabled, apps_raw, targets_raw, ports_raw, action)
+    }
+
+    pub fn from_raw_with_id(
+        id: u64,
+        name: impl Into<String>,
+        enabled: bool,
+        apps_raw: Option<&str>,
+        targets_raw: Option<&str>,
+        ports_raw: Option<&str>,
+        action: Action,
+    ) -> Self {
         let application_patterns = apps_raw.and_then(parser::parse_applications);
 
         let (target_domains, target_subnets) = targets_raw
@@ -120,6 +132,131 @@ impl Rule {
             action,
         }
     }
+
+    pub fn to_view(&self, locale: crate::i18n::Locale) -> RuleView {
+        let action_desc = format_action_desc(&self.action, locale);
+        let (action_type, node_id) = match &self.action {
+            Action::Direct => ("Direct".to_string(), None),
+            Action::Block => ("Block".to_string(), None),
+            Action::Proxy(id) => ("Proxy".to_string(), Some(*id)),
+            Action::Chain(id) => ("Chain".to_string(), Some(*id)),
+        };
+        RuleView {
+            id: self.id,
+            name: self.name.clone(),
+            enabled: self.enabled,
+            apps: self.apps_raw.clone(),
+            targets: self.targets_raw.clone(),
+            ports: self.ports_raw.clone(),
+            action: action_desc,
+            action_type,
+            node_id,
+        }
+    }
+
+    /// 评估当前规则是否命中给定流量上下文；命中返回 `Ok(())`，未命中返回原因码：
+    /// `"disabled"` | `"app_mismatch"` | `"port_mismatch"` | `"target_mismatch"`
+    pub fn check_match(&self, ctx: &RouteContext) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Err("disabled");
+        }
+
+        // 1. 匹配应用程序 (Fail-Closed: 若配置了规则但列表为空，绝不放行)
+        if let Some(patterns) = &self.application_patterns {
+            if patterns.is_empty() {
+                return Err("app_mismatch");
+            }
+            let mut app_matched = false;
+            if let Some(pname) = ctx.process_name {
+                let pname_normalized = pname.to_lowercase().replace('\\', "/");
+                for pat in patterns {
+                    if pat.matches(&pname_normalized) {
+                        app_matched = true;
+                        break;
+                    }
+                }
+            }
+            if !app_matched
+                && let Some(path) = ctx.process_path
+            {
+                let path_normalized = path.to_lowercase().replace('\\', "/");
+                for pat in patterns {
+                    if pat.matches(&path_normalized) {
+                        app_matched = true;
+                        break;
+                    }
+                }
+            }
+            if !app_matched {
+                return Err("app_mismatch");
+            }
+        }
+
+        // 2. 匹配端口
+        if let Some(ports) = &self.ports {
+            if ports.is_empty() {
+                return Err("port_mismatch");
+            }
+            let port_matched = ports
+                .iter()
+                .any(|r| ctx.target_port >= r.start && ctx.target_port <= r.end);
+            if !port_matched {
+                return Err("port_mismatch");
+            }
+        }
+
+        // 3. 匹配目标地址 (域名通配或 IP/CIDR)
+        if self.target_domains.is_some() || self.target_subnets.is_some() {
+            let mut target_matched = false;
+
+            // 检查 IP/CIDR
+            if let Some(subnets) = &self.target_subnets
+                && let Some(ip) = ctx.target_ip
+                && subnets.iter().any(|subnet| subnet.contains(&ip))
+            {
+                target_matched = true;
+            }
+
+            // 检查域名（已预编译，支持 apex 匹配与通配）
+            if !target_matched
+                && let Some(domains) = &self.target_domains
+                && let Some(host) = ctx.target_host
+            {
+                for matcher in domains {
+                    if matcher.matches(host) {
+                        target_matched = true;
+                        break;
+                    }
+                }
+            }
+
+            if !target_matched {
+                return Err("target_mismatch");
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleTraceStep {
+    pub index: usize,
+    pub rule_id: u64,
+    pub rule_name: String,
+    pub enabled: bool,
+    pub matched: bool,
+    /// "disabled" | "app_mismatch" | "port_mismatch" | "target_mismatch" | "matched"
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteSimulationResult {
+    pub matched_rule_id: Option<u64>,
+    pub matched_rule_name: String,
+    pub is_default: bool,
+    pub action: Action,
+    pub trace: Vec<RuleTraceStep>,
 }
 
 pub struct RouteContext<'a> {
@@ -132,15 +269,30 @@ pub struct RouteContext<'a> {
 
 pub struct RuleEngine {
     rules: RwLock<Arc<Vec<Rule>>>,
-    pub default_action: Action,
+    default_action: RwLock<Action>,
 }
 
 impl RuleEngine {
     pub fn new(rules: Vec<Rule>, default_action: Action) -> Self {
         Self {
             rules: RwLock::new(Arc::new(rules)),
-            default_action,
+            default_action: RwLock::new(default_action),
         }
+    }
+
+    pub fn default_action(&self) -> Action {
+        self.default_action
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_default_action(&self, action: Action) {
+        let mut guard = self
+            .default_action
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = action;
     }
 
     pub fn current_rules(&self) -> Arc<Vec<Rule>> {
@@ -154,29 +306,7 @@ impl RuleEngine {
 
     pub fn list_rules_view_with_locale(&self, locale: crate::i18n::Locale) -> Vec<RuleView> {
         let rules = self.current_rules();
-        rules
-            .iter()
-            .map(|r| {
-                let action_desc = format_action_desc(&r.action, locale);
-                let (action_type, node_id) = match &r.action {
-                    Action::Direct => ("Direct".to_string(), None),
-                    Action::Block => ("Block".to_string(), None),
-                    Action::Proxy(id) => ("Proxy".to_string(), Some(*id)),
-                    Action::Chain(id) => ("Chain".to_string(), Some(*id)),
-                };
-                RuleView {
-                    id: r.id,
-                    name: r.name.clone(),
-                    enabled: r.enabled,
-                    apps: r.apps_raw.clone(),
-                    targets: r.targets_raw.clone(),
-                    ports: r.ports_raw.clone(),
-                    action: action_desc,
-                    action_type,
-                    node_id,
-                }
-            })
-            .collect()
+        rules.iter().map(|r| r.to_view(locale)).collect()
     }
 
     pub fn add_rule(&self, rule: Rule) {
@@ -184,6 +314,33 @@ impl RuleEngine {
         let mut new_rules = (**guard).clone();
         new_rules.push(rule);
         *guard = Arc::new(new_rules);
+    }
+
+    /// 原地更新指定 ID 的规则（保留原规则 ID、启用状态与优先级顺序），返回更新后的规则副本
+    pub fn update_rule(
+        &self,
+        rule_id: u64,
+        name: String,
+        apps_raw: Option<&str>,
+        targets_raw: Option<&str>,
+        ports_raw: Option<&str>,
+        action: Action,
+    ) -> Option<Rule> {
+        let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+        let mut new_rules = (**guard).clone();
+        let slot = new_rules.iter_mut().find(|r| r.id == rule_id)?;
+        let updated = Rule::from_raw_with_id(
+            rule_id,
+            name,
+            slot.enabled,
+            apps_raw,
+            targets_raw,
+            ports_raw,
+            action,
+        );
+        *slot = updated.clone();
+        *guard = Arc::new(new_rules);
+        Some(updated)
     }
 
     pub fn delete_rule(&self, rule_id: u64) -> bool {
@@ -248,85 +405,58 @@ impl RuleEngine {
     pub fn evaluate(&self, ctx: &RouteContext) -> (Action, String) {
         let rules = self.current_rules();
         for rule in rules.iter() {
-            if !rule.enabled {
-                continue;
+            if rule.check_match(ctx).is_ok() {
+                return (rule.action.clone(), rule.name.clone());
             }
-
-            // 1. 匹配应用程序 (Fail-Closed: 若配置了规则但列表为空，绝不放行)
-            if let Some(patterns) = &rule.application_patterns {
-                if patterns.is_empty() {
-                    continue;
-                }
-                let mut app_matched = false;
-                if let Some(pname) = ctx.process_name {
-                    let pname_normalized = pname.to_lowercase().replace('\\', "/");
-                    for pat in patterns {
-                        if pat.matches(&pname_normalized) {
-                            app_matched = true;
-                            break;
-                        }
-                    }
-                }
-                if !app_matched
-                    && let Some(path) = ctx.process_path {
-                        let path_normalized = path.to_lowercase().replace('\\', "/");
-                        for pat in patterns {
-                            if pat.matches(&path_normalized) {
-                                app_matched = true;
-                                break;
-                            }
-                        }
-                }
-                if !app_matched {
-                    continue;
-                }
-            }
-
-            // 2. 匹配端口
-            if let Some(ports) = &rule.ports {
-                if ports.is_empty() {
-                    continue;
-                }
-                let port_matched = ports.iter().any(|r| {
-                    ctx.target_port >= r.start && ctx.target_port <= r.end
-                });
-                if !port_matched {
-                    continue;
-                }
-            }
-
-            // 3. 匹配目标地址 (域名通配或 IP/CIDR)
-            if rule.target_domains.is_some() || rule.target_subnets.is_some() {
-                let mut target_matched = false;
-
-                // 检查 IP/CIDR
-                if let Some(subnets) = &rule.target_subnets
-                    && let Some(ip) = ctx.target_ip
-                        && subnets.iter().any(|subnet| subnet.contains(&ip)) {
-                            target_matched = true;
-                        }
-
-                // 检查域名（已预编译，支持 apex 匹配与通配）
-                if !target_matched
-                    && let Some(domains) = &rule.target_domains
-                        && let Some(host) = ctx.target_host {
-                            for matcher in domains {
-                                if matcher.matches(host) {
-                                    target_matched = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                if !target_matched {
-                    continue;
-                }
-            }
-
-            return (rule.action.clone(), rule.name.clone());
         }
 
-        (self.default_action.clone(), DEFAULT_RULE_NAME.to_string())
+        (self.default_action(), DEFAULT_RULE_NAME.to_string())
+    }
+
+    /// 模拟流量路由并返回完整的逐条规则匹配与跳过原因诊断轨迹
+    pub fn simulate(&self, ctx: &RouteContext) -> RouteSimulationResult {
+        let rules = self.current_rules();
+        let mut trace = Vec::with_capacity(rules.len());
+
+        for (index, rule) in rules.iter().enumerate() {
+            match rule.check_match(ctx) {
+                Ok(()) => {
+                    trace.push(RuleTraceStep {
+                        index,
+                        rule_id: rule.id,
+                        rule_name: rule.name.clone(),
+                        enabled: rule.enabled,
+                        matched: true,
+                        reason: "matched".to_string(),
+                    });
+                    return RouteSimulationResult {
+                        matched_rule_id: Some(rule.id),
+                        matched_rule_name: rule.name.clone(),
+                        is_default: false,
+                        action: rule.action.clone(),
+                        trace,
+                    };
+                }
+                Err(reason) => {
+                    trace.push(RuleTraceStep {
+                        index,
+                        rule_id: rule.id,
+                        rule_name: rule.name.clone(),
+                        enabled: rule.enabled,
+                        matched: false,
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+
+        RouteSimulationResult {
+            matched_rule_id: None,
+            matched_rule_name: DEFAULT_RULE_NAME.to_string(),
+            is_default: true,
+            action: self.default_action(),
+            trace,
+        }
     }
 }
 
@@ -445,5 +575,115 @@ mod tests {
         assert_eq!(engine.move_rule(id2, "top"), Some(true));
         let ids2: Vec<u64> = engine.list_rules_view().into_iter().map(|v| v.id).collect();
         assert_eq!(ids2, vec![id2, id1, id3]);
+    }
+
+    #[test]
+    fn test_update_rule_preserves_id_and_order_and_default_action_updates() {
+        let r1 = Rule::from_raw("First", true, Some("a.exe"), None, None, Action::Direct);
+        let r2 = Rule::from_raw("Second", false, Some("b.exe"), Some("example.com"), Some("80"), Action::Block);
+        let r3 = Rule::from_raw("Third", true, Some("c.exe"), None, None, Action::Direct);
+        let (id1, id2, id3) = (r1.id, r2.id, r3.id);
+
+        let engine = RuleEngine::new(vec![r1, r2, r3], Action::Direct);
+
+        // 原地更新中间规则 r2，验证 ID、禁用状态与列表顺序保持不变
+        let updated = engine
+            .update_rule(
+                id2,
+                "SecondEdited".to_string(),
+                Some("git.exe"),
+                Some("*.github.com"),
+                Some("443"),
+                Action::Proxy(101),
+            )
+            .expect("rule should be updated");
+        assert_eq!(updated.id, id2);
+        assert!(!updated.enabled);
+        assert_eq!(updated.name, "SecondEdited");
+
+        let views = engine.list_rules_view();
+        assert_eq!(views.iter().map(|v| v.id).collect::<Vec<_>>(), vec![id1, id2, id3]);
+        assert_eq!(views[1].name, "SecondEdited");
+        assert_eq!(views[1].apps, "git.exe");
+        assert_eq!(views[1].targets, "*.github.com");
+        assert_eq!(views[1].ports, "443");
+        assert_eq!(views[1].node_id, Some(101));
+
+        // 不存在的规则 ID 返回 None
+        assert!(
+            engine
+                .update_rule(999999, "Nope".to_string(), None, None, None, Action::Block)
+                .is_none()
+        );
+
+        // 动态修改 default_action
+        assert_eq!(engine.default_action(), Action::Direct);
+        engine.set_default_action(Action::Proxy(102));
+        assert_eq!(engine.default_action(), Action::Proxy(102));
+    }
+
+    #[test]
+    fn test_simulate_route_trace_and_reasons() {
+        let r_disabled = Rule::from_raw("DisabledRule", false, None, None, None, Action::Block);
+        let r_app = Rule::from_raw("OnlyCurl", true, Some("curl.exe"), None, None, Action::Direct);
+        let r_port = Rule::from_raw("OnlySsh", true, Some("git.exe"), None, Some("22"), Action::Direct);
+        let r_target = Rule::from_raw(
+            "GitInternal",
+            true,
+            Some("git.exe"),
+            Some("*.internal.corp"),
+            Some("443"),
+            Action::Direct,
+        );
+        let r_github = Rule::from_raw(
+            "GitHubProxy",
+            true,
+            Some("git.exe"),
+            Some("*.github.com"),
+            Some("443"),
+            Action::Proxy(101),
+        );
+        let match_id = r_github.id;
+
+        let engine = RuleEngine::new(
+            vec![r_disabled, r_app, r_port, r_target, r_github],
+            Action::Block,
+        );
+
+        let ctx = RouteContext {
+            process_path: Some(r"C:\Program Files\Git\bin\git.exe"),
+            process_name: Some("git.exe"),
+            target_host: Some("api.github.com"),
+            target_ip: None,
+            target_port: 443,
+        };
+        let sim = engine.simulate(&ctx);
+        assert!(!sim.is_default);
+        assert_eq!(sim.matched_rule_id, Some(match_id));
+        assert_eq!(sim.matched_rule_name, "GitHubProxy");
+        assert_eq!(sim.action, Action::Proxy(101));
+        assert_eq!(sim.trace.len(), 5);
+        assert_eq!(sim.trace[0].reason, "disabled");
+        assert_eq!(sim.trace[1].reason, "app_mismatch");
+        assert_eq!(sim.trace[2].reason, "port_mismatch");
+        assert_eq!(sim.trace[3].reason, "target_mismatch");
+        assert_eq!(sim.trace[4].reason, "matched");
+        assert!(sim.trace[4].matched);
+
+        // 未命中任何规则时回退至 Default
+        let ctx_miss = RouteContext {
+            process_path: Some(r"C:\Program Files\Git\bin\git.exe"),
+            process_name: Some("git.exe"),
+            target_host: Some("gitlab.com"),
+            target_ip: None,
+            target_port: 443,
+        };
+        let sim_miss = engine.simulate(&ctx_miss);
+        assert!(sim_miss.is_default);
+        assert_eq!(sim_miss.matched_rule_id, None);
+        assert_eq!(sim_miss.matched_rule_name, DEFAULT_RULE_NAME);
+        assert_eq!(sim_miss.action, Action::Block);
+        assert_eq!(sim_miss.trace.len(), 5);
+        assert!(sim_miss.trace.iter().all(|s| !s.matched));
     }
 }
