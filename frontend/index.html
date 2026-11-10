@@ -961,8 +961,82 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
       font-size: 13px;
       color: var(--text-secondary);
+    }
+
+    .default-rule-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .default-select {
+      width: auto;
+      min-width: 190px;
+      padding: 6px 10px;
+      font-size: 12.5px;
+    }
+
+    .sim-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 1.4fr 130px auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .sim-result {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 10px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .sim-result.active {
+      display: flex;
+    }
+
+    .sim-summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      font-size: 13px;
+    }
+
+    .sim-trace-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+    }
+
+    .sim-trace-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 7px;
+      font-size: 12px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+
+    .sim-trace-item.matched {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+      color: var(--text-primary);
+      font-weight: 600;
     }
 
     /* Empty States */
@@ -1123,6 +1197,7 @@
       .rule-row { flex-direction: column; align-items: stretch; }
       .rule-row-right { justify-content: flex-end; }
       .form-grid-2 { grid-template-columns: 1fr; }
+      .sim-grid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -1444,19 +1519,38 @@
             </div>
             <div class="default-rule-box">
               <span data-i18n="default_rule_desc">Default (Fallback Action) · Applied when no enabled rule above matches</span>
-              <span class="badge badge-muted" id="rules-default-badge" data-i18n="filter_direct">Direct</span>
+              <div class="default-rule-controls">
+                <span class="badge badge-muted" id="rules-default-badge" data-i18n="filter_direct">Direct</span>
+                <select class="form-select default-select" id="default-action-select" onchange="changeDefaultAction(this.value)" aria-label="Default Fallback Action"></select>
+              </div>
             </div>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <div>
+                <div class="card-title" data-i18n="sim_title">Route Rule Simulator</div>
+                <div class="card-sub" data-i18n="sim_sub">Dry-run a process and target destination to inspect which rule matches and why</div>
+              </div>
+            </div>
+            <div class="sim-grid">
+              <input type="text" class="form-input mono" id="sim-process" data-i18n-placeholder="sim_proc_ph" placeholder="Process name or path (e.g. git.exe)">
+              <input type="text" class="form-input mono" id="sim-target" data-i18n-placeholder="sim_target_ph" placeholder="Target host or IP (e.g. api.github.com:443)" onkeydown="if(event.key==='Enter') runRouteSimulate()">
+              <input type="text" class="form-input mono" id="sim-port" data-i18n-placeholder="sim_port_ph" placeholder="Port (443)" onkeydown="if(event.key==='Enter') runRouteSimulate()">
+              <button class="btn btn-primary" id="btn-run-sim" onclick="runRouteSimulate()" data-i18n="btn_sim_run">Test Route</button>
+            </div>
+            <div class="sim-result" id="sim-result-box"></div>
           </div>
         </section>
       </div>
     </div>
   </div>
 
-  <!-- Modal: Add Node -->
+  <!-- Modal: Add / Edit Node -->
   <div class="modal-overlay" id="modal-node" onclick="handleBackdropClick(event, 'modal-node')">
     <div class="modal-box">
       <div class="modal-header">
-        <div class="modal-title" data-i18n="modal_add_node_title">Add Proxy Node</div>
+        <div class="modal-title" id="modal-node-title" data-i18n="modal_add_node_title">Add Proxy Node</div>
         <button class="modal-close" onclick="closeModal('modal-node')" aria-label="Close" data-i18n-aria-label="aria_close">&times;</button>
       </div>
       <div class="form-group">
@@ -1494,11 +1588,11 @@
     </div>
   </div>
 
-  <!-- Modal: Add Rule -->
+  <!-- Modal: Add / Edit Rule -->
   <div class="modal-overlay" id="modal-rule" onclick="handleBackdropClick(event, 'modal-rule')">
     <div class="modal-box">
       <div class="modal-header">
-        <div class="modal-title" data-i18n="modal_add_rule_title">Create Routing Rule</div>
+        <div class="modal-title" id="modal-rule-title" data-i18n="modal_add_rule_title">Create Routing Rule</div>
         <button class="modal-close" onclick="closeModal('modal-rule')" aria-label="Close" data-i18n-aria-label="aria_close">&times;</button>
       </div>
       <div class="form-group">
@@ -1659,6 +1753,7 @@
         node_latency_testing: '测速中...',
         node_latency_unreachable: '不可达',
         btn_ping: '测速',
+        btn_edit: '编辑',
         btn_delete: '删除',
 
         rules_title: '分流策略规则引擎',
@@ -1686,7 +1781,23 @@
         default_rule_desc: 'Default（默认兜底规则） · 当上方没有任何启用的规则命中时生效',
         action_proxy_to: 'Proxy → {name} (#{id})',
 
+        sim_title: '路由规则命中模拟器',
+        sim_sub: '输入进程与目标地址，干跑测试命中哪条规则并查看逐条匹配轨迹',
+        sim_proc_ph: '进程名或完整路径 (如 git.exe，留空代表任意)',
+        sim_target_ph: '目标主机或 IP (如 api.github.com:443 或 8.8.8.8)',
+        sim_port_ph: '端口 (默认 443)',
+        btn_sim_run: '测试命中',
+        sim_matched_label: '命中规则: ',
+        sim_action_label: '执行动作: ',
+        sim_trace_disabled: '已停用跳过',
+        sim_trace_app_mismatch: '应用不匹配',
+        sim_trace_port_mismatch: '端口不匹配',
+        sim_trace_target_mismatch: '目标不匹配',
+        sim_trace_matched: '命中生效',
+        toast_sim_target_required: '请输入要测试的目标主机或 IP 地址',
+
         modal_add_node_title: '添加代理节点',
+        modal_edit_node_title: '编辑代理节点',
         form_node_name: '节点名称',
         form_node_name_ph: '例如: HK-Socks-01',
         form_node_protocol: '代理协议',
@@ -1699,10 +1810,12 @@
         form_node_user_ph: '留空表示无认证',
         form_node_pass: '认证密码 (可选)',
         form_node_pass_ph: '留空表示无认证',
+        form_node_pass_keep_ph: '留空保持原密码不变',
         btn_cancel: '取消',
         btn_save_node: '保存节点',
 
         modal_add_rule_title: '新建分流规则',
+        modal_edit_rule_title: '编辑分流规则',
         form_rule_name: '规则名称',
         form_rule_name_ph: '例如: BrowserProxy',
         form_rule_apps: '应用程序筛选 (分号分隔，支持通配符)',
@@ -1757,9 +1870,11 @@
         toast_rule_name_required: '请输入规则名称',
         toast_rule_node_required: '请先添加并选择一个可用的代理节点',
         toast_rule_saved: '规则 [{name}] 已保存并立即生效',
-        toast_rule_add_fail: '添加规则失败',
+        toast_rule_add_fail: '保存规则失败',
         toast_rule_deleted: '规则已删除',
-        toast_rule_del_fail: '删除规则失败'
+        toast_rule_del_fail: '删除规则失败',
+        toast_default_updated: '已更新默认兜底策略: {action}',
+        toast_default_update_fail: '更新默认兜底策略失败'
       },
       'en-US': {
         app_title: 'FlowX — Transparent Proxy & Process Routing Console',
@@ -1862,6 +1977,7 @@
         node_latency_testing: 'Testing...',
         node_latency_unreachable: 'Unreachable',
         btn_ping: 'Ping',
+        btn_edit: 'Edit',
         btn_delete: 'Delete',
 
         rules_title: 'Routing Rule Engine',
@@ -1889,7 +2005,23 @@
         default_rule_desc: 'Default (Fallback Action) · Applied when no enabled rule above matches',
         action_proxy_to: 'Proxy → {name} (#{id})',
 
+        sim_title: 'Route Rule Simulator',
+        sim_sub: 'Dry-run a process and target destination to inspect which rule matches and why',
+        sim_proc_ph: 'Process name or path (e.g. git.exe, leave empty for any)',
+        sim_target_ph: 'Target host or IP (e.g. api.github.com:443 or 8.8.8.8)',
+        sim_port_ph: 'Port (443)',
+        btn_sim_run: 'Test Route',
+        sim_matched_label: 'Matched Rule: ',
+        sim_action_label: 'Action: ',
+        sim_trace_disabled: 'Skipped (Disabled)',
+        sim_trace_app_mismatch: 'App mismatch',
+        sim_trace_port_mismatch: 'Port mismatch',
+        sim_trace_target_mismatch: 'Target mismatch',
+        sim_trace_matched: 'Matched',
+        toast_sim_target_required: 'Please enter a target host or IP address to simulate',
+
         modal_add_node_title: 'Add Proxy Node',
+        modal_edit_node_title: 'Edit Proxy Node',
         form_node_name: 'Node Name',
         form_node_name_ph: 'e.g. HK-Socks-01',
         form_node_protocol: 'Proxy Protocol',
@@ -1902,10 +2034,12 @@
         form_node_user_ph: 'Leave empty for no authentication',
         form_node_pass: 'Auth Password (Optional)',
         form_node_pass_ph: 'Leave empty for no authentication',
+        form_node_pass_keep_ph: 'Leave empty to keep existing password',
         btn_cancel: 'Cancel',
         btn_save_node: 'Save Node',
 
         modal_add_rule_title: 'Create Routing Rule',
+        modal_edit_rule_title: 'Edit Routing Rule',
         form_rule_name: 'Rule Name',
         form_rule_name_ph: 'e.g. BrowserProxy',
         form_rule_apps: 'Application Filter (Semicolon-separated, wildcards supported)',
@@ -1960,9 +2094,11 @@
         toast_rule_name_required: 'Rule name is required',
         toast_rule_node_required: 'Please select an available proxy node first',
         toast_rule_saved: 'Rule [{name}] saved and applied',
-        toast_rule_add_fail: 'Failed to add rule',
+        toast_rule_add_fail: 'Failed to save rule',
         toast_rule_deleted: 'Rule deleted',
-        toast_rule_del_fail: 'Failed to delete rule'
+        toast_rule_del_fail: 'Failed to delete rule',
+        toast_default_updated: 'Updated default fallback action: {action}',
+        toast_default_update_fail: 'Failed to update default fallback action'
       }
     };
 
@@ -1982,6 +2118,9 @@
       ruleReorderLocked: false,
       busyRuleIds: {},
       busyConnIds: {},
+      editingNodeId: null,
+      editingRuleId: null,
+      lastSimResult: null,
       historyDown: new Array(MAX_HISTORY).fill(0),
       historyUp: new Array(MAX_HISTORY).fill(0)
     };
@@ -2074,10 +2213,12 @@
       renderConnections();
       renderNodes();
       renderRules();
+      renderSimResult();
       // 规则动作描述、节点测速错误等文案由后端按请求语言生成，切换语言后需重新拉取
       if (state.system && state.system.inbound_addr) {
         loadNodes();
         loadRules();
+        if (state.lastSimResult) runRouteSimulate(true);
       }
       const pauseBtn = document.getElementById('pause-poll-btn');
       if (pauseBtn) {
@@ -2313,7 +2454,10 @@
       document.getElementById('info-default-action').textContent = s.default_action || t('filter_direct');
       document.getElementById('val-fakeip-count').textContent = s.fake_ip_count || 0;
       document.getElementById('val-enabled-rules').textContent = `${s.enabled_rules_count || 0} / ${s.rules_count || 0}`;
-      document.getElementById('rules-default-badge').textContent = s.default_action || t('filter_direct');
+      const defBadge = document.getElementById('rules-default-badge');
+      defBadge.textContent = s.default_action || t('filter_direct');
+      defBadge.className = `badge ${actionBadgeClass(s.default_action_type || s.default_action)}`;
+      renderDefaultActionControl();
       document.getElementById('nav-count-nodes').textContent = s.nodes_count ?? state.nodes.length;
       document.getElementById('nav-count-rules').textContent = s.rules_count ?? state.rules.length;
 
@@ -2498,6 +2642,8 @@
           state.nodes = data;
           document.getElementById('nav-count-nodes').textContent = state.nodes.length;
           renderNodes();
+          renderDefaultActionControl();
+          renderRules();
         } else if (!res.ok) {
           showToast((data && data.error) || t('toast_load_nodes_fail'), 'error');
         }
@@ -2543,6 +2689,7 @@
               <span class="latency-pill ${latClass} mono" id="latency-${n.id}">● ${escapeHtml(latText)}</span>
               <div style="display:flex; gap:6px;">
                 <button class="btn btn-sm" onclick="pingNode(${n.id})" ${testing ? 'disabled' : ''}>${testing ? escapeHtml(t('node_latency_testing')) : escapeHtml(t('btn_ping'))}</button>
+                <button class="btn btn-sm" onclick="openEditNodeModal(${n.id})">${escapeHtml(t('btn_edit'))}</button>
                 <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteNode(${n.id})">${escapeHtml(t('btn_delete'))}</button>
               </div>
             </div>
@@ -2594,11 +2741,33 @@
     }
 
     function openAddNodeModal() {
+      state.editingNodeId = null;
+      const titleEl = document.getElementById('modal-node-title');
+      if (titleEl) titleEl.textContent = t('modal_add_node_title');
       document.getElementById('node-name').value = '';
       document.getElementById('node-protocol').value = 'SOCKS5';
       document.getElementById('node-addr').value = '';
       document.getElementById('node-user').value = '';
-      document.getElementById('node-pass').value = '';
+      const passEl = document.getElementById('node-pass');
+      passEl.value = '';
+      passEl.placeholder = t('form_node_pass_ph');
+      openModal('modal-node');
+      setTimeout(() => document.getElementById('node-name').focus(), 40);
+    }
+
+    function openEditNodeModal(id) {
+      const node = state.nodes.find(n => n.id === id);
+      if (!node) return;
+      state.editingNodeId = id;
+      const titleEl = document.getElementById('modal-node-title');
+      if (titleEl) titleEl.textContent = t('modal_edit_node_title');
+      document.getElementById('node-name').value = node.name || '';
+      document.getElementById('node-protocol').value = node.protocol || 'SOCKS5';
+      document.getElementById('node-addr').value = node.server_addr || '';
+      document.getElementById('node-user').value = node.username || '';
+      const passEl = document.getElementById('node-pass');
+      passEl.value = '';
+      passEl.placeholder = node.auth_configured ? t('form_node_pass_keep_ph') : t('form_node_pass_ph');
       openModal('modal-node');
       setTimeout(() => document.getElementById('node-name').focus(), 40);
     }
@@ -2609,6 +2778,7 @@
       const addr = document.getElementById('node-addr').value.trim();
       const user = document.getElementById('node-user').value.trim();
       const pass = document.getElementById('node-pass').value;
+      const editingId = state.editingNodeId;
 
       if (!name || !addr) {
         showToast(t('toast_node_required'), 'error');
@@ -2618,16 +2788,28 @@
       const btn = document.getElementById('btn-submit-node');
       btn.disabled = true;
       try {
+        const isEdit = editingId !== null && editingId !== undefined;
+        const payload = isEdit
+          ? {
+              id: editingId,
+              name,
+              protocol,
+              server_addr: addr,
+              username: user || null,
+              password: pass || null,
+              keep_password: Boolean(user && !pass)
+            }
+          : {
+              name,
+              protocol,
+              server_addr: addr,
+              username: user || null,
+              password: pass || null
+            };
         const res = await fetchWithTimeout('/api/nodes', {
-          method: 'POST',
+          method: isEdit ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name,
-            protocol,
-            server_addr: addr,
-            username: user || null,
-            password: pass || null
-          })
+          body: JSON.stringify(payload)
         });
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
@@ -2747,6 +2929,7 @@
               <button class="btn btn-sm" onclick="moveRule(${r.id}, 'top')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="${escapeHtml(t('btn_top_title'))}">${t('btn_top')}</button>
               <button class="btn btn-sm" onclick="moveRule(${r.id}, 'up')" ${(isFirst || disableReorder) ? 'disabled' : ''} title="${escapeHtml(t('btn_up_title'))}">${t('btn_up')}</button>
               <button class="btn btn-sm" onclick="moveRule(${r.id}, 'down')" ${(isLast || disableReorder) ? 'disabled' : ''} title="${escapeHtml(t('btn_down_title'))}">${t('btn_down')}</button>
+              <button class="btn btn-sm" onclick="openEditRuleModal(${r.id})" ${disableRowOps ? 'disabled' : ''}>${escapeHtml(t('btn_edit'))}</button>
               <button class="btn btn-sm btn-danger-ghost" onclick="confirmDeleteRule(${r.id})" ${disableRowOps ? 'disabled' : ''}>${escapeHtml(t('btn_delete'))}</button>
             </div>
           </div>
@@ -2804,8 +2987,63 @@
       }
     }
 
+    function renderDefaultActionControl() {
+      const sel = document.getElementById('default-action-select');
+      if (!sel) return;
+      const curType = state.system.default_action_type || 'Direct';
+      const curNodeId = state.system.default_node_id;
+      const currentVal = (curType === 'Proxy' && curNodeId) ? `Proxy:${curNodeId}` : curType;
+
+      const options = [
+        `<option value="Direct">${escapeHtml(t('opt_action_direct'))}</option>`,
+        `<option value="Block">${escapeHtml(t('opt_action_block'))}</option>`,
+        ...state.nodes.map(n => `<option value="Proxy:${n.id}">${escapeHtml(t('action_proxy_to', { name: n.name, id: n.id }))}</option>`)
+      ];
+      sel.innerHTML = options.join('');
+      if ([...sel.options].some(o => o.value === currentVal)) {
+        sel.value = currentVal;
+      }
+    }
+
+    async function changeDefaultAction(val) {
+      if (!val) return;
+      let action = 'Direct';
+      let nodeId = null;
+      if (val.startsWith('Proxy:')) {
+        action = 'Proxy';
+        nodeId = parseInt(val.split(':')[1], 10);
+      } else {
+        action = val;
+      }
+
+      try {
+        const res = await fetchWithTimeout('/api/rules/default', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action, node_id: nodeId })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          state.system.default_action = data.default_action || state.system.default_action;
+          state.system.default_action_type = data.default_action_type || action;
+          state.system.default_node_id = data.default_node_id ?? nodeId;
+          renderSystemInfo();
+          showToast(t('toast_default_updated', { action: state.system.default_action }), 'info');
+        } else {
+          renderDefaultActionControl();
+          showToast(data.error || t('toast_default_update_fail'), 'error');
+        }
+      } catch (e) {
+        renderDefaultActionControl();
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
+      }
+    }
+
     async function openAddRuleModal() {
       if (state.nodes.length === 0) await loadNodes();
+      state.editingRuleId = null;
+      const titleEl = document.getElementById('modal-rule-title');
+      if (titleEl) titleEl.textContent = t('modal_add_rule_title');
       document.getElementById('rule-name').value = '';
       document.getElementById('rule-apps').value = '';
       document.getElementById('rule-targets').value = '';
@@ -2816,7 +3054,24 @@
       setTimeout(() => document.getElementById('rule-name').focus(), 40);
     }
 
-    function onRuleActionChange() {
+    async function openEditRuleModal(id) {
+      const rule = state.rules.find(r => r.id === id);
+      if (!rule) return;
+      if (state.nodes.length === 0) await loadNodes();
+      state.editingRuleId = id;
+      const titleEl = document.getElementById('modal-rule-title');
+      if (titleEl) titleEl.textContent = t('modal_edit_rule_title');
+      document.getElementById('rule-name').value = rule.name || '';
+      document.getElementById('rule-apps').value = rule.apps || '';
+      document.getElementById('rule-targets').value = rule.targets || '';
+      document.getElementById('rule-ports').value = rule.ports || '';
+      document.getElementById('rule-action').value = rule.action_type || 'Direct';
+      onRuleActionChange(rule.node_id);
+      openModal('modal-rule');
+      setTimeout(() => document.getElementById('rule-name').focus(), 40);
+    }
+
+    function onRuleActionChange(selectedNodeId = null) {
       const act = document.getElementById('rule-action').value;
       const group = document.getElementById('group-node-select');
       group.style.display = act === 'Proxy' ? 'block' : 'none';
@@ -2828,6 +3083,9 @@
           select.innerHTML = state.nodes
             .map(n => `<option value="${n.id}">#${n.id} ${escapeHtml(n.name)} (${escapeHtml(n.protocol)} · ${escapeHtml(n.server_addr)})</option>`)
             .join('');
+          if (selectedNodeId && state.nodes.some(n => n.id === selectedNodeId)) {
+            select.value = String(selectedNodeId);
+          }
         }
       }
     }
@@ -2840,6 +3098,7 @@
       const action = document.getElementById('rule-action').value;
       const nodeVal = document.getElementById('rule-node-id').value;
       const nodeId = action === 'Proxy' && nodeVal ? parseInt(nodeVal, 10) : null;
+      const editingId = state.editingRuleId;
 
       if (!name) {
         showToast(t('toast_rule_name_required'), 'error');
@@ -2853,17 +3112,29 @@
       const btn = document.getElementById('btn-submit-rule');
       btn.disabled = true;
       try {
+        const isEdit = editingId !== null && editingId !== undefined;
+        const payload = isEdit
+          ? {
+              id: editingId,
+              name,
+              apps: apps || null,
+              targets: targets || null,
+              ports: ports || null,
+              action,
+              node_id: nodeId
+            }
+          : {
+              name,
+              apps: apps || null,
+              targets: targets || null,
+              ports: ports || null,
+              action,
+              node_id: nodeId
+            };
         const res = await fetchWithTimeout('/api/rules', {
-          method: 'POST',
+          method: isEdit ? 'PUT' : 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name,
-            apps: apps || null,
-            targets: targets || null,
-            ports: ports || null,
-            action,
-            node_id: nodeId
-          })
+          body: JSON.stringify(payload)
         });
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
@@ -2875,6 +3146,94 @@
         }
       } catch (e) {
         showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    function traceReasonLabel(reason) {
+      switch (reason) {
+        case 'disabled': return t('sim_trace_disabled');
+        case 'app_mismatch': return t('sim_trace_app_mismatch');
+        case 'port_mismatch': return t('sim_trace_port_mismatch');
+        case 'target_mismatch': return t('sim_trace_target_mismatch');
+        case 'matched': return t('sim_trace_matched');
+        default: return reason;
+      }
+    }
+
+    function renderSimResult() {
+      const box = document.getElementById('sim-result-box');
+      if (!box) return;
+      const res = state.lastSimResult;
+      if (!res) {
+        box.classList.remove('active');
+        box.innerHTML = '';
+        return;
+      }
+
+      const actionLabel = formatRuleActionLabel(res);
+      const traceHtml = Array.isArray(res.trace) && res.trace.length > 0
+        ? `<div class="sim-trace-list">
+            ${res.trace.map(step => `
+              <span class="sim-trace-item ${step.matched ? 'matched' : ''}">
+                <span class="mono">#${step.index + 1}</span>
+                <span>${escapeHtml(step.rule_name)}</span>
+                <span style="opacity:0.78;">· ${escapeHtml(traceReasonLabel(step.reason))}</span>
+              </span>
+            `).join('')}
+          </div>`
+        : '';
+
+      box.innerHTML = `
+        <div class="sim-summary">
+          <div>
+            <span>${escapeHtml(t('sim_matched_label'))}</span>
+            <strong>${escapeHtml(res.matched_rule_name)}</strong>
+            <span class="mono" style="color:var(--text-muted); font-size:12px; margin-left:8px;">
+              ${res.process_name ? escapeHtml(res.process_name) + ' → ' : ''}${escapeHtml(res.target_host || '')}:${res.target_port}
+            </span>
+          </div>
+          <div>
+            <span>${escapeHtml(t('sim_action_label'))}</span>
+            <span class="badge ${actionBadgeClass(res.action_type || res.action)}">${escapeHtml(actionLabel)}</span>
+          </div>
+        </div>
+        ${traceHtml}
+      `;
+      box.classList.add('active');
+    }
+
+    async function runRouteSimulate(silent = false) {
+      const proc = document.getElementById('sim-process').value.trim();
+      const target = document.getElementById('sim-target').value.trim();
+      const portRaw = document.getElementById('sim-port').value.trim();
+      if (!target) {
+        if (!silent) showToast(t('toast_sim_target_required'), 'error');
+        return;
+      }
+      const port = portRaw ? parseInt(portRaw, 10) : null;
+      const btn = document.getElementById('btn-run-sim');
+      btn.disabled = true;
+      try {
+        const res = await fetchWithTimeout('/api/rules/simulate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            process: proc || null,
+            target,
+            port: Number.isFinite(port) ? port : null
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          state.lastSimResult = data;
+          renderSimResult();
+        } else if (!silent) {
+          showToast(data.error || t('toast_err_unknown'), 'error');
+        }
+      } catch (e) {
+        if (!silent) showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
         btn.disabled = false;
       }
