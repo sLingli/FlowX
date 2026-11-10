@@ -144,6 +144,9 @@ fn translate_zh(key: &str) -> &'static str {
         "error.invalid_toggle_body" => "无效的规则启停请求体",
         "error.invalid_move_body" => "无效的规则排序请求体",
         "error.invalid_move_direction" => "排序方向仅支持 up / down / top / bottom",
+        "error.invalid_default_action_body" => "无效的默认兜底动作请求体",
+        "error.invalid_simulate_body" => "无效的路由模拟请求体",
+        "error.invalid_simulate_target" => "模拟目标地址不能为空，且端口需在 1-65535 之间",
 
         // 系统与动作描述
         "status.ok" => "运行正常",
@@ -204,6 +207,9 @@ fn translate_en(key: &str) -> &'static str {
         "error.invalid_toggle_body" => "Invalid rule toggle request payload",
         "error.invalid_move_body" => "Invalid rule move request payload",
         "error.invalid_move_direction" => "Move direction only supports up / down / top / bottom",
+        "error.invalid_default_action_body" => "Invalid default fallback action request payload",
+        "error.invalid_simulate_body" => "Invalid route simulation request payload",
+        "error.invalid_simulate_target" => "Simulation target host cannot be empty and port must be between 1 and 65535",
 
         // Status & Actions
         "status.ok" => "Operational",

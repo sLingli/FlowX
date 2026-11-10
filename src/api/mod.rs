@@ -30,6 +30,7 @@ pub struct ProxyNodeView {
     pub protocol: String,
     pub server_addr: String,
     pub auth_configured: bool,
+    pub username: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +40,17 @@ pub struct AddNodeRequest {
     pub server_addr: String,
     pub username: Option<String>,
     pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateNodeRequest {
+    pub id: u32,
+    pub name: String,
+    pub protocol: String,
+    pub server_addr: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub keep_password: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -64,6 +76,46 @@ pub struct AddRuleRequest {
     pub ports: Option<String>,
     pub action: String, // "Direct", "Block", "Proxy"
     pub node_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateRuleRequest {
+    pub id: u64,
+    pub name: String,
+    pub apps: Option<String>,
+    pub targets: Option<String>,
+    pub ports: Option<String>,
+    pub action: String, // "Direct", "Block", "Proxy"
+    pub node_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetDefaultActionRequest {
+    pub action: String, // "Direct", "Block", "Proxy"
+    pub node_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SimulateRouteRequest {
+    pub process: Option<String>,
+    pub target: String,
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateRouteResponse {
+    pub matched_rule_id: Option<u64>,
+    pub matched_rule_name: String,
+    pub is_default: bool,
+    pub action: String,
+    pub action_type: String,
+    pub node_id: Option<u32>,
+    pub process_name: Option<String>,
+    pub process_path: Option<String>,
+    pub target_host: Option<String>,
+    pub target_ip: Option<String>,
+    pub target_port: u16,
+    pub trace: Vec<crate::router::RuleTraceStep>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,6 +153,8 @@ pub struct SystemInfoResponse {
     pub fake_ip_count: usize,
     pub uptime_secs: u64,
     pub default_action: String,
+    pub default_action_type: String,
+    pub default_node_id: Option<u32>,
     pub nodes_count: usize,
     pub rules_count: usize,
     pub enabled_rules_count: usize,
@@ -600,6 +654,7 @@ async fn handle_api_request(
                     protocol: n.protocol.clone(),
                     server_addr: n.server_addr.clone(),
                     auth_configured: n.username.is_some(),
+                    username: n.username.clone(),
                 })
                 .collect();
             list.sort_by_key(|n| n.id);
@@ -613,6 +668,20 @@ async fn handle_api_request(
             ),
             Ok(req) => {
                 let res = handle_add_node(req, &proxy_nodes, &self_ports, locale);
+                if res.0 == "200 OK" {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                }
+                res
+            }
+        },
+        ("PUT", "/api/nodes") => match serde_json::from_str::<UpdateNodeRequest>(req_body) {
+            Err(_) => (
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                json_error(locale, "ERR_INVALID_NODE_BODY", "error.invalid_node_body"),
+            ),
+            Ok(req) => {
+                let res = handle_update_node(req, &proxy_nodes, &self_ports, locale);
                 if res.0 == "200 OK" {
                     persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                 }
@@ -719,6 +788,54 @@ async fn handle_api_request(
                 res
             }
         },
+        ("PUT", "/api/rules") => match serde_json::from_str::<UpdateRuleRequest>(req_body) {
+            Err(_) => (
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                json_error(locale, "ERR_INVALID_RULE_BODY", "error.invalid_rule_body"),
+            ),
+            Ok(req) => {
+                let res = handle_update_rule(req, &rule_engine, &proxy_nodes, locale);
+                if res.0 == "200 OK" {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                }
+                res
+            }
+        },
+        ("POST", "/api/rules/default") => {
+            match serde_json::from_str::<SetDefaultActionRequest>(req_body) {
+                Err(_) => (
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    json_error(
+                        locale,
+                        "ERR_INVALID_DEFAULT_ACTION_BODY",
+                        "error.invalid_default_action_body",
+                    ),
+                ),
+                Ok(req) => {
+                    let res = handle_set_default_action(req, &rule_engine, &proxy_nodes, locale);
+                    if res.0 == "200 OK" {
+                        persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    }
+                    res
+                }
+            }
+        }
+        ("POST", "/api/rules/simulate") => {
+            match serde_json::from_str::<SimulateRouteRequest>(req_body) {
+                Err(_) => (
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    json_error(
+                        locale,
+                        "ERR_INVALID_SIMULATE_BODY",
+                        "error.invalid_simulate_body",
+                    ),
+                ),
+                Ok(req) => handle_simulate_route(req, &rule_engine, locale),
+            }
+        }
         ("POST", "/api/rules/toggle") => match serde_json::from_str::<ToggleRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
@@ -931,6 +1048,182 @@ fn handle_add_node(
     ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, new_id))
 }
 
+fn handle_update_node(
+    req: UpdateNodeRequest,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    self_ports: &[u16],
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
+        );
+    }
+
+    let protocol = req.protocol.trim().to_ascii_uppercase();
+    if !matches!(protocol.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_UNSUPPORTED_PROTOCOL", "error.unsupported_protocol"),
+        );
+    }
+
+    let server_addr = req.server_addr.trim().to_string();
+    let Ok(target_parsed) = parse_target_addr(&server_addr) else {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_NODE_ADDR", "error.invalid_node_addr"),
+        );
+    };
+    if target_parsed.port() == 0 || target_parsed.host_string().is_empty() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_NODE_PORT", "error.invalid_node_port"),
+        );
+    }
+
+    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
+        );
+    }
+
+    let username = req
+        .username
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    let explicit_password = req.password.filter(|p| !p.is_empty());
+
+    if let Some(u) = &username
+        && (u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255)
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
+        );
+    }
+    if let Some(p) = &explicit_password
+        && (p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255)
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
+        );
+    }
+
+    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+    let Some(existing) = nodes_guard.get(&req.id) else {
+        return (
+            "404 Not Found",
+            ct,
+            json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
+        );
+    };
+
+    let password = if username.is_some() {
+        if explicit_password.is_some() {
+            explicit_password
+        } else if req.keep_password.unwrap_or(false) {
+            existing.client.auth_credentials().1.map(|s| s.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let client = match protocol.as_str() {
+        "HTTP" => {
+            let mut c = HttpConnectClient::new(&server_addr);
+            if let (Some(u), Some(p)) = (&username, &password) {
+                c = c.with_auth(u.clone(), p.clone());
+            }
+            ProxyNode::Http(c)
+        }
+        "SOCKS4" => {
+            let mut c = Socks4Client::new(&server_addr);
+            if let Some(u) = &username {
+                c = c.with_user_id(u.clone());
+            }
+            ProxyNode::Socks4(c)
+        }
+        _ => {
+            let mut c = Socks5Client::new(&server_addr);
+            if let (Some(u), Some(p)) = (&username, &password) {
+                c = c.with_auth(u.clone(), p.clone());
+            }
+            ProxyNode::Socks5(c)
+        }
+    };
+
+    nodes_guard.insert(
+        req.id,
+        ProxyNodeEntry {
+            id: req.id,
+            name,
+            protocol,
+            server_addr,
+            username,
+            client,
+        },
+    );
+    ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, req.id))
+}
+
+fn parse_and_validate_action(
+    action_raw: &str,
+    node_id: Option<u32>,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    locale: Locale,
+) -> std::result::Result<Action, (&'static str, &'static str, String)> {
+    let ct = "application/json; charset=utf-8";
+    match action_raw.trim().to_ascii_uppercase().as_str() {
+        "DIRECT" => Ok(Action::Direct),
+        "BLOCK" => Ok(Action::Block),
+        "PROXY" => {
+            let Some(nid) = node_id else {
+                return Err((
+                    "400 Bad Request",
+                    ct,
+                    json_error(
+                        locale,
+                        "ERR_MISSING_NODE_FOR_PROXY",
+                        "error.missing_node_id_for_proxy",
+                    ),
+                ));
+            };
+            let exists = {
+                let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
+                nodes_guard.contains_key(&nid)
+            };
+            if !exists {
+                return Err((
+                    "400 Bad Request",
+                    ct,
+                    json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
+                ));
+            }
+            Ok(Action::Proxy(nid))
+        }
+        _ => Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_RULE_ACTION", "error.invalid_rule_action"),
+        )),
+    }
+}
+
 fn handle_add_rule(
     req: AddRuleRequest,
     rule_engine: &RuleEngine,
@@ -947,37 +1240,9 @@ fn handle_add_rule(
         );
     }
 
-    let action = match req.action.trim().to_ascii_uppercase().as_str() {
-        "DIRECT" => Action::Direct,
-        "BLOCK" => Action::Block,
-        "PROXY" => {
-            let Some(nid) = req.node_id else {
-                return (
-                    "400 Bad Request",
-                    ct,
-                    json_error(locale, "ERR_MISSING_NODE_FOR_PROXY", "error.missing_node_id_for_proxy"),
-                );
-            };
-            let exists = {
-                let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-                nodes_guard.contains_key(&nid)
-            };
-            if !exists {
-                return (
-                    "400 Bad Request",
-                    ct,
-                    json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
-                );
-            }
-            Action::Proxy(nid)
-        }
-        _ => {
-            return (
-                "400 Bad Request",
-                ct,
-                json_error(locale, "ERR_INVALID_RULE_ACTION", "error.invalid_rule_action"),
-            );
-        }
+    let action = match parse_and_validate_action(&req.action, req.node_id, proxy_nodes, locale) {
+        Ok(a) => a,
+        Err(resp) => return resp,
     };
 
     let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -1018,6 +1283,203 @@ fn handle_add_rule(
     ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, id))
 }
 
+fn handle_update_rule(
+    req: UpdateRuleRequest,
+    rule_engine: &RuleEngine,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_RULE_NAME", "error.empty_rule_name"),
+        );
+    }
+
+    let action = match parse_and_validate_action(&req.action, req.node_id, proxy_nodes, locale) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let targets_clean = req.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let ports_clean = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    let probe = Rule::from_raw_with_id(
+        req.id,
+        &name,
+        true,
+        apps_clean,
+        targets_clean,
+        ports_clean,
+        action.clone(),
+    );
+
+    if apps_clean.is_some()
+        && probe.application_patterns.as_ref().is_some_and(Vec::is_empty)
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_APP_PATTERN", "error.invalid_app_pattern"),
+        );
+    }
+    if targets_clean.is_some()
+        && probe.target_subnets.is_none()
+        && probe.target_domains.as_ref().is_some_and(Vec::is_empty)
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_TARGET_PATTERN", "error.invalid_target_pattern"),
+        );
+    }
+    if ports_clean.is_some() && probe.ports.as_ref().is_some_and(Vec::is_empty) {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_PORT_FORMAT", "error.invalid_port_format"),
+        );
+    }
+
+    match rule_engine.update_rule(req.id, name, apps_clean, targets_clean, ports_clean, action) {
+        Some(updated) => ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, updated.id)),
+        None => (
+            "404 Not Found",
+            ct,
+            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
+        ),
+    }
+}
+
+fn handle_set_default_action(
+    req: SetDefaultActionRequest,
+    rule_engine: &RuleEngine,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let action = match parse_and_validate_action(&req.action, req.node_id, proxy_nodes, locale) {
+        Ok(a) => a,
+        Err(resp) => return resp,
+    };
+
+    rule_engine.set_default_action(action.clone());
+    let resp = serde_json::json!({
+        "ok": true,
+        "default_action": crate::router::format_action_desc(&action, locale),
+        "default_action_type": action.type_str(),
+        "default_node_id": action.target_id(),
+    });
+    ("200 OK", ct, resp.to_string())
+}
+
+pub(crate) fn parse_simulate_target(
+    raw: &str,
+    explicit_port: Option<u16>,
+) -> Option<(String, Option<std::net::IpAddr>, u16)> {
+    if explicit_port == Some(0) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (host_str, inline_port) = if trimmed.starts_with('[') {
+        if let Some((bracket_host, port_str)) = trimmed.split_once("]:") {
+            let host_inner = bracket_host.strip_prefix('[')?.trim();
+            let p = port_str.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+            (host_inner, Some(p))
+        } else {
+            let host_inner = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
+            (host_inner.trim(), None)
+        }
+    } else if trimmed.parse::<std::net::IpAddr>().is_ok() {
+        (trimmed, None)
+    } else if let Some((h, p_str)) = trimmed.rsplit_once(':') {
+        let p = p_str.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+        (h.trim(), Some(p))
+    } else {
+        (trimmed, None)
+    };
+
+    if host_str.is_empty() {
+        return None;
+    }
+    let port = explicit_port.or(inline_port).unwrap_or(443);
+    let ip_opt = host_str.parse::<std::net::IpAddr>().ok();
+    Some((host_str.to_string(), ip_opt, port))
+}
+
+fn handle_simulate_route(
+    req: SimulateRouteRequest,
+    rule_engine: &RuleEngine,
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let Some((target_host, target_ip, target_port)) = parse_simulate_target(&req.target, req.port) else {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_SIMULATE_TARGET", "error.invalid_simulate_target"),
+        );
+    };
+
+    let proc_raw = req
+        .process
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let process_path = proc_raw.map(|s| s.to_string());
+    let process_name = proc_raw.map(|p| {
+        let base = p.rsplit(['/', '\\']).next().unwrap_or(p).trim();
+        if base.is_empty() {
+            p.to_string()
+        } else {
+            base.to_string()
+        }
+    });
+
+    let ctx = crate::router::RouteContext {
+        process_path: process_path.as_deref(),
+        process_name: process_name.as_deref(),
+        target_host: Some(target_host.as_str()),
+        target_ip,
+        target_port,
+    };
+
+    let sim = rule_engine.simulate(&ctx);
+    let matched_rule_name = if sim.is_default {
+        t(locale, "action.default_rule").to_string()
+    } else {
+        sim.matched_rule_name
+    };
+    let action_desc = crate::router::format_action_desc(&sim.action, locale);
+    let action_type = sim.action.type_str().to_string();
+    let node_id = sim.action.target_id();
+
+    let resp = SimulateRouteResponse {
+        matched_rule_id: sim.matched_rule_id,
+        matched_rule_name,
+        is_default: sim.is_default,
+        action: action_desc,
+        action_type,
+        node_id,
+        process_name,
+        process_path,
+        target_host: Some(target_host),
+        target_ip: target_ip.map(|ip| ip.to_string()),
+        target_port,
+        trace: sim.trace,
+    };
+
+    ("200 OK", ct, serde_json_to_string(&resp))
+}
+
 fn build_system_info(
     actual_port: u16,
     runtime_ctx: Option<&SystemRuntimeContext>,
@@ -1036,6 +1498,8 @@ fn build_system_info(
     let enabled_rules_count = rules.iter().filter(|r| r.enabled).count();
     let current_default = rule_engine.default_action();
     let default_action = crate::router::format_action_desc(&current_default, locale);
+    let default_action_type = current_default.type_str().to_string();
+    let default_node_id = current_default.target_id();
 
     let (inbound_addr, dns_addr, upstream_dns, api_addr, fake_ip_count, uptime_secs) =
         match runtime_ctx {
@@ -1071,6 +1535,8 @@ fn build_system_info(
         fake_ip_count,
         uptime_secs,
         default_action,
+        default_action_type,
+        default_node_id,
         nodes_count,
         rules_count,
         enabled_rules_count,
@@ -1665,5 +2131,117 @@ mod tests {
         .await;
         assert!(en.contains("Proxy (Node-101)"), "en action should be localized: {en}");
         assert!(en.contains("\"rule_name\":\"Default\""));
+    }
+
+    #[tokio::test]
+    async fn test_api_update_node_rule_default_and_simulate() {
+        let mut path = std::env::current_dir().unwrap().join("target");
+        path.push(format!("flowx_api_stage2_{}.xml", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = Arc::new(ConfigStore::new(&path));
+        let (rt, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
+        let rule2_id = rt.rules[1].id;
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(rt.rules, rt.default_action));
+        let nodes = Arc::new(RwLock::new(rt.proxy_nodes));
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_self_ports(vec![40001, 40080, 1053])
+            .with_config_store(Arc::clone(&store));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx).await });
+        let _keep_tx = tx;
+        let port = addr.port();
+
+        // 1. PUT /api/nodes 更新节点 101 并设置认证，随后 keep_password=true 仅改名保留密码
+        let put_node1 = r#"{"id":101,"name":"SG-Auth","protocol":"SOCKS5","server_addr":"10.10.0.1:1080","username":"alice","password":"secret"}"#;
+        let resp1 = raw_http(
+            addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                put_node1.len(),
+                put_node1
+            ),
+        )
+        .await;
+        assert!(resp1.starts_with("HTTP/1.1 200 OK"), "resp1: {resp1}");
+
+        let put_node2 = r#"{"id":101,"name":"SG-Auth-Renamed","protocol":"SOCKS5","server_addr":"10.10.0.1:1080","username":"alice","password":"","keep_password":true}"#;
+        let resp2 = raw_http(
+            addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                put_node2.len(),
+                put_node2
+            ),
+        )
+        .await;
+        assert!(resp2.starts_with("HTTP/1.1 200 OK"), "resp2: {resp2}");
+
+        // 2. PUT /api/rules 原地修改规则 2
+        let put_rule = format!(
+            r#"{{"id":{},"name":"GitRule","apps":"git.exe","targets":"*.github.com","ports":"443; 22","action":"Proxy","node_id":101}}"#,
+            rule2_id
+        );
+        let resp_rule = raw_http(
+            addr,
+            &format!(
+                "PUT /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                put_rule.len(),
+                put_rule
+            ),
+        )
+        .await;
+        assert!(resp_rule.starts_with("HTTP/1.1 200 OK"), "resp_rule: {resp_rule}");
+
+        // 3. POST /api/rules/default 修改默认兜底动作
+        let def_body = r#"{"action":"Proxy","node_id":101}"#;
+        let resp_def = raw_http(
+            addr,
+            &format!(
+                "POST /api/rules/default HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                def_body.len(),
+                def_body
+            ),
+        )
+        .await;
+        assert!(resp_def.starts_with("HTTP/1.1 200 OK"), "resp_def: {resp_def}");
+        assert!(resp_def.contains("\"default_action_type\":\"Proxy\""));
+        assert!(resp_def.contains("\"default_node_id\":101"));
+
+        // 4. POST /api/rules/simulate 测试路由命中与轨迹
+        let sim_body = r#"{"process":"C:\\Program Files\\Git\\bin\\git.exe","target":"api.github.com:443"}"#;
+        let resp_sim = raw_http(
+            addr,
+            &format!(
+                "POST /api/rules/simulate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                sim_body.len(),
+                sim_body
+            ),
+        )
+        .await;
+        assert!(resp_sim.starts_with("HTTP/1.1 200 OK"), "resp_sim: {resp_sim}");
+        assert!(resp_sim.contains("\"matched_rule_name\":\"GitRule\""));
+        assert!(resp_sim.contains("\"is_default\":false"));
+        assert!(resp_sim.contains("\"reason\":\"target_mismatch\""));
+        assert!(resp_sim.contains("\"reason\":\"matched\""));
+
+        // 5. 验证 XML 持久化结果
+        let (reloaded, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
+        let node101 = reloaded.proxy_nodes.get(&101).unwrap();
+        assert_eq!(node101.name, "SG-Auth-Renamed");
+        assert_eq!(node101.client.auth_credentials(), (Some("alice"), Some("secret")));
+        assert_eq!(reloaded.rules[1].name, "GitRule");
+        assert_eq!(reloaded.default_action, Action::Proxy(101));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
