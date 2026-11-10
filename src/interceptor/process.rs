@@ -400,7 +400,9 @@ fn find_socket_inode_in_proc_tcp(
 
     for line in content.lines() {
         let mut cols = line.split_ascii_whitespace();
-        let _sl = cols.next()?;
+        let Some(_sl) = cols.next() else {
+            continue;
+        };
         let Some(local_raw) = cols.next() else {
             continue;
         };
@@ -435,7 +437,9 @@ fn find_socket_inode_in_proc_tcp6(
 
     for line in content.lines() {
         let mut cols = line.split_ascii_whitespace();
-        let _sl = cols.next()?;
+        let Some(_sl) = cols.next() else {
+            continue;
+        };
         let Some(local_raw) = cols.next() else {
             continue;
         };
@@ -538,7 +542,7 @@ fn get_process_image_path(pid: u32) -> Option<String> {
     if let Ok(bytes) = std::fs::read(&cmdline_path)
         && !bytes.is_empty()
     {
-        let first_arg = bytes.split(|&b| b == 0).next().unwrap_or(&bytes);
+        let first_arg = bytes.split(|&b| b == 0).next().unwrap_or(&bytes[..]);
         let arg0 = String::from_utf8_lossy(first_arg).trim().to_string();
         if !arg0.is_empty() {
             return Some(arg0);
