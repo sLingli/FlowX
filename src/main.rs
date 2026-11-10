@@ -1,4 +1,5 @@
 pub mod api;
+pub mod cli;
 pub mod config;
 pub mod dns;
 pub mod i18n;
@@ -41,6 +42,11 @@ fn resolve_config_path() -> String {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if cli::should_run_cli(&raw_args) {
+        return cli::run_cli(&raw_args).await;
+    }
+
     // 1. 初始化标准结构化日志
     let subscriber = FmtSubscriber::builder()
         .with_max_level(Level::INFO)

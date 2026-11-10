@@ -934,7 +934,7 @@ async fn handle_api_request(
     Ok(())
 }
 
-fn handle_add_node(
+pub(crate) fn handle_add_node(
     req: AddNodeRequest,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     self_ports: &[u16],
@@ -1048,7 +1048,7 @@ fn handle_add_node(
     ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, new_id))
 }
 
-fn handle_update_node(
+pub(crate) fn handle_update_node(
     req: UpdateNodeRequest,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     self_ports: &[u16],
@@ -1224,7 +1224,7 @@ fn parse_and_validate_action(
     }
 }
 
-fn handle_add_rule(
+pub(crate) fn handle_add_rule(
     req: AddRuleRequest,
     rule_engine: &RuleEngine,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
@@ -1283,7 +1283,7 @@ fn handle_add_rule(
     ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, id))
 }
 
-fn handle_update_rule(
+pub(crate) fn handle_update_rule(
     req: UpdateRuleRequest,
     rule_engine: &RuleEngine,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
@@ -1355,7 +1355,7 @@ fn handle_update_rule(
     }
 }
 
-fn handle_set_default_action(
+pub(crate) fn handle_set_default_action(
     req: SetDefaultActionRequest,
     rule_engine: &RuleEngine,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
@@ -1415,7 +1415,7 @@ pub(crate) fn parse_simulate_target(
     Some((host_str.to_string(), ip_opt, port))
 }
 
-fn handle_simulate_route(
+pub(crate) fn handle_simulate_route(
     req: SimulateRouteRequest,
     rule_engine: &RuleEngine,
     locale: Locale,
@@ -1613,7 +1613,7 @@ fn localize_connection_view(conn: &mut crate::monitor::ConnectionSnapshot, local
     }
 }
 
-async fn ping_address(addr: &str, locale: Locale) -> (bool, u64, String, Option<String>) {
+pub(crate) async fn ping_address(addr: &str, locale: Locale) -> (bool, u64, String, Option<String>) {
     let start = std::time::Instant::now();
     let res = tokio::time::timeout(Duration::from_millis(2000), TcpStream::connect(addr)).await;
     match res {
