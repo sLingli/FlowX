@@ -2646,7 +2646,7 @@
                 <span class="proc-name">${escapeHtml(c.process_name)} <span class="mono" style="color:var(--text-muted); font-size:11px;">#${c.pid}</span></span>
               </div>
             </td>
-            <td class="mono">${escapeHtml(c.target)}</td>
+            <td class="mono">${escapeHtml(formatTargetAuthority(c.target))}</td>
             <td>${escapeHtml(c.rule_name)}</td>
             <td><span class="badge ${actionBadgeClass(c.action_type || c.action)}">${escapeHtml(c.action)}</span></td>
             <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)} / ↓${formatSpeed(c.download_bytes_per_sec)}</td>
@@ -2685,7 +2685,7 @@
               <span class="proc-path mono" title="${escapeHtml(c.process_path)}">${escapeHtml(c.process_path)}</span>
             </div>
           </td>
-          <td class="mono">${escapeHtml(c.target)}</td>
+          <td class="mono">${escapeHtml(formatTargetAuthority(c.target))}</td>
           <td>${escapeHtml(c.rule_name)}</td>
           <td><span class="badge ${actionBadgeClass(c.action_type || c.action)}">${escapeHtml(c.action)}</span></td>
           <td class="mono" style="font-size:12px;">↑${formatSpeed(c.upload_bytes_per_sec)}<br>↓${formatSpeed(c.download_bytes_per_sec)}</td>
@@ -2744,6 +2744,21 @@
       if (!host) return `:${port}`;
       const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
       return `${formattedHost}:${port}`;
+    }
+
+    function formatTargetAuthority(target) {
+      if (!target) return '-';
+      const s = String(target);
+      if (s.startsWith('[')) return s;
+      const firstColon = s.indexOf(':');
+      const lastColon = s.lastIndexOf(':');
+      if (firstColon !== -1 && lastColon !== firstColon) {
+        const maybePort = s.slice(lastColon + 1);
+        if (/^\d+$/.test(maybePort)) {
+          return `[${s.slice(0, lastColon)}]:${maybePort}`;
+        }
+      }
+      return s;
     }
 
     function protocolBadgeClass(proto) {

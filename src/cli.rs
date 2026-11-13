@@ -22,6 +22,21 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:40080";
 const DEFAULT_SELF_PORTS: [u16; 3] = [40001, 40080, 1053];
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const API_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CLI_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_CLI_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Debug)]
+struct SilentExitError {
+    code: i32,
+}
+
+impl std::fmt::Display for SilentExitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Command exited with status {}", self.code)
+    }
+}
+
+impl std::error::Error for SilentExitError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchMode {
@@ -37,6 +52,7 @@ pub struct GlobalCliOpts {
     pub offline: bool,
     pub json_output: bool,
     pub show_help: bool,
+    pub locale: Locale,
     pub rest: Vec<String>,
 }
 
@@ -79,9 +95,17 @@ fn is_known_subcommand_value_flag(name: &str) -> bool {
     )
 }
 
+fn resolve_config_path_from_env(raw: Option<&str>) -> String {
+    raw.map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "flowx.xml".to_string())
+}
+
 fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
     let mut config_path =
-        std::env::var("FLOWX_CONFIG").unwrap_or_else(|_| "flowx.xml".to_string());
+        resolve_config_path_from_env(std::env::var("FLOWX_CONFIG").ok().as_deref());
+    let locale = Locale::from_env();
     let env_api = std::env::var("FLOWX_API")
         .ok()
         .map(|v| v.trim().to_string())
@@ -102,6 +126,15 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
     while i < args.len() {
         let arg = &args[i];
         let in_subcommand = !rest.is_empty();
+
+        if arg == "--" {
+            if in_subcommand {
+                rest.extend(args[i..].iter().cloned());
+            } else {
+                rest.extend(args[i + 1..].iter().cloned());
+            }
+            break;
+        }
 
         if arg == "--config" {
             i += 1;
@@ -212,6 +245,7 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
                     offline,
                     json_output,
                     show_help: true,
+                    locale,
                     rest: vec!["--help".to_string()],
                 },
             });
@@ -239,6 +273,7 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
                 offline,
                 json_output,
                 show_help,
+                locale,
                 rest,
             },
         });
@@ -265,6 +300,7 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
                 offline,
                 json_output,
                 show_help,
+                locale,
                 rest,
             },
         });
@@ -279,6 +315,7 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
             offline,
             json_output,
             show_help,
+            locale,
             rest,
         },
     })
@@ -482,12 +519,14 @@ enum ApiTransportError {
 
 async fn api_request_raw(
     api_addr: &str,
+    locale: Locale,
     method: &str,
     path: &str,
     body: Option<&Value>,
 ) -> std::result::Result<(u16, Value), ApiTransportError> {
     api_request_raw_with_timeouts(
         api_addr,
+        locale,
         method,
         path,
         body,
@@ -497,8 +536,242 @@ async fn api_request_raw(
     .await
 }
 
+struct ResponseCursor<'a> {
+    stream: &'a mut TcpStream,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl<'a> ResponseCursor<'a> {
+    fn new(stream: &'a mut TcpStream) -> Self {
+        Self {
+            stream,
+            buf: Vec::new(),
+            pos: 0,
+        }
+    }
+
+    fn unread(&self) -> &[u8] {
+        &self.buf[self.pos..]
+    }
+
+    fn compact_if_needed(&mut self) {
+        if self.pos >= 4096 || (self.pos > 0 && self.pos == self.buf.len()) {
+            self.buf.drain(..self.pos);
+            self.pos = 0;
+        }
+    }
+
+    async fn read_headers(&mut self, max_header: usize, api_addr: &str) -> Result<Vec<u8>> {
+        let mut tmp = [0u8; 4096];
+        loop {
+            if let Some(rel) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let end = rel + 4;
+                if end > max_header {
+                    bail!(
+                        "HTTP response headers from {} exceed {} bytes limit",
+                        api_addr,
+                        max_header
+                    );
+                }
+                self.pos = end;
+                return Ok(self.buf[..rel].to_vec());
+            }
+            if self.buf.len() >= max_header {
+                bail!(
+                    "HTTP response headers from {} exceed {} bytes limit",
+                    api_addr,
+                    max_header
+                );
+            }
+            let max_add = (max_header - self.buf.len()).min(tmp.len());
+            let n = self.stream.read(&mut tmp[..max_add]).await?;
+            if n == 0 {
+                bail!(
+                    "Invalid HTTP response from {} (missing header terminator)",
+                    api_addr
+                );
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    async fn read_line_crlf(&mut self, max_line: usize, api_addr: &str) -> Result<String> {
+        let mut tmp = [0u8; 1024];
+        loop {
+            let unread = self.unread();
+            if let Some(rel) = unread.windows(2).position(|w| w == b"\r\n") {
+                if rel > max_line {
+                    bail!(
+                        "HTTP response line from {} exceeds {} bytes",
+                        api_addr,
+                        max_line
+                    );
+                }
+                let line_bytes = unread[..rel].to_vec();
+                self.pos += rel + 2;
+                self.compact_if_needed();
+                return String::from_utf8(line_bytes).map_err(|_| {
+                    anyhow!(
+                        "Non-UTF-8 chunk/trailer line in HTTP response from {}",
+                        api_addr
+                    )
+                });
+            }
+            if unread.len() > max_line + 2 {
+                bail!(
+                    "HTTP response line from {} exceeds {} bytes",
+                    api_addr,
+                    max_line
+                );
+            }
+            self.compact_if_needed();
+            let remain_cap = ((max_line + 2) - self.unread().len()).min(tmp.len());
+            let n = self.stream.read(&mut tmp[..remain_cap]).await?;
+            if n == 0 {
+                bail!(
+                    "Unexpected EOF while reading chunked framing from {}",
+                    api_addr
+                );
+            }
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    async fn read_exact_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        expected_len: usize,
+        api_addr: &str,
+    ) -> Result<()> {
+        let mut rem = expected_len;
+        let mut tmp = [0u8; 8192];
+        while rem > 0 {
+            let unread = self.unread();
+            if !unread.is_empty() {
+                let take = rem.min(unread.len());
+                out.extend_from_slice(&unread[..take]);
+                self.pos += take;
+                self.compact_if_needed();
+                rem -= take;
+                continue;
+            }
+            self.buf.clear();
+            self.pos = 0;
+            let to_read = rem.min(tmp.len());
+            let n = self.stream.read(&mut tmp[..to_read]).await?;
+            if n == 0 {
+                bail!(
+                    "Truncated HTTP response from {} (expected {} bytes, got {})",
+                    api_addr,
+                    expected_len,
+                    expected_len - rem
+                );
+            }
+            out.extend_from_slice(&tmp[..n]);
+            rem -= n;
+        }
+        Ok(())
+    }
+
+    async fn read_to_eof_bounded(&mut self, max_body: usize, api_addr: &str) -> Result<Vec<u8>> {
+        let unread_len = self.unread().len();
+        if unread_len > max_body {
+            bail!(
+                "HTTP response body from {} exceeds {} bytes limit",
+                api_addr,
+                max_body
+            );
+        }
+        let mut body = Vec::with_capacity(unread_len);
+        body.extend_from_slice(self.unread());
+        self.buf.clear();
+        self.pos = 0;
+
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = self.stream.read(&mut tmp).await?;
+            if n == 0 {
+                break;
+            }
+            if body.len().saturating_add(n) > max_body {
+                bail!(
+                    "HTTP response body from {} exceeds {} bytes limit",
+                    api_addr,
+                    max_body
+                );
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        Ok(body)
+    }
+
+    async fn read_chunked_bounded(
+        &mut self,
+        max_header: usize,
+        max_body: usize,
+        api_addr: &str,
+    ) -> Result<Vec<u8>> {
+        let mut body = Vec::new();
+        loop {
+            let size_line = self.read_line_crlf(4096, api_addr).await?;
+            let size_part = size_line
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == ' ' || c == '\t');
+            if size_part.is_empty()
+                || size_part.len() > 16
+                || !size_part.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("Invalid HTTP chunk size '{}' from {}", size_line, api_addr);
+            }
+            let chunk_size = usize::from_str_radix(size_part, 16).map_err(|_| {
+                anyhow!(
+                    "Overflow parsing HTTP chunk size '{}' from {}",
+                    size_part,
+                    api_addr
+                )
+            })?;
+            if chunk_size == 0 {
+                let mut trailer_bytes = 0usize;
+                loop {
+                    let trailer = self.read_line_crlf(4096, api_addr).await?;
+                    if trailer.is_empty() {
+                        break;
+                    }
+                    trailer_bytes = trailer_bytes.saturating_add(trailer.len() + 2);
+                    if trailer_bytes > max_header {
+                        bail!(
+                            "HTTP chunked trailers from {} exceed {} bytes limit",
+                            api_addr,
+                            max_header
+                        );
+                    }
+                }
+                break;
+            }
+            if chunk_size > max_body.saturating_sub(body.len()) {
+                bail!(
+                    "Chunked HTTP response body from {} exceeds {} bytes limit",
+                    api_addr,
+                    max_body
+                );
+            }
+            self.read_exact_into(&mut body, chunk_size, api_addr).await?;
+            let mut crlf = Vec::with_capacity(2);
+            self.read_exact_into(&mut crlf, 2, api_addr).await?;
+            if crlf != b"\r\n" {
+                bail!("Invalid HTTP chunk terminator from {}", api_addr);
+            }
+        }
+        Ok(body)
+    }
+}
+
 async fn api_request_raw_with_timeouts(
     api_addr: &str,
+    locale: Locale,
     method: &str,
     path: &str,
     body: Option<&Value>,
@@ -530,40 +803,157 @@ async fn api_request_raw_with_timeouts(
         }
     };
 
+    let accept_lang = locale.accept_language_header();
     let body_str = body.map(|b| b.to_string()).unwrap_or_default();
     let req = if body.is_some() {
         format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nAccept-Language: zh-CN\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "{} {} HTTP/1.1\r\nHost: {}\r\nAccept-Language: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             method,
             path,
             api_addr,
+            accept_lang,
             body_str.len(),
             body_str
         )
     } else {
         format!(
-            "{} {} HTTP/1.1\r\nHost: {}\r\nAccept-Language: zh-CN\r\nConnection: close\r\n\r\n",
-            method, path, api_addr
+            "{} {} HTTP/1.1\r\nHost: {}\r\nAccept-Language: {}\r\nConnection: close\r\n\r\n",
+            method, path, api_addr, accept_lang
         )
     };
 
     let io_res = tokio::time::timeout(io_timeout, async {
-        stream.write_all(req.as_bytes()).await?;
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await?;
-        Ok::<Vec<u8>, std::io::Error>(buf)
+        stream
+            .write_all(req.as_bytes())
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mut cursor = ResponseCursor::new(&mut stream);
+        let header_bytes = cursor
+            .read_headers(MAX_CLI_HTTP_HEADER_BYTES, api_addr)
+            .await?;
+
+        let header_str = std::str::from_utf8(&header_bytes)
+            .map_err(|_| anyhow!("Non-UTF-8 HTTP response headers from {}", api_addr))?;
+        let mut lines = header_str.split("\r\n");
+        let status_line = lines.next().unwrap_or_default();
+        let status_rest = status_line
+            .strip_prefix("HTTP/1.1 ")
+            .or_else(|| status_line.strip_prefix("HTTP/1.0 "))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Invalid HTTP status line from {}: '{}'",
+                    api_addr,
+                    status_line
+                )
+            })?;
+        let code_token = status_rest.split_whitespace().next().unwrap_or_default();
+        if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+            bail!(
+                "Invalid HTTP status code from {}: '{}'",
+                api_addr,
+                status_line
+            );
+        }
+        let status_code: u16 = code_token.parse().map_err(|_| {
+            anyhow!(
+                "Unparseable HTTP status code from {}: '{}'",
+                api_addr,
+                code_token
+            )
+        })?;
+
+        let mut content_length: Option<usize> = None;
+        let mut transfer_codings: Vec<String> = Vec::new();
+        for line in lines {
+            let Some((k, v)) = line.split_once(':') else {
+                continue;
+            };
+            let key = k.trim();
+            if key.eq_ignore_ascii_case("content-length") {
+                let trimmed_v = v.trim();
+                if trimmed_v.is_empty() || !trimmed_v.bytes().all(|b| b.is_ascii_digit()) {
+                    bail!("Invalid Content-Length header '{}' from {}", trimmed_v, api_addr);
+                }
+                let parsed = trimmed_v.parse::<usize>().map_err(|_| {
+                    anyhow!(
+                        "Invalid Content-Length value '{}' from {}",
+                        trimmed_v,
+                        api_addr
+                    )
+                })?;
+                if parsed > MAX_CLI_HTTP_BODY_BYTES {
+                    bail!(
+                        "HTTP response Content-Length ({}) from {} exceeds {} bytes limit",
+                        parsed,
+                        api_addr,
+                        MAX_CLI_HTTP_BODY_BYTES
+                    );
+                }
+                if let Some(prev) = content_length
+                    && prev != parsed
+                {
+                    bail!("Conflicting Content-Length headers from {}", api_addr);
+                }
+                content_length = Some(parsed);
+            } else if key.eq_ignore_ascii_case("transfer-encoding") {
+                for token in v.split(',') {
+                    let coding = token.trim().to_ascii_lowercase();
+                    if !coding.is_empty() {
+                        transfer_codings.push(coding);
+                    }
+                }
+            }
+        }
+
+        let transfer_chunked = if transfer_codings.is_empty() {
+            false
+        } else if transfer_codings.len() == 1 && transfer_codings[0] == "chunked" {
+            true
+        } else {
+            bail!(
+                "Unsupported Transfer-Encoding '{:?}' from {}",
+                transfer_codings,
+                api_addr
+            );
+        };
+
+        if content_length.is_some() && transfer_chunked {
+            bail!(
+                "HTTP response from {} contains conflicting Content-Length and Transfer-Encoding headers",
+                api_addr
+            );
+        }
+
+        let body_bytes = if transfer_chunked {
+            cursor
+                .read_chunked_bounded(MAX_CLI_HTTP_HEADER_BYTES, MAX_CLI_HTTP_BODY_BYTES, api_addr)
+                .await?
+        } else if let Some(expected_len) = content_length {
+            let mut out = Vec::with_capacity(expected_len);
+            cursor
+                .read_exact_into(&mut out, expected_len, api_addr)
+                .await?;
+            if !cursor.unread().is_empty() {
+                bail!(
+                    "Unexpected trailing bytes in HTTP response from {} (expected {} bytes)",
+                    api_addr,
+                    expected_len
+                );
+            }
+            out
+        } else {
+            cursor
+                .read_to_eof_bounded(MAX_CLI_HTTP_BODY_BYTES, api_addr)
+                .await?
+        };
+
+        Ok::<(u16, Vec<u8>), anyhow::Error>((status_code, body_bytes))
     })
     .await;
 
-    let buf = match io_res {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => {
-            return Err(ApiTransportError::Other(anyhow!(
-                "I/O error communicating with FlowX API at {}: {}",
-                api_addr,
-                e
-            )));
-        }
+    let (status_code, body_bytes) = match io_res {
+        Ok(Ok(res)) => res,
+        Ok(Err(e)) => return Err(ApiTransportError::Other(e)),
         Err(_) => {
             return Err(ApiTransportError::Other(anyhow!(
                 "Timed out waiting for HTTP response from FlowX API at {} after {}ms",
@@ -573,102 +963,17 @@ async fn api_request_raw_with_timeouts(
         }
     };
 
-    let Some(header_sep) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return Err(ApiTransportError::Other(anyhow!(
-            "Invalid HTTP response from {} (missing header terminator)",
-            api_addr
-        )));
-    };
-    let header_bytes = &buf[..header_sep];
-    let body_bytes = &buf[header_sep + 4..];
-
-    let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
-        ApiTransportError::Other(anyhow!("Non-UTF-8 HTTP response headers from {}", api_addr))
-    })?;
-    let mut lines = header_str.split("\r\n");
-    let status_line = lines.next().unwrap_or_default();
-    let status_rest = status_line
-        .strip_prefix("HTTP/1.1 ")
-        .or_else(|| status_line.strip_prefix("HTTP/1.0 "))
-        .ok_or_else(|| {
-            ApiTransportError::Other(anyhow!(
-                "Invalid HTTP status line from {}: '{}'",
-                api_addr,
-                status_line
-            ))
-        })?;
-    let code_token = status_rest.split_whitespace().next().unwrap_or_default();
-    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(ApiTransportError::Other(anyhow!(
-            "Invalid HTTP status code from {}: '{}'",
-            api_addr,
-            status_line
-        )));
-    }
-    let status_code: u16 = code_token.parse().map_err(|_| {
-        ApiTransportError::Other(anyhow!(
-            "Unparseable HTTP status code from {}: '{}'",
-            api_addr,
-            code_token
-        ))
-    })?;
-
-    let mut content_length: Option<usize> = None;
-    for line in lines {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        if k.trim().eq_ignore_ascii_case("content-length") {
-            let trimmed_v = v.trim();
-            if trimmed_v.is_empty() || !trimmed_v.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(ApiTransportError::Other(anyhow!(
-                    "Invalid Content-Length header '{}' from {}",
-                    trimmed_v,
-                    api_addr
-                )));
-            }
-            let parsed = trimmed_v.parse::<usize>().map_err(|_| {
-                ApiTransportError::Other(anyhow!(
-                    "Invalid Content-Length value '{}' from {}",
-                    trimmed_v,
-                    api_addr
-                ))
-            })?;
-            if let Some(prev) = content_length
-                && prev != parsed
-            {
-                return Err(ApiTransportError::Other(anyhow!(
-                    "Conflicting Content-Length headers from {}",
-                    api_addr
-                )));
-            }
-            content_length = Some(parsed);
-        }
-    }
-
-    if let Some(expected_len) = content_length {
-        if body_bytes.len() < expected_len {
-            return Err(ApiTransportError::Other(anyhow!(
-                "Truncated HTTP response from {} (expected {} bytes, got {})",
-                api_addr,
-                expected_len,
-                body_bytes.len()
-            )));
-        }
-        if body_bytes.len() > expected_len {
-            return Err(ApiTransportError::Other(anyhow!(
-                "Unexpected trailing bytes in HTTP response from {} (expected {}, got {})",
-                api_addr,
-                expected_len,
-                body_bytes.len()
-            )));
-        }
-    }
-
-    let body_text = std::str::from_utf8(body_bytes).map_err(|_| {
+    let body_text = std::str::from_utf8(&body_bytes).map_err(|_| {
         ApiTransportError::Other(anyhow!("Response body from {} is not valid UTF-8", api_addr))
     })?;
     let json_val = if body_text.trim().is_empty() {
+        if (200..300).contains(&status_code) {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Empty HTTP {} JSON response body from {}",
+                status_code,
+                api_addr
+            )));
+        }
         Value::Null
     } else {
         match serde_json::from_str::<Value>(body_text) {
@@ -695,7 +1000,7 @@ async fn api_request_strict(
     path: &str,
     body: Option<&Value>,
 ) -> Result<(u16, Value)> {
-    match api_request_raw(api_addr, method, path, body).await {
+    match api_request_raw(api_addr, Locale::from_env(), method, path, body).await {
         Ok(res) => Ok(res),
         Err(ApiTransportError::ConnectionRefused(msg)) => Err(anyhow!("{}", msg)),
         Err(ApiTransportError::Other(e)) => Err(e),
@@ -711,7 +1016,7 @@ async fn api_request_or_offline(
     if opts.offline {
         return Ok(None);
     }
-    match api_request_raw(&opts.api_addr, method, path, body).await {
+    match api_request_raw(&opts.api_addr, opts.locale, method, path, body).await {
         Ok(res) => Ok(Some(res)),
         Err(ApiTransportError::ConnectionRefused(_)) if !opts.api_explicit => Ok(None),
         Err(ApiTransportError::ConnectionRefused(msg)) => {
@@ -832,6 +1137,9 @@ pub fn format_cli_error_json(err: &anyhow::Error) -> Value {
 }
 
 pub fn emit_cli_error_and_exit(err: &anyhow::Error, json_output: bool) -> ! {
+    if let Some(silent) = err.downcast_ref::<SilentExitError>() {
+        std::process::exit(silent.code);
+    }
     if json_output {
         let payload = format_cli_error_json(err);
         if let Ok(s) = serde_json::to_string_pretty(&payload) {
@@ -915,8 +1223,12 @@ fn resolve_rule_id_from_views(rules: &[RuleView], id_or_index: u64) -> Option<u6
     None
 }
 
-fn offline_resolve_rule_id(rule_engine: &RuleEngine, id_or_index: u64) -> Option<u64> {
-    let views = rule_engine.list_rules_view_with_locale(Locale::Zh);
+fn offline_resolve_rule_id(
+    rule_engine: &RuleEngine,
+    id_or_index: u64,
+    locale: Locale,
+) -> Option<u64> {
+    let views = rule_engine.list_rules_view_with_locale(locale);
     resolve_rule_id_from_views(&views, id_or_index)
 }
 
@@ -952,10 +1264,16 @@ fn parse_flags_with_spec(
     let mut flags = HashMap::new();
     let mut seen_groups: HashMap<String, String> = HashMap::new();
 
+    let mut after_double_dash = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if let Some(stripped) = arg.strip_prefix("--") {
+        if !after_double_dash && arg == "--" {
+            after_double_dash = true;
+            i += 1;
+            continue;
+        }
+        if !after_double_dash && let Some(stripped) = arg.strip_prefix("--") {
             let (name, val) = if let Some((k, v)) = stripped.split_once('=') {
                 if spec.bool_flags.contains(&k) {
                     bail!("Option '--{}' does not take a value", k);
@@ -985,7 +1303,7 @@ fn parse_flags_with_spec(
                 );
             }
             flags.insert(name.to_string(), val);
-        } else if arg.starts_with('-') {
+        } else if !after_double_dash && arg.starts_with('-') {
             bail!("Unknown option '{}' for `{}`", arg, spec.cmd_label);
         } else {
             positionals.push(arg.clone());
@@ -1144,7 +1462,7 @@ async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
     let rules = engine.current_rules();
     let enabled_count = rules.iter().filter(|r| r.enabled).count();
     let def_act = engine.default_action();
-    let def_desc = format_action_desc(&def_act, Locale::Zh);
+    let def_desc = format_action_desc(&def_act, opts.locale);
 
     let out = json!({
         "mode": "offline",
@@ -1266,7 +1584,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
                 let req: AddNodeRequest = serde_json::from_value(payload)?;
-                let (st, _, body) = handle_add_node(req, &nodes, &DEFAULT_SELF_PORTS, Locale::Zh);
+                let (st, _, body) = handle_add_node(req, &nodes, &DEFAULT_SELF_PORTS, opts.locale);
                 let val = ensure_offline_handler_ok(st, &body)?;
                 store.save_runtime(&nodes, &engine)?;
                 val
@@ -1349,7 +1667,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
                 let (st, _, body) =
-                    handle_patch_node(req, &nodes, &DEFAULT_SELF_PORTS, Locale::Zh);
+                    handle_patch_node(req, &nodes, &DEFAULT_SELF_PORTS, opts.locale);
                 let val = ensure_offline_handler_ok(st, &body)?;
                 store.save_runtime(&nodes, &engine)?;
                 val
@@ -1458,7 +1776,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                         .ok_or_else(|| anyhow!("Proxy node #{} not found", id))?
                 };
                 let (ok, latency_ms, message, detail) =
-                    ping_address(&addr, &DEFAULT_SELF_PORTS, Locale::Zh).await;
+                    ping_address(&addr, &DEFAULT_SELF_PORTS, opts.locale).await;
                 serde_json::to_value(PingResponse {
                     ok,
                     latency_ms,
@@ -1481,6 +1799,10 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     id,
                     res_val["message"].as_str().unwrap_or("failed")
                 );
+            }
+            let _ = std::io::stdout().flush();
+            if !res_val["ok"].as_bool().unwrap_or(false) {
+                return Err(anyhow::Error::new(SilentExitError { code: 1 }));
             }
             Ok(())
         }
@@ -1514,7 +1836,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     serde_json::from_value(ensure_api_ok(st, val)?)?
                 } else {
                     let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
-                    engine.list_rules_view_with_locale(Locale::Zh)
+                    engine.list_rules_view_with_locale(opts.locale)
                 };
 
             if opts.json_output {
@@ -1592,7 +1914,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
                 let req: AddRuleRequest = serde_json::from_value(payload)?;
-                let (st, _, body) = handle_add_rule(req, &engine, &nodes, Locale::Zh);
+                let (st, _, body) = handle_add_rule(req, &engine, &nodes, opts.locale);
                 let val = ensure_offline_handler_ok(st, &body)?;
                 store.save_runtime(&nodes, &engine)?;
                 val
@@ -1690,7 +2012,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     nodes,
                     engine,
                 } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
                     let payload = json!({
                         "id": resolved_id,
@@ -1703,7 +2025,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                         "enabled": enabled,
                     });
                     let req: PatchRuleRequest = serde_json::from_value(payload)?;
-                    let (st, _, body) = handle_patch_rule(req, &engine, &nodes, Locale::Zh);
+                    let (st, _, body) = handle_patch_rule(req, &engine, &nodes, opts.locale);
                     let val = ensure_offline_handler_ok(st, &body)?;
                     store.save_runtime(&nodes, &engine)?;
                     (resolved_id, val)
@@ -1767,7 +2089,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     nodes,
                     engine,
                 } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
                     let next_state = engine
                         .toggle_rule(resolved_id, enabled)
@@ -1833,7 +2155,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     nodes,
                     engine,
                 } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
                     let moved = engine
                         .move_rule(resolved_id, &direction)
@@ -1896,7 +2218,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     nodes,
                     engine,
                 } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
                     if !engine.delete_rule(resolved_id) {
                         bail!("Routing rule #{} not found", raw_id);
@@ -1958,7 +2280,7 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         } else {
             let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
             let req: SetDefaultActionRequest = serde_json::from_value(payload)?;
-            let (st, _, body) = handle_set_default_action(req, &engine, &nodes, Locale::Zh);
+            let (st, _, body) = handle_set_default_action(req, &engine, &nodes, opts.locale);
             let val = ensure_offline_handler_ok(st, &body)?;
             store.save_runtime(&nodes, &engine)?;
             val
@@ -2000,7 +2322,7 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
 
     let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
     let act = engine.default_action();
-    let desc = format_action_desc(&act, Locale::Zh);
+    let desc = format_action_desc(&act, opts.locale);
     let out = json!({
         "default_action": desc,
         "default_action_type": act.type_str(),
@@ -2061,7 +2383,7 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
     } else {
         let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
         let req: SimulateRouteRequest = serde_json::from_value(payload)?;
-        let (st, _, body) = handle_simulate_route(req, &engine, Locale::Zh);
+        let (st, _, body) = handle_simulate_route(req, &engine, opts.locale);
         ensure_offline_handler_ok(st, &body)?
     };
 
@@ -2161,14 +2483,15 @@ async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
             )
             .await?;
             let v = ensure_api_ok(st, val)?;
+            let killed = v["killed"].as_bool().unwrap_or(false);
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&v)?);
             } else {
-                println!(
-                    "Connection #{} kill signal sent (killed={})",
-                    id,
-                    v["killed"].as_bool().unwrap_or(false)
-                );
+                println!("Connection #{} kill signal sent (killed={})", id, killed);
+            }
+            let _ = std::io::stdout().flush();
+            if !killed {
+                return Err(anyhow::Error::new(SilentExitError { code: 1 }));
             }
             Ok(())
         }
@@ -2372,6 +2695,7 @@ mod tests {
         });
         let timeout_err = api_request_raw_with_timeouts(
             &stall_addr,
+            Locale::En,
             "GET",
             "/api/system",
             None,
@@ -2994,5 +3318,182 @@ mod tests {
         assert_eq!(j["status"], 409);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_cli_double_dash_empty_config_env_chunked_and_exit_status() {
+        // 1. FLOWX_CONFIG empty/whitespace normalization
+        assert_eq!(resolve_config_path_from_env(None), "flowx.xml");
+        assert_eq!(resolve_config_path_from_env(Some("")), "flowx.xml");
+        assert_eq!(resolve_config_path_from_env(Some("   ")), "flowx.xml");
+        assert_eq!(
+            resolve_config_path_from_env(Some("  custom.xml  ")),
+            "custom.xml"
+        );
+
+        // 2. `--` end-of-options in both parse_cli_invocation and parse_flags_with_spec
+        let inv = parse_cli_invocation(&[
+            "flowx".into(),
+            "--offline".into(),
+            "--".into(),
+            "node".into(),
+            "list".into(),
+        ])
+        .unwrap();
+        assert!(inv.opts.offline);
+        assert_eq!(inv.opts.rest, vec!["node", "list"]);
+
+        let (pos, flags) = parse_flags_with_spec(
+            &[
+                "--name".into(),
+                "R1".into(),
+                "--".into(),
+                "-literal".into(),
+            ],
+            ArgSpec {
+                cmd_label: "flowx test",
+                value_flags: &["name"],
+                bool_flags: &[],
+                min_pos: 1,
+                max_pos: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(flags.get("name").map(String::as_str), Some("R1"));
+        assert_eq!(pos, vec!["-literal"]);
+
+        let inv_bad_node = run_cli(&[
+            "flowx".into(),
+            "--offline".into(),
+            "node".into(),
+            "update".into(),
+            "--".into(),
+            "-123".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(inv_bad_node.to_string().contains("Invalid node ID"));
+
+        // 3. HTTP client chunked decoding + Accept-Language header from locale
+        let listener_chunked = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_chunked = listener_chunked.local_addr().unwrap().to_string();
+        let srv_chunked = tokio::spawn(async move {
+            let (mut sock, _) = listener_chunked.accept().await.unwrap();
+            let mut req_buf = [0u8; 2048];
+            let n = sock.read(&mut req_buf).await.unwrap();
+            let req_text = String::from_utf8_lossy(&req_buf[..n]).into_owned();
+            let resp = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Transfer-Encoding: chunked\r\n\r\n",
+                "8;ext=1\r\n{\"ok\":tr\r\n",
+                "3\r\nue}\r\n",
+                "0\r\nX-Trailer: done\r\n\r\n"
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            req_text
+        });
+        let (st, val) = api_request_raw_with_timeouts(
+            &addr_chunked,
+            Locale::En,
+            "GET",
+            "/api/system",
+            None,
+            API_CONNECT_TIMEOUT,
+            API_IO_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(st, 200);
+        assert_eq!(val["ok"], Value::Bool(true));
+        let sent_req = srv_chunked.await.unwrap();
+        assert!(sent_req.contains("Accept-Language: en-US\r\n"));
+
+        // 4. CL+TE conflict, empty 200 OK body, and >16 MiB Content-Length rejection
+        for mock_resp in [
+            "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n",
+        ] {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = l.local_addr().unwrap().to_string();
+            let raw_resp = mock_resp.to_string();
+            tokio::spawn(async move {
+                if let Ok((mut sock, _)) = l.accept().await {
+                    let mut req_buf = [0u8; 512];
+                    let _ = sock.read(&mut req_buf).await;
+                    let _ = sock.write_all(raw_resp.as_bytes()).await;
+                }
+            });
+            let err = api_request_raw_with_timeouts(
+                &a,
+                Locale::Zh,
+                "GET",
+                "/api/system",
+                None,
+                API_CONNECT_TIMEOUT,
+                API_IO_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ApiTransportError::Other(_)));
+        }
+
+        // 5. `node ping` unreachable & `conn kill` killed=false trigger non-zero SilentExitError
+        let ping_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ping_addr = ping_listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = ping_listener.accept().await {
+                let mut req_buf = [0u8; 1024];
+                let _ = sock.read(&mut req_buf).await;
+                let body = r#"{"ok":false,"latency_ms":null,"message":"unreachable"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let ping_err = run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            ping_addr,
+            "--json".into(),
+            "node".into(),
+            "ping".into(),
+            "101".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(ping_err.downcast_ref::<SilentExitError>().is_some());
+
+        let kill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let kill_addr = kill_listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = kill_listener.accept().await {
+                let mut req_buf = [0u8; 1024];
+                let _ = sock.read(&mut req_buf).await;
+                let body = r#"{"ok":true,"id":42,"killed":false}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let kill_err = run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            kill_addr,
+            "--json".into(),
+            "conn".into(),
+            "kill".into(),
+            "42".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(kill_err.downcast_ref::<SilentExitError>().is_some());
     }
 }

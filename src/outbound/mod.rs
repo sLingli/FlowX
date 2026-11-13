@@ -336,6 +336,20 @@ impl TargetAddr {
             TargetAddr::Domain(host, _) => host.clone(),
         }
     }
+
+    /// 构造标准 `host:port`（对 IPv6 字面量自动包裹方括号 `[...]:port`）
+    pub fn to_authority_string(&self) -> String {
+        match self {
+            TargetAddr::Ip(addr) => addr.to_string(),
+            TargetAddr::Domain(host, port) => {
+                if host.contains(':') && !host.starts_with('[') {
+                    format!("[{host}]:{port}")
+                } else {
+                    format!("{host}:{port}")
+                }
+            }
+        }
+    }
 }
 
 fn record_activity_us(start: &tokio::time::Instant, tracker: &std::sync::atomic::AtomicU64) {
@@ -1699,5 +1713,20 @@ mod tests {
             b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
         );
         assert_eq!(down4, got4.len() as u64);
+    }
+
+    #[test]
+    fn test_target_addr_to_authority_string_brackets_ipv6() {
+        let v4 = TargetAddr::Ip("1.2.3.4:80".parse().unwrap());
+        assert_eq!(v4.to_authority_string(), "1.2.3.4:80");
+
+        let v6 = TargetAddr::Ip("[2001:db8::1]:443".parse().unwrap());
+        assert_eq!(v6.to_authority_string(), "[2001:db8::1]:443");
+
+        let domain = TargetAddr::Domain("api.github.com".to_string(), 443);
+        assert_eq!(domain.to_authority_string(), "api.github.com:443");
+
+        let raw_v6_domain = TargetAddr::Domain("2001:db8::2".to_string(), 8443);
+        assert_eq!(raw_v6_domain.to_authority_string(), "[2001:db8::2]:8443");
     }
 }

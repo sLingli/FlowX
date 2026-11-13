@@ -263,7 +263,7 @@ async fn handle_connection(
         proc_name,
         proc_path,
         pid,
-        format!("{}:{}", target.host_string(), target.port()),
+        target.to_authority_string(),
         rule_name,
         action.type_str().to_string(),
         action.target_id(),
