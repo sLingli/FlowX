@@ -1,6 +1,6 @@
 # FlowX
 
-基于 Rust 异步运行时（Tokio）构建的跨平台（Windows / Linux）进程级代理与分流引擎，内建混合协议入站、Fake-IP DNS、XML 配置持久化及单文件 Web 控制台。
+基于 Rust 异步运行时（Tokio）构建的跨平台（Windows / Linux / macOS）进程级代理与分流引擎，内建混合协议入站、Fake-IP DNS、XML 配置持久化及单文件 Web 控制台。
 
 ## 平台支持
 
@@ -8,9 +8,11 @@
 |---|---|---|
 | Windows | `GetExtendedTcpTable` + `QueryFullProcessImageNameW` | `Ctrl+C` |
 | Linux | `/proc/net/tcp[6]` → socket inode → `/proc/<pid>/fd` → `/proc/<pid>/exe` | `SIGINT` / `SIGTERM`（兼容 `systemctl stop`） |
+| macOS | `libproc` (`proc_listpids` / `PROC_PIDFDSOCKETINFO` / `PROC_PIDTBSDINFO`，兼容双栈 `INI_IPV4 \| INI_IPV6`) | `SIGINT` / `SIGTERM`（兼容 `launchd`） |
 
-- **Linux 权限**：默认端口（`1053` / `40001` / `40080`）均大于 1024，普通用户即可运行；普通用户只能识别同一用户下的进程，若需识别其它用户（如 root 或系统服务）发起的连接，请以 `sudo` 运行或为二进制授予 `CAP_SYS_PTRACE` 与 `CAP_DAC_READ_SEARCH` 能力（`sudo setcap cap_sys_ptrace,cap_dac_read_search+ep ./flowx`）。
-- **规则跨平台互通**：应用程序规则中的 `.exe` 后缀双向兼容，`git.exe` 可匹配 Linux 下的 `git`，`git` 也可匹配 Windows 下的 `git.exe`；`%ComputerName%` / `%HOSTNAME%` 在 Linux 下会读取 `/proc/sys/kernel/hostname` 或 `/etc/hostname`。
+- **Unix 权限**：默认端口（`1053` / `40001` / `40080`）均大于 1024，普通用户即可运行，且在 Unix 下写回 `flowx.xml` 时强制使用 `0600` 私有文件权限；普通用户仅能反查同用户下发起的进程连接，Linux 跨用户识别可通过 `sudo` 或授予 `CAP_SYS_PTRACE` + `CAP_DAC_READ_SEARCH` 能力（`sudo setcap cap_sys_ptrace,cap_dac_read_search+ep ./flowx`），macOS 跨用户进程反查需以 `sudo` 运行。
+- **规则跨平台互通与安全限制**：应用程序规则中的 `.exe` 后缀双向兼容，`git.exe` 可匹配 Linux / macOS 下的 `git`，`git` 也可匹配 Windows 下的 `git.exe`；`%ComputerName%` / `%HOSTNAME%` 在拆词之后解析并过滤 `;` / 通配符 / CIDR 等元字符，防止主机名注入。
+- **代理认证与节点安全**：`HTTP` 与 `SOCKS5` 节点强制要求用户名与密码成对配置（清空密码会同步清除用户名；`HTTP` 用户名禁止包含冒号 `:`），`SOCKS4` 仅支持可选 `UserID`（无密码）；节点地址禁止指向 Fake-IP（`198.18.0.0/15`）或本机/回环中的 FlowX 自身服务端口。
 
 ## 默认监听端口
 
@@ -37,7 +39,7 @@ cargo test
 
 ### CLI 控制子命令（支持在线热调用与离线 XML 直改）
 
-`flowx` 内置双栖 CLI 子命令，当守护进程运行时自动通过本地 API 实时同步，当守护进程未运行时自动回退为离线读写 `flowx.xml`（所有子命令均支持 `--json` 输出）：
+`flowx` 内置双栖 CLI 子命令，当守护进程运行时自动通过本地 API 实时同步；当未显式指定 `--api` / `$FLOWX_API` 且默认回环端口返回连接拒绝（`ConnectionRefused`）时安全回退离线读写 `flowx.xml`（只读命令绝不新建缺失配置，离线变更在参数校验失败时也不会提前写入文件；所有子命令均支持 `--json` 结构化输出）：
 
 ```bash
 # 查看运行状态与统计概览

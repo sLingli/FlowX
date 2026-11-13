@@ -6,7 +6,7 @@ description: 配置、诊断与管理 FlowX 进程级透明代理与网络分流
 # FlowX 进程级分流与代理控制技能指南
 
 FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux / macOS）进程级透明网络代理与分流引擎，内建双栖 CLI 控制子命令与本地回环 HTTP API。
-仓库根目录提供了配置示例模板 [flowx.example.xml](file:///c:/Users/DELL/Desktop/FlowX/flowx.example.xml)（首次启动若无配置文件会自动生成，也可直接复制按需调整，文件权限按敏感凭据保护写为 `0600`）。
+仓库根目录提供了配置示例模板 [flowx.example.xml](../../flowx.example.xml)（首次启动若无配置文件会自动生成，也可直接复制按需调整，在 Unix 平台按敏感凭据保护写为 `0600` 权限）。
 无论是守护进程在线运行中（默认监听 `http://127.0.0.1:40080`），还是守护进程尚未启动（离线直接读写 `flowx.xml`），都优先通过 `flowx` CLI 子命令（携带 `--json`）完成查询、修改与干跑验证。
 
 ---
@@ -26,7 +26,7 @@ FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux / macOS）进程
 
 `flowx` 子命令执行严格参数校验与确定性路由（未知参数如 `--targe` 或多余位置参数会直接报错退出）：
 - **在线模式（Online）**：连接运行中守护进程的 HTTP API（支持 `PATCH` 原子部分更新），内存状态与 `flowx.xml` 实时同步；
-- **显式离线模式（`--offline`）**：直接安全校验并原子读写 `--config` / `$FLOWX_CONFIG` 指定的 XML 文件，不尝试连接守护进程（`conn` 命令除外，其要求在线守护进程）；
+- **显式离线模式（`--offline`）**：直接安全校验并原子读写 `--config` / `$FLOWX_CONFIG` 指定的 XML 文件，不尝试连接守护进程（`conn` 命令除外，其要求在线守护进程）；只读命令缺失配置文件时直接报错而不新建文件，变更命令在参数/规则校验失败时同样不会在磁盘提前生成 `flowx.xml`；
 - **默认地址离线回退**：仅当未显式指定 `--api` / `$FLOWX_API` 且连接默认本地 `127.0.0.1:40080` 收到 `ConnectionRefused` 时，`status` / `node` / `rule` / `default` / `sim` 才会安全回退离线 XML；若超时、HTTP 返回错误或自定义 `--api` 失败，CLI 会直接报错，避免配置分脑。
 
 ### 1. 状态与默认兜底策略
@@ -45,6 +45,8 @@ flowx default Proxy:101 --json
 
 ### 2. 代理节点管理 (`flowx node`)
 支持协议：`SOCKS5`、`HTTP`（HTTP CONNECT）、`SOCKS4`（含 SOCKS4a）。
+- **凭证成对约束**：`HTTP` 与 `SOCKS5` 节点要求用户名（`--user`）与密码（`--pass`）必须同时配置或同时留空（单传其一分别返回 `ERR_USERNAME_WITHOUT_PASSWORD` / `ERR_PASSWORD_WITHOUT_USERNAME`；`HTTP` 用户名禁止包含 `:`）；清除密码（`--clear-password` 或 `--pass ""`）会同步清除用户名，除非同一请求中另行显式传入新用户名（将报错拒绝）。`SOCKS4` 仅支持可选 `--user`（`UserID`）且不允许设置密码。`auth_configured` 在 `SOCKS4` 下表示是否配置 `UserID`，在 `HTTP`/`SOCKS5` 下表示用户名与密码是否成对就绪。
+- **节点地址安全限制**：禁止指向 Fake-IP（`198.18.0.0/15`）或本机/回环中的 FlowX 自身服务端口（`--addr` 与 `ping` 解析上游 DNS 后均会二次拦截回环与重绑定）。
 ```bash
 # 列出所有代理节点
 flowx node list --json
@@ -56,7 +58,7 @@ flowx node add --name "Auth-HTTP" --addr "10.0.0.2:8080" --protocol HTTP --user 
 # 原地修改现有节点（使用 PATCH 原子部分更新；未改用户名且未传 --pass 时保留原密码）
 flowx node update 101 --name "HK-Main" --addr "127.0.0.1:10809" --json
 
-# 显式清除节点已保存密码，或仅离线修改本地 XML
+# 显式清除节点已保存认证（HTTP/SOCKS5 将同步清空用户名与密码），或仅离线修改本地 XML
 flowx node update 101 --clear-password --json
 flowx --offline node update 101 --user "bob" --pass "new-secret" --json
 
