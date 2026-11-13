@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use crate::dns::FakeIpPool;
+use super::direct::{connect_proxy_tcp, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,10 +30,26 @@ impl Socks5Client {
 
     /// Establish initial TCP connection through proxy address and handshake (with 10s timeout protection)
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
+        self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
+            .await
+    }
+
+    pub async fn connect_with_policy(
+        &self,
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<TcpStream> {
         tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            let stream = TcpStream::connect(&self.proxy_addr)
-                .await
-                .with_context(|| format!("Failed to connect to SOCKS5 proxy: {}", self.proxy_addr))?;
+            let stream = connect_proxy_tcp(
+                &self.proxy_addr,
+                upstream_dns,
+                fake_ip_pool,
+                self_ports,
+                "SOCKS5 proxy",
+            )
+            .await?;
 
             self.handshake(stream, target).await
         })
@@ -178,5 +196,55 @@ mod tests {
             .with_auth("user".into(), "pass".into());
         assert_eq!(client.proxy_addr, "127.0.0.1:1080");
         assert_eq!(client.auth, Some(("user".into(), "pass".into())));
+    }
+
+    #[tokio::test]
+    async fn test_socks5_uses_upstream_dns_and_blocks_loopback_rebinding_and_fake_ip() {
+        let mock_dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dns_addr = mock_dns.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buf = [0u8; 512];
+                let (n, src) = mock_dns.recv_from(&mut buf).await.unwrap();
+                let (tx, q) = crate::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                let resp = if q.qtype == 1 {
+                    let mut r = Vec::new();
+                    r.extend_from_slice(&tx.to_be_bytes());
+                    r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                    r.extend_from_slice(&buf[12..q.raw_len]);
+                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1]);
+                    r
+                } else {
+                    crate::dns::server::DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)
+                };
+                mock_dns.send_to(&resp, src).await.unwrap();
+            }
+        });
+
+        let pool = FakeIpPool::new_default();
+        let client = Socks5Client::new("proxy-domain.example:40001");
+        let err = client
+            .connect_with_policy(
+                &TargetAddr::Domain("example.com".into(), 443),
+                dns_addr,
+                Some(&pool),
+                &[40001, 40080, 1053],
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err).contains("self/loopback IP resolution"));
+
+        let fake_ip = pool.allocate("socks5.example");
+        let fake_client = Socks5Client::new(format!("{}:1080", fake_ip));
+        let err2 = fake_client
+            .connect_with_policy(
+                &TargetAddr::Domain("example.com".into(), 443),
+                dns_addr,
+                Some(&pool),
+                &[40001],
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err2).contains("Fake-IP"));
     }
 }

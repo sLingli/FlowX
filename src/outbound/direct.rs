@@ -11,9 +11,32 @@ use super::{is_local_or_loopback_ip, is_loopback_domain, local_interface_ips, Ta
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DIRECT_DNS_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// 默认上游 DNS 地址（仅在测试或无独立运行时配置注入的场景下使用）
+pub(crate) const DEFAULT_OUTBOUND_UPSTREAM_DNS: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)), 53);
+
 pub struct DirectOutbound;
 
-fn validate_direct_ips(ips: &[IpAddr], port: u16, self_ports: &[u16], host_label: &str) -> Result<()> {
+pub(crate) fn validate_direct_ips(
+    ips: &[IpAddr],
+    port: u16,
+    self_ports: &[u16],
+    fake_ip_pool: Option<&FakeIpPool>,
+    host_label: &str,
+) -> Result<()> {
+    if let Some(pool) = fake_ip_pool
+        && let Some(fake_ip) = ips.iter().copied().find(|ip| match ip {
+            IpAddr::V4(v4) => pool.is_fake_ip(v4),
+            IpAddr::V6(_) => false,
+        })
+    {
+        bail!(
+            "Outbound connection blocked: resolved Fake-IP {} for {}:{}",
+            fake_ip,
+            host_label,
+            port
+        );
+    }
     if self_ports.contains(&port) {
         let local_ips = local_interface_ips();
         if let Some(bad_ip) = ips.iter().copied().find(|ip| is_local_or_loopback_ip(*ip, &local_ips)) {
@@ -28,6 +51,21 @@ fn validate_direct_ips(ips: &[IpAddr], port: u16, self_ports: &[u16], host_label
     Ok(())
 }
 
+/// 通过显式上游 DNS + Fake-IP 防死锁与回环自检连接上级代理节点，避免阻塞 `getaddrinfo` 命中系统 Fake-IP
+pub(crate) async fn connect_proxy_tcp(
+    proxy_addr: &str,
+    upstream_dns: SocketAddr,
+    fake_ip_pool: Option<&FakeIpPool>,
+    self_ports: &[u16],
+    role: &str,
+) -> Result<TcpStream> {
+    let proxy_target = TargetAddr::parse_authority(proxy_addr, None, false)
+        .with_context(|| format!("Invalid {} server address: {}", role, proxy_addr))?;
+    DirectOutbound::connect(&proxy_target, upstream_dns, fake_ip_pool, self_ports)
+        .await
+        .with_context(|| format!("Failed to connect to {}: {}", role, proxy_addr))
+}
+
 impl DirectOutbound {
     pub async fn connect(
         target: &TargetAddr,
@@ -38,7 +76,13 @@ impl DirectOutbound {
         let fut = async {
             match target {
                 TargetAddr::Ip(addr) => {
-                    validate_direct_ips(&[addr.ip()], addr.port(), self_ports, &addr.ip().to_string())?;
+                    validate_direct_ips(
+                        &[addr.ip()],
+                        addr.port(),
+                        self_ports,
+                        fake_ip_pool,
+                        &addr.ip().to_string(),
+                    )?;
                     TcpStream::connect(addr)
                         .await
                         .with_context(|| format!("Direct connection to target IP failed: {}", addr))
@@ -62,7 +106,7 @@ impl DirectOutbound {
                             .with_context(|| format!("Upstream DNS resolution failed for direct target {}", domain))?
                     };
 
-                    validate_direct_ips(&resolved_ips, *port, self_ports, domain)?;
+                    validate_direct_ips(&resolved_ips, *port, self_ports, fake_ip_pool, domain)?;
 
                     let mut last_err = None;
                     for ip in resolved_ips {

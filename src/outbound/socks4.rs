@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use crate::dns::FakeIpPool;
+use super::direct::{connect_proxy_tcp, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,10 +29,26 @@ impl Socks4Client {
     }
 
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
+        self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
+            .await
+    }
+
+    pub async fn connect_with_policy(
+        &self,
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<TcpStream> {
         tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            let stream = TcpStream::connect(&self.proxy_addr)
-                .await
-                .with_context(|| format!("Failed to connect to SOCKS4 proxy: {}", self.proxy_addr))?;
+            let stream = connect_proxy_tcp(
+                &self.proxy_addr,
+                upstream_dns,
+                fake_ip_pool,
+                self_ports,
+                "SOCKS4 proxy",
+            )
+            .await?;
 
             self.handshake(stream, target).await
         })

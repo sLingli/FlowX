@@ -1,7 +1,10 @@
+use std::net::SocketAddr;
 use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use crate::dns::FakeIpPool;
+use super::direct::{connect_proxy_tcp, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -26,10 +29,26 @@ impl HttpConnectClient {
     }
 
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
+        self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
+            .await
+    }
+
+    pub async fn connect_with_policy(
+        &self,
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<TcpStream> {
         tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            let stream = TcpStream::connect(&self.proxy_addr)
-                .await
-                .with_context(|| format!("Failed to connect to HTTP proxy: {}", self.proxy_addr))?;
+            let stream = connect_proxy_tcp(
+                &self.proxy_addr,
+                upstream_dns,
+                fake_ip_pool,
+                self_ports,
+                "HTTP proxy",
+            )
+            .await?;
 
             self.handshake(stream, target).await
         })
@@ -49,8 +68,14 @@ impl HttpConnectClient {
         let target_authority = match target {
             TargetAddr::Ip(addr) => addr.to_string(),
             TargetAddr::Domain(host, port) => {
-                if host.contains('\r') || host.contains('\n') || host.contains(' ') {
-                    bail!("HTTP target domain contains invalid control characters: {:?}", host);
+                if host.is_empty()
+                    || host.bytes().any(|b| {
+                        b < 0x20
+                            || b == 0x7f
+                            || matches!(b, b' ' | b'/' | b'?' | b'#' | b'@' | b'\\')
+                    })
+                {
+                    bail!("HTTP target domain contains invalid characters: {:?}", host);
                 }
                 format!("{}:{}", host, port)
             }
@@ -64,6 +89,9 @@ impl HttpConnectClient {
         if let Some((user, pass)) = &self.auth {
             if user.chars().any(char::is_control) || pass.chars().any(char::is_control) {
                 bail!("HTTP proxy credentials contain invalid control characters");
+            }
+            if user.contains(':') {
+                bail!("HTTP proxy Basic authentication username cannot contain ':' (RFC 7617)");
             }
             let encoded = base64_encode(format!("{}:{}", user, pass).as_bytes());
             req.push_str(&format!("Proxy-Authorization: Basic {}\r\n", encoded));
@@ -252,5 +280,55 @@ mod tests {
         assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\r\nProxy-Agent: x\r\n\r\n").is_ok());
         assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\n\r\n\r\n").is_err());
         assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_http_connect_rejects_bad_target_chars_basic_colon_and_fake_ip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+
+        let client = HttpConnectClient::new(proxy_addr.to_string());
+        for bad_host in ["evil.com/path", "evil.com?x=1", "evil.com#frag", "user@evil.com", "evil.com\tHTTP/1.1", "evil\0.com"] {
+            let s = TcpStream::connect(proxy_addr).await.unwrap();
+            let err = client
+                .handshake(s, &TargetAddr::Domain(bad_host.into(), 443))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid characters"),
+                "expected invalid char err for {:?}: {}",
+                bad_host,
+                err
+            );
+        }
+
+        let bad_user_client = HttpConnectClient::new(proxy_addr.to_string())
+            .with_auth("ali:ce".into(), "secret".into());
+        let s = TcpStream::connect(proxy_addr).await.unwrap();
+        let err = bad_user_client
+            .handshake(s, &TargetAddr::Domain("example.com".into(), 443))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("':'"));
+
+        // Fake-IP server_addr must be blocked rather than connecting back into Fake-IP range
+        let pool = FakeIpPool::new_default();
+        let fake_ip = pool.allocate("upstream-proxy.example");
+        let fake_client = HttpConnectClient::new(format!("{}:8080", fake_ip));
+        let err = fake_client
+            .connect_with_policy(
+                &TargetAddr::Domain("example.com".into(), 443),
+                "127.0.0.1:53".parse().unwrap(),
+                Some(&pool),
+                &[40001],
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{:#}", err).contains("Fake-IP"));
     }
 }

@@ -1,5 +1,8 @@
+use std::net::{IpAddr, SocketAddr};
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpStream;
+use crate::dns::FakeIpPool;
+use super::direct::{connect_proxy_tcp, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::http::HttpConnectClient;
 use super::socks4::Socks4Client;
 use super::socks5::Socks5Client;
@@ -84,6 +87,17 @@ impl ProxyChain {
 
     /// Establish multi-hop tunnel to final target through proxy chain (with single-hop timeout and overall chain timeout)
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
+        self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
+            .await
+    }
+
+    pub async fn connect_with_policy(
+        &self,
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<TcpStream> {
         if self.nodes.is_empty() {
             bail!("Proxy chain '{}' does not contain any proxy nodes", self.name);
         }
@@ -92,18 +106,21 @@ impl ProxyChain {
         const CHAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         tokio::time::timeout(CHAIN_TOTAL_TIMEOUT, async {
-            // 1. Establish basic TCP connection with first hop
+            // 1. Establish basic TCP connection with first hop via upstream DNS + Fake-IP/self-loop validation
             let first_node = &self.nodes[0];
-            let mut stream = tokio::time::timeout(HOP_CONNECT_TIMEOUT, TcpStream::connect(first_node.server_addr()))
-                .await
-                .map_err(|_| anyhow::anyhow!("Proxy chain [{}] first node connection timed out ({:?}): {}", self.name, HOP_CONNECT_TIMEOUT, first_node.server_addr()))?
-                .with_context(|| {
-                    format!(
-                        "Proxy chain [{}] first node connection failed: {}",
-                        self.name,
-                        first_node.server_addr()
-                    )
-                })?;
+            let role = format!("Proxy chain [{}] first node", self.name);
+            let mut stream = tokio::time::timeout(
+                HOP_CONNECT_TIMEOUT,
+                connect_proxy_tcp(
+                    first_node.server_addr(),
+                    upstream_dns,
+                    fake_ip_pool,
+                    self_ports,
+                    &role,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Proxy chain [{}] first node connection timed out ({:?}): {}", self.name, HOP_CONNECT_TIMEOUT, first_node.server_addr()))??;
 
             // 2. Iterate and handshake through each hop, requesting CONNECT to next hop
             for i in 0..self.nodes.len() {
@@ -128,6 +145,18 @@ impl ProxyChain {
                     // Intermediate hop: connect to next proxy node
                     let next_node = &self.nodes[i + 1];
                     let next_target = parse_target_addr(next_node.server_addr())?;
+                    if let TargetAddr::Ip(addr) = &next_target {
+                        if let IpAddr::V4(v4) = addr.ip()
+                            && fake_ip_pool.is_some_and(|p| p.is_fake_ip(&v4))
+                        {
+                            bail!("Proxy chain [{}] intermediate node {} uses Fake-IP", self.name, next_node.server_addr());
+                        }
+                        if next_target.is_loopback_or_unspecified() && self_ports.contains(&next_target.port()) {
+                            bail!("Proxy chain [{}] intermediate node {} points to internal port", self.name, next_node.server_addr());
+                        }
+                    } else if next_target.is_loopback_or_unspecified() && self_ports.contains(&next_target.port()) {
+                        bail!("Proxy chain [{}] intermediate node {} points to internal port", self.name, next_node.server_addr());
+                    }
 
                     stream = current_node
                         .handshake(stream, &next_target)
