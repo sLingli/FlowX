@@ -291,13 +291,7 @@ async fn handle_connection(
                 }
             }
         }
-        _ = async {
-            let notified = cancel_token.cancel_notify.notified();
-            if cancel_token.is_cancelled() {
-                return;
-            }
-            notified.await;
-        } => {
+        _ = cancel_token.cancelled() => {
             inbound::send_failure(&mut local_stream, kind, true).await.ok();
             bail!("Connection aborted by administrator during establishment");
         }

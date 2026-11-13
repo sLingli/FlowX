@@ -52,6 +52,18 @@ impl ActiveConnection {
         self.cancelled.load(Ordering::Acquire)
     }
 
+    /// Wait until this connection is cancelled, registering the waiter before checking
+    /// the atomic flag so cancellations happening concurrently are never missed.
+    pub async fn cancelled(&self) {
+        let notified = self.cancel_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+
     pub fn add_upload(&self, bytes: u64) {
         self.uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -309,6 +321,8 @@ impl InFlightTracker {
     pub async fn wait_zero(&self) {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.count() == 0 {
                 return;
             }
@@ -426,5 +440,43 @@ mod tests {
             .expect("wait_zero timed out")
             .unwrap();
         assert_eq!(tracker.count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_active_connection_cancelled_no_lost_wakeup() {
+        for _ in 0..200 {
+            let mgr = ConnectionManager::new();
+            let conn = mgr.register(
+                "app.exe".into(),
+                "C:/app.exe".into(),
+                1000,
+                "example.com:443".into(),
+                "Default".into(),
+                "Direct".into(),
+                None,
+            );
+            let id = conn.id;
+            let cancel_fut = conn.cancelled();
+            let killer = tokio::spawn(async move { mgr.kill_connection(id) });
+            let killed = killer.await.unwrap();
+            assert!(killed);
+            tokio::time::timeout(std::time::Duration::from_secs(1), cancel_fut)
+                .await
+                .expect("cancelled() lost notification");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_in_flight_tracker_wait_zero_no_lost_wakeup() {
+        for _ in 0..200 {
+            let tracker = Arc::new(InFlightTracker::new());
+            let guard = tracker.enter();
+            let wait_fut = tracker.wait_zero();
+            let dropper = tokio::spawn(async move { drop(guard) });
+            dropper.await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), wait_fut)
+                .await
+                .expect("wait_zero() lost notification");
+        }
     }
 }

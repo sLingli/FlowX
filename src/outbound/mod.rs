@@ -409,11 +409,7 @@ where
         }
         _ = async {
             if let Some(c) = conn {
-                let notified = c.cancel_notify.notified();
-                if c.is_cancelled() {
-                    return;
-                }
-                notified.await;
+                c.cancelled().await;
             } else {
                 std::future::pending::<()>().await;
             }

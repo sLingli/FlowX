@@ -258,13 +258,19 @@ where
 
     let header_end = loop {
         if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break pos + 4;
+            let end = pos + 4;
+            if end > MAX_HTTP_HEADER {
+                reply_http_error(stream, "431 Request Header Fields Too Large").await;
+                bail!("HTTP headers exceed {} bytes limit", MAX_HTTP_HEADER);
+            }
+            break end;
         }
-        if buf.len() > MAX_HTTP_HEADER {
+        if buf.len() >= MAX_HTTP_HEADER {
             reply_http_error(stream, "431 Request Header Fields Too Large").await;
             bail!("HTTP headers exceed {} bytes limit", MAX_HTTP_HEADER);
         }
-        let n = stream.read(&mut tmp).await?;
+        let max_read = (MAX_HTTP_HEADER - buf.len()).min(tmp.len());
+        let n = stream.read(&mut tmp[..max_read]).await?;
         if n == 0 {
             bail!("Connection closed before HTTP headers ended");
         }
@@ -330,6 +336,10 @@ where
         if authority.contains(['?', '#', '@', '\\']) {
             reply_http_error(stream, "400 Bad Request").await;
             bail!("HTTP proxy authority contains forbidden delimiter: {}", authority);
+        }
+        if path.bytes().any(|b| b <= 0x1f || b == 0x7f) {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("HTTP proxy request path contains ASCII control characters");
         }
         let target = match parse_authority(authority, Some(80)) {
             Ok(t) => t,
@@ -458,7 +468,8 @@ where
         bail!("HTTP/1.1 request missing Host header");
     }
     if let Some(host_str) = host_header {
-        let Ok(host_target) = TargetAddr::parse_authority(host_str, Some(target.port()), false) else {
+        let host_default_port = if is_connect { None } else { Some(80) };
+        let Ok(host_target) = TargetAddr::parse_authority(host_str, host_default_port, false) else {
             reply_http_error(stream, "400 Bad Request").await;
             bail!("Invalid Host header: {:?}", host_str);
         };
@@ -744,5 +755,133 @@ mod tests {
             parse_authority("1.2.3.4:5", None).unwrap(),
             TargetAddr::Ip("1.2.3.4:5".parse().unwrap())
         );
+    }
+
+    async fn parse_http_from_start<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+        stream: &mut S,
+    ) -> Result<InboundRequest> {
+        let first = stream.read_u8().await?;
+        read_http(stream, first).await
+    }
+
+    #[tokio::test]
+    async fn test_read_http_exact_max_header_boundary() {
+        // Exactly MAX_HTTP_HEADER bytes WITH terminator fits and succeeds.
+        let prefix = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nX-Pad: ";
+        let suffix = b"\r\n\r\n";
+        let pad_len = MAX_HTTP_HEADER - prefix.len() - suffix.len();
+        let mut exact_req = Vec::with_capacity(MAX_HTTP_HEADER + 4);
+        exact_req.extend_from_slice(prefix);
+        exact_req.extend(std::iter::repeat_n(b'a', pad_len));
+        exact_req.extend_from_slice(suffix);
+        exact_req.extend_from_slice(b"PING");
+        assert_eq!(exact_req.len(), MAX_HTTP_HEADER + 4);
+
+        let (mut client, mut server) = tokio::io::duplex(MAX_HTTP_HEADER * 2);
+        let write_task = tokio::spawn(async move {
+            client.write_all(&exact_req).await.unwrap();
+            client.shutdown().await.unwrap();
+            client
+        });
+
+        let parsed = parse_http_from_start(&mut server)
+            .await
+            .expect("exact MAX_HTTP_HEADER should pass");
+        assert_eq!(parsed.target, TargetAddr::Domain("example.com".to_string(), 443));
+        // Read capped at MAX_HTTP_HEADER, so trailing bytes remain unread in stream until relay.
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"PING");
+        let _ = write_task.await.unwrap();
+
+        // Headers reaching MAX_HTTP_HEADER WITHOUT terminator return 431.
+        let mut too_long = Vec::with_capacity(MAX_HTTP_HEADER + 16);
+        too_long.extend_from_slice(prefix);
+        too_long.extend(std::iter::repeat_n(b'b', MAX_HTTP_HEADER - prefix.len() + 16));
+        let (mut client2, mut server2) = tokio::io::duplex(MAX_HTTP_HEADER * 2);
+        let write_task2 = tokio::spawn(async move {
+            let _ = client2.write_all(&too_long).await;
+            let _ = client2.shutdown().await;
+            let mut resp = Vec::new();
+            let _ = client2.read_to_end(&mut resp).await;
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+        assert!(parse_http_from_start(&mut server2).await.is_err());
+        drop(server2);
+        let resp = write_task2.await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 431 "), "expected 431, got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn test_read_http_rejects_control_chars_in_origin_path() {
+        for bad_byte in [0x09u8, 0x1f, 0x7f] {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            let mut req = b"GET http://example.com/ok".to_vec();
+            req.push(bad_byte);
+            req.extend_from_slice(b"next HTTP/1.1\r\nHost: example.com\r\n\r\n");
+
+            let write_task = tokio::spawn(async move {
+                client.write_all(&req).await.unwrap();
+                client.shutdown().await.unwrap();
+                let mut resp = Vec::new();
+                client.read_to_end(&mut resp).await.unwrap();
+                String::from_utf8_lossy(&resp).into_owned()
+            });
+
+            assert!(parse_http_from_start(&mut server).await.is_err());
+            drop(server);
+            let resp = write_task.await.unwrap();
+            assert!(
+                resp.starts_with("HTTP/1.1 400 "),
+                "expected 400 for byte {bad_byte:#x}, got: {resp}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_http_host_default_port_mismatch_rejected() {
+        // Plain HTTP non-default port must not let Host without port inherit target.port().
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(b"GET http://example.com:8080/api HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await
+                .unwrap();
+            client.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            client.read_to_end(&mut resp).await.unwrap();
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+        assert!(parse_http_from_start(&mut server).await.is_err());
+        drop(server);
+        assert!(writer.await.unwrap().starts_with("HTTP/1.1 400 "));
+
+        // CONNECT must require explicit port in Host matching CONNECT authority.
+        let (mut client2, mut server2) = tokio::io::duplex(1024);
+        let writer2 = tokio::spawn(async move {
+            client2
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .await
+                .unwrap();
+            client2.shutdown().await.unwrap();
+            let mut resp = Vec::new();
+            client2.read_to_end(&mut resp).await.unwrap();
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+        assert!(parse_http_from_start(&mut server2).await.is_err());
+        drop(server2);
+        assert!(writer2.await.unwrap().starts_with("HTTP/1.1 400 "));
+
+        // CONNECT with matching explicit host:port succeeds.
+        let (mut client3, mut server3) = tokio::io::duplex(1024);
+        tokio::spawn(async move {
+            client3
+                .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+                .await
+                .unwrap();
+            client3.shutdown().await.unwrap();
+        });
+        let ok = parse_http_from_start(&mut server3).await.unwrap();
+        assert_eq!(ok.target, TargetAddr::Domain("example.com".to_string(), 443));
     }
 }
