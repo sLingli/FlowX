@@ -134,10 +134,10 @@ pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
 
         let mut ips = Vec::new();
         let mut buf_len: u32 = 16 * 1024;
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf: Vec<u64> = Vec::new();
 
         for _ in 0..4 {
-            buf.resize(buf_len as usize, 0);
+            buf.resize((buf_len as usize).div_ceil(std::mem::size_of::<u64>()), 0);
             let ret = unsafe {
                 GetAdaptersAddresses(
                     AF_UNSPEC as u32,

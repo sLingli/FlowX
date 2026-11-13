@@ -99,8 +99,9 @@ pub struct RuntimeProfile {
 }
 
 impl ProfileConfig {
-    pub fn from_xml(xml_content: &str) -> Result<Self, quick_xml::DeError> {
-        quick_xml::de::from_str(xml_content)
+    pub fn from_xml(xml_content: &str) -> Result<Self> {
+        validate_xml_root_profile(xml_content)?;
+        quick_xml::de::from_str(xml_content).map_err(|e| anyhow::anyhow!(e))
     }
 
     pub fn to_xml(&self) -> Result<String> {
@@ -458,6 +459,10 @@ impl ConfigStore {
         if let Some(runtime) = self.read_existing_opt(self_ports)? {
             return Ok((runtime, false));
         }
+        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(runtime) = self.read_existing_opt(self_ports)? {
+            return Ok((runtime, false));
+        }
         let default_cfg = ProfileConfig::default_profile();
         self.write_config_atomic(&default_cfg)?;
         let runtime = default_cfg.into_runtime(self_ports)?;
@@ -582,6 +587,44 @@ impl ConfigStore {
         }
 
         Ok(())
+    }
+}
+
+fn validate_xml_root_profile(xml_content: &str) -> Result<()> {
+    let trimmed_bom = xml_content.strip_prefix('\u{feff}').unwrap_or(xml_content);
+    let mut reader = quick_xml::Reader::from_str(trimmed_bom);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
+                let local = e.local_name();
+                if local.as_ref() != b"Profile" {
+                    let found = String::from_utf8_lossy(local.as_ref());
+                    bail!("Invalid XML root element <{}>: expected <Profile>", found);
+                }
+                return Ok(());
+            }
+            Ok(quick_xml::events::Event::Decl(_))
+            | Ok(quick_xml::events::Event::Comment(_))
+            | Ok(quick_xml::events::Event::PI(_))
+            | Ok(quick_xml::events::Event::DocType(_)) => continue,
+            Ok(quick_xml::events::Event::Text(t))
+                if t.as_ref().iter().all(|b| b.is_ascii_whitespace()) =>
+            {
+                continue;
+            }
+            Ok(quick_xml::events::Event::Text(_)) | Ok(quick_xml::events::Event::CData(_)) => {
+                bail!("Unexpected text content before <Profile> root element");
+            }
+            Ok(quick_xml::events::Event::Eof) => {
+                bail!("Empty XML configuration: missing <Profile> root element");
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let local = e.local_name();
+                let found = String::from_utf8_lossy(local.as_ref());
+                bail!("Unexpected closing tag </{}> before <Profile> root element", found);
+            }
+            Err(e) => bail!("Malformed XML syntax: {}", e),
+        }
     }
 }
 
@@ -810,5 +853,51 @@ mod tests {
         </Profile>
         "#;
         assert!(ProfileConfig::from_xml(bad_pw_only).unwrap().into_runtime(&[]).is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_wrong_root_xml_and_empty_xml() {
+        let wrong_root = r#"
+        <OtherRoot version="1">
+          <ProxyList />
+          <RuleList />
+        </OtherRoot>
+        "#;
+        let err = ProfileConfig::from_xml(wrong_root).unwrap_err();
+        assert!(
+            err.to_string().contains("expected <Profile>"),
+            "unexpected error: {err}"
+        );
+        assert!(ProfileConfig::from_xml("   ").is_err());
+
+        // Valid self-closing <Profile /> succeeds
+        let empty_profile = r#"<?xml version="1.0" encoding="utf-8"?><Profile version="1"/>"#;
+        assert!(ProfileConfig::from_xml(empty_profile).is_ok());
+
+        // Concurrent load_or_init inside workspace target dir produces a valid config file cleanly
+        let tmp = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_init_lock_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let store = std::sync::Arc::new(ConfigStore::new(&tmp));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let s = std::sync::Arc::clone(&store);
+            handles.push(std::thread::spawn(move || s.load_or_init(&[]).unwrap()));
+        }
+        let mut created_count = 0usize;
+        for h in handles {
+            let (_, created) = h.join().unwrap();
+            if created {
+                created_count += 1;
+            }
+        }
+        assert_eq!(created_count, 1);
+        let _ = std::fs::remove_file(&tmp);
     }
 }

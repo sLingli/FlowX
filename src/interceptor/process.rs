@@ -584,14 +584,26 @@ fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
     let _guard = HandleGuard(handle);
 
     let start_time = query_windows_process_creation_time(handle);
-    let mut buf = [0u16; 1024];
-    let mut size = buf.len() as u32;
-    let ret = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
-    if ret == 0 || size == 0 || (size as usize) > buf.len() {
+    let mut cap = 1024usize;
+    while cap <= 32768 {
+        let mut buf = vec![0u16; cap];
+        let mut size = buf.len() as u32;
+        let ret = unsafe { QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut size) };
+        if ret != 0 {
+            if size == 0 || (size as usize) > buf.len() {
+                return None;
+            }
+            let path = String::from_utf16_lossy(&buf[..size as usize]);
+            return Some((path, start_time));
+        }
+        let last_err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        if last_err == windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER {
+            cap = cap.saturating_mul(2);
+            continue;
+        }
         return None;
     }
-    let path = String::from_utf16_lossy(&buf[..size as usize]);
-    Some((path, start_time))
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -602,28 +614,28 @@ fn get_pid_by_connection_with_hints(
     neg_cache: &BoundedCache<u32, ()>,
     now: Instant,
 ) -> Option<u32> {
-    let inode = find_socket_inode_linux(client, server)?;
-    find_pid_by_socket_inode_linux(inode, hint_pids, neg_cache, now)
+    let (inode, sock_uid) = find_socket_inode_linux(client, server)?;
+    find_pid_by_socket_inode_linux(inode, sock_uid, hint_pids, neg_cache, now)
 }
 
 #[cfg(target_os = "linux")]
-fn find_socket_inode_linux(client: SocketAddr, server: SocketAddr) -> Option<u64> {
+fn find_socket_inode_linux(client: SocketAddr, server: SocketAddr) -> Option<(u64, Option<u32>)> {
     use std::fs::File;
     use std::io::BufReader;
 
-    let try_tcp4 = |c_v4: SocketAddrV4, s_v4: SocketAddrV4| -> Option<u64> {
+    let try_tcp4 = |c_v4: SocketAddrV4, s_v4: SocketAddrV4| -> Option<(u64, Option<u32>)> {
         let file = File::open("/proc/net/tcp").ok()?;
-        find_socket_inode_in_proc_tcp_reader(BufReader::new(file), c_v4, s_v4)
+        find_socket_meta_in_proc_tcp_reader(BufReader::new(file), c_v4, s_v4)
     };
-    let try_tcp6 = |c_v6: SocketAddrV6, s_v6: SocketAddrV6| -> Option<u64> {
+    let try_tcp6 = |c_v6: SocketAddrV6, s_v6: SocketAddrV6| -> Option<(u64, Option<u32>)> {
         let file = File::open("/proc/net/tcp6").ok()?;
-        find_socket_inode_in_proc_tcp6_reader(BufReader::new(file), c_v6, s_v6)
+        find_socket_meta_in_proc_tcp6_reader(BufReader::new(file), c_v6, s_v6)
     };
 
     match (client, server) {
         (SocketAddr::V4(c_v4), SocketAddr::V4(s_v4)) => {
-            if let Some(inode) = try_tcp4(c_v4, s_v4) {
-                return Some(inode);
+            if let Some(meta) = try_tcp4(c_v4, s_v4) {
+                return Some(meta);
             }
             if let Some((c_v6, s_v6)) = normalize_ipv6_pair(client, server) {
                 return try_tcp6(c_v6, s_v6);
@@ -631,8 +643,8 @@ fn find_socket_inode_linux(client: SocketAddr, server: SocketAddr) -> Option<u64
             None
         }
         (SocketAddr::V6(c_v6), SocketAddr::V6(s_v6)) => {
-            if let Some(inode) = try_tcp6(c_v6, s_v6) {
-                return Some(inode);
+            if let Some(meta) = try_tcp6(c_v6, s_v6) {
+                return Some(meta);
             }
             if let Some((c_v4, s_v4)) = normalize_ipv4_pair(client, server) {
                 return try_tcp4(c_v4, s_v4);
@@ -641,9 +653,9 @@ fn find_socket_inode_linux(client: SocketAddr, server: SocketAddr) -> Option<u64
         }
         _ => {
             if let Some((c_v4, s_v4)) = normalize_ipv4_pair(client, server)
-                && let Some(inode) = try_tcp4(c_v4, s_v4)
+                && let Some(meta) = try_tcp4(c_v4, s_v4)
             {
-                return Some(inode);
+                return Some(meta);
             }
             if let Some((c_v6, s_v6)) = normalize_ipv6_pair(client, server) {
                 return try_tcp6(c_v6, s_v6);
@@ -684,24 +696,37 @@ fn proc_pid_owns_socket_inode(pid: u32, inode: u64) -> PidFdProbe {
 #[cfg(target_os = "linux")]
 fn find_pid_by_socket_inode_linux(
     inode: u64,
+    sock_uid: Option<u32>,
     hint_pids: &[u32],
     neg_cache: &BoundedCache<u32, ()>,
     now: Instant,
 ) -> Option<u32> {
-    // 1. 快路径：优先探测最近活跃进程
-    for &pid in hint_pids {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe_pid = |pid: u32| -> bool {
         if neg_cache.contains_active(&pid, now) {
-            continue;
+            return false;
         }
         match proc_pid_owns_socket_inode(pid, inode) {
-            PidFdProbe::Matched => return Some(pid),
-            PidFdProbe::PermissionDenied => neg_cache.insert(pid, (), now),
-            PidFdProbe::NoMatch => {}
+            PidFdProbe::Matched => true,
+            PidFdProbe::PermissionDenied => {
+                neg_cache.insert(pid, (), now);
+                false
+            }
+            PidFdProbe::NoMatch => false,
+        }
+    };
+
+    // 1. 快路径：优先探测最近活跃进程
+    for &pid in hint_pids {
+        if probe_pid(pid) {
+            return Some(pid);
         }
     }
 
-    // 2. 慢路径：流式遍历 /proc 下纯数字 PID 目录（跳过已检查或负缓存的 PID）
+    // 2. 慢路径：遍历 /proc 下纯数字 PID 目录，若已解析出套接字 UID 则先探测同 UID 进程
     let entries = std::fs::read_dir("/proc").ok()?;
+    let mut deferred_pids: Vec<u32> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else {
@@ -716,10 +741,22 @@ fn find_pid_by_socket_inode_linux(
         if hint_pids.contains(&pid) || neg_cache.contains_active(&pid, now) {
             continue;
         }
-        match proc_pid_owns_socket_inode(pid, inode) {
-            PidFdProbe::Matched => return Some(pid),
-            PidFdProbe::PermissionDenied => neg_cache.insert(pid, (), now),
-            PidFdProbe::NoMatch => {}
+        if let Some(target_uid) = sock_uid {
+            let dir_uid = entry.metadata().ok().map(|m| m.uid());
+            if dir_uid != Some(target_uid) {
+                deferred_pids.push(pid);
+                continue;
+            }
+        }
+        if probe_pid(pid) {
+            return Some(pid);
+        }
+    }
+
+    // 3. 回退：兼容跨 UID fd 继承/传递或 setuid 服务场景
+    for pid in deferred_pids {
+        if probe_pid(pid) {
+            return Some(pid);
         }
     }
     None
@@ -771,12 +808,17 @@ fn parse_proc_net_ipv6_addr(raw: &str) -> Option<(Ipv6Addr, u16)> {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn find_socket_inode_in_proc_reader<R, A, P>(
+fn parse_proc_u32(s: &str) -> Option<u32> {
+    parse_proc_u64(s).and_then(|v| u32::try_from(v).ok())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn find_socket_meta_in_proc_reader<R, A, P>(
     mut reader: R,
     target_local: (A, u16),
     target_rem: (A, u16),
     parse_addr: P,
-) -> Option<u64>
+) -> Option<(u64, Option<u32>)>
 where
     R: std::io::BufRead,
     A: PartialEq,
@@ -805,23 +847,24 @@ where
             continue;
         }
         // 列布局: sl(0) local(1) rem(2) st(3) queue(4) tr(5) retrnsmt(6) uid(7) timeout(8) inode(9)
-        if let Some(inode_str) = cols.nth(6)
+        let uid = cols.nth(4).and_then(parse_proc_u32);
+        if let Some(inode_str) = cols.nth(1)
             && let Some(inode) = parse_proc_u64(inode_str)
             && inode > 0
         {
-            return Some(inode);
+            return Some((inode, uid));
         }
     }
     None
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn find_socket_inode_in_proc_tcp_reader<R: std::io::BufRead>(
+fn find_socket_meta_in_proc_tcp_reader<R: std::io::BufRead>(
     reader: R,
     client: SocketAddrV4,
     server: SocketAddrV4,
-) -> Option<u64> {
-    find_socket_inode_in_proc_reader(
+) -> Option<(u64, Option<u32>)> {
+    find_socket_meta_in_proc_reader(
         reader,
         (*client.ip(), client.port()),
         (*server.ip(), server.port()),
@@ -830,17 +873,35 @@ fn find_socket_inode_in_proc_tcp_reader<R: std::io::BufRead>(
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn find_socket_inode_in_proc_tcp6_reader<R: std::io::BufRead>(
+fn find_socket_meta_in_proc_tcp6_reader<R: std::io::BufRead>(
     reader: R,
     client: SocketAddrV6,
     server: SocketAddrV6,
-) -> Option<u64> {
-    find_socket_inode_in_proc_reader(
+) -> Option<(u64, Option<u32>)> {
+    find_socket_meta_in_proc_reader(
         reader,
         (*client.ip(), client.port()),
         (*server.ip(), server.port()),
         parse_proc_net_ipv6_addr,
     )
+}
+
+#[cfg(test)]
+fn find_socket_inode_in_proc_tcp_reader<R: std::io::BufRead>(
+    reader: R,
+    client: SocketAddrV4,
+    server: SocketAddrV4,
+) -> Option<u64> {
+    find_socket_meta_in_proc_tcp_reader(reader, client, server).map(|(inode, _)| inode)
+}
+
+#[cfg(test)]
+fn find_socket_inode_in_proc_tcp6_reader<R: std::io::BufRead>(
+    reader: R,
+    client: SocketAddrV6,
+    server: SocketAddrV6,
+) -> Option<u64> {
+    find_socket_meta_in_proc_tcp6_reader(reader, client, server).map(|(inode, _)| inode)
 }
 
 /// 在 `/proc/net/tcp` 文本中按完整四元组 (`local == client && remote == server`) 查找套接字 inode
@@ -907,6 +968,38 @@ fn clean_proc_exe_path(raw: &str) -> String {
         .to_string()
 }
 
+/// 规范化 `/proc/<pid>/cmdline` 的首个参数，剥离 ASCII 控制字符并截断前导空白
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_cmdline_argv0(bytes: &[u8]) -> Option<String> {
+    let first_arg = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
+    let sanitized: String = String::from_utf8_lossy(first_arg)
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// 清理 `/proc/<pid>/comm` 进程短名中的目录分隔符与控制字符，避免破坏进程名提取与日志安全
+#[cfg(any(target_os = "linux", test))]
+fn sanitize_proc_comm_fallback(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if c == '/' { '_' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
     if pid == 0 {
@@ -924,25 +1017,24 @@ fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
         }
     }
 
-    // 2. 回退：读取 /proc/<pid>/cmdline 的首个 NUL 分隔参数 (argv[0])
+    // 2. 回退：受限读取 /proc/<pid>/cmdline 的前 4096 字节并取 argv[0]
     let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(bytes) = std::fs::read(&cmdline_path)
-        && !bytes.is_empty()
-    {
-        let first_arg = bytes.split(|&b| b == 0).next().unwrap_or(&bytes[..]);
-        let arg0 = String::from_utf8_lossy(first_arg).trim().to_string();
-        if !arg0.is_empty() {
+    if let Ok(file) = std::fs::File::open(&cmdline_path) {
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(256);
+        if file.take(4096).read_to_end(&mut bytes).is_ok()
+            && let Some(arg0) = parse_proc_cmdline_argv0(&bytes)
+        {
             return Some((arg0, start_time));
         }
     }
 
-    // 3. 回退：读取 /proc/<pid>/comm 进程短名
+    // 3. 回退：读取并清洗 /proc/<pid>/comm 进程短名
     let comm_path = format!("/proc/{}/comm", pid);
-    if let Ok(comm) = std::fs::read_to_string(&comm_path) {
-        let trimmed = comm.trim();
-        if !trimmed.is_empty() {
-            return Some((trimmed.to_string(), start_time));
-        }
+    if let Ok(comm) = std::fs::read_to_string(&comm_path)
+        && let Some(cleaned) = sanitize_proc_comm_fallback(&comm)
+    {
+        return Some((cleaned, start_time));
     }
 
     None
@@ -1620,6 +1712,20 @@ mod tests {
             "/usr/bin/curl"
         );
         assert_eq!(clean_proc_exe_path("/usr/bin/git"), "/usr/bin/git");
+        assert_eq!(
+            find_socket_meta_in_proc_tcp_reader(std::io::Cursor::new(&sample_tcp), client_v4, server_v4),
+            Some((987654, Some(1000)))
+        );
+        assert_eq!(
+            parse_proc_cmdline_argv0(b"/usr/bin/curl\n--silent\0https://example.com\0"),
+            Some("/usr/bin/curl--silent".to_string())
+        );
+        assert_eq!(parse_proc_cmdline_argv0(b"\0--flag"), None);
+        assert_eq!(
+            sanitize_proc_comm_fallback("../../ev\x1bil/app\n"),
+            Some(".._.._evil_app".to_string())
+        );
+        assert_eq!(sanitize_proc_comm_fallback("\x00\n\t "), None);
     }
 
     #[test]

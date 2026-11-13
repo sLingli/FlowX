@@ -277,7 +277,7 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
                 res.context("Failed to listen for SIGINT (Ctrl+C)")?;
                 Ok("SIGINT (Ctrl+C)")
             }
-            _ = sigterm.recv() => {
+            Some(()) = sigterm.recv() => {
                 Ok("SIGTERM")
             }
         }

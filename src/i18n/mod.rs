@@ -68,20 +68,76 @@ impl Locale {
             let Some(locale) = Locale::from_tag(parts.next().unwrap_or_default()) else {
                 continue;
             };
-            let weight = parts
-                .find_map(|p| {
-                    let p = p.trim();
-                    p.strip_prefix("q=")
-                        .or_else(|| p.strip_prefix("Q="))
-                        .and_then(|v| v.trim().parse::<f32>().ok())
-                })
-                .unwrap_or(1.0);
+            let mut weight = 1.0f32;
+            let mut valid_q = true;
+            for param in parts {
+                let param = param.trim();
+                if let Some(raw_q) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
+                    match raw_q.trim().parse::<f32>() {
+                        Ok(w) if w.is_finite() && (0.0..=1.0).contains(&w) => {
+                            weight = w;
+                            break;
+                        }
+                        _ => {
+                            valid_q = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !valid_q {
+                continue;
+            }
             if best.is_none_or(|(best_weight, _)| weight > best_weight) {
                 best = Some((weight, locale));
             }
         }
         // 显式 q=0 表示客户端拒绝该语言，不应被选中
         best.filter(|(weight, _)| *weight > 0.0).map(|(_, locale)| locale)
+    }
+
+    /// 从进程环境变量按 POSIX 优先级 (`FLOWX_LANG` -> `LC_ALL` -> `LC_MESSAGES` -> `LANG`) 自动探测语言
+    pub fn from_env() -> Self {
+        Self::from_env_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// 使用自定义查询闭包解析环境变量语言设置（默认回落至英文）
+    pub fn from_env_lookup<F>(mut get_var: F) -> Self
+    where
+        F: FnMut(&str) -> Option<String>,
+    {
+        for key in ["FLOWX_LANG", "LC_ALL", "LC_MESSAGES", "LANG"] {
+            if let Some(raw) = get_var(key) {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                return Self::from_posix_locale(trimmed);
+            }
+        }
+        Locale::En
+    }
+
+    fn from_posix_locale(raw: &str) -> Self {
+        let stripped = raw
+            .trim()
+            .split(['.', '@'])
+            .next()
+            .unwrap_or_default()
+            .replace('_', "-")
+            .to_ascii_lowercase();
+        if stripped == "zh" || stripped.starts_with("zh-") {
+            Locale::Zh
+        } else {
+            Locale::En
+        }
+    }
+
+    pub fn accept_language_header(&self) -> &'static str {
+        match self {
+            Locale::Zh => "zh-CN",
+            Locale::En => "en-US",
+        }
     }
 }
 
@@ -309,5 +365,64 @@ mod tests {
         let err_en = json_error(Locale::En, "ERR_NODE_IN_USE", "error.node_in_use");
         assert!(err_en.contains(r#""error":"Node is referenced"#));
         assert!(err_en.contains(r#""code":"ERR_NODE_IN_USE""#));
+    }
+
+    #[test]
+    fn test_accept_language_q_validation_and_from_env_precedence() {
+        // Out-of-range / NaN / Inf / non-numeric q values must be ignored cleanly
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN;q=NaN, en-US;q=0.5"), None),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN;q=inf, en-US;q=0.4"), None),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN;q=1.5, en-US;q=0.4"), None),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN;q=-0.2, en-US;q=0.3"), None),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_header_or_query(Some("en-US;q=bad, zh-CN;q=0.8"), None),
+            Locale::Zh
+        );
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN;q=1.0, en-US;q=0.8"), None),
+            Locale::Zh
+        );
+
+        // Env precedence: FLOWX_LANG -> LC_ALL -> LC_MESSAGES -> LANG -> En
+        assert_eq!(
+            Locale::from_env_lookup(|k| match k {
+                "FLOWX_LANG" => Some("zh-CN".into()),
+                "LC_ALL" => Some("en_US.UTF-8".into()),
+                _ => None,
+            }),
+            Locale::Zh
+        );
+        assert_eq!(
+            Locale::from_env_lookup(|k| match k {
+                "FLOWX_LANG" => Some("  ".into()),
+                "LC_ALL" => Some("C.UTF-8".into()),
+                "LANG" => Some("zh_CN.UTF-8".into()),
+                _ => None,
+            }),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_env_lookup(|k| match k {
+                "LC_MESSAGES" => Some("zh_TW.UTF-8".into()),
+                "LANG" => Some("en_US.UTF-8".into()),
+                _ => None,
+            }),
+            Locale::Zh
+        );
+        assert_eq!(Locale::from_env_lookup(|_| None), Locale::En);
+        assert_eq!(Locale::Zh.accept_language_header(), "zh-CN");
+        assert_eq!(Locale::En.accept_language_header(), "en-US");
     }
 }

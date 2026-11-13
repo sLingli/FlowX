@@ -602,12 +602,24 @@ pub(crate) async fn resolve_via_upstream_dns_with_options(
 }
 
 fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
-    matches!(
+    if matches!(
         err.kind(),
         std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
-    )
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.raw_os_error() == Some(10040) {
+        // WSAEMSGSIZE: UDP datagram truncated by socket receive buffer
+        return true;
+    }
+    #[cfg(unix)]
+    if err.raw_os_error() == Some(libc::EMSGSIZE) {
+        return true;
+    }
+    false
 }
 
 impl DnsServer {
@@ -1042,6 +1054,10 @@ mod tests {
         assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::ConnectionReset)));
         assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::WouldBlock)));
         assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::Interrupted)));
+        #[cfg(windows)]
+        assert!(is_transient_udp_recv_error(&Error::from_raw_os_error(10040)));
+        #[cfg(unix)]
+        assert!(is_transient_udp_recv_error(&Error::from_raw_os_error(libc::EMSGSIZE)));
         assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::PermissionDenied)));
         assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::InvalidInput)));
     }

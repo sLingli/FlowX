@@ -17,8 +17,56 @@ pub struct FakeIpPool {
 #[derive(Debug)]
 struct PoolState {
     current: u32,
-    ip_to_domain: HashMap<Ipv4Addr, (String, Instant)>,
+    alloc_seq: u64,
+    ip_to_domain: HashMap<Ipv4Addr, (String, Instant, u64)>,
     domain_to_ip: HashMap<String, (Ipv4Addr, Instant)>,
+    expiry_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Instant, u64, u32)>>,
+}
+
+impl PoolState {
+    fn new(start: u32) -> Self {
+        Self {
+            current: start,
+            alloc_seq: 0,
+            ip_to_domain: HashMap::new(),
+            domain_to_ip: HashMap::new(),
+            expiry_heap: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    fn record_mapping(&mut self, ip: Ipv4Addr, domain: String, expire: Instant) {
+        self.alloc_seq = self.alloc_seq.wrapping_add(1);
+        let seq = self.alloc_seq;
+        self.domain_to_ip.insert(domain.clone(), (ip, expire));
+        self.ip_to_domain.insert(ip, (domain, expire, seq));
+        self.expiry_heap
+            .push(std::cmp::Reverse((expire, seq, u32::from(ip))));
+        if self.expiry_heap.len() > self.ip_to_domain.len().saturating_mul(4).max(256) {
+            self.rebuild_expiry_heap();
+        }
+    }
+
+    fn rebuild_expiry_heap(&mut self) {
+        self.expiry_heap.clear();
+        for (&ip, (_, expire, seq)) in &self.ip_to_domain {
+            self.expiry_heap
+                .push(std::cmp::Reverse((*expire, *seq, u32::from(ip))));
+        }
+    }
+
+    fn pop_oldest_ip(&mut self) -> Option<Ipv4Addr> {
+        while let Some(std::cmp::Reverse((exp, seq, ip_raw))) = self.expiry_heap.pop() {
+            let ip = Ipv4Addr::from(ip_raw);
+            if self
+                .ip_to_domain
+                .get(&ip)
+                .is_some_and(|(_, cur_exp, cur_seq)| *cur_exp == exp && *cur_seq == seq)
+            {
+                return Some(ip);
+            }
+        }
+        None
+    }
 }
 
 impl FakeIpPool {
@@ -31,11 +79,7 @@ impl FakeIpPool {
         Self {
             min,
             max,
-            inner: RwLock::new(PoolState {
-                current: min,
-                ip_to_domain: HashMap::new(),
-                domain_to_ip: HashMap::new(),
-            }),
+            inner: RwLock::new(PoolState::new(min)),
             ttl: Duration::from_secs(600), // 默认映射保留 10 分钟
         }
     }
@@ -69,54 +113,52 @@ impl FakeIpPool {
         // 已有映射（即使已过期）只要其 IP 尚未被转让给其它域名，就原地续期复用，
         // 避免客户端仍缓存旧 IP 时出现域名无法还原的问题
         if let Some((ip, _)) = state.domain_to_ip.get(&domain_lower).copied()
-            && state.ip_to_domain.get(&ip).is_some_and(|(d, _)| *d == domain_lower) {
-                state.domain_to_ip.insert(domain_lower.clone(), (ip, expire));
-                state.ip_to_domain.insert(ip, (domain_lower, expire));
-                return ip;
-            }
-
-        // 从环形游标起探测首个空闲或已过期槽位，避免在池未满时直接覆写仍活跃的旧映射
-        let cap = (self.max - self.min) as usize + 1;
-        let mut cursor = state.current;
-        let mut chosen_ip = None;
-        for _ in 0..cap {
-            let candidate = Ipv4Addr::from(cursor);
-            cursor = if cursor >= self.max { self.min } else { cursor + 1 };
-            match state.ip_to_domain.get(&candidate) {
-                None => {
-                    chosen_ip = Some(candidate);
-                    break;
-                }
-                Some((_, old_expire)) if *old_expire <= now => {
-                    chosen_ip = Some(candidate);
-                    break;
-                }
-                Some(_) => {}
-            }
+            && state.ip_to_domain.get(&ip).is_some_and(|(d, _, _)| *d == domain_lower)
+        {
+            state.record_mapping(ip, domain_lower, expire);
+            return ip;
         }
-        state.current = cursor;
+
+        // 从环形游标起探测首个空闲或已过期槽位；池已满时直接使用 O(log N) 过期优先堆淘汰
+        let cap = (self.max - self.min) as usize + 1;
+        let chosen_ip = if state.ip_to_domain.len() < cap {
+            let mut cursor = state.current;
+            let mut found = None;
+            for _ in 0..cap {
+                let candidate = Ipv4Addr::from(cursor);
+                cursor = if cursor >= self.max { self.min } else { cursor + 1 };
+                match state.ip_to_domain.get(&candidate) {
+                    None => {
+                        found = Some(candidate);
+                        break;
+                    }
+                    Some((_, old_expire, _)) if *old_expire <= now => {
+                        found = Some(candidate);
+                        break;
+                    }
+                    Some(_) => {}
+                }
+            }
+            state.current = cursor;
+            found
+        } else {
+            None
+        };
 
         let ip = match chosen_ip {
             Some(ip) => ip,
-            None => {
-                // 所有槽位均被未过期映射占满：按最早到期（等效 LRU）淘汰
-                state
-                    .ip_to_domain
-                    .iter()
-                    .min_by_key(|(_, (_, exp))| *exp)
-                    .map(|(candidate, _)| *candidate)
-                    .unwrap_or_else(|| Ipv4Addr::from(self.min))
-            }
+            None => state
+                .pop_oldest_ip()
+                .unwrap_or_else(|| Ipv4Addr::from(self.min)),
         };
 
         // 若当前选中的 IP 之前绑定过其它域名，清理其旧的逆向映射
-        let old_domain_opt = state.ip_to_domain.get(&ip).map(|(d, _)| d.clone());
+        let old_domain_opt = state.ip_to_domain.get(&ip).map(|(d, _, _)| d.clone());
         if let Some(old_domain) = old_domain_opt {
             state.domain_to_ip.remove(&old_domain);
         }
 
-        state.domain_to_ip.insert(domain_lower.clone(), (ip, expire));
-        state.ip_to_domain.insert(ip, (domain_lower, expire));
+        state.record_mapping(ip, domain_lower, expire);
 
         ip
     }
@@ -129,16 +171,15 @@ impl FakeIpPool {
             let state = self.inner.read().unwrap_or_else(|e| e.into_inner());
             match state.ip_to_domain.get(ip) {
                 None => return None,
-                Some((d, expire)) if *expire > refresh_threshold => return Some(d.clone()),
+                Some((d, expire, _)) if *expire > refresh_threshold => return Some(d.clone()),
                 Some(_) => {}
             }
         }
 
         let mut state = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        let domain = state.ip_to_domain.get(ip).map(|(d, _)| d.clone())?;
+        let domain = state.ip_to_domain.get(ip).map(|(d, _, _)| d.clone())?;
         let expire = now + self.ttl;
-        state.ip_to_domain.insert(*ip, (domain.clone(), expire));
-        state.domain_to_ip.insert(domain.clone(), (*ip, expire));
+        state.record_mapping(*ip, domain.clone(), expire);
         Some(domain)
     }
 
@@ -192,8 +233,11 @@ impl FakeIpPool {
         let mut state = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let before_count = state.ip_to_domain.len();
 
-        state.ip_to_domain.retain(|_, (_, expire)| *expire > now);
+        state.ip_to_domain.retain(|_, (_, expire, _)| *expire > now);
         state.domain_to_ip.retain(|_, (_, expire)| *expire > now);
+        if state.expiry_heap.len() > state.ip_to_domain.len().saturating_mul(4).max(256) {
+            state.rebuild_expiry_heap();
+        }
 
         before_count - state.ip_to_domain.len()
     }
@@ -251,11 +295,7 @@ mod tests {
         let small_pool = FakeIpPool {
             min: u32::from(Ipv4Addr::new(198, 18, 0, 1)),
             max: u32::from(Ipv4Addr::new(198, 18, 0, 3)),
-            inner: RwLock::new(PoolState {
-                current: u32::from(Ipv4Addr::new(198, 18, 0, 1)),
-                ip_to_domain: HashMap::new(),
-                domain_to_ip: HashMap::new(),
-            }),
+            inner: RwLock::new(PoolState::new(u32::from(Ipv4Addr::new(198, 18, 0, 1)))),
             ttl: Duration::from_millis(120),
         };
 
@@ -282,11 +322,7 @@ mod tests {
         let lru_pool = FakeIpPool {
             min: u32::from(Ipv4Addr::new(198, 18, 2, 1)),
             max: u32::from(Ipv4Addr::new(198, 18, 2, 3)),
-            inner: RwLock::new(PoolState {
-                current: u32::from(Ipv4Addr::new(198, 18, 2, 1)),
-                ip_to_domain: HashMap::new(),
-                domain_to_ip: HashMap::new(),
-            }),
+            inner: RwLock::new(PoolState::new(u32::from(Ipv4Addr::new(198, 18, 2, 1)))),
             ttl: Duration::from_millis(100),
         };
         let p1 = lru_pool.allocate("old.example");
@@ -300,5 +336,31 @@ mod tests {
         assert_eq!(p4, p2);
         assert_eq!(lru_pool.restore(&p1).as_deref(), Some("old.example"));
         assert_eq!(lru_pool.restore(&p3).as_deref(), Some("new.example"));
+    }
+
+    #[test]
+    fn test_fake_ip_heap_eviction_and_large_pool_lru() {
+        let base = u32::from(Ipv4Addr::new(198, 18, 10, 0));
+        let pool = FakeIpPool {
+            min: base,
+            max: base + 999,
+            inner: RwLock::new(PoolState::new(base)),
+            ttl: Duration::from_secs(30),
+        };
+
+        // Fill all 1000 slots with deterministic seq order
+        let mut allocated = Vec::with_capacity(1000);
+        for i in 0..1000 {
+            allocated.push(pool.allocate(&format!("d{i}.example")));
+        }
+        assert_eq!(pool.len(), 1000);
+
+        // Overwrite oldest 10 slots via heap eviction
+        for (j, expected_ip) in allocated.iter().enumerate().take(10) {
+            let evicted_reused = pool.allocate(&format!("overflow{j}.example"));
+            assert_eq!(evicted_reused, *expected_ip);
+        }
+        assert_eq!(pool.len(), 1000);
+        assert!(pool.restore(&allocated[10]).is_some());
     }
 }
