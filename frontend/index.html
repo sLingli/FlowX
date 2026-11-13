@@ -1818,8 +1818,8 @@
         form_node_pass_ph: '留空表示无认证',
         form_node_pass_keep_ph: '留空保持原密码不变',
         form_node_pass_socks4_ph: 'SOCKS4 不支持密码认证',
-        form_node_pass_user_changed_ph: '修改用户名后请重新输入密码或留空不设密码',
-        form_node_clear_pass: '清除已保存密码',
+        form_node_pass_user_changed_ph: '修改 HTTP/SOCKS5 用户名时必须输入新密码',
+        form_node_clear_pass: '清除已保存认证（用户名与密码）',
         btn_cancel: '取消',
         btn_save_node: '保存节点',
 
@@ -1868,6 +1868,8 @@
         toast_ping_all_done: '已完成 {count} 个节点的延迟探测',
         toast_node_required: '请填写节点名称与服务器地址',
         toast_node_pass_requires_user: '填写密码时必须同时填写用户名',
+        toast_node_user_requires_pass: 'HTTP/SOCKS5 代理填写用户名时必须同时填写密码（仅 SOCKS4 支持单独配置 UserID）',
+        toast_node_user_changed_pass_required: '修改 HTTP/SOCKS5 代理用户名时必须输入新密码',
         toast_node_http_user_colon: 'HTTP 代理用户名不能包含冒号 (:)',
         toast_node_saved: '节点 [{name}] 已保存并写入配置',
         toast_node_add_fail: '添加节点失败',
@@ -2047,8 +2049,8 @@
         form_node_pass_ph: 'Leave empty for no authentication',
         form_node_pass_keep_ph: 'Leave empty to keep existing password',
         form_node_pass_socks4_ph: 'Password auth not supported by SOCKS4',
-        form_node_pass_user_changed_ph: 'Enter new password (username changed) or leave empty',
-        form_node_clear_pass: 'Clear saved password',
+        form_node_pass_user_changed_ph: 'Enter new password for the updated username',
+        form_node_clear_pass: 'Clear saved credentials (username & password)',
         btn_cancel: 'Cancel',
         btn_save_node: 'Save Node',
 
@@ -2097,6 +2099,8 @@
         toast_ping_all_done: 'Completed latency probes for {count} nodes',
         toast_node_required: 'Please provide both node name and server address',
         toast_node_pass_requires_user: 'Username is required when a password is provided',
+        toast_node_user_requires_pass: 'Password is required when username is set for HTTP/SOCKS5 (only SOCKS4 allows standalone UserID)',
+        toast_node_user_changed_pass_required: 'Please enter a new password when changing HTTP/SOCKS5 proxy username',
         toast_node_http_user_colon: 'HTTP proxy username cannot contain a colon (:)',
         toast_node_saved: 'Node [{name}] saved and written to configuration',
         toast_node_add_fail: 'Failed to add node',
@@ -2130,14 +2134,24 @@
       paused: false,
       failStreak: 0,
       pollInFlight: false,
+      pendingForcedPoll: false,
       pollTimerId: null,
+      pollSeq: 0,
+      nodesSeq: 0,
+      rulesSeq: 0,
+      simSeq: 0,
       ruleReorderLocked: false,
       busyRuleIds: {},
       busyConnIds: {},
+      pingingNodeIds: {},
       editingNodeId: null,
       editingNodeOriginalUser: '',
       editingNodeHasPassword: false,
+      editingNodeLastProtocol: 'SOCKS5',
+      editingNodeStashedUser: '',
+      editingNodeStashedPass: '',
       editingRuleId: null,
+      confirmContext: null,
       lastSimResult: null,
       historyDown: new Array(MAX_HISTORY).fill(0),
       historyUp: new Array(MAX_HISTORY).fill(0)
@@ -2243,6 +2257,11 @@
       const ruleTitleEl = document.getElementById('modal-rule-title');
       if (ruleTitleEl && state.editingRuleId !== null && state.editingRuleId !== undefined) {
         ruleTitleEl.textContent = t('modal_edit_rule_title');
+      }
+      const confirmModalEl = document.getElementById('modal-confirm');
+      if (confirmModalEl && confirmModalEl.classList.contains('active') && state.confirmContext) {
+        document.getElementById('confirm-title').textContent = t(state.confirmContext.titleKey);
+        document.getElementById('confirm-message').textContent = t(state.confirmContext.messageKey, state.confirmContext.params);
       }
       const ruleActionEl = document.getElementById('rule-action');
       const ruleNodeEl = document.getElementById('rule-node-id');
@@ -2406,8 +2425,13 @@
     }
 
     async function pollRealtime({ force = false, recordHistory = false } = {}) {
-      if ((!force && state.paused) || state.pollInFlight) return;
+      if (!force && state.paused) return;
+      if (state.pollInFlight) {
+        if (force) state.pendingForcedPoll = true;
+        return;
+      }
       state.pollInFlight = true;
+      const mySeq = ++state.pollSeq;
       try {
         const [statsRes, connsRes, sysRes] = await Promise.all([
           fetchWithTimeout('/api/stats'),
@@ -2419,11 +2443,16 @@
           throw new Error('HTTP ' + statsRes.status);
         }
 
+        const [stats, conns, sysData] = await Promise.all([
+          statsRes.json(),
+          connsRes.json(),
+          sysRes.ok ? sysRes.json().catch(() => null) : Promise.resolve(null)
+        ]);
+        if (mySeq !== state.pollSeq || (!force && state.paused)) return;
+
         state.failStreak = 0;
         setHealthStatus(true);
 
-        const stats = await statsRes.json();
-        const conns = await connsRes.json();
         state.connections = Array.isArray(conns) ? conns : [];
 
         const liveIds = new Set(state.connections.map(c => c.id));
@@ -2452,19 +2481,24 @@
         }
         renderChart();
 
-        if (sysRes.ok) {
-          state.system = await sysRes.json();
+        if (sysData) {
+          state.system = sysData;
           renderSystemInfo();
         }
 
         renderConnections();
       } catch (e) {
+        if (mySeq !== state.pollSeq) return;
         state.failStreak += 1;
         if (state.failStreak >= 2) {
           setHealthStatus(false);
         }
       } finally {
         state.pollInFlight = false;
+        if (state.pendingForcedPoll) {
+          state.pendingForcedPoll = false;
+          void pollRealtime({ force: true, recordHistory: false });
+        }
       }
     }
 
@@ -2473,10 +2507,12 @@
         clearTimeout(state.pollTimerId);
         state.pollTimerId = null;
       }
+      if (state.paused) return;
       state.pollTimerId = setTimeout(async () => {
         state.pollTimerId = null;
+        if (state.paused) return;
         await pollRealtime({ force: false, recordHistory: true });
-        schedulePoll();
+        if (!state.paused) schedulePoll();
       }, 1000);
     }
 
@@ -2581,8 +2617,17 @@
       const btn = document.getElementById('pause-poll-btn');
       btn.textContent = state.paused ? t('btn_resume_poll') : t('btn_pause_poll');
       btn.classList.toggle('btn-primary', state.paused);
-      if (!state.paused) {
-        pollRealtime({ force: true, recordHistory: false }).then(schedulePoll);
+      if (state.paused) {
+        state.pollSeq += 1;
+        state.pendingForcedPoll = false;
+        if (state.pollTimerId !== null) {
+          clearTimeout(state.pollTimerId);
+          state.pollTimerId = null;
+        }
+      } else {
+        pollRealtime({ force: true, recordHistory: false }).then(() => {
+          if (!state.paused) schedulePoll();
+        });
       }
     }
 
@@ -2675,9 +2720,11 @@
 
     // Section Nodes
     async function loadNodes() {
+      const mySeq = ++state.nodesSeq;
       try {
         const res = await fetchWithTimeout('/api/nodes');
         const data = await res.json().catch(() => null);
+        if (mySeq !== state.nodesSeq) return;
         if (res.ok && Array.isArray(data)) {
           state.nodes = data;
           document.getElementById('nav-count-nodes').textContent = state.nodes.length;
@@ -2688,8 +2735,15 @@
           showToast((data && data.error) || t('toast_load_nodes_fail'), 'error');
         }
       } catch (e) {
+        if (mySeq !== state.nodesSeq) return;
         showToast(t('toast_load_nodes_fail'), 'error');
       }
+    }
+
+    function formatHostPort(host, port) {
+      if (!host) return `:${port}`;
+      const formattedHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+      return `${formattedHost}:${port}`;
     }
 
     function protocolBadgeClass(proto) {
@@ -2709,7 +2763,7 @@
         const lat = state.latencies[n.id];
         const latClass = lat ? lat.status : '';
         const latText = latencyText(lat);
-        const testing = lat && lat.status === 'testing';
+        const testing = Boolean(state.pingingNodeIds[n.id]) || (lat && lat.status === 'testing');
         return `
           <div class="node-card" id="node-card-${n.id}">
             <div>
@@ -2739,8 +2793,10 @@
     }
 
     async function pingNode(id, silent = false) {
+      if (state.pingingNodeIds[id]) return;
       const node = state.nodes.find(n => n.id === id);
       if (!node) return;
+      state.pingingNodeIds[id] = true;
       state.latencies[id] = { status: 'testing' };
       renderNodes();
 
@@ -2750,20 +2806,34 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ id })
         });
-        const data = await res.json();
-        if (res.ok && data.ok) {
+        const data = await res.json().catch(() => null);
+        if (res.ok && data && data.ok) {
           const ms = data.latency_ms;
           state.latencies[id] = { status: ms < 150 ? 'ok' : 'warn', ms };
           if (!silent) showToast(t('toast_ping_handshake', { name: node.name, ms }));
-        } else {
+        } else if (res.ok && data) {
           const errText = data.message || data.error || t('node_latency_unreachable');
+          state.latencies[id] = { status: 'err', error: errText };
+          if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: errText }), 'error');
+        } else {
+          const errText = (data && (data.error || data.message)) || ('HTTP ' + res.status);
           state.latencies[id] = { status: 'err', error: errText };
           if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: errText }), 'error');
         }
       } catch (e) {
-        state.latencies[id] = { status: 'err', error: t('toast_ping_timeout') };
-        if (!silent) showToast(t('toast_ping_network_err', { name: node.name }), 'error');
+        const isTimeout = e && e.name === 'AbortError';
+        state.latencies[id] = {
+          status: 'err',
+          error: isTimeout ? t('toast_ping_timeout') : t('toast_err_network')
+        };
+        if (!silent) {
+          showToast(
+            isTimeout ? t('toast_ping_timeout') : t('toast_ping_network_err', { name: node.name }),
+            'error'
+          );
+        }
       } finally {
+        delete state.pingingNodeIds[id];
         renderNodes();
       }
     }
@@ -2789,11 +2859,20 @@
       if (!protocolEl || !userEl || !passEl || !clearWrap || !clearCheck) return;
 
       const protocol = protocolEl.value;
-      const userVal = userEl.value.trim();
+      const prevProto = state.editingNodeLastProtocol || protocol;
+      state.editingNodeLastProtocol = protocol;
       const isEdit = state.editingNodeId !== null && state.editingNodeId !== undefined;
-      const usernameChanged = isEdit && userVal !== (state.editingNodeOriginalUser || '');
 
       if (protocol === 'SOCKS4') {
+        if (prevProto !== 'SOCKS4') {
+          if (passEl.value) state.editingNodeStashedPass = passEl.value;
+          if (clearCheck.checked) state.editingNodeStashedClear = true;
+        }
+        if (userEl.disabled) {
+          userEl.disabled = false;
+          userEl.value = state.editingNodeStashedUser || state.editingNodeOriginalUser || '';
+          state.editingNodeStashedUser = '';
+        }
         passEl.value = '';
         passEl.disabled = true;
         passEl.placeholder = t('form_node_pass_socks4_ph');
@@ -2802,7 +2881,23 @@
         return;
       }
 
-      const canShowClear = Boolean(isEdit && state.editingNodeHasPassword && userVal && !usernameChanged);
+      if (prevProto === 'SOCKS4') {
+        passEl.disabled = false;
+        if (!passEl.value && state.editingNodeStashedPass) {
+          passEl.value = state.editingNodeStashedPass;
+          state.editingNodeStashedPass = '';
+        }
+        if (isEdit && state.editingNodeHasPassword && state.editingNodeStashedClear) {
+          clearCheck.checked = true;
+          state.editingNodeStashedClear = false;
+        }
+      }
+
+      const rawUserVal = (userEl.disabled ? (state.editingNodeStashedUser || '') : userEl.value).trim();
+      const usernameChanged = isEdit && rawUserVal !== (state.editingNodeOriginalUser || '');
+      const canShowClear = Boolean(
+        isEdit && state.editingNodeHasPassword && (clearCheck.checked || (rawUserVal && !usernameChanged))
+      );
       if (canShowClear) {
         clearWrap.style.display = 'block';
       } else {
@@ -2811,15 +2906,37 @@
       }
 
       if (clearCheck.checked) {
+        if (!userEl.disabled) {
+          state.editingNodeStashedUser = userEl.value;
+          userEl.value = '';
+          userEl.disabled = true;
+        }
+        if (passEl.value) {
+          state.editingNodeStashedPass = passEl.value;
+        }
         passEl.value = '';
         passEl.disabled = true;
       } else {
-        passEl.disabled = false;
+        if (userEl.disabled) {
+          userEl.disabled = false;
+          userEl.value = state.editingNodeStashedUser || state.editingNodeOriginalUser || '';
+          state.editingNodeStashedUser = '';
+        }
+        if (passEl.disabled) {
+          passEl.disabled = false;
+          if (!passEl.value && state.editingNodeStashedPass) {
+            passEl.value = state.editingNodeStashedPass;
+            state.editingNodeStashedPass = '';
+          }
+        }
       }
 
-      if (isEdit && state.editingNodeHasPassword && !clearCheck.checked && !usernameChanged && userVal) {
+      const userVal = userEl.value.trim();
+      if (clearCheck.checked) {
+        passEl.placeholder = t('form_node_pass_ph');
+      } else if (isEdit && state.editingNodeHasPassword && userVal && userVal === (state.editingNodeOriginalUser || '')) {
         passEl.placeholder = t('form_node_pass_keep_ph');
-      } else if (isEdit && state.editingNodeHasPassword && usernameChanged && userVal) {
+      } else if (isEdit && state.editingNodeHasPassword && userVal && userVal !== (state.editingNodeOriginalUser || '')) {
         passEl.placeholder = t('form_node_pass_user_changed_ph');
       } else {
         passEl.placeholder = t('form_node_pass_ph');
@@ -2830,13 +2947,21 @@
       state.editingNodeId = null;
       state.editingNodeOriginalUser = '';
       state.editingNodeHasPassword = false;
+      state.editingNodeLastProtocol = 'SOCKS5';
+      state.editingNodeStashedUser = '';
+      state.editingNodeStashedPass = '';
+      state.editingNodeStashedClear = false;
       const titleEl = document.getElementById('modal-node-title');
       if (titleEl) titleEl.textContent = t('modal_add_node_title');
       document.getElementById('node-name').value = '';
       document.getElementById('node-protocol').value = 'SOCKS5';
       document.getElementById('node-addr').value = '';
-      document.getElementById('node-user').value = '';
-      document.getElementById('node-pass').value = '';
+      const userEl = document.getElementById('node-user');
+      const passEl = document.getElementById('node-pass');
+      userEl.disabled = false;
+      userEl.value = '';
+      passEl.disabled = false;
+      passEl.value = '';
       const clearCheck = document.getElementById('node-clear-pass');
       if (clearCheck) clearCheck.checked = false;
       syncNodeAuthControls();
@@ -2850,13 +2975,21 @@
       state.editingNodeId = id;
       state.editingNodeOriginalUser = node.username || '';
       state.editingNodeHasPassword = Boolean(node.password_configured);
+      state.editingNodeLastProtocol = node.protocol || 'SOCKS5';
+      state.editingNodeStashedUser = '';
+      state.editingNodeStashedPass = '';
+      state.editingNodeStashedClear = false;
       const titleEl = document.getElementById('modal-node-title');
       if (titleEl) titleEl.textContent = t('modal_edit_node_title');
       document.getElementById('node-name').value = node.name || '';
       document.getElementById('node-protocol').value = node.protocol || 'SOCKS5';
       document.getElementById('node-addr').value = node.server_addr || '';
-      document.getElementById('node-user').value = node.username || '';
-      document.getElementById('node-pass').value = '';
+      const userEl = document.getElementById('node-user');
+      const passEl = document.getElementById('node-pass');
+      userEl.disabled = false;
+      userEl.value = node.username || '';
+      passEl.disabled = false;
+      passEl.value = '';
       const clearCheck = document.getElementById('node-clear-pass');
       if (clearCheck) clearCheck.checked = false;
       syncNodeAuthControls();
@@ -2868,33 +3001,51 @@
       const name = document.getElementById('node-name').value.trim();
       const protocol = document.getElementById('node-protocol').value;
       const addr = document.getElementById('node-addr').value.trim();
-      const user = document.getElementById('node-user').value.trim();
-      const pass = document.getElementById('node-pass').value;
-      const clearPass = Boolean(document.getElementById('node-clear-pass')?.checked);
+      const clearPass = protocol !== 'SOCKS4' && Boolean(document.getElementById('node-clear-pass')?.checked);
+      const user = clearPass ? '' : document.getElementById('node-user').value.trim();
+      const pass = clearPass ? '' : document.getElementById('node-pass').value;
       const editingId = state.editingNodeId;
+      const isEdit = editingId !== null && editingId !== undefined;
+      const usernameChanged = isEdit && user !== (state.editingNodeOriginalUser || '');
 
       if (!name || !addr) {
         showToast(t('toast_node_required'), 'error');
-        return;
-      }
-      if (protocol !== 'SOCKS4' && !user && pass.length > 0) {
-        showToast(t('toast_node_pass_requires_user'), 'error');
         return;
       }
       if (protocol === 'HTTP' && user.includes(':')) {
         showToast(t('toast_node_http_user_colon'), 'error');
         return;
       }
+      if (protocol !== 'SOCKS4') {
+        if (!user && pass.length > 0) {
+          showToast(t('toast_node_pass_requires_user'), 'error');
+          return;
+        }
+        if (!isEdit && user && pass.length === 0) {
+          showToast(t('toast_node_user_requires_pass'), 'error');
+          return;
+        }
+        if (isEdit && user && pass.length === 0) {
+          if (state.editingNodeHasPassword && usernameChanged) {
+            showToast(t('toast_node_user_changed_pass_required'), 'error');
+            return;
+          }
+          if (!state.editingNodeHasPassword) {
+            showToast(t('toast_node_user_requires_pass'), 'error');
+            return;
+          }
+        }
+      }
 
       const btn = document.getElementById('btn-submit-node');
       btn.disabled = true;
       try {
-        const isEdit = editingId !== null && editingId !== undefined;
-        const usernameChanged = isEdit && user !== (state.editingNodeOriginalUser || '');
-        const effectiveClearPass = protocol === 'SOCKS4' || !user || clearPass;
+        const effectiveClearPass = protocol !== 'SOCKS4' && (clearPass || !user);
+        const effectiveUser = (protocol !== 'SOCKS4' && effectiveClearPass) ? null : (user || null);
         const effectivePass = (protocol === 'SOCKS4' || effectiveClearPass || !pass) ? null : pass;
         const keepPassword = Boolean(
           isEdit
+          && protocol !== 'SOCKS4'
           && !effectiveClearPass
           && !effectivePass
           && user
@@ -2907,7 +3058,7 @@
               name,
               protocol,
               server_addr: addr,
-              username: user || null,
+              username: effectiveUser,
               password: effectivePass,
               keep_password: keepPassword,
               clear_password: effectiveClearPass
@@ -2943,8 +3094,9 @@
       const node = state.nodes.find(n => n.id === id);
       const label = node ? `#${id} (${node.name})` : `#${id}`;
       openConfirmModal(
-        t('confirm_delete_node_title'),
-        t('confirm_delete_node_msg', { label }),
+        'confirm_delete_node_title',
+        'confirm_delete_node_msg',
+        { label },
         async () => {
           try {
             const res = await fetchWithTimeout(`/api/nodes?id=${id}`, { method: 'DELETE' });
@@ -2965,9 +3117,11 @@
 
     // Section Rules
     async function loadRules() {
+      const mySeq = ++state.rulesSeq;
       try {
         const res = await fetchWithTimeout('/api/rules');
         const data = await res.json().catch(() => null);
+        if (mySeq !== state.rulesSeq) return;
         if (res.ok && Array.isArray(data)) {
           state.rules = data;
           document.getElementById('nav-count-rules').textContent = state.rules.length;
@@ -2976,6 +3130,7 @@
           showToast((data && data.error) || t('toast_load_rules_fail'), 'error');
         }
       } catch (e) {
+        if (mySeq !== state.rulesSeq) return;
         showToast(t('toast_load_rules_fail'), 'error');
       }
     }
@@ -3304,7 +3459,7 @@
             <span>${escapeHtml(t('sim_matched_label'))}</span>
             <strong>${escapeHtml(res.matched_rule_name)}</strong>
             <span class="mono" style="color:var(--text-muted); font-size:12px; margin-left:8px;">
-              ${res.process_name ? escapeHtml(res.process_name) + ' → ' : ''}${escapeHtml(res.target_host || res.target_ip || '')}:${res.target_port}
+              ${res.process_name ? escapeHtml(res.process_name) + ' → ' : ''}${escapeHtml(formatHostPort(res.target_host || res.target_ip || '', res.target_port))}
             </span>
           </div>
           <div>
@@ -3325,6 +3480,7 @@
         if (!silent) showToast(t('toast_sim_target_required'), 'error');
         return;
       }
+      const mySeq = ++state.simSeq;
       const port = portRaw ? parseInt(portRaw, 10) : null;
       const btn = document.getElementById('btn-run-sim');
       btn.disabled = true;
@@ -3339,6 +3495,7 @@
           })
         });
         const data = await res.json().catch(() => ({}));
+        if (mySeq !== state.simSeq) return;
         if (res.ok) {
           state.lastSimResult = data;
           renderSimResult();
@@ -3346,9 +3503,10 @@
           showToast(data.error || t('toast_err_unknown'), 'error');
         }
       } catch (e) {
+        if (mySeq !== state.simSeq) return;
         if (!silent) showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
       } finally {
-        btn.disabled = false;
+        if (mySeq === state.simSeq) btn.disabled = false;
       }
     }
 
@@ -3356,8 +3514,9 @@
       const rule = state.rules.find(r => r.id === id);
       const name = rule ? rule.name : `#${id}`;
       openConfirmModal(
-        t('confirm_delete_rule_title'),
-        t('confirm_delete_rule_msg', { name }),
+        'confirm_delete_rule_title',
+        'confirm_delete_rule_msg',
+        { name },
         async () => {
           try {
             const res = await fetchWithTimeout(`/api/rules?id=${id}`, { method: 'DELETE' });
@@ -3386,8 +3545,18 @@
         state.editingNodeId = null;
         state.editingNodeOriginalUser = '';
         state.editingNodeHasPassword = false;
+        state.editingNodeLastProtocol = 'SOCKS5';
+        state.editingNodeStashedUser = '';
+        state.editingNodeStashedPass = '';
+        state.editingNodeStashedClear = false;
+        const userEl = document.getElementById('node-user');
+        const passEl = document.getElementById('node-pass');
+        if (userEl) userEl.disabled = false;
+        if (passEl) passEl.disabled = false;
       } else if (id === 'modal-rule') {
         state.editingRuleId = null;
+      } else if (id === 'modal-confirm') {
+        state.confirmContext = null;
       }
     }
 
@@ -3395,9 +3564,10 @@
       if (e.target.id === id) closeModal(id);
     }
 
-    function openConfirmModal(title, message, onConfirm) {
-      document.getElementById('confirm-title').textContent = title;
-      document.getElementById('confirm-message').textContent = message;
+    function openConfirmModal(titleKey, messageKey, params, onConfirm) {
+      state.confirmContext = { titleKey, messageKey, params };
+      document.getElementById('confirm-title').textContent = t(titleKey);
+      document.getElementById('confirm-message').textContent = t(messageKey, params);
       const btn = document.getElementById('confirm-ok-btn');
       btn.onclick = async () => {
         closeModal('modal-confirm');
