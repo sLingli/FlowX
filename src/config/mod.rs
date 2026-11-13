@@ -325,8 +325,22 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
     let server_addr = format_host_port(address, item.port);
     let target_parsed = parse_target_addr(&server_addr)
         .with_context(|| format!("Node #{} address format is invalid: {}", item.id, server_addr))?;
-    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
-        bail!("Node #{} address points to FlowX internal service port: {}", item.id, server_addr);
+    match &target_parsed {
+        crate::outbound::TargetAddr::Ip(sa) => {
+            crate::outbound::direct::validate_direct_ips(
+                &[sa.ip()],
+                sa.port(),
+                self_ports,
+                None,
+                &server_addr,
+            )
+            .with_context(|| format!("Node #{} address is unsafe or reserved", item.id))?;
+        }
+        crate::outbound::TargetAddr::Domain(_, port) => {
+            if target_parsed.is_loopback_or_unspecified() && self_ports.contains(port) {
+                bail!("Node #{} address points to FlowX internal service port: {}", item.id, server_addr);
+            }
+        }
     }
 
     let username = item
@@ -692,5 +706,43 @@ mod tests {
         "#;
         let parsed = ProfileConfig::from_xml(chain_xml).unwrap();
         assert!(parsed.into_runtime(&[]).is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_fake_ip_and_local_interface_self_port_node() {
+        let fake_xml = r#"
+        <Profile version="1">
+          <ProxyList>
+            <Proxy id="1" type="SOCKS5">
+              <Name>FakeNode</Name>
+              <Address>198.18.0.10</Address>
+              <Port>1080</Port>
+            </Proxy>
+          </ProxyList>
+        </Profile>
+        "#;
+        let fake_cfg = ProfileConfig::from_xml(fake_xml).unwrap();
+        assert!(fake_cfg.into_runtime(&[40001, 40080]).is_err());
+
+        let local_ip = crate::outbound::local_interface_ips()
+            .into_iter()
+            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let iface_xml = format!(
+            r#"
+        <Profile version="1">
+          <ProxyList>
+            <Proxy id="1" type="HTTP">
+              <Name>SelfIface</Name>
+              <Address>{}</Address>
+              <Port>40080</Port>
+            </Proxy>
+          </ProxyList>
+        </Profile>
+        "#,
+            local_ip
+        );
+        let iface_cfg = ProfileConfig::from_xml(&iface_xml).unwrap();
+        assert!(iface_cfg.into_runtime(&[40001, 40080]).is_err());
     }
 }

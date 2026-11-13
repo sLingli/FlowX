@@ -42,7 +42,7 @@ impl Socks5Client {
         self_ports: &[u16],
     ) -> Result<TcpStream> {
         tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            let stream = connect_proxy_tcp(
+            let mut stream = connect_proxy_tcp(
                 &self.proxy_addr,
                 upstream_dns,
                 fake_ip_pool,
@@ -51,7 +51,8 @@ impl Socks5Client {
             )
             .await?;
 
-            self.handshake(stream, target).await
+            self.handshake_internal(&mut stream, target).await?;
+            Ok(stream)
         })
         .await
         .map_err(|_| anyhow::anyhow!("SOCKS5 connection timed out ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?

@@ -117,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         upstream_dns,
         api_addr: api_bind,
         fake_ip_pool: Arc::clone(&fake_ip_pool),
+        block_ipv6: true,
         started_at: Instant::now(),
     });
 

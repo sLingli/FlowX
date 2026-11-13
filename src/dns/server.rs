@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::net::UdpSocket;
@@ -11,6 +11,11 @@ use crate::monitor::InFlightTracker;
 
 const MAX_DNS_UPSTREAM_CONCURRENCY: usize = 1024;
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(2);
+static UPSTREAM_RESOLVE_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+
+fn upstream_resolve_semaphore() -> &'static Semaphore {
+    UPSTREAM_RESOLVE_SEMAPHORE.get_or_init(|| Semaphore::new(MAX_DNS_UPSTREAM_CONCURRENCY))
+}
 
 /// 极简、零外部依赖的 RFC 1035 DNS 报文解析与构造器
 #[derive(Debug, Clone)]
@@ -518,25 +523,54 @@ pub(crate) async fn resolve_via_upstream_dns(
     fake_ip_pool: Option<&FakeIpPool>,
     timeout: Duration,
 ) -> Result<Vec<IpAddr>> {
-    let tx_a = csprng_u16();
-    let tx_aaaa = csprng_u16();
-    let (pkt_a, q_a) = build_dns_query_packet(tx_a, domain, 1)?;
-    let (pkt_aaaa, q_aaaa) = build_dns_query_packet(tx_aaaa, domain, 28)?;
+    resolve_via_upstream_dns_with_options(domain, upstream_dns, fake_ip_pool, timeout, true).await
+}
 
-    let (res_a, res_aaaa) = tokio::join!(
-        forward_upstream_udp(upstream_dns, &pkt_a, tx_a, &q_a, timeout),
-        forward_upstream_udp(upstream_dns, &pkt_aaaa, tx_aaaa, &q_aaaa, timeout),
-    );
+pub(crate) async fn resolve_via_upstream_dns_with_options(
+    domain: &str,
+    upstream_dns: SocketAddr,
+    fake_ip_pool: Option<&FakeIpPool>,
+    timeout: Duration,
+    include_ipv6: bool,
+) -> Result<Vec<IpAddr>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let _permit = tokio::time::timeout(timeout, upstream_resolve_semaphore().acquire())
+        .await
+        .map_err(|_| anyhow::anyhow!("Upstream DNS concurrency wait timed out for {}", domain))?
+        .context("Upstream DNS semaphore closed")?;
+
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        bail!("Upstream DNS resolution timed out for {}", domain);
+    }
+
+    let tx_a = csprng_u16();
+    let (pkt_a, q_a) = build_dns_query_packet(tx_a, domain, 1)?;
+
+    let mut responses = Vec::with_capacity(if include_ipv6 { 2 } else { 1 });
+    if include_ipv6 {
+        let tx_aaaa = csprng_u16();
+        let (pkt_aaaa, q_aaaa) = build_dns_query_packet(tx_aaaa, domain, 28)?;
+        let (res_a, res_aaaa) = tokio::join!(
+            forward_upstream_udp(upstream_dns, &pkt_a, tx_a, &q_a, remaining),
+            forward_upstream_udp(upstream_dns, &pkt_aaaa, tx_aaaa, &q_aaaa, remaining),
+        );
+        responses.push((res_a, q_a));
+        responses.push((res_aaaa, q_aaaa));
+    } else {
+        let res_a = forward_upstream_udp(upstream_dns, &pkt_a, tx_a, &q_a, remaining).await;
+        responses.push((res_a, q_a));
+    }
 
     let mut ips = Vec::new();
     let mut got_response = false;
     let mut last_err: Option<anyhow::Error> = None;
 
-    for (res, q) in [(res_a, &q_a), (res_aaaa, &q_aaaa)] {
+    for (res, q) in &responses {
         match res {
             Ok(Some((resp, ans_off))) => {
                 got_response = true;
-                match parse_answer_ips(&resp, q, ans_off, fake_ip_pool) {
+                match parse_answer_ips(resp, q, *ans_off, fake_ip_pool) {
                     Ok(parsed) => {
                         for ip in parsed {
                             if !ips.contains(&ip) {
@@ -548,7 +582,7 @@ pub(crate) async fn resolve_via_upstream_dns(
                 }
             }
             Ok(None) => {}
-            Err(e) => last_err = Some(e),
+            Err(e) => last_err = Some(anyhow::anyhow!("{:#}", e)),
         }
     }
 
@@ -607,7 +641,8 @@ impl DnsServer {
 
     /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and ephemeral upstream isolation)
     pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
-        let mut buf = [0u8; 1500];
+        let mut buf = vec![0u8; 4096];
+        let mut transient_err_streak: u32 = 0;
 
         loop {
             if *shutdown_rx.borrow() {
@@ -617,14 +652,23 @@ impl DnsServer {
             let (len, peer) = tokio::select! {
                 res = socket.recv_from(&mut buf) => {
                     match res {
-                        Ok(r) => r,
+                        Ok(r) => {
+                            transient_err_streak = 0;
+                            r
+                        }
                         Err(e) if is_transient_udp_recv_error(&e) => {
                             // Windows returns WSAECONNRESET when a local UDP peer closes early after querying;
-                            // exempt transient socket errors from backoff so throughput is not capped at ~20 qps.
+                            // exempt transient socket errors from backoff so throughput is not capped at ~20 qps,
+                            // while yielding periodically during burst transient errors to prevent executor spin.
+                            transient_err_streak = transient_err_streak.saturating_add(1);
                             debug!("[DNS Engine] Transient UDP receive error ignored: {}", e);
+                            if transient_err_streak.is_multiple_of(16) {
+                                tokio::task::yield_now().await;
+                            }
                             continue;
                         }
                         Err(e) => {
+                            transient_err_streak = 0;
                             error!("[DNS Engine] Failed to receive UDP DNS packet: {}", e);
                             tokio::select! {
                                 _ = tokio::time::sleep(Duration::from_millis(50)) => {}
@@ -1046,5 +1090,47 @@ mod tests {
 
         let _ = tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), srv_handle).await;
+    }
+
+    #[tokio::test]
+    async fn test_resolve_via_upstream_dns_skips_aaaa_when_ipv6_blocked() {
+        let mock_upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = mock_upstream.local_addr().unwrap();
+
+        let up_task = {
+            let mock_upstream = Arc::clone(&mock_upstream);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                let (n, src) = mock_upstream.recv_from(&mut buf).await.unwrap();
+                let (tx, q) = DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                assert_eq!(q.qtype, 1, "Only A query expected when include_ipv6=false");
+                let mut resp = Vec::new();
+                resp.extend_from_slice(&tx.to_be_bytes());
+                resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                resp.extend_from_slice(&buf[12..q.raw_len]);
+                resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 30, 0, 4, 93, 184, 216, 34]);
+                mock_upstream.send_to(&resp, src).await.unwrap();
+
+                // Verify no second AAAA query arrives
+                let extra = tokio::time::timeout(
+                    Duration::from_millis(80),
+                    mock_upstream.recv_from(&mut buf),
+                )
+                .await;
+                assert!(extra.is_err(), "Unexpected extra DNS query when include_ipv6=false");
+            })
+        };
+
+        let ips = resolve_via_upstream_dns_with_options(
+            "v4only.example",
+            upstream_addr,
+            None,
+            Duration::from_secs(2),
+            false,
+        )
+        .await
+        .unwrap();
+        up_task.await.unwrap();
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
     }
 }

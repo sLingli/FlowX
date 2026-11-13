@@ -168,6 +168,7 @@ pub struct SystemRuntimeContext {
     pub upstream_dns: SocketAddr,
     pub api_addr: SocketAddr,
     pub fake_ip_pool: Arc<FakeIpPool>,
+    pub block_ipv6: bool,
     pub started_at: Instant,
 }
 
@@ -1090,6 +1091,7 @@ async fn handle_api_request(
                 if let Some(addr) = target_addr {
                     let (ok, ms, msg, detail) = ping_address_with_context(
                         &addr,
+                        &self_ports,
                         runtime_context.as_deref(),
                         Some(&ping_semaphore),
                         locale,
@@ -1375,12 +1377,34 @@ fn validate_node_base(
         ));
     }
 
-    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
-        ));
+    match &target_parsed {
+        crate::outbound::TargetAddr::Ip(sa) => {
+            if let Some(violation) = crate::outbound::direct::check_direct_ips_violation(
+                &[sa.ip()],
+                sa.port(),
+                self_ports,
+                None,
+            ) {
+                let (code, key) = match violation {
+                    crate::outbound::direct::DirectIpViolation::FakeIp(_) => {
+                        ("ERR_NODE_FAKE_IP", "error.node_fake_ip")
+                    }
+                    crate::outbound::direct::DirectIpViolation::SelfLoop(_) => {
+                        ("ERR_NODE_SELF_LOOP", "error.node_self_loop")
+                    }
+                };
+                return Err(("400 Bad Request", ct, json_error(locale, code, key)));
+            }
+        }
+        crate::outbound::TargetAddr::Domain(_, port) => {
+            if target_parsed.is_loopback_or_unspecified() && self_ports.contains(port) {
+                return Err((
+                    "400 Bad Request",
+                    ct,
+                    json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
+                ));
+            }
+        }
     }
 
     let username = username_raw
@@ -2262,12 +2286,17 @@ fn localize_connection_view(conn: &mut crate::monitor::ConnectionSnapshot, local
     }
 }
 
-pub(crate) async fn ping_address(addr: &str, locale: Locale) -> (bool, u64, String, Option<String>) {
-    ping_address_with_context(addr, None, None, locale).await
+pub(crate) async fn ping_address(
+    addr: &str,
+    self_ports: &[u16],
+    locale: Locale,
+) -> (bool, u64, String, Option<String>) {
+    ping_address_with_context(addr, self_ports, None, None, locale).await
 }
 
 async fn ping_address_with_context(
     addr: &str,
+    self_ports: &[u16],
     runtime_ctx: Option<&SystemRuntimeContext>,
     ping_semaphore: Option<&Semaphore>,
     locale: Locale,
@@ -2304,14 +2333,26 @@ async fn ping_address_with_context(
         }
     };
 
-    let target_addrs: Vec<SocketAddr> = match parsed {
-        TargetAddr::Ip(sock_addr) => vec![sock_addr],
+    let default_pool;
+    let fake_pool = match runtime_ctx {
+        Some(ctx) => ctx.fake_ip_pool.as_ref(),
+        None => {
+            default_pool = FakeIpPool::new_default();
+            &default_pool
+        }
+    };
+
+    let (port, candidate_ips): (u16, Vec<std::net::IpAddr>) = match &parsed {
+        TargetAddr::Ip(sock_addr) => (sock_addr.port(), vec![sock_addr.ip()]),
         TargetAddr::Domain(domain, port) => {
-            if crate::outbound::is_loopback_domain(&domain) {
-                vec![
-                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
-                    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
-                ]
+            if crate::outbound::is_loopback_domain(domain) {
+                (
+                    *port,
+                    vec![
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    ],
+                )
             } else {
                 let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
                 if remaining.is_zero() {
@@ -2320,9 +2361,17 @@ async fn ping_address_with_context(
                 let upstream_dns = runtime_ctx
                     .map(|c| c.upstream_dns)
                     .unwrap_or_else(|| "223.5.5.5:53".parse().unwrap());
-                let fake_pool = runtime_ctx.map(|c| c.fake_ip_pool.as_ref());
-                match crate::dns::server::resolve_via_upstream_dns(&domain, upstream_dns, fake_pool, remaining).await {
-                    Ok(ips) => ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect(),
+                let include_ipv6 = runtime_ctx.is_none_or(|c| !c.block_ipv6);
+                match crate::dns::server::resolve_via_upstream_dns_with_options(
+                    domain,
+                    upstream_dns,
+                    Some(fake_pool),
+                    remaining,
+                    include_ipv6,
+                )
+                .await
+                {
+                    Ok(ips) => (*port, ips),
                     Err(e) => {
                         return (
                             false,
@@ -2335,6 +2384,40 @@ async fn ping_address_with_context(
             }
         }
     };
+
+    if let Some(violation) = crate::outbound::direct::check_direct_ips_violation(
+        &candidate_ips,
+        port,
+        self_ports,
+        Some(fake_pool),
+    ) {
+        let (key, detail) = match violation {
+            crate::outbound::direct::DirectIpViolation::FakeIp(ip) => (
+                "error.node_fake_ip",
+                format!(
+                    "Ping probe blocked: resolved Fake-IP {} for {}:{}",
+                    ip,
+                    parsed.host_string(),
+                    port
+                ),
+            ),
+            crate::outbound::direct::DirectIpViolation::SelfLoop(ip) => (
+                "error.node_self_loop",
+                format!(
+                    "Ping probe blocked due to self/loopback IP resolution ({} -> {}:{})",
+                    parsed.host_string(),
+                    ip,
+                    port
+                ),
+            ),
+        };
+        return (false, 0, t(locale, key).to_string(), Some(detail));
+    }
+
+    let target_addrs: Vec<SocketAddr> = candidate_ips
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect();
 
     let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
     if remaining.is_zero() {
@@ -2583,6 +2666,7 @@ mod tests {
             upstream_dns: "223.5.5.5:53".parse().unwrap(),
             api_addr: "127.0.0.1:40080".parse().unwrap(),
             fake_ip_pool: fake_pool,
+            block_ipv6: true,
             started_at: Instant::now(),
         });
 
@@ -3544,5 +3628,72 @@ mod tests {
         assert!(r_def.contains("ERR_CONFIG_PERSIST_FAILED"));
         assert_eq!(re.default_action(), Action::Direct);
         let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[tokio::test]
+    async fn test_api_node_and_ping_block_fake_ip_and_local_interface_self_ports() {
+        let (api_addr, _api_nodes, _api_re, _tx) = spawn_test_api().await;
+        let api_port = api_addr.port();
+
+        // 1. Node creation with Fake-IP literal must fail with ERR_NODE_FAKE_IP
+        let fake_node = r#"{"name":"fake","protocol":"SOCKS5","server_addr":"198.18.0.55:1080"}"#;
+        let r_fake = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                fake_node.len(),
+                fake_node
+            ),
+        )
+        .await;
+        assert!(r_fake.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_fake.contains("ERR_NODE_FAKE_IP"));
+
+        // 2. Node creation with local interface non-loopback IP on self_port (40080) must fail
+        let local_ips = crate::outbound::local_interface_ips();
+        let non_loopback_ip = local_ips
+            .iter()
+            .copied()
+            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let iface_self_addr = SocketAddr::new(non_loopback_ip, 40080).to_string();
+        let iface_body = format!(
+            r#"{{"name":"iface","protocol":"SOCKS5","server_addr":"{}"}}"#,
+            iface_self_addr
+        );
+        let r_iface = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                iface_body.len(),
+                iface_body
+            ),
+        )
+        .await;
+        assert!(r_iface.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_iface.contains("ERR_NODE_SELF_LOOP"));
+
+        // 3. ping_address_with_context must reject Fake-IP, self_port loopback/local-interface, and DNS rebinding to self_port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_port = listener.local_addr().unwrap().port();
+        let (ok_fake, _, msg_fake, _) = ping_address("198.18.0.10:1080", &[bound_port], Locale::En).await;
+        assert!(!ok_fake);
+        assert!(msg_fake.contains("Fake-IP"));
+
+        let (ok_self, _, msg_self, _) =
+            ping_address(&format!("127.0.0.1:{}", bound_port), &[bound_port], Locale::En).await;
+        assert!(!ok_self);
+        assert!(msg_self.contains("internal service"));
+
+        let (ok_iface, _, msg_iface, _) = ping_address(
+            &SocketAddr::new(non_loopback_ip, bound_port).to_string(),
+            &[bound_port],
+            Locale::En,
+        )
+        .await;
+        assert!(!ok_iface);
+        assert!(msg_iface.contains("internal service"));
     }
 }

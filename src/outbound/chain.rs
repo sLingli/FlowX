@@ -1,12 +1,35 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use anyhow::{bail, Context, Result};
 use tokio::net::TcpStream;
 use crate::dns::FakeIpPool;
-use super::direct::{connect_proxy_tcp, DEFAULT_OUTBOUND_UPSTREAM_DNS};
+use super::direct::{connect_proxy_tcp, validate_direct_ips, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::http::HttpConnectClient;
 use super::socks4::Socks4Client;
 use super::socks5::Socks5Client;
 use super::TargetAddr;
+
+fn validate_chain_hop_target(
+    chain_name: &str,
+    addr: &str,
+    target: &TargetAddr,
+    self_ports: &[u16],
+    fake_ip_pool: Option<&FakeIpPool>,
+) -> Result<()> {
+    match target {
+        TargetAddr::Ip(sa) => validate_direct_ips(&[sa.ip()], sa.port(), self_ports, fake_ip_pool, addr)
+            .with_context(|| format!("Proxy chain [{}] hop target rejected", chain_name)),
+        TargetAddr::Domain(_, port) => {
+            if target.is_loopback_or_unspecified() && self_ports.contains(port) {
+                bail!(
+                    "Proxy chain [{}] node points to internal service port, blocked to prevent loop: {}",
+                    chain_name,
+                    addr
+                );
+            }
+            Ok(())
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ProxyNode {
@@ -68,7 +91,7 @@ impl ProxyChain {
         self
     }
 
-    /// Validate proxy chain nodes for loopback and circular dependency risks
+    /// Validate proxy chain nodes for loopback, local interface self-ports, Fake-IP, and circular risks
     pub fn validate_loop(&self, forbidden_ports: &[u16]) -> Result<()> {
         let mut visited = std::collections::HashSet::new();
         for node in &self.nodes {
@@ -78,14 +101,12 @@ impl ProxyChain {
             if !visited.insert(target.clone()) {
                 bail!("Proxy chain [{}] contains duplicate node, circular dependency detected: {}", self.name, addr);
             }
-            if target.is_loopback_or_unspecified() && forbidden_ports.contains(&target.port()) {
-                bail!("Proxy chain [{}] node points to internal service port, blocked to prevent loop: {}", self.name, addr);
-            }
+            validate_chain_hop_target(&self.name, addr, &target, forbidden_ports, None)?;
         }
         Ok(())
     }
 
-    /// Establish multi-hop tunnel to final target through proxy chain (with single-hop timeout and overall chain timeout)
+    /// Establish multi-hop tunnel to final target through proxy chain (with overall chain timeout)
     pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
         self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
             .await
@@ -102,25 +123,20 @@ impl ProxyChain {
             bail!("Proxy chain '{}' does not contain any proxy nodes", self.name);
         }
 
-        const HOP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
         const CHAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
         tokio::time::timeout(CHAIN_TOTAL_TIMEOUT, async {
             // 1. Establish basic TCP connection with first hop via upstream DNS + Fake-IP/self-loop validation
             let first_node = &self.nodes[0];
             let role = format!("Proxy chain [{}] first node", self.name);
-            let mut stream = tokio::time::timeout(
-                HOP_CONNECT_TIMEOUT,
-                connect_proxy_tcp(
-                    first_node.server_addr(),
-                    upstream_dns,
-                    fake_ip_pool,
-                    self_ports,
-                    &role,
-                ),
+            let mut stream = connect_proxy_tcp(
+                first_node.server_addr(),
+                upstream_dns,
+                fake_ip_pool,
+                self_ports,
+                &role,
             )
-            .await
-            .map_err(|_| anyhow::anyhow!("Proxy chain [{}] first node connection timed out ({:?}): {}", self.name, HOP_CONNECT_TIMEOUT, first_node.server_addr()))??;
+            .await?;
 
             // 2. Iterate and handshake through each hop, requesting CONNECT to next hop
             for i in 0..self.nodes.len() {
@@ -142,21 +158,16 @@ impl ProxyChain {
                             )
                         })?;
                 } else {
-                    // Intermediate hop: connect to next proxy node
+                    // Intermediate hop: validate target via shared Fake-IP & local-interface self-port guards
                     let next_node = &self.nodes[i + 1];
                     let next_target = parse_target_addr(next_node.server_addr())?;
-                    if let TargetAddr::Ip(addr) = &next_target {
-                        if let IpAddr::V4(v4) = addr.ip()
-                            && fake_ip_pool.is_some_and(|p| p.is_fake_ip(&v4))
-                        {
-                            bail!("Proxy chain [{}] intermediate node {} uses Fake-IP", self.name, next_node.server_addr());
-                        }
-                        if next_target.is_loopback_or_unspecified() && self_ports.contains(&next_target.port()) {
-                            bail!("Proxy chain [{}] intermediate node {} points to internal port", self.name, next_node.server_addr());
-                        }
-                    } else if next_target.is_loopback_or_unspecified() && self_ports.contains(&next_target.port()) {
-                        bail!("Proxy chain [{}] intermediate node {} points to internal port", self.name, next_node.server_addr());
-                    }
+                    validate_chain_hop_target(
+                        &self.name,
+                        next_node.server_addr(),
+                        &next_target,
+                        self_ports,
+                        fake_ip_pool,
+                    )?;
 
                     stream = current_node
                         .handshake(stream, &next_target)
@@ -242,5 +253,53 @@ mod tests {
         assert!(parse_target_addr("bad host:443").is_err());
         assert!(parse_target_addr("user@127.0.0.1:1080").is_err());
         assert!(parse_target_addr("no-port.example.com").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_proxy_chain_blocks_intermediate_local_interface_ip_and_fake_ip() {
+        use tokio::net::TcpListener;
+
+        let local_ips = super::super::local_interface_ips();
+        let non_loopback_ip = local_ips
+            .iter()
+            .copied()
+            .find(|ip| !ip.is_loopback() && !ip.is_unspecified())
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let hop2_addr = SocketAddr::new(non_loopback_ip, 40080).to_string();
+
+        // Also validate Fake-IP literal in validate_loop and connect_with_policy
+        let fake_chain = ProxyChain::new("Fake-Chain")
+            .add_node(ProxyNode::Socks5(Socks5Client::new("10.0.0.1:1080")))
+            .add_node(ProxyNode::Http(HttpConnectClient::new("198.18.0.5:8080")));
+        assert!(fake_chain.validate_loop(&[40080]).is_err());
+
+        // Hop 0 listens, intermediate hop points to local interface + forbidden self_port
+        let hop0 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hop0_addr = hop0.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_s, _) = hop0.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        });
+
+        let pool = FakeIpPool::new_default();
+        let chain = ProxyChain::new("Self-Iface-Chain")
+            .add_node(ProxyNode::Socks5(Socks5Client::new(hop0_addr.to_string())))
+            .add_node(ProxyNode::Http(HttpConnectClient::new(hop2_addr)));
+
+        let err = chain
+            .connect_with_policy(
+                &TargetAddr::Domain("example.com".into(), 443),
+                DEFAULT_OUTBOUND_UPSTREAM_DNS,
+                Some(&pool),
+                &[40080],
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("hop target rejected")
+                || format!("{:#}", err).contains("self/loopback IP"),
+            "Unexpected error: {:#}",
+            err
+        );
     }
 }

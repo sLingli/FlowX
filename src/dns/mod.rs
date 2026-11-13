@@ -148,6 +148,11 @@ impl FakeIpPool {
         raw >= self.min && raw <= self.max
     }
 
+    /// 判断 IPv4 地址是否落在默认 Fake-IP 保留网段 (`198.18.0.0/15`)
+    pub fn is_default_fake_ip(ip: &Ipv4Addr) -> bool {
+        (u32::from(*ip) & 0xFFFE_0000) == 0xC612_0000
+    }
+
     /// 返回当前池中映射条目数
     pub fn len(&self) -> usize {
         let state = self.inner.read().unwrap_or_else(|e| e.into_inner());

@@ -1476,7 +1476,8 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                         .map(|n| n.server_addr.clone())
                         .ok_or_else(|| anyhow!("Proxy node #{} not found", id))?
                 };
-                let (ok, latency_ms, message, detail) = ping_address(&addr, Locale::Zh).await;
+                let (ok, latency_ms, message, detail) =
+                    ping_address(&addr, &DEFAULT_SELF_PORTS, Locale::Zh).await;
                 serde_json::to_value(PingResponse {
                     ok,
                     latency_ms,
