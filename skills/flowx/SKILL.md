@@ -26,7 +26,7 @@ FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux / macOS）进程
 
 `flowx` 子命令执行严格参数校验与确定性路由（未知参数如 `--targe` 或多余位置参数会直接报错退出）：
 - **在线模式（Online）**：连接运行中守护进程的 HTTP API（支持 `PATCH` 原子部分更新），内存状态与 `flowx.xml` 实时同步；
-- **显式离线模式（`--offline`）**：直接安全校验并原子读写 `--config` / `$FLOWX_CONFIG` 指定的 XML 文件，不尝试连接守护进程（`conn` 命令除外，其要求在线守护进程）；只读命令缺失配置文件时直接报错而不新建文件，变更命令在参数/规则校验失败时同样不会在磁盘提前生成 `flowx.xml`；
+- **显式离线模式（`--offline`）**：直接安全校验并原子读写 `--config` / `$FLOWX_CONFIG` 指定的 XML 文件（未设置或为空白时回落至 `./flowx.xml`），不尝试连接守护进程（`conn` 命令除外，其要求在线守护进程）；只读命令缺失配置文件时直接报错而不新建文件，变更命令在参数/规则校验失败时同样不会在磁盘提前生成 `flowx.xml`；CLI 支持 `--` 选项终止符分隔位置参数，并按 `FLOWX_LANG` → `LC_ALL` → `LC_MESSAGES` → `LANG`（默认英文）自适应本地化语言与 `Accept-Language`；
 - **默认地址离线回退**：仅当未显式指定 `--api` / `$FLOWX_API` 且连接默认本地 `127.0.0.1:40080` 收到 `ConnectionRefused` 时，`status` / `node` / `rule` / `default` / `sim` 才会安全回退离线 XML；若超时、HTTP 返回错误或自定义 `--api` 失败，CLI 会直接报错，避免配置分脑。
 
 ### 1. 状态与默认兜底策略
@@ -45,8 +45,12 @@ flowx default Proxy:101 --json
 
 ### 2. 代理节点管理 (`flowx node`)
 支持协议：`SOCKS5`、`HTTP`（HTTP CONNECT）、`SOCKS4`（含 SOCKS4a）。
-- **凭证成对约束**：`HTTP` 与 `SOCKS5` 节点要求用户名（`--user`）与密码（`--pass`）必须同时配置或同时留空（单传其一分别返回 `ERR_USERNAME_WITHOUT_PASSWORD` / `ERR_PASSWORD_WITHOUT_USERNAME`；`HTTP` 用户名禁止包含 `:`）；清除密码（`--clear-password` 或 `--pass ""`）会同步清除用户名，除非同一请求中另行显式传入新用户名（将报错拒绝）。`SOCKS4` 仅支持可选 `--user`（`UserID`）且不允许设置密码。`auth_configured` 在 `SOCKS4` 下表示是否配置 `UserID`，在 `HTTP`/`SOCKS5` 下表示用户名与密码是否成对就绪。
-- **节点地址安全限制**：禁止指向 Fake-IP（`198.18.0.0/15`）或本机/回环中的 FlowX 自身服务端口（`--addr` 与 `ping` 解析上游 DNS 后均会二次拦截回环与重绑定）。
+- **凭证成对与字段返回约束**：
+  - `HTTP` 与 `SOCKS5` 节点要求用户名（`--user`）与密码（`--pass`）成对存在：`node add` 传入 `--pass ""` 会拒绝并返回 `ERR_EMPTY_PASSWORD`；`HTTP` 用户名禁止包含 `:`。
+  - `PUT` / `PATCH` 更新时，若提交（或沿用已有的）非空用户名却既未传 `keep_password: true`（在 `flowx node update` CLI 中省略 `--pass` 与 `--clear-password` 时自动附带保留指令）又未提供新非空密码，统一返回 `ERR_USERNAME_WITHOUT_PASSWORD`；参数互相冲突时分别返回 `ERR_CONFLICTING_PASSWORD_OPTIONS`（如同时传 `--clear-password` 与 `--pass`）或 `ERR_CONFLICTING_USERNAME_OPTIONS`（如 API 传入 `clear_username: true` 与非空 `username`）；清除密码（`--clear-password` 或 `--pass ""`）会同步清空用户名。
+  - `SOCKS4` 仅支持可选 `--user`（`UserID`）且严禁携带密码字段（在线 API 传入 `password: ""` 也会返回 `ERR_SOCKS4_PASSWORD_UNSUPPORTED`）。
+  - 返回 JSON 中的 `password_configured`（仅 `HTTP`/`SOCKS5` 已存密码时为 `true`）与 `auth_configured`（`SOCKS4` 下表示是否配置了 `UserID`，`HTTP`/`SOCKS5` 下表示用户名与密码是否已成对配置）用于判断节点真实认证状态（历史 XML 若存在孤立 `<Username>` 无 `<Password>`，启动加载时会告警降级并清空用户名，返回 `auth_configured: false`）。
+- **节点地址与测速语义**：禁止指向 Fake-IP（`198.18.0.0/15` / `[::ffff:198.18.0.x]`）或本机/回环中的 FlowX 自身服务端口（`--addr` 与 `ping` 解析上游 `A + AAAA` 后均会二次拦截回环与重绑定，支持纯 IPv6 域名节点）；`flowx node ping <ID>` 在节点不可达（`ok == false`）时会完整输出 JSON / 文本结果后以**非零退出码 (`1`)** 退出，脚本应检查退出码并照常解析 stdout JSON。
 ```bash
 # 列出所有代理节点
 flowx node list --json
@@ -119,7 +123,7 @@ flowx sim --app "curl.exe" --target "192.168.1.1" --port 80 --json
 # 列出当前活跃连接快照
 flowx conn list --json
 
-# 强制物理切断指定连接 ID
+# 强制物理切断指定连接 ID；若连接已不存在/已关闭 (killed=false)，会完整输出 JSON 后以非零状态码 1 退出
 flowx conn kill 42 --json
 ```
 
