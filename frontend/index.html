@@ -1560,7 +1560,7 @@
       <div class="form-grid-2">
         <div class="form-group">
           <label class="form-label" for="node-protocol" data-i18n="form_node_protocol">Proxy Protocol</label>
-          <select class="form-select" id="node-protocol">
+          <select class="form-select" id="node-protocol" onchange="syncNodeAuthControls()">
             <option value="SOCKS5" data-i18n="opt_proto_socks5">SOCKS5 (Recommended)</option>
             <option value="HTTP" data-i18n="opt_proto_http">HTTP CONNECT</option>
             <option value="SOCKS4" data-i18n="opt_proto_socks4">SOCKS4 / SOCKS4a</option>
@@ -1574,12 +1574,18 @@
       <div class="form-grid-2">
         <div class="form-group">
           <label class="form-label" for="node-user" data-i18n="form_node_user">Auth Username (Optional)</label>
-          <input type="text" class="form-input" id="node-user" data-i18n-placeholder="form_node_user_ph" placeholder="Leave empty for no authentication">
+          <input type="text" class="form-input" id="node-user" oninput="syncNodeAuthControls()" data-i18n-placeholder="form_node_user_ph" placeholder="Leave empty for no authentication">
         </div>
         <div class="form-group">
           <label class="form-label" for="node-pass" data-i18n="form_node_pass">Auth Password (Optional)</label>
-          <input type="password" class="form-input" id="node-pass" data-i18n-placeholder="form_node_pass_ph" placeholder="Leave empty for no authentication">
+          <input type="password" class="form-input" id="node-pass" oninput="syncNodeAuthControls()" data-i18n-placeholder="form_node_pass_ph" placeholder="Leave empty for no authentication">
         </div>
+      </div>
+      <div class="form-group" id="node-clear-pass-wrap" style="display:none; margin-top:-6px;">
+        <label style="display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--text-muted); cursor:pointer;">
+          <input type="checkbox" id="node-clear-pass" onchange="syncNodeAuthControls()">
+          <span data-i18n="form_node_clear_pass">Clear saved password</span>
+        </label>
       </div>
       <div class="modal-actions">
         <button class="btn" onclick="closeModal('modal-node')" data-i18n="btn_cancel">Cancel</button>
@@ -1811,6 +1817,9 @@
         form_node_pass: '认证密码 (可选)',
         form_node_pass_ph: '留空表示无认证',
         form_node_pass_keep_ph: '留空保持原密码不变',
+        form_node_pass_socks4_ph: 'SOCKS4 不支持密码认证',
+        form_node_pass_user_changed_ph: '修改用户名后请重新输入密码或留空不设密码',
+        form_node_clear_pass: '清除已保存密码',
         btn_cancel: '取消',
         btn_save_node: '保存节点',
 
@@ -2035,6 +2044,9 @@
         form_node_pass: 'Auth Password (Optional)',
         form_node_pass_ph: 'Leave empty for no authentication',
         form_node_pass_keep_ph: 'Leave empty to keep existing password',
+        form_node_pass_socks4_ph: 'Password auth not supported by SOCKS4',
+        form_node_pass_user_changed_ph: 'Enter new password (username changed) or leave empty',
+        form_node_clear_pass: 'Clear saved password',
         btn_cancel: 'Cancel',
         btn_save_node: 'Save Node',
 
@@ -2119,6 +2131,8 @@
       busyRuleIds: {},
       busyConnIds: {},
       editingNodeId: null,
+      editingNodeOriginalUser: '',
+      editingNodeHasPassword: false,
       editingRuleId: null,
       lastSimResult: null,
       historyDown: new Array(MAX_HISTORY).fill(0),
@@ -2214,10 +2228,30 @@
       renderNodes();
       renderRules();
       renderSimResult();
-      // 规则动作描述、节点测速错误等文案由后端按请求语言生成，切换语言后需重新拉取
+
+      const nodeTitleEl = document.getElementById('modal-node-title');
+      if (nodeTitleEl && state.editingNodeId !== null && state.editingNodeId !== undefined) {
+        nodeTitleEl.textContent = t('modal_edit_node_title');
+      }
+      if (typeof syncNodeAuthControls === 'function') {
+        syncNodeAuthControls();
+      }
+      const ruleTitleEl = document.getElementById('modal-rule-title');
+      if (ruleTitleEl && state.editingRuleId !== null && state.editingRuleId !== undefined) {
+        ruleTitleEl.textContent = t('modal_edit_rule_title');
+      }
+      const ruleActionEl = document.getElementById('rule-action');
+      const ruleNodeEl = document.getElementById('rule-node-id');
+      if (ruleActionEl && ruleActionEl.value === 'Proxy' && ruleNodeEl) {
+        const selectedNodeId = parseInt(ruleNodeEl.value, 10);
+        onRuleActionChange(Number.isFinite(selectedNodeId) ? selectedNodeId : null);
+      }
+
+      // 规则动作描述、节点测速错误、默认策略等文案由后端按请求语言生成，切换语言后需重新拉取（即使已暂停刷新）
       if (state.system && state.system.inbound_addr) {
         loadNodes();
         loadRules();
+        pollRealtime(true);
         if (state.lastSimResult) runRouteSimulate(true);
       }
       const pauseBtn = document.getElementById('pause-poll-btn');
@@ -2367,8 +2401,8 @@
       }
     }
 
-    async function pollRealtime() {
-      if (state.paused || state.pollInFlight) return;
+    async function pollRealtime(force = false) {
+      if ((!force && state.paused) || state.pollInFlight) return;
       state.pollInFlight = true;
       try {
         const [statsRes, connsRes, sysRes] = await Promise.all([
@@ -2542,7 +2576,7 @@
       btn.textContent = state.paused ? t('btn_resume_poll') : t('btn_pause_poll');
       btn.classList.toggle('btn-primary', state.paused);
       if (!state.paused) {
-        pollRealtime().then(schedulePoll);
+        pollRealtime(true).then(schedulePoll);
       }
     }
 
@@ -2621,7 +2655,7 @@
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
           showToast(t('toast_conn_killed', { id }), 'info');
-          await pollRealtime();
+          await pollRealtime(true);
         } else {
           showToast(data.error || t('toast_conn_kill_fail'), 'error');
         }
@@ -2740,17 +2774,66 @@
       }
     }
 
+    function syncNodeAuthControls() {
+      const protocolEl = document.getElementById('node-protocol');
+      const userEl = document.getElementById('node-user');
+      const passEl = document.getElementById('node-pass');
+      const clearWrap = document.getElementById('node-clear-pass-wrap');
+      const clearCheck = document.getElementById('node-clear-pass');
+      if (!protocolEl || !userEl || !passEl || !clearWrap || !clearCheck) return;
+
+      const protocol = protocolEl.value;
+      const userVal = userEl.value.trim();
+      const isEdit = state.editingNodeId !== null && state.editingNodeId !== undefined;
+      const usernameChanged = isEdit && userVal !== (state.editingNodeOriginalUser || '');
+
+      if (protocol === 'SOCKS4') {
+        passEl.value = '';
+        passEl.disabled = true;
+        passEl.placeholder = t('form_node_pass_socks4_ph');
+        clearCheck.checked = false;
+        clearWrap.style.display = 'none';
+        return;
+      }
+
+      const canShowClear = Boolean(isEdit && state.editingNodeHasPassword && userVal && !usernameChanged);
+      if (canShowClear) {
+        clearWrap.style.display = 'block';
+      } else {
+        clearCheck.checked = false;
+        clearWrap.style.display = 'none';
+      }
+
+      if (clearCheck.checked) {
+        passEl.value = '';
+        passEl.disabled = true;
+      } else {
+        passEl.disabled = false;
+      }
+
+      if (isEdit && state.editingNodeHasPassword && !clearCheck.checked && !usernameChanged && userVal) {
+        passEl.placeholder = t('form_node_pass_keep_ph');
+      } else if (isEdit && state.editingNodeHasPassword && usernameChanged && userVal) {
+        passEl.placeholder = t('form_node_pass_user_changed_ph');
+      } else {
+        passEl.placeholder = t('form_node_pass_ph');
+      }
+    }
+
     function openAddNodeModal() {
       state.editingNodeId = null;
+      state.editingNodeOriginalUser = '';
+      state.editingNodeHasPassword = false;
       const titleEl = document.getElementById('modal-node-title');
       if (titleEl) titleEl.textContent = t('modal_add_node_title');
       document.getElementById('node-name').value = '';
       document.getElementById('node-protocol').value = 'SOCKS5';
       document.getElementById('node-addr').value = '';
       document.getElementById('node-user').value = '';
-      const passEl = document.getElementById('node-pass');
-      passEl.value = '';
-      passEl.placeholder = t('form_node_pass_ph');
+      document.getElementById('node-pass').value = '';
+      const clearCheck = document.getElementById('node-clear-pass');
+      if (clearCheck) clearCheck.checked = false;
+      syncNodeAuthControls();
       openModal('modal-node');
       setTimeout(() => document.getElementById('node-name').focus(), 40);
     }
@@ -2759,15 +2842,18 @@
       const node = state.nodes.find(n => n.id === id);
       if (!node) return;
       state.editingNodeId = id;
+      state.editingNodeOriginalUser = node.username || '';
+      state.editingNodeHasPassword = Boolean(node.password_configured);
       const titleEl = document.getElementById('modal-node-title');
       if (titleEl) titleEl.textContent = t('modal_edit_node_title');
       document.getElementById('node-name').value = node.name || '';
       document.getElementById('node-protocol').value = node.protocol || 'SOCKS5';
       document.getElementById('node-addr').value = node.server_addr || '';
       document.getElementById('node-user').value = node.username || '';
-      const passEl = document.getElementById('node-pass');
-      passEl.value = '';
-      passEl.placeholder = node.auth_configured ? t('form_node_pass_keep_ph') : t('form_node_pass_ph');
+      document.getElementById('node-pass').value = '';
+      const clearCheck = document.getElementById('node-clear-pass');
+      if (clearCheck) clearCheck.checked = false;
+      syncNodeAuthControls();
       openModal('modal-node');
       setTimeout(() => document.getElementById('node-name').focus(), 40);
     }
@@ -2778,6 +2864,7 @@
       const addr = document.getElementById('node-addr').value.trim();
       const user = document.getElementById('node-user').value.trim();
       const pass = document.getElementById('node-pass').value;
+      const clearPass = Boolean(document.getElementById('node-clear-pass')?.checked);
       const editingId = state.editingNodeId;
 
       if (!name || !addr) {
@@ -2789,6 +2876,17 @@
       btn.disabled = true;
       try {
         const isEdit = editingId !== null && editingId !== undefined;
+        const usernameChanged = isEdit && user !== (state.editingNodeOriginalUser || '');
+        const effectiveClearPass = protocol === 'SOCKS4' || !user || clearPass;
+        const effectivePass = (protocol === 'SOCKS4' || effectiveClearPass || !pass) ? null : pass;
+        const keepPassword = Boolean(
+          isEdit
+          && !effectiveClearPass
+          && !effectivePass
+          && user
+          && state.editingNodeHasPassword
+          && !usernameChanged
+        );
         const payload = isEdit
           ? {
               id: editingId,
@@ -2796,15 +2894,16 @@
               protocol,
               server_addr: addr,
               username: user || null,
-              password: pass || null,
-              keep_password: Boolean(user && !pass)
+              password: effectivePass,
+              keep_password: keepPassword,
+              clear_password: effectiveClearPass
             }
           : {
               name,
               protocol,
               server_addr: addr,
               username: user || null,
-              password: pass || null
+              password: protocol === 'SOCKS4' ? null : (pass || null)
             };
         const res = await fetchWithTimeout('/api/nodes', {
           method: isEdit ? 'PUT' : 'POST',
@@ -3191,7 +3290,7 @@
             <span>${escapeHtml(t('sim_matched_label'))}</span>
             <strong>${escapeHtml(res.matched_rule_name)}</strong>
             <span class="mono" style="color:var(--text-muted); font-size:12px; margin-left:8px;">
-              ${res.process_name ? escapeHtml(res.process_name) + ' → ' : ''}${escapeHtml(res.target_host || '')}:${res.target_port}
+              ${res.process_name ? escapeHtml(res.process_name) + ' → ' : ''}${escapeHtml(res.target_host || res.target_ip || '')}:${res.target_port}
             </span>
           </div>
           <div>
@@ -3269,6 +3368,13 @@
 
     function closeModal(id) {
       document.getElementById(id).classList.remove('active');
+      if (id === 'modal-node') {
+        state.editingNodeId = null;
+        state.editingNodeOriginalUser = '';
+        state.editingNodeHasPassword = false;
+      } else if (id === 'modal-rule') {
+        state.editingRuleId = null;
+      }
     }
 
     function handleBackdropClick(e, id) {
@@ -3288,12 +3394,12 @@
 
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') {
-        document.querySelectorAll('.modal-overlay.active').forEach(el => el.classList.remove('active'));
+        document.querySelectorAll('.modal-overlay.active').forEach(el => closeModal(el.id));
       }
     });
 
     async function refreshAll() {
-      await Promise.all([loadNodes(), loadRules(), pollRealtime()]);
+      await Promise.all([loadNodes(), loadRules(), pollRealtime(true)]);
     }
 
     (async function bootstrap() {

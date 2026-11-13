@@ -7,101 +7,318 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::api::{
-    handle_add_node, handle_add_rule, handle_set_default_action, handle_simulate_route,
-    handle_update_node, handle_update_rule, ping_address, AddNodeRequest, AddRuleRequest,
-    PingResponse, ProxyNodeView, SetDefaultActionRequest, SimulateRouteRequest, UpdateNodeRequest,
-    UpdateRuleRequest,
+    handle_add_node, handle_add_rule, handle_patch_node, handle_patch_rule,
+    handle_set_default_action, handle_simulate_route, ping_address, AddNodeRequest, AddRuleRequest,
+    PatchNodeRequest, PatchRuleRequest, PingResponse, ProxyNodeView, SetDefaultActionRequest,
+    SimulateRouteRequest,
 };
 use crate::config::ConfigStore;
 use crate::i18n::Locale;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
-use crate::router::{format_action_desc, Action, RuleEngine};
+use crate::router::{format_action_desc, Action, RuleEngine, RuleView};
 
 const DEFAULT_API_ADDR: &str = "127.0.0.1:40080";
 const DEFAULT_SELF_PORTS: [u16; 3] = [40001, 40080, 1053];
+const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const API_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 判断命令行参数是否应进入 CLI 子命令模式（无子命令或 `serve` 时返回 `false` 进入后台守护模式）
-pub fn should_run_cli(args: &[String]) -> bool {
-    let mut iter = args.iter().skip(1);
-    while let Some(arg) = iter.next() {
-        if arg == "--config" || arg == "--api" {
-            let _ = iter.next();
-            continue;
-        }
-        if arg.starts_with("--config=") || arg.starts_with("--api=") {
-            continue;
-        }
-        if arg == "serve" {
-            return false;
-        }
-        return true;
-    }
-    false
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchMode {
+    Serve { config_path: String },
+    Cli,
 }
 
 #[derive(Debug, Clone)]
 pub struct GlobalCliOpts {
     pub config_path: String,
     pub api_addr: String,
+    pub api_explicit: bool,
+    pub offline: bool,
     pub json_output: bool,
+    pub show_help: bool,
     pub rest: Vec<String>,
 }
 
-pub fn parse_global_opts(args: &[String]) -> Result<GlobalCliOpts> {
+#[derive(Debug)]
+struct ParsedCliInvocation {
+    mode: LaunchMode,
+    opts: GlobalCliOpts,
+}
+
+fn is_subcommand_bool_flag(name: &str) -> bool {
+    matches!(name, "enable" | "disable" | "clear-password")
+}
+
+fn is_known_subcommand_value_flag(name: &str) -> bool {
+    matches!(
+        name,
+        "id" | "name"
+            | "addr"
+            | "server"
+            | "protocol"
+            | "proto"
+            | "user"
+            | "username"
+            | "pass"
+            | "password"
+            | "action"
+            | "node"
+            | "node-id"
+            | "apps"
+            | "app"
+            | "targets"
+            | "target"
+            | "host"
+            | "ports"
+            | "port"
+            | "dir"
+            | "direction"
+            | "process"
+            | "proc"
+    )
+}
+
+fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
     let mut config_path =
         std::env::var("FLOWX_CONFIG").unwrap_or_else(|_| "flowx.xml".to_string());
-    let mut api_addr =
-        std::env::var("FLOWX_API").unwrap_or_else(|_| DEFAULT_API_ADDR.to_string());
+    let env_api = std::env::var("FLOWX_API")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let mut api_addr = env_api
+        .as_deref()
+        .map(normalize_api_addr)
+        .transpose()?
+        .unwrap_or_else(|| DEFAULT_API_ADDR.to_string());
+    let mut api_explicit = env_api.is_some();
+    let mut api_cli_flag = false;
+    let mut offline = false;
     let mut json_output = false;
-    let mut rest = Vec::new();
+    let mut show_help = false;
+    let mut rest: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
         let arg = &args[i];
+        let in_subcommand = !rest.is_empty();
+
         if arg == "--config" {
             i += 1;
             let val = args
                 .get(i)
+                .filter(|v| !v.is_empty())
                 .ok_or_else(|| anyhow!("Missing value for --config"))?;
             config_path = val.clone();
-        } else if let Some(val) = arg.strip_prefix("--config=") {
+            i += 1;
+            continue;
+        }
+        if let Some(val) = arg.strip_prefix("--config=") {
+            if val.is_empty() {
+                bail!("Missing value for --config");
+            }
             config_path = val.to_string();
-        } else if arg == "--api" {
+            i += 1;
+            continue;
+        }
+
+        if arg == "--api" {
             i += 1;
             let val = args
                 .get(i)
                 .ok_or_else(|| anyhow!("Missing value for --api"))?;
-            api_addr = normalize_api_addr(val);
-        } else if let Some(val) = arg.strip_prefix("--api=") {
-            api_addr = normalize_api_addr(val);
-        } else if arg == "--json" {
-            json_output = true;
-        } else {
-            rest.push(arg.clone());
+            api_addr = normalize_api_addr(val)?;
+            api_explicit = true;
+            api_cli_flag = true;
+            i += 1;
+            continue;
         }
+        if let Some(val) = arg.strip_prefix("--api=") {
+            api_addr = normalize_api_addr(val)?;
+            api_explicit = true;
+            api_cli_flag = true;
+            i += 1;
+            continue;
+        }
+
+        if arg == "--json" {
+            json_output = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--offline" {
+            offline = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--help" || arg == "-h" {
+            show_help = true;
+            if !in_subcommand {
+                rest.push(arg.clone());
+            }
+            i += 1;
+            continue;
+        }
+        if (arg == "--version" || arg == "-V") && !in_subcommand {
+            rest.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if let Some(stripped) = arg.strip_prefix("--") {
+            if !in_subcommand || rest.first().map(|s| s.as_str()) == Some("serve") {
+                bail!("Unknown option '{}'", arg);
+            }
+            if !stripped.contains('=') && !is_subcommand_bool_flag(stripped) {
+                if !is_known_subcommand_value_flag(stripped) {
+                    bail!("Unknown option '{}'", arg);
+                }
+                rest.push(arg.clone());
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("Missing value for option --{}", stripped))?;
+                rest.push(val.clone());
+                i += 1;
+                continue;
+            }
+            rest.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if arg.starts_with('-') {
+            bail!("Unknown option '{}'", arg);
+        }
+
+        rest.push(arg.clone());
         i += 1;
     }
 
-    api_addr = normalize_api_addr(&api_addr);
-    Ok(GlobalCliOpts {
-        config_path,
-        api_addr,
-        json_output,
-        rest,
+    if api_cli_flag && offline {
+        bail!("Cannot specify both --api and --offline");
+    }
+
+    if let Some(first) = rest.first()
+        && first == "serve"
+    {
+        if show_help {
+            return Ok(ParsedCliInvocation {
+                mode: LaunchMode::Cli,
+                opts: GlobalCliOpts {
+                    config_path,
+                    api_addr,
+                    api_explicit,
+                    offline,
+                    json_output,
+                    show_help: true,
+                    rest: vec!["--help".to_string()],
+                },
+            });
+        }
+        if json_output {
+            bail!("Global flag --json cannot be used with `serve`");
+        }
+        if api_cli_flag {
+            bail!("Global flag --api cannot be used with `serve`");
+        }
+        if offline {
+            bail!("Global flag --offline cannot be used with `serve`");
+        }
+        if rest.len() > 1 {
+            bail!("Unexpected argument '{}' for `serve`", rest[1]);
+        }
+        return Ok(ParsedCliInvocation {
+            mode: LaunchMode::Serve {
+                config_path: config_path.clone(),
+            },
+            opts: GlobalCliOpts {
+                config_path,
+                api_addr,
+                api_explicit,
+                offline,
+                json_output,
+                show_help,
+                rest,
+            },
+        });
+    }
+
+    if rest.is_empty() && !show_help {
+        if json_output {
+            bail!("Global flag --json requires a CLI subcommand");
+        }
+        if api_cli_flag {
+            bail!("Global flag --api requires a CLI subcommand");
+        }
+        if offline {
+            bail!("Global flag --offline requires a CLI subcommand");
+        }
+        return Ok(ParsedCliInvocation {
+            mode: LaunchMode::Serve {
+                config_path: config_path.clone(),
+            },
+            opts: GlobalCliOpts {
+                config_path,
+                api_addr,
+                api_explicit,
+                offline,
+                json_output,
+                show_help,
+                rest,
+            },
+        });
+    }
+
+    Ok(ParsedCliInvocation {
+        mode: LaunchMode::Cli,
+        opts: GlobalCliOpts {
+            config_path,
+            api_addr,
+            api_explicit,
+            offline,
+            json_output,
+            show_help,
+            rest,
+        },
     })
 }
 
-fn normalize_api_addr(raw: &str) -> String {
+/// 顶层启动路由：无子命令或仅传入 `serve [--config <path>]` 时返回 `Serve`，否则进入 CLI（含参数错误）
+pub fn resolve_launch_mode(args: &[String]) -> Result<LaunchMode> {
+    parse_cli_invocation(args).map(|p| p.mode)
+}
+
+/// 判断命令行参数是否应进入 CLI 子命令模式（含参数解析错误时亦返回 `true` 以便输出 CLI 错误而非静默启动守护进程）
+pub fn should_run_cli(args: &[String]) -> bool {
+    !matches!(resolve_launch_mode(args), Ok(LaunchMode::Serve { .. }))
+}
+
+pub fn parse_global_opts(args: &[String]) -> Result<GlobalCliOpts> {
+    parse_cli_invocation(args).map(|p| p.opts)
+}
+
+fn normalize_api_addr(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
-    let without_scheme = trimmed
-        .strip_prefix("http://")
-        .or_else(|| trimmed.strip_prefix("https://"))
-        .unwrap_or(trimmed);
-    without_scheme.trim_end_matches('/').to_string()
+    if trimmed.is_empty() {
+        bail!("--api value cannot be empty");
+    }
+    if trimmed.starts_with("https://") {
+        bail!("--api does not support https:// (FlowX local API uses HTTP)");
+    }
+    let without_scheme = trimmed.strip_prefix("http://").unwrap_or(trimmed);
+    let authority = without_scheme.trim_end_matches('/');
+    if authority.is_empty() || authority.contains('/') {
+        bail!("Invalid --api address '{}': expected HOST:PORT", raw);
+    }
+    Ok(authority.to_string())
 }
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let opts = parse_global_opts(args)?;
+    if opts.show_help {
+        print_help();
+        return Ok(());
+    }
     let Some(cmd) = opts.rest.first().map(|s| s.as_str()) else {
         print_help();
         return Ok(());
@@ -140,7 +357,7 @@ FlowX v{} — Transparent Proxy & Process Routing Engine CLI
 
 USAGE:
   flowx [serve] [--config <flowx.xml>]
-  flowx <SUBCOMMAND> [OPTIONS] [--config <flowx.xml>] [--api <127.0.0.1:40080>] [--json]
+  flowx <SUBCOMMAND> [OPTIONS] [--config <flowx.xml>] [--api <127.0.0.1:40080>] [--offline] [--json]
 
 SUBCOMMANDS:
   status
@@ -148,18 +365,18 @@ SUBCOMMANDS:
 
   node list
   node add --name <NAME> --addr <HOST:PORT> [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U>] [--pass <P>]
-  node update <ID> [--name <NAME>] [--addr <HOST:PORT>] [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U>] [--pass <P>]
+  node update <ID> [--name <NAME>] [--addr <HOST:PORT>] [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U>] [--pass <P> | --clear-password]
   node remove <ID>
   node ping <ID>
       Manage proxy nodes (persists to XML automatically; syncs with live daemon when running).
 
   rule list
   rule add --name <NAME> --action <Direct|Block|Proxy[:NODE_ID]> [--node <NODE_ID>] [--apps <GLOB>] [--targets <HOSTS>] [--ports <PORTS>]
-  rule update <ID> [--name <NAME>] [--action <Direct|Block|Proxy[:NODE_ID]>] [--node <NODE_ID>] [--apps <GLOB>] [--targets <HOSTS>] [--ports <PORTS>]
-  rule toggle <ID> [--enable | --disable]
-  rule move <ID> <up|down|top|bottom>
-  rule remove <ID>
-      Manage top-down routing rules (First-Match Wins).
+  rule update <ID_OR_INDEX> [--name <NAME>] [--action <Direct|Block|Proxy[:NODE_ID]>] [--node <NODE_ID>] [--apps <GLOB>] [--targets <HOSTS>] [--ports <PORTS>] [--enable | --disable]
+  rule toggle <ID_OR_INDEX> [--enable | --disable]
+  rule move <ID_OR_INDEX> <up|down|top|bottom>
+  rule remove <ID_OR_INDEX>
+      Manage top-down routing rules (First-Match Wins; accepts rule ID or 1-based list index).
 
   default [Direct | Block | Proxy:<NODE_ID>] [--node <NODE_ID>]
       Query or update the fallback default action when no enabled rule matches.
@@ -173,23 +390,68 @@ SUBCOMMANDS:
 
 GLOBAL FLAGS:
   --config <PATH>   Path to XML configuration file (default: flowx.xml or $FLOWX_CONFIG)
-  --api <ADDR>      FlowX HTTP API address (default: 127.0.0.1:40080 or $FLOWX_API)
+  --api <ADDR>      FlowX HTTP API address (default: 127.0.0.1:40080 or $FLOWX_API; never falls back to XML)
+  --offline         Operate directly on the local XML config without connecting to the daemon
   --json            Output machine-readable JSON for AI Agents and automation scripts
 ",
         env!("CARGO_PKG_VERSION")
     );
 }
 
-async fn api_request(
+#[derive(Debug)]
+enum ApiTransportError {
+    ConnectionRefused(String),
+    Other(anyhow::Error),
+}
+
+async fn api_request_raw(
     api_addr: &str,
     method: &str,
     path: &str,
     body: Option<&Value>,
-) -> Result< Option<(u16, Value)> > {
-    let stream_res =
-        tokio::time::timeout(Duration::from_millis(800), TcpStream::connect(api_addr)).await;
-    let Ok(Ok(mut stream)) = stream_res else {
-        return Ok(None);
+) -> std::result::Result<(u16, Value), ApiTransportError> {
+    api_request_raw_with_timeouts(
+        api_addr,
+        method,
+        path,
+        body,
+        API_CONNECT_TIMEOUT,
+        API_IO_TIMEOUT,
+    )
+    .await
+}
+
+async fn api_request_raw_with_timeouts(
+    api_addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+) -> std::result::Result<(u16, Value), ApiTransportError> {
+    let mut stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(api_addr)).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Err(ApiTransportError::ConnectionRefused(format!(
+                "Connection refused by FlowX API at {}",
+                api_addr
+            )));
+        }
+        Ok(Err(e)) => {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Failed to connect to FlowX API at {}: {}",
+                api_addr,
+                e
+            )));
+        }
+        Err(_) => {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Timed out connecting to FlowX API at {} after {}ms",
+                api_addr,
+                connect_timeout.as_millis()
+            )));
+        }
     };
 
     let body_str = body.map(|b| b.to_string()).unwrap_or_default();
@@ -209,24 +471,181 @@ async fn api_request(
         )
     };
 
-    stream.write_all(req.as_bytes()).await?;
-    let mut buf = Vec::new();
-    tokio::time::timeout(Duration::from_secs(4), stream.read_to_end(&mut buf)).await??;
+    let io_res = tokio::time::timeout(io_timeout, async {
+        stream.write_all(req.as_bytes()).await?;
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await?;
+        Ok::<Vec<u8>, std::io::Error>(buf)
+    })
+    .await;
 
-    let raw = String::from_utf8_lossy(&buf);
-    let Some((header_part, body_part)) = raw.split_once("\r\n\r\n") else {
-        bail!("Invalid HTTP response from {}", api_addr);
+    let buf = match io_res {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            return Err(ApiTransportError::Other(anyhow!(
+                "I/O error communicating with FlowX API at {}: {}",
+                api_addr,
+                e
+            )));
+        }
+        Err(_) => {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Timed out waiting for HTTP response from FlowX API at {} after {}ms",
+                api_addr,
+                io_timeout.as_millis()
+            )));
+        }
     };
-    let status_line = header_part.lines().next().unwrap_or_default();
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(500);
 
-    let json_val = serde_json::from_str::<Value>(body_part)
-        .unwrap_or_else(|_| json!({ "raw": body_part.trim() }));
-    Ok(Some((status_code, json_val)))
+    let Some(header_sep) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Err(ApiTransportError::Other(anyhow!(
+            "Invalid HTTP response from {} (missing header terminator)",
+            api_addr
+        )));
+    };
+    let header_bytes = &buf[..header_sep];
+    let body_bytes = &buf[header_sep + 4..];
+
+    let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
+        ApiTransportError::Other(anyhow!("Non-UTF-8 HTTP response headers from {}", api_addr))
+    })?;
+    let mut lines = header_str.split("\r\n");
+    let status_line = lines.next().unwrap_or_default();
+    let status_rest = status_line
+        .strip_prefix("HTTP/1.1 ")
+        .or_else(|| status_line.strip_prefix("HTTP/1.0 "))
+        .ok_or_else(|| {
+            ApiTransportError::Other(anyhow!(
+                "Invalid HTTP status line from {}: '{}'",
+                api_addr,
+                status_line
+            ))
+        })?;
+    let code_token = status_rest.split_whitespace().next().unwrap_or_default();
+    if code_token.len() != 3 || !code_token.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ApiTransportError::Other(anyhow!(
+            "Invalid HTTP status code from {}: '{}'",
+            api_addr,
+            status_line
+        )));
+    }
+    let status_code: u16 = code_token.parse().map_err(|_| {
+        ApiTransportError::Other(anyhow!(
+            "Unparseable HTTP status code from {}: '{}'",
+            api_addr,
+            code_token
+        ))
+    })?;
+
+    let mut content_length: Option<usize> = None;
+    for line in lines {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        if k.trim().eq_ignore_ascii_case("content-length") {
+            let trimmed_v = v.trim();
+            if trimmed_v.is_empty() || !trimmed_v.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ApiTransportError::Other(anyhow!(
+                    "Invalid Content-Length header '{}' from {}",
+                    trimmed_v,
+                    api_addr
+                )));
+            }
+            let parsed = trimmed_v.parse::<usize>().map_err(|_| {
+                ApiTransportError::Other(anyhow!(
+                    "Invalid Content-Length value '{}' from {}",
+                    trimmed_v,
+                    api_addr
+                ))
+            })?;
+            if let Some(prev) = content_length
+                && prev != parsed
+            {
+                return Err(ApiTransportError::Other(anyhow!(
+                    "Conflicting Content-Length headers from {}",
+                    api_addr
+                )));
+            }
+            content_length = Some(parsed);
+        }
+    }
+
+    if let Some(expected_len) = content_length {
+        if body_bytes.len() < expected_len {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Truncated HTTP response from {} (expected {} bytes, got {})",
+                api_addr,
+                expected_len,
+                body_bytes.len()
+            )));
+        }
+        if body_bytes.len() > expected_len {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Unexpected trailing bytes in HTTP response from {} (expected {}, got {})",
+                api_addr,
+                expected_len,
+                body_bytes.len()
+            )));
+        }
+    }
+
+    let body_text = std::str::from_utf8(body_bytes).map_err(|_| {
+        ApiTransportError::Other(anyhow!("Response body from {} is not valid UTF-8", api_addr))
+    })?;
+    let json_val = if body_text.trim().is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_str::<Value>(body_text) {
+            Ok(v) => v,
+            Err(e) => {
+                if (200..300).contains(&status_code) {
+                    return Err(ApiTransportError::Other(anyhow!(
+                        "Invalid JSON response body from {}: {}",
+                        api_addr,
+                        e
+                    )));
+                }
+                json!({ "raw": body_text.trim() })
+            }
+        }
+    };
+
+    Ok((status_code, json_val))
+}
+
+async fn api_request_strict(
+    api_addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<(u16, Value)> {
+    match api_request_raw(api_addr, method, path, body).await {
+        Ok(res) => Ok(res),
+        Err(ApiTransportError::ConnectionRefused(msg)) => Err(anyhow!("{}", msg)),
+        Err(ApiTransportError::Other(e)) => Err(e),
+    }
+}
+
+async fn api_request_or_offline(
+    opts: &GlobalCliOpts,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Option<(u16, Value)>> {
+    if opts.offline {
+        return Ok(None);
+    }
+    match api_request_raw(&opts.api_addr, method, path, body).await {
+        Ok(res) => Ok(Some(res)),
+        Err(ApiTransportError::ConnectionRefused(_)) if !opts.api_explicit => Ok(None),
+        Err(ApiTransportError::ConnectionRefused(msg)) => {
+            bail!(
+                "{} (explicit --api / $FLOWX_API target refused connection; pass --offline to edit local XML directly)",
+                msg
+            );
+        }
+        Err(ApiTransportError::Other(e)) => Err(e),
+    }
 }
 
 fn ensure_api_ok(status: u16, val: Value) -> Result<Value> {
@@ -236,6 +655,7 @@ fn ensure_api_ok(status: u16, val: Value) -> Result<Value> {
         let err_msg = val
             .get("error")
             .and_then(|v| v.as_str())
+            .or_else(|| val.get("raw").and_then(|v| v.as_str()))
             .unwrap_or("API request failed");
         bail!("{} (HTTP {})", err_msg, status);
     }
@@ -257,8 +677,7 @@ fn load_offline_runtime(config_path: &str) -> Result<OfflineRuntime> {
     Ok((store, nodes, engine))
 }
 
-fn offline_resolve_rule_id(rule_engine: &RuleEngine, id_or_index: u64) -> Option<u64> {
-    let rules = rule_engine.current_rules();
+fn resolve_rule_id_from_views(rules: &[RuleView], id_or_index: u64) -> Option<u64> {
     if rules.iter().any(|r| r.id == id_or_index) {
         return Some(id_or_index);
     }
@@ -271,52 +690,193 @@ fn offline_resolve_rule_id(rule_engine: &RuleEngine, id_or_index: u64) -> Option
     None
 }
 
-fn parse_flag_map(args: &[String]) -> Result<(Vec<String>, HashMap<String, String>)> {
+fn offline_resolve_rule_id(rule_engine: &RuleEngine, id_or_index: u64) -> Option<u64> {
+    let views = rule_engine.list_rules_view_with_locale(Locale::Zh);
+    resolve_rule_id_from_views(&views, id_or_index)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArgSpec<'a> {
+    cmd_label: &'a str,
+    value_flags: &'a [&'a str],
+    bool_flags: &'a [&'a str],
+    min_pos: usize,
+    max_pos: usize,
+}
+
+fn canonical_flag_group(flag: &str) -> &str {
+    match flag {
+        "server" | "addr" => "addr",
+        "proto" | "protocol" => "protocol",
+        "username" | "user" => "user",
+        "password" | "pass" => "pass",
+        "node-id" | "node" => "node",
+        "app" | "apps" => "apps",
+        "target" | "targets" => "targets",
+        "host" => "target",
+        "port" | "ports" => "ports",
+        "process" | "proc" => "app",
+        "dir" | "direction" => "dir",
+        other => other,
+    }
+}
+
+fn parse_flags_with_spec(
+    args: &[String],
+    spec: ArgSpec<'_>,
+) -> Result<(Vec<String>, HashMap<String, String>)> {
     let mut positionals = Vec::new();
     let mut flags = HashMap::new();
+    let mut seen_groups: HashMap<String, String> = HashMap::new();
+
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if let Some(stripped) = arg.strip_prefix("--") {
-            if let Some((k, v)) = stripped.split_once('=') {
-                flags.insert(k.to_string(), v.to_string());
-            } else if matches!(stripped, "enable" | "disable") {
-                flags.insert(stripped.to_string(), "true".to_string());
-            } else {
+            let (name, val) = if let Some((k, v)) = stripped.split_once('=') {
+                if spec.bool_flags.contains(&k) {
+                    bail!("Option '--{}' does not take a value", k);
+                }
+                if !spec.value_flags.contains(&k) {
+                    bail!("Unknown option '--{}' for `{}`", k, spec.cmd_label);
+                }
+                (k, v.to_string())
+            } else if spec.bool_flags.contains(&stripped) {
+                (stripped, "true".to_string())
+            } else if spec.value_flags.contains(&stripped) {
                 i += 1;
-                let val = args
+                let v = args
                     .get(i)
                     .ok_or_else(|| anyhow!("Missing value for option --{}", stripped))?;
-                flags.insert(stripped.to_string(), val.clone());
+                (stripped, v.clone())
+            } else {
+                bail!("Unknown option '--{}' for `{}`", stripped, spec.cmd_label);
+            };
+
+            let group = if spec.cmd_label == "flowx sim" && name == "port" {
+                "sim-port".to_string()
+            } else if spec.cmd_label == "flowx sim" && name == "target" {
+                "sim-target".to_string()
+            } else {
+                canonical_flag_group(name).to_string()
+            };
+            if let Some(prev) = seen_groups.insert(group, format!("--{}", name)) {
+                bail!(
+                    "Duplicate or conflicting option '--{}' (already set via '{}')",
+                    name,
+                    prev
+                );
             }
+            flags.insert(name.to_string(), val);
+        } else if arg.starts_with('-') {
+            bail!("Unknown option '{}' for `{}`", arg, spec.cmd_label);
         } else {
             positionals.push(arg.clone());
         }
         i += 1;
     }
+
+    if positionals.len() > spec.max_pos {
+        bail!(
+            "Unexpected positional argument '{}' for `{}`",
+            positionals[spec.max_pos],
+            spec.cmd_label
+        );
+    }
+    if positionals.len() < spec.min_pos {
+        bail!(
+            "Missing required positional argument for `{}` (expected at least {}, got {})",
+            spec.cmd_label,
+            spec.min_pos,
+            positionals.len()
+        );
+    }
+
     Ok((positionals, flags))
 }
 
 fn split_action_spec(raw: &str, explicit_node: Option<u32>) -> Result<(String, Option<u32>)> {
     if let Some((act_part, id_part)) = raw.split_once(':') {
-        let nid = id_part
+        let parsed_nid = id_part
             .trim()
             .parse::<u32>()
             .with_context(|| format!("Invalid node ID in action '{}'", raw))?;
-        Ok((act_part.trim().to_string(), Some(nid)))
+        if let Some(explicit) = explicit_node
+            && explicit != parsed_nid
+        {
+            bail!(
+                "Conflicting node IDs specified in --action '{}' and --node {}",
+                raw,
+                explicit
+            );
+        }
+        Ok((act_part.trim().to_string(), Some(parsed_nid)))
     } else {
         Ok((raw.trim().to_string(), explicit_node))
     }
 }
 
+fn resolve_id_arg(
+    pos: &[String],
+    flags: &HashMap<String, String>,
+    missing_msg: &str,
+) -> Result<String> {
+    match (pos.first(), flags.get("id")) {
+        (Some(_), Some(_)) => bail!("Cannot specify both positional <ID> and --id"),
+        (Some(p), None) => Ok(p.clone()),
+        (None, Some(f)) => Ok(f.clone()),
+        (None, None) => bail!("{}", missing_msg),
+    }
+}
+
+enum RuleBackend {
+    Online {
+        rules: Vec<RuleView>,
+    },
+    Offline {
+        store: ConfigStore,
+        nodes: RwLock<HashMap<u32, ProxyNodeEntry>>,
+        engine: RuleEngine,
+    },
+}
+
+async fn load_rule_backend(opts: &GlobalCliOpts) -> Result<RuleBackend> {
+    if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/rules", None).await? {
+        let rules: Vec<RuleView> = serde_json::from_value(ensure_api_ok(st, val)?)?;
+        Ok(RuleBackend::Online { rules })
+    } else {
+        let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
+        Ok(RuleBackend::Offline {
+            store,
+            nodes,
+            engine,
+        })
+    }
+}
+
 async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
-    if let Some((status, sys_val)) = api_request(&opts.api_addr, "GET", "/api/system", None).await?
-        && status == 200
+    let tail = if opts.rest.len() > 1 {
+        &opts.rest[1..]
+    } else {
+        &[]
+    };
+    let _ = parse_flags_with_spec(
+        tail,
+        ArgSpec {
+            cmd_label: "flowx status",
+            value_flags: &[],
+            bool_flags: &[],
+            min_pos: 0,
+            max_pos: 0,
+        },
+    )?;
+
+    if let Some((status, raw_sys)) = api_request_or_offline(opts, "GET", "/api/system", None).await?
     {
-        let stats_val = api_request(&opts.api_addr, "GET", "/api/stats", None)
-            .await?
-            .and_then(|(st, v)| (st == 200).then_some(v))
-            .unwrap_or_else(|| json!({}));
+        let sys_val = ensure_api_ok(status, raw_sys)?;
+        let (stats_status, raw_stats) =
+            api_request_strict(&opts.api_addr, "GET", "/api/stats", None).await?;
+        let stats_val = ensure_api_ok(stats_status, raw_stats)?;
 
         let out = json!({
             "mode": "online",
@@ -402,12 +962,22 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
     } else {
         &[]
     };
-    let (pos, flags) = parse_flag_map(tail)?;
 
     match sub {
         "list" | "ls" => {
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx node list",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
             let list: Vec<ProxyNodeView> =
-                if let Some((st, val)) = api_request(&opts.api_addr, "GET", "/api/nodes", None).await? {
+                if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/nodes", None).await?
+                {
                     let v = ensure_api_ok(st, val)?;
                     serde_json::from_value(v)?
                 } else {
@@ -445,6 +1015,19 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "add" => {
+            let (_, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx node add",
+                    value_flags: &[
+                        "name", "addr", "server", "protocol", "proto", "user", "username", "pass",
+                        "password",
+                    ],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
             let name = flags
                 .get("name")
                 .cloned()
@@ -471,7 +1054,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             });
 
             let res_val = if let Some((st, val)) =
-                api_request(&opts.api_addr, "POST", "/api/nodes", Some(&payload)).await?
+                api_request_or_offline(opts, "POST", "/api/nodes", Some(&payload)).await?
             {
                 ensure_api_ok(st, val)?
             } else {
@@ -498,55 +1081,50 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "update" | "edit" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing node <ID> for `flowx node update`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx node update",
+                    value_flags: &[
+                        "id", "name", "addr", "server", "protocol", "proto", "user", "username",
+                        "pass", "password",
+                    ],
+                    bool_flags: &["clear-password"],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing node <ID> for `flowx node update`",
+            )?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
-            // 先查询当前节点信息以支持部分字段更新
-            let existing_list: Vec<ProxyNodeView> =
-                if let Some((st, val)) = api_request(&opts.api_addr, "GET", "/api/nodes", None).await? {
-                    serde_json::from_value(ensure_api_ok(st, val)?)?
-                } else {
-                    let (_, nodes, _) = load_offline_runtime(&opts.config_path)?;
-                    let guard = nodes.read().unwrap_or_else(|e| e.into_inner());
-                    guard
-                        .values()
-                        .map(|n| ProxyNodeView {
-                            id: n.id,
-                            name: n.name.clone(),
-                            protocol: n.protocol.clone(),
-                            server_addr: n.server_addr.clone(),
-                            auth_configured: n.username.is_some(),
-                            password_configured: n.client.auth_credentials().1.is_some(),
-                            username: n.username.clone(),
-                        })
-                        .collect()
-                };
-            let current = existing_list
-                .into_iter()
-                .find(|n| n.id == id)
-                .ok_or_else(|| anyhow!("Proxy node #{} not found", id))?;
+            let clear_password_flag = flags.contains_key("clear-password");
+            let pass_flag = flags.get("pass").or_else(|| flags.get("password")).cloned();
+            if clear_password_flag && pass_flag.is_some() {
+                bail!("Cannot specify both --pass and --clear-password");
+            }
 
-            let name = flags.get("name").cloned().unwrap_or(current.name);
-            let server_addr = flags
-                .get("addr")
-                .or_else(|| flags.get("server"))
-                .cloned()
-                .unwrap_or(current.server_addr);
+            let name = flags.get("name").cloned();
+            let server_addr = flags.get("addr").or_else(|| flags.get("server")).cloned();
             let protocol = flags
                 .get("protocol")
                 .or_else(|| flags.get("proto"))
-                .cloned()
-                .unwrap_or(current.protocol);
-            let username = match flags.get("user").or_else(|| flags.get("username")) {
-                Some(u) if u.is_empty() => None,
-                Some(u) => Some(u.clone()),
-                None => current.username,
+                .cloned();
+            let (username, clear_username) =
+                match flags.get("user").or_else(|| flags.get("username")) {
+                    Some(u) if u.trim().is_empty() => (None, Some(true)),
+                    Some(u) => (Some(u.clone()), None),
+                    None => (None, None),
+                };
+            let clear_password = clear_password_flag.then_some(true);
+            let keep_password = if clear_password_flag {
+                Some(false)
+            } else {
+                None
             };
-            let pass_flag = flags.get("pass").or_else(|| flags.get("password")).cloned();
-            let keep_password = pass_flag.is_none() && username.is_some();
 
             let payload = json!({
                 "id": id,
@@ -556,17 +1134,19 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 "username": username,
                 "password": pass_flag,
                 "keep_password": keep_password,
+                "clear_password": clear_password,
+                "clear_username": clear_username,
             });
 
             let res_val = if let Some((st, val)) =
-                api_request(&opts.api_addr, "PUT", "/api/nodes", Some(&payload)).await?
+                api_request_or_offline(opts, "PATCH", "/api/nodes", Some(&payload)).await?
             {
                 ensure_api_ok(st, val)?
             } else {
                 let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-                let req: UpdateNodeRequest = serde_json::from_value(payload)?;
+                let req: PatchNodeRequest = serde_json::from_value(payload)?;
                 let (st, _, body) =
-                    handle_update_node(req, &nodes, &DEFAULT_SELF_PORTS, Locale::Zh);
+                    handle_patch_node(req, &nodes, &DEFAULT_SELF_PORTS, Locale::Zh);
                 let val: Value = serde_json::from_str(&body)?;
                 if st != "200 OK" {
                     bail!("{}", val["error"].as_str().unwrap_or(&body));
@@ -577,20 +1157,33 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
 
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&res_val)?);
+            } else if let Some(ref n) = name {
+                println!("Updated proxy node #{} ({})", id, n);
             } else {
-                println!("Updated proxy node #{} ({})", id, name);
+                println!("Updated proxy node #{}", id);
             }
             Ok(())
         }
         "remove" | "delete" | "rm" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing node <ID> for `flowx node remove`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx node remove",
+                    value_flags: &["id"],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing node <ID> for `flowx node remove`",
+            )?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
-            let res_val = if let Some((st, val)) = api_request(
-                &opts.api_addr,
+            let res_val = if let Some((st, val)) = api_request_or_offline(
+                opts,
                 "DELETE",
                 &format!("/api/nodes?id={}", id),
                 None,
@@ -632,14 +1225,22 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "ping" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing node <ID> for `flowx node ping`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx node ping",
+                    value_flags: &["id"],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str =
+                resolve_id_arg(&pos, &flags, "Missing node <ID> for `flowx node ping`")?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
-            let res_val = if let Some((st, val)) = api_request(
-                &opts.api_addr,
+            let res_val = if let Some((st, val)) = api_request_or_offline(
+                opts,
                 "POST",
                 "/api/nodes/ping",
                 Some(&json!({ "id": id })),
@@ -693,12 +1294,22 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
     } else {
         &[]
     };
-    let (pos, flags) = parse_flag_map(tail)?;
 
     match sub {
         "list" | "ls" => {
-            let list: Vec<crate::router::RuleView> =
-                if let Some((st, val)) = api_request(&opts.api_addr, "GET", "/api/rules", None).await? {
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx rule list",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            let list: Vec<RuleView> =
+                if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/rules", None).await?
+                {
                     serde_json::from_value(ensure_api_ok(st, val)?)?
                 } else {
                     let (_, _, engine) = load_offline_runtime(&opts.config_path)?;
@@ -731,6 +1342,19 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "add" => {
+            let (_, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx rule add",
+                    value_flags: &[
+                        "name", "action", "node", "node-id", "apps", "app", "targets", "target",
+                        "ports", "port",
+                    ],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
             let name = flags
                 .get("name")
                 .cloned()
@@ -761,7 +1385,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             });
 
             let res_val = if let Some((st, val)) =
-                api_request(&opts.api_addr, "POST", "/api/rules", Some(&payload)).await?
+                api_request_or_offline(opts, "POST", "/api/rules", Some(&payload)).await?
             {
                 ensure_api_ok(st, val)?
             } else {
@@ -788,126 +1412,177 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "update" | "edit" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing rule <ID> for `flowx rule update`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx rule update",
+                    value_flags: &[
+                        "id", "name", "action", "node", "node-id", "apps", "app", "targets",
+                        "target", "ports", "port",
+                    ],
+                    bool_flags: &["enable", "disable"],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing rule <ID> for `flowx rule update`",
+            )?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
 
-            let list: Vec<crate::router::RuleView> =
-                if let Some((st, val)) = api_request(&opts.api_addr, "GET", "/api/rules", None).await? {
-                    serde_json::from_value(ensure_api_ok(st, val)?)?
-                } else {
-                    let (_, _, engine) = load_offline_runtime(&opts.config_path)?;
-                    engine.list_rules_view_with_locale(Locale::Zh)
-                };
-
-            let current = list
-                .iter()
-                .find(|r| r.id == raw_id)
-                .or_else(|| {
-                    if raw_id >= 1 {
-                        list.get((raw_id as usize) - 1)
-                    } else {
-                        None
-                    }
-                })
-                .cloned()
-                .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-
-            let name = flags.get("name").cloned().unwrap_or(current.name);
-            let explicit_node = match flags.get("node").or_else(|| flags.get("node-id")) {
-                Some(s) => Some(s.parse::<u32>().context("Invalid --node ID")?),
-                None => current.node_id,
-            };
-            let (action, node_id) = match flags.get("action") {
-                Some(act_raw) => split_action_spec(act_raw, explicit_node)?,
-                None => (current.action_type, explicit_node),
-            };
-            let apps = flags
-                .get("apps")
-                .or_else(|| flags.get("app"))
-                .cloned()
-                .unwrap_or(current.apps);
-            let targets = flags
-                .get("targets")
-                .or_else(|| flags.get("target"))
-                .cloned()
-                .unwrap_or(current.targets);
-            let ports = flags
-                .get("ports")
-                .or_else(|| flags.get("port"))
-                .cloned()
-                .unwrap_or(current.ports);
-
-            let payload = json!({
-                "id": current.id,
-                "name": name,
-                "apps": apps,
-                "targets": targets,
-                "ports": ports,
-                "action": action,
-                "node_id": node_id,
-            });
-
-            let res_val = if let Some((st, val)) =
-                api_request(&opts.api_addr, "PUT", "/api/rules", Some(&payload)).await?
-            {
-                ensure_api_ok(st, val)?
-            } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-                let resolved_id = offline_resolve_rule_id(&engine, raw_id)
-                    .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                let mut req: UpdateRuleRequest = serde_json::from_value(payload)?;
-                req.id = resolved_id;
-                let (st, _, body) = handle_update_rule(req, &engine, &nodes, Locale::Zh);
-                let val: Value = serde_json::from_str(&body)?;
-                if st != "200 OK" {
-                    bail!("{}", val["error"].as_str().unwrap_or(&body));
-                }
-                store.save_runtime(&nodes, &engine)?;
-                val
-            };
-
-            if opts.json_output {
-                println!("{}", serde_json::to_string_pretty(&res_val)?);
-            } else {
-                println!("Updated routing rule #{} ({})", current.id, name);
+            let has_enable = flags.contains_key("enable");
+            let has_disable = flags.contains_key("disable");
+            if has_enable && has_disable {
+                bail!("Cannot specify both --enable and --disable");
             }
-            Ok(())
-        }
-        "toggle" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing rule <ID> for `flowx rule toggle`"))?;
-            let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
-            let enabled = if flags.contains_key("enable") {
+            let enabled = if has_enable {
                 Some(true)
-            } else if flags.contains_key("disable") {
+            } else if has_disable {
                 Some(false)
             } else {
                 None
             };
 
-            let res_val = if let Some((st, val)) = api_request(
-                &opts.api_addr,
-                "POST",
-                "/api/rules/toggle",
-                Some(&json!({ "id": raw_id, "enabled": enabled })),
-            )
-            .await?
-            {
-                ensure_api_ok(st, val)?
+            let explicit_node = match flags.get("node").or_else(|| flags.get("node-id")) {
+                Some(s) => Some(s.parse::<u32>().context("Invalid --node ID")?),
+                None => None,
+            };
+            let (action, node_id) = match flags.get("action") {
+                Some(act_raw) => {
+                    let (a, nid) = split_action_spec(act_raw, explicit_node)?;
+                    (Some(a), nid)
+                }
+                None => (None, explicit_node),
+            };
+            let name = flags.get("name").cloned();
+            let apps = flags.get("apps").or_else(|| flags.get("app")).cloned();
+            let targets = flags
+                .get("targets")
+                .or_else(|| flags.get("target"))
+                .cloned();
+            let ports = flags.get("ports").or_else(|| flags.get("port")).cloned();
+
+            let (resolved_id, res_val) = match load_rule_backend(opts).await? {
+                RuleBackend::Online { rules } => {
+                    let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let payload = json!({
+                        "id": resolved_id,
+                        "name": name,
+                        "apps": apps,
+                        "targets": targets,
+                        "ports": ports,
+                        "action": action,
+                        "node_id": node_id,
+                        "enabled": enabled,
+                    });
+                    let (st, val) = api_request_strict(
+                        &opts.api_addr,
+                        "PATCH",
+                        "/api/rules",
+                        Some(&payload),
+                    )
+                    .await?;
+                    (resolved_id, ensure_api_ok(st, val)?)
+                }
+                RuleBackend::Offline {
+                    store,
+                    nodes,
+                    engine,
+                } => {
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let payload = json!({
+                        "id": resolved_id,
+                        "name": name,
+                        "apps": apps,
+                        "targets": targets,
+                        "ports": ports,
+                        "action": action,
+                        "node_id": node_id,
+                        "enabled": enabled,
+                    });
+                    let req: PatchRuleRequest = serde_json::from_value(payload)?;
+                    let (st, _, body) = handle_patch_rule(req, &engine, &nodes, Locale::Zh);
+                    let val: Value = serde_json::from_str(&body)?;
+                    if st != "200 OK" {
+                        bail!("{}", val["error"].as_str().unwrap_or(&body));
+                    }
+                    store.save_runtime(&nodes, &engine)?;
+                    (resolved_id, val)
+                }
+            };
+
+            if opts.json_output {
+                println!("{}", serde_json::to_string_pretty(&res_val)?);
+            } else if let Some(ref n) = name {
+                println!("Updated routing rule #{} ({})", resolved_id, n);
             } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-                let resolved_id = offline_resolve_rule_id(&engine, raw_id)
-                    .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                let next_state = engine
-                    .toggle_rule(resolved_id, enabled)
-                    .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                store.save_runtime(&nodes, &engine)?;
-                json!({ "ok": true, "id": resolved_id, "enabled": next_state })
+                println!("Updated routing rule #{}", resolved_id);
+            }
+            Ok(())
+        }
+        "toggle" => {
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx rule toggle",
+                    value_flags: &["id"],
+                    bool_flags: &["enable", "disable"],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing rule <ID> for `flowx rule toggle`",
+            )?;
+            let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
+            let has_enable = flags.contains_key("enable");
+            let has_disable = flags.contains_key("disable");
+            if has_enable && has_disable {
+                bail!("Cannot specify both --enable and --disable");
+            }
+            let enabled = if has_enable {
+                Some(true)
+            } else if has_disable {
+                Some(false)
+            } else {
+                None
+            };
+
+            let (resolved_id, res_val) = match load_rule_backend(opts).await? {
+                RuleBackend::Online { rules } => {
+                    let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let (st, val) = api_request_strict(
+                        &opts.api_addr,
+                        "POST",
+                        "/api/rules/toggle",
+                        Some(&json!({ "id": resolved_id, "enabled": enabled })),
+                    )
+                    .await?;
+                    (resolved_id, ensure_api_ok(st, val)?)
+                }
+                RuleBackend::Offline {
+                    store,
+                    nodes,
+                    engine,
+                } => {
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let next_state = engine
+                        .toggle_rule(resolved_id, enabled)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    store.save_runtime(&nodes, &engine)?;
+                    (
+                        resolved_id,
+                        json!({ "ok": true, "id": resolved_id, "enabled": next_state }),
+                    )
+                }
             };
 
             if opts.json_output {
@@ -915,45 +1590,67 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 println!(
                     "Rule #{} enabled={}",
-                    raw_id,
+                    resolved_id,
                     res_val["enabled"].as_bool().unwrap_or(false)
                 );
             }
             Ok(())
         }
         "move" | "mv" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing rule <ID> for `flowx rule move`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx rule move",
+                    value_flags: &["id", "dir", "direction"],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 2,
+                },
+            )?;
+            let id_str =
+                resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule move`")?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
-            let direction = pos
-                .get(1)
-                .or_else(|| flags.get("dir"))
-                .or_else(|| flags.get("direction"))
-                .cloned()
-                .ok_or_else(|| anyhow!("Missing direction <up|down|top|bottom>"))?;
-
-            let res_val = if let Some((st, val)) = api_request(
-                &opts.api_addr,
-                "POST",
-                "/api/rules/move",
-                Some(&json!({ "id": raw_id, "direction": direction })),
-            )
-            .await?
-            {
-                ensure_api_ok(st, val)?
-            } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-                let resolved_id = offline_resolve_rule_id(&engine, raw_id)
-                    .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                let moved = engine
-                    .move_rule(resolved_id, &direction)
-                    .ok_or_else(|| anyhow!("Invalid move target or direction '{}'", direction))?;
-                if moved {
-                    store.save_runtime(&nodes, &engine)?;
+            let flag_dir = flags.get("dir").or_else(|| flags.get("direction"));
+            let direction = match (pos.get(1), flag_dir) {
+                (Some(_), Some(_)) => {
+                    bail!("Cannot specify both positional <DIRECTION> and --dir/--direction")
                 }
-                json!({ "ok": true, "id": resolved_id, "moved": moved })
+                (Some(p), None) => p.clone(),
+                (None, Some(f)) => f.clone(),
+                (None, None) => bail!("Missing direction <up|down|top|bottom>"),
+            };
+
+            let (resolved_id, res_val) = match load_rule_backend(opts).await? {
+                RuleBackend::Online { rules } => {
+                    let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let (st, val) = api_request_strict(
+                        &opts.api_addr,
+                        "POST",
+                        "/api/rules/move",
+                        Some(&json!({ "id": resolved_id, "direction": direction })),
+                    )
+                    .await?;
+                    (resolved_id, ensure_api_ok(st, val)?)
+                }
+                RuleBackend::Offline {
+                    store,
+                    nodes,
+                    engine,
+                } => {
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let moved = engine
+                        .move_rule(resolved_id, &direction)
+                        .ok_or_else(|| anyhow!("Invalid move target or direction '{}'", direction))?;
+                    if moved {
+                        store.save_runtime(&nodes, &engine)?;
+                    }
+                    (
+                        resolved_id,
+                        json!({ "ok": true, "id": resolved_id, "moved": moved }),
+                    )
+                }
             };
 
             if opts.json_output {
@@ -961,7 +1658,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 println!(
                     "Rule #{} move {} (moved={})",
-                    raw_id,
+                    resolved_id,
                     direction,
                     res_val["moved"].as_bool().unwrap_or(false)
                 );
@@ -969,36 +1666,55 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "remove" | "delete" | "rm" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing rule <ID> for `flowx rule remove`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx rule remove",
+                    value_flags: &["id"],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing rule <ID> for `flowx rule remove`",
+            )?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
 
-            let res_val = if let Some((st, val)) = api_request(
-                &opts.api_addr,
-                "DELETE",
-                &format!("/api/rules?id={}", raw_id),
-                None,
-            )
-            .await?
-            {
-                ensure_api_ok(st, val)?
-            } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-                let resolved_id = offline_resolve_rule_id(&engine, raw_id)
-                    .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                if !engine.delete_rule(resolved_id) {
-                    bail!("Routing rule #{} not found", raw_id);
+            let (resolved_id, res_val) = match load_rule_backend(opts).await? {
+                RuleBackend::Online { rules } => {
+                    let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    let (st, val) = api_request_strict(
+                        &opts.api_addr,
+                        "DELETE",
+                        &format!("/api/rules?id={}", resolved_id),
+                        None,
+                    )
+                    .await?;
+                    (resolved_id, ensure_api_ok(st, val)?)
                 }
-                store.save_runtime(&nodes, &engine)?;
-                json!({ "ok": true, "id": resolved_id })
+                RuleBackend::Offline {
+                    store,
+                    nodes,
+                    engine,
+                } => {
+                    let resolved_id = offline_resolve_rule_id(&engine, raw_id)
+                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                    if !engine.delete_rule(resolved_id) {
+                        bail!("Routing rule #{} not found", raw_id);
+                    }
+                    store.save_runtime(&nodes, &engine)?;
+                    (resolved_id, json!({ "ok": true, "id": resolved_id }))
+                }
             };
 
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&res_val)?);
             } else {
-                println!("Removed routing rule #{}", raw_id);
+                println!("Removed routing rule #{}", resolved_id);
             }
             Ok(())
         }
@@ -1012,9 +1728,23 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
     } else {
         &[]
     };
-    let (pos, flags) = parse_flag_map(tail)?;
+    let (pos, flags) = parse_flags_with_spec(
+        tail,
+        ArgSpec {
+            cmd_label: "flowx default",
+            value_flags: &["action", "node", "node-id"],
+            bool_flags: &[],
+            min_pos: 0,
+            max_pos: 1,
+        },
+    )?;
 
-    let action_arg = pos.first().or_else(|| flags.get("action")).cloned();
+    let action_arg = match (pos.first(), flags.get("action")) {
+        (Some(_), Some(_)) => bail!("Cannot specify both positional <ACTION> and --action"),
+        (Some(p), None) => Some(p.clone()),
+        (None, Some(f)) => Some(f.clone()),
+        (None, None) => None,
+    };
     if let Some(raw_act) = action_arg {
         let explicit_node = match flags.get("node").or_else(|| flags.get("node-id")) {
             Some(s) => Some(s.parse::<u32>().context("Invalid --node ID")?),
@@ -1027,7 +1757,7 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         });
 
         let res_val = if let Some((st, val)) =
-            api_request(&opts.api_addr, "POST", "/api/rules/default", Some(&payload)).await?
+            api_request_or_offline(opts, "POST", "/api/rules/default", Some(&payload)).await?
         {
             ensure_api_ok(st, val)?
         } else {
@@ -1053,10 +1783,13 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         return Ok(());
     }
 
+    if flags.contains_key("node") || flags.contains_key("node-id") {
+        bail!("--node requires an action argument (e.g. `flowx default Proxy --node 101`)");
+    }
+
     // 未提供新动作时查询当前默认兜底动作
-    if let Some((st, sys_val)) = api_request(&opts.api_addr, "GET", "/api/system", None).await?
-        && st == 200
-    {
+    if let Some((st, raw_sys)) = api_request_or_offline(opts, "GET", "/api/system", None).await? {
+        let sys_val = ensure_api_ok(st, raw_sys)?;
         let out = json!({
             "default_action": sys_val["default_action"],
             "default_action_type": sys_val["default_action_type"],
@@ -1095,14 +1828,24 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
     } else {
         &[]
     };
-    let (pos, flags) = parse_flag_map(tail)?;
+    let (pos, flags) = parse_flags_with_spec(
+        tail,
+        ArgSpec {
+            cmd_label: "flowx sim",
+            value_flags: &["target", "host", "app", "process", "proc", "port"],
+            bool_flags: &[],
+            min_pos: 0,
+            max_pos: 1,
+        },
+    )?;
 
-    let target = flags
-        .get("target")
-        .or_else(|| flags.get("host"))
-        .or_else(|| pos.first())
-        .cloned()
-        .ok_or_else(|| anyhow!("Missing --target <HOST[:PORT]> for `flowx sim`"))?;
+    let flag_target = flags.get("target").or_else(|| flags.get("host"));
+    let target = match (pos.first(), flag_target) {
+        (Some(_), Some(_)) => bail!("Cannot specify both positional <TARGET> and --target"),
+        (Some(p), None) => p.clone(),
+        (None, Some(f)) => f.clone(),
+        (None, None) => bail!("Missing --target <HOST[:PORT]> for `flowx sim`"),
+    };
     let process = flags
         .get("app")
         .or_else(|| flags.get("process"))
@@ -1120,7 +1863,7 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
     });
 
     let res_val = if let Some((st, val)) =
-        api_request(&opts.api_addr, "POST", "/api/rules/simulate", Some(&payload)).await?
+        api_request_or_offline(opts, "POST", "/api/rules/simulate", Some(&payload)).await?
     {
         ensure_api_ok(st, val)?
     } else {
@@ -1162,21 +1905,30 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
 }
 
 async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
+    if opts.offline {
+        bail!("`flowx conn` requires a running FlowX daemon and cannot be used with --offline");
+    }
     let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("list");
     let tail = if opts.rest.len() > 2 {
         &opts.rest[2..]
     } else {
         &[]
     };
-    let (pos, flags) = parse_flag_map(tail)?;
 
     match sub {
         "list" | "ls" => {
-            let Some((st, val)) =
-                api_request(&opts.api_addr, "GET", "/api/connections", None).await?
-            else {
-                bail!("FlowX daemon is not running at {}", opts.api_addr);
-            };
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx conn list",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            let (st, val) =
+                api_request_strict(&opts.api_addr, "GET", "/api/connections", None).await?;
             let v = ensure_api_ok(st, val)?;
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&v)?);
@@ -1200,21 +1952,26 @@ async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
             Ok(())
         }
         "kill" => {
-            let id_str = pos
-                .first()
-                .or_else(|| flags.get("id"))
-                .ok_or_else(|| anyhow!("Missing connection <ID> for `flowx conn kill`"))?;
+            let (pos, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx conn kill",
+                    value_flags: &["id"],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 1,
+                },
+            )?;
+            let id_str =
+                resolve_id_arg(&pos, &flags, "Missing connection <ID> for `flowx conn kill`")?;
             let id: u64 = id_str.parse().context("Invalid connection ID")?;
-            let Some((st, val)) = api_request(
+            let (st, val) = api_request_strict(
                 &opts.api_addr,
                 "POST",
                 &format!("/api/connections/kill?id={}", id),
                 None,
             )
-            .await?
-            else {
-                bail!("FlowX daemon is not running at {}", opts.api_addr);
-            };
+            .await?;
             let v = ensure_api_ok(st, val)?;
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&v)?);
@@ -1234,30 +1991,232 @@ async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::ApiServer;
+    use crate::monitor::ConnectionManager;
+    use crate::outbound::{chain::ProxyNode, socks5::Socks5Client};
+    use crate::router::Rule;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::watch;
 
     #[test]
     fn test_should_run_cli_detection() {
         assert!(!should_run_cli(&["flowx".into()]));
-        assert!(!should_run_cli(&[
-            "flowx".into(),
-            "--config".into(),
-            "custom.xml".into()
-        ]));
-        assert!(!should_run_cli(&[
-            "flowx".into(),
-            "serve".into(),
-            "--config=custom.xml".into()
-        ]));
+        assert_eq!(
+            resolve_launch_mode(&["flowx".into(), "--config".into(), "custom.xml".into()]).unwrap(),
+            LaunchMode::Serve {
+                config_path: "custom.xml".into()
+            }
+        );
+        assert_eq!(
+            resolve_launch_mode(&["flowx".into(), "serve".into(), "--config=custom.xml".into()])
+                .unwrap(),
+            LaunchMode::Serve {
+                config_path: "custom.xml".into()
+            }
+        );
         assert!(should_run_cli(&["flowx".into(), "status".into()]));
         assert!(should_run_cli(&["flowx".into(), "--help".into()]));
         assert!(should_run_cli(&[
             "flowx".into(),
-            "--config".into(),
-            "a.xml".into(),
-            "sim".into(),
-            "--target".into(),
-            "github.com".into()
+            "serve".into(),
+            "--help".into()
         ]));
+        assert!(should_run_cli(&["flowx".into(), "--config".into()]));
+        assert!(resolve_launch_mode(&["flowx".into(), "--config".into()]).is_err());
+        assert!(should_run_cli(&["flowx".into(), "--json".into(), "serve".into()]));
+        assert!(parse_global_opts(&["flowx".into(), "--json".into(), "serve".into()]).is_err());
+        assert!(should_run_cli(&["flowx".into(), "--unknown".into()]));
+        assert!(parse_global_opts(&["flowx".into(), "--unknown".into()]).is_err());
+
+        // Value matching a global flag name (e.g. `--pass --json`) stays bound to `--pass`
+        let opts = parse_global_opts(&[
+            "flowx".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "N".into(),
+            "--addr".into(),
+            "10.0.0.1:1080".into(),
+            "--pass".into(),
+            "--json".into(),
+        ])
+        .unwrap();
+        assert!(!opts.json_output);
+        assert!(opts.rest.ends_with(&["--pass".into(), "--json".into()]));
+    }
+
+    #[tokio::test]
+    async fn test_cli_strict_arg_validation() {
+        let mut temp_cfg = std::env::current_dir().unwrap().join("target");
+        temp_cfg.push(format!("flowx_cli_unused_{}.xml", std::process::id()));
+        let _ = std::fs::remove_file(&temp_cfg);
+        let cfg_str = temp_cfg.to_string_lossy().to_string();
+
+        // Unknown typo flag `--targe` must fail
+        let err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "rule".into(),
+            "add".into(),
+            "--name".into(),
+            "Bad".into(),
+            "--action".into(),
+            "Direct".into(),
+            "--targe".into(),
+            "github.com".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("Unknown option '--targe'"));
+
+        // Extra positional argument on `status` must fail
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--offline".into(),
+                "status".into(),
+                "extra".into()
+            ])
+            .await
+            .is_err()
+        );
+
+        // Mutually exclusive `--enable` + `--disable` must fail
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--config".into(),
+                cfg_str.clone(),
+                "--offline".into(),
+                "rule".into(),
+                "toggle".into(),
+                "1".into(),
+                "--enable".into(),
+                "--disable".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        // Mutually exclusive `--pass` + `--clear-password` must fail
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--config".into(),
+                cfg_str.clone(),
+                "--offline".into(),
+                "node".into(),
+                "update".into(),
+                "101".into(),
+                "--pass".into(),
+                "secret".into(),
+                "--clear-password".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        // Mutually exclusive `--api` + `--offline` must fail
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--api".into(),
+                "127.0.0.1:40080".into(),
+                "--offline".into(),
+                "status".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        // `flowx serve --help` prints help and succeeds cleanly
+        run_cli(&["flowx".into(), "serve".into(), "--help".into()])
+            .await
+            .unwrap();
+
+        assert!(!temp_cfg.exists());
+    }
+
+    #[tokio::test]
+    async fn test_cli_explicit_api_and_timeout_no_offline_fallback() {
+        let mut temp_cfg = std::env::current_dir().unwrap().join("target");
+        temp_cfg.push(format!("flowx_cli_nofallback_{}.xml", std::process::id()));
+        let _ = std::fs::remove_file(&temp_cfg);
+        let cfg_str = temp_cfg.to_string_lossy().to_string();
+
+        // Bind then drop ephemeral listener to get a guaranteed refused localhost port
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--api".into(),
+            closed_addr,
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "ShouldFail".into(),
+            "--addr".into(),
+            "10.0.0.1:1080".into(),
+        ])
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("refused"), "unexpected error message: {}", msg);
+        assert!(
+            !temp_cfg.exists(),
+            "Explicit --api refusal must not silently create or mutate local XML"
+        );
+
+        // Stalled server socket that accepts and sleeps -> timeout error (never silent fallback)
+        let stall_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stall_addr = stall_listener.local_addr().unwrap().to_string();
+        let _stall_task = tokio::spawn(async move {
+            if let Ok((_sock, _)) = stall_listener.accept().await {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        let timeout_err = api_request_raw_with_timeouts(
+            &stall_addr,
+            "GET",
+            "/api/system",
+            None,
+            Duration::from_millis(500),
+            Duration::from_millis(80),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(timeout_err, ApiTransportError::Other(_)));
+
+        // Truncated HTTP response (EOF before Content-Length) must fail as Other error
+        let trunc_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let trunc_addr = trunc_listener.local_addr().unwrap().to_string();
+        let _trunc_task = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = trunc_listener.accept().await {
+                let mut req_buf = [0u8; 512];
+                let _ = sock.read(&mut req_buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\n{\"ok\":")
+                    .await;
+            }
+        });
+        let trunc_err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str,
+            "--api".into(),
+            trunc_addr,
+            "status".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(trunc_err.to_string().contains("Truncated HTTP response"));
     }
 
     #[tokio::test]
@@ -1266,17 +2225,13 @@ mod tests {
         path.push(format!("flowx_cli_test_{}.xml", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg_str = path.to_string_lossy().to_string();
-        // 使用未监听端口强制触发离线 XML 模式
-        let unused_api = "127.0.0.1:59999";
 
-        // 1. 添加节点 (离线初始化并写入默认配置 + 新节点 #102)
+        // 1. 添加节点 (显式 `--offline` 离线初始化并写入默认配置 + 新节点 #102，密码刻意命名为 `--json`)
         run_cli(&[
             "flowx".into(),
             "--config".into(),
             cfg_str.clone(),
-            "--api".into(),
-            unused_api.into(),
-            "--json".into(),
+            "--offline".into(),
             "node".into(),
             "add".into(),
             "--name".into(),
@@ -1285,17 +2240,48 @@ mod tests {
             "10.20.0.1:1080".into(),
             "--protocol".into(),
             "SOCKS5".into(),
+            "--user".into(),
+            "alice".into(),
+            "--pass".into(),
+            "--json".into(),
         ])
         .await
         .unwrap();
+
+        // 验证 `--pass --json` 写入了密码而不是被解析为全局 `--json`
+        let store = ConfigStore::new(&path);
+        let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
+        assert_eq!(
+            rt.proxy_nodes.get(&102).unwrap().client.auth_credentials().1,
+            Some("--json")
+        );
+
+        // 1b. 使用 `--clear-password` 清除节点密码
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "node".into(),
+            "update".into(),
+            "102".into(),
+            "--clear-password".into(),
+        ])
+        .await
+        .unwrap();
+        let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
+        assert_eq!(
+            rt.proxy_nodes.get(&102).unwrap().client.auth_credentials().1,
+            None
+        );
 
         // 2. 添加规则指向新节点 #102
         run_cli(&[
             "flowx".into(),
             "--config".into(),
             cfg_str.clone(),
-            "--api".into(),
-            unused_api.into(),
+            "--offline".into(),
             "--json".into(),
             "rule".into(),
             "add".into(),
@@ -1318,8 +2304,7 @@ mod tests {
             "flowx".into(),
             "--config".into(),
             cfg_str.clone(),
-            "--api".into(),
-            unused_api.into(),
+            "--offline".into(),
             "--json".into(),
             "default".into(),
             "Proxy:102".into(),
@@ -1332,8 +2317,7 @@ mod tests {
             "flowx".into(),
             "--config".into(),
             cfg_str.clone(),
-            "--api".into(),
-            unused_api.into(),
+            "--offline".into(),
             "--json".into(),
             "sim".into(),
             "--app".into(),
@@ -1345,12 +2329,152 @@ mod tests {
         .unwrap();
 
         // 验证 XML 文件中的最终状态
-        let store = ConfigStore::new(&path);
         let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
         assert!(rt.proxy_nodes.contains_key(&102));
         assert!(rt.rules.iter().any(|r| r.name == "GitRule"));
         assert_eq!(rt.default_action, Action::Proxy(102));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_cli_online_patch_and_1based_rule_index() {
+        let mut nodes_map = HashMap::new();
+        nodes_map.insert(
+            101,
+            ProxyNodeEntry {
+                id: 101,
+                name: "MainProxy".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: "127.0.0.1:10808".into(),
+                username: Some("bob".into()),
+                client: ProxyNode::Socks5(
+                    Socks5Client::new("127.0.0.1:10808")
+                        .with_auth("bob".to_string(), "oldpass".to_string()),
+                ),
+            },
+        );
+        let proxy_nodes = Arc::new(RwLock::new(nodes_map));
+        let r1 = Rule::from_raw_with_id(
+            100,
+            "RuleOne",
+            true,
+            None,
+            Some("example.com"),
+            None,
+            Action::Direct,
+        );
+        let r2 = Rule::from_raw_with_id(
+            200,
+            "RuleTwo",
+            true,
+            None,
+            Some("github.com"),
+            Some("443"),
+            Action::Proxy(101),
+        );
+        let rule_engine = Arc::new(RuleEngine::new(vec![r1, r2], Action::Direct));
+        let monitor = Arc::new(ConnectionManager::new());
+
+        let server = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            monitor,
+            Arc::clone(&rule_engine),
+            Arc::clone(&proxy_nodes),
+        );
+        let listener = server.bind().await.unwrap();
+        let api_addr = listener.local_addr().unwrap().to_string();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv_handle = tokio::spawn(async move {
+            let _ = server.run(listener, shutdown_rx).await;
+        });
+
+        // 1. 在线 PATCH 节点密码，验证 --clear-password 生效
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            api_addr.clone(),
+            "--json".into(),
+            "node".into(),
+            "update".into(),
+            "101".into(),
+            "--clear-password".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(
+            proxy_nodes
+                .read()
+                .unwrap()
+                .get(&101)
+                .unwrap()
+                .client
+                .auth_credentials()
+                .1,
+            None
+        );
+
+        // 2. 在线按 1-based 下标 `2` 禁用并更新规则（真实 ID 为 200）
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            api_addr.clone(),
+            "rule".into(),
+            "toggle".into(),
+            "2".into(),
+            "--disable".into(),
+        ])
+        .await
+        .unwrap();
+        assert!(!rule_engine.current_rules()[1].enabled);
+
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            api_addr.clone(),
+            "rule".into(),
+            "update".into(),
+            "2".into(),
+            "--targets".into(),
+            "api.github.com".into(),
+            "--enable".into(),
+        ])
+        .await
+        .unwrap();
+        let rules_after_update = rule_engine.current_rules();
+        assert_eq!(rules_after_update[1].id, 200);
+        assert!(rules_after_update[1].enabled);
+        assert_eq!(rules_after_update[1].targets_raw, "api.github.com");
+
+        // 3. 在线按 1-based 下标 `2` 上移至顶部，再按下标 `1` 删除
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            api_addr.clone(),
+            "rule".into(),
+            "move".into(),
+            "2".into(),
+            "top".into(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(rule_engine.current_rules()[0].id, 200);
+
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            api_addr.clone(),
+            "rule".into(),
+            "remove".into(),
+            "1".into(),
+        ])
+        .await
+        .unwrap();
+        let remaining = rule_engine.current_rules();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, 100);
+
+        let _ = shutdown_tx.send(true);
+        let _ = srv_handle.await;
     }
 }

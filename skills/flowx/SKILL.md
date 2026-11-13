@@ -5,7 +5,8 @@ description: 配置、诊断与管理 FlowX 进程级透明代理与网络分流
 
 # FlowX 进程级分流与代理控制技能指南
 
-FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux）进程级透明网络代理与分流引擎，内建双栖 CLI 控制子命令与本地回环 HTTP API。
+FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux / macOS）进程级透明网络代理与分流引擎，内建双栖 CLI 控制子命令与本地回环 HTTP API。
+仓库根目录提供了配置示例模板 [flowx.example.xml](file:///c:/Users/DELL/Desktop/FlowX/flowx.example.xml)（首次启动若无配置文件会自动生成，也可直接复制按需调整，文件权限按敏感凭据保护写为 `0600`）。
 无论是守护进程在线运行中（默认监听 `http://127.0.0.1:40080`），还是守护进程尚未启动（离线直接读写 `flowx.xml`），都优先通过 `flowx` CLI 子命令（携带 `--json`）完成查询、修改与干跑验证。
 
 ---
@@ -17,15 +18,16 @@ FlowX 是一套基于 Rust 构建的跨平台（Windows / Linux）进程级透�
 | 混合代理入站 | `127.0.0.1:40001` | 单端口自动识别 `SOCKS5`、`SOCKS4 / SOCKS4a`、`HTTP CONNECT` 与 `HTTP` |
 | 本地 Fake-IP DNS | `127.0.0.1:1053` | 分配 `198.18.0.0/15` 虚拟 IP，默认阻断 `AAAA`/`SVCB`/`HTTPS` 防泄漏 |
 | Web 控制台与 API | `http://127.0.0.1:40080` | 仅限本地回环访问的控制面 API 与实时仪表盘 |
-| 持久化配置文件 | `./flowx.xml` | 可通过 `--config <路径>` 或环境变量 `FLOWX_CONFIG` 指定 |
+| 持久化配置文件 | `./flowx.xml` | 可通过 `--config <路径>` 或环境变量 `FLOWX_CONFIG` 指定；参考模板为 `flowx.example.xml` |
 
 ---
 
 ## 二、 CLI 控制子命令速查（推荐优先使用 `--json`）
 
-`flowx` 子命令会自动探测本地 `127.0.0.1:40080` 是否在线：
-- **在线模式（Online）**：直接调用运行中守护进程的 HTTP API，内存状态与 `flowx.xml` 实时同步；
-- **离线模式（Offline）**：当守护进程未运行时，`status` / `node` / `rule` / `default` / `sim` 自动回退为直接校验并原子读写 `flowx.xml`。
+`flowx` 子命令执行严格参数校验与确定性路由（未知参数如 `--targe` 或多余位置参数会直接报错退出）：
+- **在线模式（Online）**：连接运行中守护进程的 HTTP API（支持 `PATCH` 原子部分更新），内存状态与 `flowx.xml` 实时同步；
+- **显式离线模式（`--offline`）**：直接安全校验并原子读写 `--config` / `$FLOWX_CONFIG` 指定的 XML 文件，不尝试连接守护进程（`conn` 命令除外，其要求在线守护进程）；
+- **默认地址离线回退**：仅当未显式指定 `--api` / `$FLOWX_API` 且连接默认本地 `127.0.0.1:40080` 收到 `ConnectionRefused` 时，`status` / `node` / `rule` / `default` / `sim` 才会安全回退离线 XML；若超时、HTTP 返回错误或自定义 `--api` 失败，CLI 会直接报错，避免配置分脑。
 
 ### 1. 状态与默认兜底策略
 ```bash
@@ -51,8 +53,12 @@ flowx node list --json
 flowx node add --name "HK-Socks" --addr "127.0.0.1:10808" --protocol SOCKS5 --json
 flowx node add --name "Auth-HTTP" --addr "10.0.0.2:8080" --protocol HTTP --user "alice" --pass "secret" --json
 
-# 原地修改现有节点（支持部分字段更新；未传 --pass 时自动保留原密码）
+# 原地修改现有节点（使用 PATCH 原子部分更新；未改用户名且未传 --pass 时保留原密码）
 flowx node update 101 --name "HK-Main" --addr "127.0.0.1:10809" --json
+
+# 显式清除节点已保存密码，或仅离线修改本地 XML
+flowx node update 101 --clear-password --json
+flowx --offline node update 101 --user "bob" --pass "new-secret" --json
 
 # 探测节点 TCP 握手延迟
 flowx node ping 101 --json
@@ -62,9 +68,9 @@ flowx node remove 101 --json
 ```
 
 ### 3. 分流规则管理 (`flowx rule`)
-规则采用 **自顶向下、首次命中生效 (First-Match Wins)** 原则。
+规则采用 **自顶向下、首次命中生效 (First-Match Wins)** 原则。`update` / `toggle` / `move` / `remove` 在线与离线均统一支持真实规则 ID 与列表 1-based 下标（如 `2`）。
 ```bash
-# 列出当前所有规则（含顺序下标、规则 ID、启用状态、匹配条件与动作）
+# 列出当前所有规则（含 1-based 顺序下标、规则 ID、启用状态、匹配条件与动作）
 flowx rule list --json
 
 # 新增规则（追加至列表末尾）
@@ -76,10 +82,10 @@ flowx rule add \
   --action Proxy:101 \
   --json
 
-# 原地更新指定规则（保留原规则 ID、启用状态与优先级位置；未传字段保持原值）
+# 原地更新指定规则（使用 PATCH 保留原规则 ID、未传字段与优先级位置；可同时传 --enable/--disable）
 flowx rule update 2 --targets "*.github.com; *.npmjs.org" --action Proxy:101 --json
 
-# 启用 / 停用规则
+# 启用 / 停用规则（在线与离线统一按规则 ID 或 1-based 下标定位）
 flowx rule toggle 2 --enable --json
 flowx rule toggle 2 --disable --json
 
@@ -122,8 +128,8 @@ flowx conn kill 42 --json
 1. **`apps`（应用程序过滤）**：
    - 使用分号 `;` 分隔多个匹配项，大小写不敏感，路径分隔符 `/` 与 `\` 自动归一化；
    - 支持 `*` 与 `?` 通配符（如 `node.exe; *chrome*.exe; "C:\Program Files\App\*.exe"; /usr/bin/node`）；
-   - `.exe` 后缀跨平台双向兼容：`git.exe` 同时匹配 Windows `git.exe` 与 Linux `git`，`git` 也可匹配 Windows `git.exe`，因此同一份 `flowx.xml` 可在两个平台复用；
-   - 在 Linux 上按完整路径匹配时使用 `/usr/bin/...` 等 Unix 路径；普通用户运行时只能识别同用户进程，跨用户进程会显示为 `Unknown` 并落入不限制应用的规则；
+   - 仅当规则为显式主干名 + `.exe`（如 `git.exe`、`*git*.exe`）时兼容无后缀可执行文件名（如 Linux `git`）；`*.exe` / `*.*` 等纯通配后缀仅匹配实际带 `.exe` 扩展名的进程；含路径分隔符 `/` 的规则强制精确分隔匹配（`*` 不跨越 `/`），未含 `/` 的规则仅按进程文件名匹配；
+   - 在 Linux / macOS 上按完整路径匹配时使用 `/usr/bin/...` 等 Unix 路径；普通用户运行时受权限隔离无法反查跨用户进程（未识别进程在路由引擎中视为空进程，仅命中不限制 `apps` 的规则）；
    - 留空表示不限制应用（匹配所有进程）。
 2. **`targets`（目标地址过滤）**：
    - 使用分号 `;` 分隔多个域名、IPv4/IPv6 地址或 CIDR 子网（如 `127.0.0.1; ::1; 192.168.0.0/16; *.google.com`）；

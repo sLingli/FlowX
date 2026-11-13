@@ -26,26 +26,13 @@ use crate::interceptor::process::ProcessTracker;
 use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::router::RuleEngine;
 
-fn resolve_config_path() -> String {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--config"
-            && let Some(path) = args.next()
-        {
-            return path;
-        } else if let Some(path) = arg.strip_prefix("--config=") {
-            return path.to_string();
-        }
-    }
-    std::env::var("FLOWX_CONFIG").unwrap_or_else(|_| "flowx.xml".to_string())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
-    if cli::should_run_cli(&raw_args) {
-        return cli::run_cli(&raw_args).await;
-    }
+    let config_path = match cli::resolve_launch_mode(&raw_args)? {
+        cli::LaunchMode::Serve { config_path } => config_path,
+        cli::LaunchMode::Cli => return cli::run_cli(&raw_args).await,
+    };
 
     // 1. 初始化标准结构化日志
     let subscriber = FmtSubscriber::builder()
@@ -69,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
     let self_ports = vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()];
 
     // 3. 从 XML 配置文件加载代理节点与路由规则（缺失时自动生成默认配置）
-    let config_path = resolve_config_path();
     let config_store = Arc::new(ConfigStore::new(&config_path));
     let (runtime_profile, created_default) = config_store
         .load_or_init(&self_ports)
