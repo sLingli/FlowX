@@ -901,7 +901,7 @@ async fn handle_api_request(
                 "/api/rules/default" | "/api/rules/toggle" | "/api/rules/move"
             )
     );
-    let _mutation_guard = if is_mutation {
+    let mut mutation_guard = if is_mutation {
         Some(mutation_lock.lock().await)
     } else {
         None
@@ -1330,6 +1330,9 @@ async fn handle_api_request(
         }
     }
 
+    // 内存与磁盘均提交/回滚完毕后立即释放写锁，避免慢读客户端占用 mutation_lock
+    drop(mutation_guard.take());
+
     send_http_response(&mut stream, status, content_type, &body).await?;
     Ok(())
 }
@@ -1501,10 +1504,23 @@ fn resolve_updated_credentials(
     locale: Locale,
 ) -> std::result::Result<(Option<String>, Option<String>), ApiErrorResp> {
     let ct = "application/json; charset=utf-8";
+    let has_raw_password_field = explicit_password.is_some();
     let explicit_empty = explicit_password.as_deref() == Some("");
     let explicit_non_empty = explicit_password.filter(|p| !p.is_empty());
 
-    if clear_password == Some(true) && (keep_password == Some(true) || explicit_non_empty.is_some()) {
+    if clear_password == Some(true) && (keep_password == Some(true) || explicit_non_empty.is_some())
+    {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_CONFLICTING_PASSWORD_OPTIONS",
+                "error.conflicting_password_options",
+            ),
+        ));
+    }
+    if keep_password == Some(true) && explicit_non_empty.is_some() {
         return Err((
             "400 Bad Request",
             ct,
@@ -1528,9 +1544,7 @@ fn resolve_updated_credentials(
     }
 
     if protocol == "SOCKS4" {
-        if explicit_non_empty.is_some()
-            || (keep_password == Some(true) && clear_password != Some(true))
-        {
+        if has_raw_password_field || keep_password == Some(true) {
             return Err((
                 "400 Bad Request",
                 ct,
@@ -1556,12 +1570,25 @@ fn resolve_updated_credentials(
                 ),
             ));
         }
+        if clear_password == Some(false)
+            && keep_password == Some(false)
+            && !has_raw_password_field
+            && existing_password.is_some()
+        {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_CONFLICTING_PASSWORD_OPTIONS",
+                    "error.conflicting_password_options",
+                ),
+            ));
+        }
         return Ok((None, None));
     }
 
-    let clearing_password = clear_password == Some(true)
-        || explicit_empty
-        || (keep_password == Some(false) && explicit_non_empty.is_none());
+    let clearing_password = clear_password == Some(true) || explicit_empty;
 
     if clearing_password {
         let setting_explicit_user = if is_patch {
@@ -1771,6 +1798,19 @@ pub(crate) fn handle_patch_node(
     let name_raw = req.name.unwrap_or_else(|| existing.name.clone());
     let protocol_raw = req.protocol.unwrap_or_else(|| existing.protocol.clone());
     let server_addr_raw = req.server_addr.unwrap_or_else(|| existing.server_addr.clone());
+    if req.clear_username == Some(true)
+        && req.username.as_deref().is_some_and(|u| !u.trim().is_empty())
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_CONFLICTING_USERNAME_OPTIONS",
+                "error.conflicting_username_options",
+            ),
+        );
+    }
     let req_username_explicit = req.clear_username != Some(true)
         && req.username.as_deref().is_some_and(|u| !u.trim().is_empty());
     let username_raw = if req.clear_username == Some(true) {
@@ -3950,5 +3990,106 @@ mod tests {
         assert!(!s5_view.auth_configured);
         assert!(!s5_view.password_configured);
         assert_eq!(s5_view.username, None);
+
+        // 5. PUT same username with keep_password=false, clear_password=false (e.g. SOCKS4 -> SOCKS5 without password) must reject
+        let put_s4_to_s5_no_pw = format!(
+            r#"{{"id":{},"name":"s4user","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"s4id","password":null,"keep_password":false,"clear_password":false}}"#,
+            s4_id
+        );
+        let r_put_s4_s5 = raw_http(
+            api_addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                put_s4_to_s5_no_pw.len(),
+                put_s4_to_s5_no_pw
+            ),
+        )
+        .await;
+        assert!(r_put_s4_s5.starts_with("HTTP/1.1 400 Bad Request"), "resp: {}", r_put_s4_s5);
+        assert!(r_put_s4_s5.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
+        {
+            let guard = api_nodes.read().unwrap();
+            let s4 = guard.get(&s4_id).unwrap();
+            assert_eq!(s4.protocol, "SOCKS4");
+            assert_eq!(s4.username.as_deref(), Some("s4id"));
+        }
+
+        // 6. PUT/PATCH credential flag parity: keep_password=true + non-empty password, clear_username + username, SOCKS4 + ""
+        let keep_and_pw_patch = format!(r#"{{"id":{},"username":"alice","password":"pw2","keep_password":true}}"#, s5_id);
+        let r_keep_and_pw = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                keep_and_pw_patch.len(),
+                keep_and_pw_patch
+            ),
+        )
+        .await;
+        assert!(r_keep_and_pw.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_keep_and_pw.contains("ERR_CONFLICTING_PASSWORD_OPTIONS"));
+
+        let keep_and_pw_put = format!(
+            r#"{{"id":{},"name":"s5pair","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","password":"pw2","keep_password":true}}"#,
+            s5_id
+        );
+        let r_keep_and_pw_put = raw_http(
+            api_addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                keep_and_pw_put.len(),
+                keep_and_pw_put
+            ),
+        )
+        .await;
+        assert!(r_keep_and_pw_put.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_keep_and_pw_put.contains("ERR_CONFLICTING_PASSWORD_OPTIONS"));
+
+        let conflict_user_patch = format!(r#"{{"id":{},"username":"bob","clear_username":true}}"#, s5_id);
+        let r_clear_user_conflict = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                conflict_user_patch.len(),
+                conflict_user_patch
+            ),
+        )
+        .await;
+        assert!(r_clear_user_conflict.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_clear_user_conflict.contains("ERR_CONFLICTING_USERNAME_OPTIONS"));
+
+        let s4_empty_pw_patch = format!(r#"{{"id":{},"password":""}}"#, s4_id);
+        let r_s4_empty_pw = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                s4_empty_pw_patch.len(),
+                s4_empty_pw_patch
+            ),
+        )
+        .await;
+        assert!(r_s4_empty_pw.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_s4_empty_pw.contains("ERR_SOCKS4_PASSWORD_UNSUPPORTED"));
+
+        let s4_empty_pw_put = format!(
+            r#"{{"id":{},"name":"s4user","protocol":"SOCKS4","server_addr":"10.0.0.2:1080","username":"s4id","password":""}}"#,
+            s4_id
+        );
+        let r_s4_empty_pw_put = raw_http(
+            api_addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                s4_empty_pw_put.len(),
+                s4_empty_pw_put
+            ),
+        )
+        .await;
+        assert!(r_s4_empty_pw_put.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_s4_empty_pw_put.contains("ERR_SOCKS4_PASSWORD_UNSUPPORTED"));
     }
 }

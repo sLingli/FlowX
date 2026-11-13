@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::outbound::chain::{parse_target_addr, ProxyNode};
@@ -343,7 +344,7 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
         }
     }
 
-    let username = item
+    let mut username = item
         .username
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty());
@@ -351,15 +352,19 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
     if proto == "HTTP" && username.as_deref().is_some_and(|u| u.contains(':')) {
         bail!("Node #{} HTTP proxy username cannot contain ':' (RFC 7617)", item.id);
     }
-    if proto != "SOCKS4" && username.is_some() != password.is_some() {
-        if username.is_none() {
+    if proto != "SOCKS4" {
+        if username.is_none() && password.is_some() {
             bail!("Node #{} has a password configured without a username", item.id);
         }
-        bail!(
-            "Node #{} ({}) has a username configured without a password",
-            item.id,
-            proto
-        );
+        if let Some(orphan_user) = username.as_deref()
+            && password.is_none()
+        {
+            warn!(
+                "[Config] Node #{} ({}) has legacy standalone username '{}' without password; clearing orphan username so service can start (reconfigure paired credentials to re-enable auth)",
+                item.id, proto, orphan_user
+            );
+            username = None;
+        }
     }
     let name = item
         .name
@@ -759,5 +764,51 @@ mod tests {
         );
         let iface_cfg = ProfileConfig::from_xml(&iface_xml).unwrap();
         assert!(iface_cfg.into_runtime(&[40001, 40080]).is_err());
+    }
+
+    #[test]
+    fn test_config_legacy_orphan_username_downgrades_with_warning() {
+        let legacy_xml = r#"
+        <Profile version="1">
+          <ProxyList>
+            <Proxy id="101" type="SOCKS5">
+              <Name>LegacyS5</Name>
+              <Address>10.0.0.2</Address>
+              <Port>1080</Port>
+              <Username>orphan-user</Username>
+            </Proxy>
+            <Proxy id="102" type="HTTP">
+              <Name>LegacyHttpEmptyPass</Name>
+              <Address>10.0.0.3</Address>
+              <Port>8080</Port>
+              <Username>orphan-http</Username>
+              <Password></Password>
+            </Proxy>
+          </ProxyList>
+        </Profile>
+        "#;
+        let rt = ProfileConfig::from_xml(legacy_xml)
+            .unwrap()
+            .into_runtime(&[40001, 40080])
+            .expect("Legacy orphan username without password should downgrade cleanly on startup");
+        assert_eq!(rt.proxy_nodes[&101].username, None);
+        assert_eq!(rt.proxy_nodes[&101].client.auth_credentials(), (None, None));
+        assert_eq!(rt.proxy_nodes[&102].username, None);
+        assert_eq!(rt.proxy_nodes[&102].client.auth_credentials(), (None, None));
+
+        // Password without username still fails fast
+        let bad_pw_only = r#"
+        <Profile version="1">
+          <ProxyList>
+            <Proxy id="103" type="SOCKS5">
+              <Name>PwOnly</Name>
+              <Address>10.0.0.4</Address>
+              <Port>1080</Port>
+              <Password>secret</Password>
+            </Proxy>
+          </ProxyList>
+        </Profile>
+        "#;
+        assert!(ProfileConfig::from_xml(bad_pw_only).unwrap().into_runtime(&[]).is_err());
     }
 }
