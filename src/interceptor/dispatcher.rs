@@ -191,14 +191,14 @@ async fn handle_connection(
         );
     }
 
-    // 5. Build route context and evaluate rules
+    // 5. Build route context and evaluate rules (`None` when process is unattributed so app rules like `*` or `*.exe` don't match "Unknown")
     let (target_host, target_ip) = match &target {
         TargetAddr::Ip(addr) => (None, Some(addr.ip())),
         TargetAddr::Domain(host, _) => (Some(host.as_str()), None),
     };
     let ctx = RouteContext {
-        process_path: Some(&proc_path),
-        process_name: Some(&proc_name),
+        process_path: proc_info.as_ref().map(|p| p.path.as_str()),
+        process_name: proc_info.as_ref().map(|p| p.name.as_str()),
         target_host,
         target_ip,
         target_port: target.port(),
