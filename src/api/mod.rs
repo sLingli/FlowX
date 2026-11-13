@@ -38,6 +38,18 @@ pub struct ProxyNodeView {
     pub username: Option<String>,
 }
 
+pub(crate) fn proxy_node_view(n: &ProxyNodeEntry) -> ProxyNodeView {
+    ProxyNodeView {
+        id: n.id,
+        name: n.name.clone(),
+        protocol: n.protocol.clone(),
+        server_addr: n.server_addr.clone(),
+        auth_configured: n.is_auth_configured(),
+        password_configured: n.client.auth_credentials().1.is_some(),
+        username: n.username.clone(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AddNodeRequest {
     pub name: String,
@@ -973,18 +985,7 @@ async fn handle_api_request(
         }
         ("GET", "/api/nodes") => {
             let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-            let mut list: Vec<ProxyNodeView> = nodes_guard
-                .values()
-                .map(|n| ProxyNodeView {
-                    id: n.id,
-                    name: n.name.clone(),
-                    protocol: n.protocol.clone(),
-                    server_addr: n.server_addr.clone(),
-                    auth_configured: n.username.is_some(),
-                    password_configured: n.client.auth_credentials().1.is_some(),
-                    username: n.username.clone(),
-                })
-                .collect();
+            let mut list: Vec<ProxyNodeView> = nodes_guard.values().map(proxy_node_view).collect();
             list.sort_by_key(|n| n.id);
             ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&list))
         }
@@ -1483,18 +1484,21 @@ fn build_proxy_client(
     }
 }
 
+type ApiErrorResp = (&'static str, &'static str, String);
+
 #[allow(clippy::too_many_arguments)]
-fn resolve_updated_password(
+fn resolve_updated_credentials(
+    is_patch: bool,
     protocol: &str,
-    username: &Option<String>,
+    username: Option<String>,
+    req_username_explicit: bool,
     existing_username: &Option<String>,
     existing_password: Option<String>,
     explicit_password: Option<String>,
     keep_password: Option<bool>,
-    default_keep_when_omitted: bool,
     clear_password: Option<bool>,
     locale: Locale,
-) -> std::result::Result<Option<String>, (&'static str, &'static str, String)> {
+) -> std::result::Result<(Option<String>, Option<String>), ApiErrorResp> {
     let ct = "application/json; charset=utf-8";
     let explicit_empty = explicit_password.as_deref() == Some("");
     let explicit_non_empty = explicit_password.filter(|p| !p.is_empty());
@@ -1536,39 +1540,90 @@ fn resolve_updated_password(
                 ),
             ));
         }
-        return Ok(None);
+        return Ok((username, None));
     }
 
     if username.is_none() {
-        return Ok(None);
-    }
-
-    if clear_password == Some(true) || explicit_empty {
-        return Ok(None);
-    }
-    if explicit_non_empty.is_some() {
-        return Ok(explicit_non_empty);
-    }
-    if keep_password == Some(false) {
-        return Ok(None);
-    }
-
-    if keep_password.unwrap_or(default_keep_when_omitted) {
-        if username != existing_username && existing_password.is_some() {
+        if keep_password == Some(true) && existing_password.is_some() {
             return Err((
                 "400 Bad Request",
                 ct,
                 json_error(
                     locale,
-                    "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
-                    "error.password_required_on_user_change",
+                    "ERR_PASSWORD_WITHOUT_USERNAME",
+                    "error.password_without_username",
                 ),
             ));
         }
-        return Ok(existing_password);
+        return Ok((None, None));
     }
 
-    Ok(None)
+    let clearing_password = clear_password == Some(true)
+        || explicit_empty
+        || (keep_password == Some(false) && explicit_non_empty.is_none());
+
+    if clearing_password {
+        let setting_explicit_user = if is_patch {
+            req_username_explicit
+        } else {
+            username != *existing_username
+        };
+        if setting_explicit_user {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_USERNAME_WITHOUT_PASSWORD",
+                    "error.username_without_password",
+                ),
+            ));
+        }
+        return Ok((None, None));
+    }
+
+    if let Some(p) = explicit_non_empty {
+        return Ok((username, Some(p)));
+    }
+
+    let should_keep = keep_password.unwrap_or(is_patch);
+    if should_keep {
+        if username != *existing_username {
+            if existing_password.is_some() {
+                return Err((
+                    "400 Bad Request",
+                    ct,
+                    json_error(
+                        locale,
+                        "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
+                        "error.password_required_on_user_change",
+                    ),
+                ));
+            }
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_USERNAME_WITHOUT_PASSWORD",
+                    "error.username_without_password",
+                ),
+            ));
+        }
+        if let Some(pw) = existing_password {
+            return Ok((username, Some(pw)));
+        }
+    }
+
+    Err((
+        "400 Bad Request",
+        ct,
+        json_error(
+            locale,
+            "ERR_USERNAME_WITHOUT_PASSWORD",
+            "error.username_without_password",
+        ),
+    ))
 }
 
 pub(crate) fn handle_add_node(
@@ -1603,6 +1658,17 @@ pub(crate) fn handle_add_node(
             "400 Bad Request",
             ct,
             json_error(locale, "ERR_EMPTY_PASSWORD", "error.empty_password"),
+        );
+    }
+    if protocol != "SOCKS4" && username.is_some() && explicit_password.is_none() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_USERNAME_WITHOUT_PASSWORD",
+                "error.username_without_password",
+            ),
         );
     }
     let password = explicit_password;
@@ -1654,18 +1720,19 @@ pub(crate) fn handle_update_node(
     };
 
     let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
-    let password = match resolve_updated_password(
+    let (username, password) = match resolve_updated_credentials(
+        false,
         &protocol,
-        &username,
+        username,
+        true,
         &existing.username,
         existing_password,
         explicit_password,
         req.keep_password,
-        false,
         req.clear_password,
         locale,
     ) {
-        Ok(p) => p,
+        Ok(creds) => creds,
         Err(resp) => return resp,
     };
 
@@ -1703,6 +1770,8 @@ pub(crate) fn handle_patch_node(
     let name_raw = req.name.unwrap_or_else(|| existing.name.clone());
     let protocol_raw = req.protocol.unwrap_or_else(|| existing.protocol.clone());
     let server_addr_raw = req.server_addr.unwrap_or_else(|| existing.server_addr.clone());
+    let req_username_explicit = req.clear_username != Some(true)
+        && req.username.as_deref().is_some_and(|u| !u.trim().is_empty());
     let username_raw = if req.clear_username == Some(true) {
         None
     } else if req.username.is_some() {
@@ -1725,18 +1794,19 @@ pub(crate) fn handle_patch_node(
     };
 
     let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
-    let password = match resolve_updated_password(
+    let (username, password) = match resolve_updated_credentials(
+        true,
         &protocol,
-        &username,
+        username,
+        req_username_explicit,
         &existing.username,
         existing_password,
         explicit_password,
         req.keep_password,
-        true,
         req.clear_password,
         locale,
     ) {
-        Ok(p) => p,
+        Ok(creds) => creds,
         Err(resp) => return resp,
     };
 
@@ -3219,7 +3289,7 @@ mod tests {
         {
             let guard = nodes.read().unwrap();
             let n = guard.get(&101).unwrap();
-            assert_eq!(n.username.as_deref(), Some("alice"));
+            assert_eq!(n.username, None);
             assert_eq!(n.client.auth_credentials(), (None, None));
         }
 
@@ -3430,11 +3500,16 @@ mod tests {
         )
         .await;
         assert!(r_clear.starts_with("HTTP/1.1 200 OK"));
-        assert_eq!(
-            api_nodes.read().unwrap().get(&101).unwrap().client.auth_credentials(),
-            (None, None),
-            "PATCH with explicit empty password string must clear stored password"
-        );
+        {
+            let guard = api_nodes.read().unwrap();
+            let n = guard.get(&101).unwrap();
+            assert_eq!(n.username, None);
+            assert_eq!(
+                n.client.auth_credentials(),
+                (None, None),
+                "PATCH with explicit empty password string must clear stored credentials"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3695,5 +3770,130 @@ mod tests {
         .await;
         assert!(!ok_iface);
         assert!(msg_iface.contains("internal service"));
+    }
+
+    #[tokio::test]
+    async fn test_api_paired_credentials_and_auth_configured() {
+        let (api_addr, api_nodes, _api_re, _tx) = spawn_test_api().await;
+        let api_port = api_addr.port();
+
+        // 1. HTTP / SOCKS5 POST with username but without password rejects with ERR_USERNAME_WITHOUT_PASSWORD
+        for proto in ["SOCKS5", "HTTP"] {
+            let body = format!(
+                r#"{{"name":"uonly","protocol":"{}","server_addr":"10.0.0.2:1080","username":"alice"}}"#,
+                proto
+            );
+            let r = raw_http(
+                api_addr,
+                &format!(
+                    "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    api_port,
+                    body.len(),
+                    body
+                ),
+            )
+            .await;
+            assert!(r.starts_with("HTTP/1.1 400 Bad Request"), "proto {} resp: {}", proto, r);
+            assert!(r.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
+        }
+
+        // 2. SOCKS4 POST with standalone UserID succeeds and auth_configured == true
+        let s4_body = r#"{"name":"s4user","protocol":"SOCKS4","server_addr":"10.0.0.2:1080","username":"s4id"}"#;
+        let r_s4 = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                s4_body.len(),
+                s4_body
+            ),
+        )
+        .await;
+        assert!(r_s4.starts_with("HTTP/1.1 200 OK"), "s4 resp: {}", r_s4);
+        let s4_id = serde_json::from_str::<serde_json::Value>(r_s4.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"].as_u64().unwrap() as u32;
+
+        // 3. Switching SOCKS4 node (with UserID) to SOCKS5 without supplying a password must reject
+        let upgrade_no_pw = format!(r#"{{"id":{},"protocol":"SOCKS5"}}"#, s4_id);
+        let r_upgrade = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                upgrade_no_pw.len(),
+                upgrade_no_pw
+            ),
+        )
+        .await;
+        assert!(r_upgrade.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_upgrade.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
+
+        // 4. Add paired SOCKS5 node, check GET /api/nodes auth_configured=true, then PUT clear_password clears username too
+        let s5_body = r#"{"name":"s5pair","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","password":"pw1"}"#;
+        let r_s5 = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                s5_body.len(),
+                s5_body
+            ),
+        )
+        .await;
+        assert!(r_s5.starts_with("HTTP/1.1 200 OK"));
+        let s5_id = serde_json::from_str::<serde_json::Value>(r_s5.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"].as_u64().unwrap() as u32;
+
+        // Setting a new username alongside clear_password on PUT/PATCH rejects
+        let patch_new_user_clear = format!(r#"{{"id":{},"username":"bob","clear_password":true}}"#, s5_id);
+        let r_bad_patch = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                patch_new_user_clear.len(),
+                patch_new_user_clear
+            ),
+        )
+        .await;
+        assert!(r_bad_patch.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_bad_patch.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
+
+        // PUT with clear_password clears both password and username
+        let put_clear = format!(
+            r#"{{"id":{},"name":"s5pair","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","clear_password":true}}"#,
+            s5_id
+        );
+        let r_put_clear = raw_http(
+            api_addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                put_clear.len(),
+                put_clear
+            ),
+        )
+        .await;
+        assert!(r_put_clear.starts_with("HTTP/1.1 200 OK"), "put_clear: {}", r_put_clear);
+        {
+            let guard = api_nodes.read().unwrap();
+            let s5 = guard.get(&s5_id).unwrap();
+            assert_eq!(s5.username, None);
+            assert_eq!(s5.client.auth_credentials(), (None, None));
+        }
+
+        let r_list = raw_http(
+            api_addr,
+            &format!("GET /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", api_port),
+        )
+        .await;
+        assert!(r_list.starts_with("HTTP/1.1 200 OK"));
+        let views: Vec<ProxyNodeView> =
+            serde_json::from_str(r_list.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let s4_view = views.iter().find(|v| v.id == s4_id).unwrap();
+        assert!(s4_view.auth_configured);
+        assert!(!s4_view.password_configured);
+        let s5_view = views.iter().find(|v| v.id == s5_id).unwrap();
+        assert!(!s5_view.auth_configured);
+        assert!(!s5_view.password_configured);
+        assert_eq!(s5_view.username, None);
     }
 }

@@ -9,9 +9,9 @@ use tokio::net::TcpStream;
 
 use crate::api::{
     handle_add_node, handle_add_rule, handle_patch_node, handle_patch_rule,
-    handle_set_default_action, handle_simulate_route, ping_address, AddNodeRequest, AddRuleRequest,
-    PatchNodeRequest, PatchRuleRequest, PingResponse, ProxyNodeView, SetDefaultActionRequest,
-    SimulateRouteRequest,
+    handle_set_default_action, handle_simulate_route, ping_address, proxy_node_view,
+    AddNodeRequest, AddRuleRequest, PatchNodeRequest, PatchRuleRequest, PingResponse,
+    ProxyNodeView, SetDefaultActionRequest, SimulateRouteRequest,
 };
 use crate::config::ConfigStore;
 use crate::i18n::Locale;
@@ -884,8 +884,8 @@ type OfflineRuntime = (
 
 fn load_offline_runtime(config_path: &str) -> Result<OfflineRuntime> {
     let store = ConfigStore::new(config_path);
-    let (rt, _) = store
-        .load_or_init(&DEFAULT_SELF_PORTS)
+    let rt = store
+        .load_existing_or_default(&DEFAULT_SELF_PORTS)
         .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
     let nodes = RwLock::new(rt.proxy_nodes);
     let engine = RuleEngine::new(rt.rules, rt.default_action);
@@ -936,11 +936,9 @@ fn canonical_flag_group(flag: &str) -> &str {
         "username" | "user" => "user",
         "password" | "pass" => "pass",
         "node-id" | "node" => "node",
-        "app" | "apps" => "apps",
-        "target" | "targets" => "targets",
-        "host" => "target",
+        "app" | "apps" | "process" | "proc" => "apps",
+        "target" | "targets" | "host" => "targets",
         "port" | "ports" => "ports",
-        "process" | "proc" => "app",
         "dir" | "direction" => "dir",
         other => other,
     }
@@ -978,13 +976,7 @@ fn parse_flags_with_spec(
                 bail!("Unknown option '--{}' for `{}`", stripped, spec.cmd_label);
             };
 
-            let group = if spec.cmd_label == "flowx sim" && name == "port" {
-                "sim-port".to_string()
-            } else if spec.cmd_label == "flowx sim" && name == "target" {
-                "sim-target".to_string()
-            } else {
-                canonical_flag_group(name).to_string()
-            };
+            let group = canonical_flag_group(name).to_string();
             if let Some(prev) = seen_groups.insert(group, format!("--{}", name)) {
                 bail!(
                     "Duplicate or conflicting option '--{}' (already set via '{}')",
@@ -1208,18 +1200,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 } else {
                     let (_, nodes, _) = load_offline_runtime_readonly(&opts.config_path)?;
                     let guard = nodes.read().unwrap_or_else(|e| e.into_inner());
-                    let mut v: Vec<ProxyNodeView> = guard
-                        .values()
-                        .map(|n| ProxyNodeView {
-                            id: n.id,
-                            name: n.name.clone(),
-                            protocol: n.protocol.clone(),
-                            server_addr: n.server_addr.clone(),
-                            auth_configured: n.username.is_some(),
-                            password_configured: n.client.auth_credentials().1.is_some(),
-                            username: n.username.clone(),
-                        })
-                        .collect();
+                    let mut v: Vec<ProxyNodeView> = guard.values().map(proxy_node_view).collect();
                     v.sort_by_key(|n| n.id);
                     v
                 };
@@ -2873,8 +2854,70 @@ mod tests {
         .unwrap_err();
         let j = format_cli_error_json(&err);
         assert_eq!(j["code"], "ERR_HTTP_USERNAME_COLON");
+        assert!(
+            !path.exists(),
+            "Failed offline mutations must not create {}",
+            cfg_str
+        );
 
-        // 4. Add valid node then clear password with explicit `--pass ""`
+        // 3b. Offline add HTTP/SOCKS5 with username but without password fails cleanly and does not create XML
+        let err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "UserOnly".into(),
+            "--addr".into(),
+            "10.0.0.2:1080".into(),
+            "--user".into(),
+            "alice".into(),
+        ])
+        .await
+        .unwrap_err();
+        let j = format_cli_error_json(&err);
+        assert_eq!(j["code"], "ERR_USERNAME_WITHOUT_PASSWORD");
+        assert!(!path.exists());
+
+        // 3c. Duplicate/conflicting aliases in `flowx sim` fail cleanly
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--config".into(),
+                cfg_str.clone(),
+                "--offline".into(),
+                "sim".into(),
+                "--target".into(),
+                "example.com:443".into(),
+                "--host".into(),
+                "other.com".into(),
+            ])
+            .await
+            .is_err()
+        );
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--config".into(),
+                cfg_str.clone(),
+                "--offline".into(),
+                "sim".into(),
+                "--target".into(),
+                "example.com:443".into(),
+                "--app".into(),
+                "curl.exe".into(),
+                "--process".into(),
+                "git.exe".into(),
+            ])
+            .await
+            .is_err()
+        );
+        assert!(!path.exists());
+
+        // 4. Add valid node then clear password with explicit `--pass ""` (clears username as well on SOCKS5/HTTP)
         run_cli(&[
             "flowx".into(),
             "--config".into(),
@@ -2893,6 +2936,7 @@ mod tests {
         ])
         .await
         .unwrap();
+        assert!(path.exists(), "Successful offline mutation must persist {}", cfg_str);
 
         run_cli(&[
             "flowx".into(),
@@ -2911,8 +2955,9 @@ mod tests {
         let store = ConfigStore::new(&path);
         let rt = store.load_existing(&DEFAULT_SELF_PORTS).unwrap();
         let node = rt.proxy_nodes.get(&102).unwrap();
-        assert_eq!(node.username.as_deref(), Some("alice"));
-        assert_eq!(node.client.auth_credentials().1, None);
+        assert_eq!(node.username, None);
+        assert_eq!(node.client.auth_credentials(), (None, None));
+        assert!(!node.is_auth_configured());
 
         // 5. Online API HTTP 400 response preserves structured JSON error code/status
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

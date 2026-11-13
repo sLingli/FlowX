@@ -351,8 +351,15 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
     if proto == "HTTP" && username.as_deref().is_some_and(|u| u.contains(':')) {
         bail!("Node #{} HTTP proxy username cannot contain ':' (RFC 7617)", item.id);
     }
-    if proto != "SOCKS4" && username.is_none() && password.is_some() {
-        bail!("Node #{} has a password configured without a username", item.id);
+    if proto != "SOCKS4" && username.is_some() != password.is_some() {
+        if username.is_none() {
+            bail!("Node #{} has a password configured without a username", item.id);
+        }
+        bail!(
+            "Node #{} ({}) has a username configured without a password",
+            item.id,
+            proto
+        );
     }
     let name = item
         .name
@@ -431,6 +438,14 @@ impl ConfigStore {
             Some(rt) => Ok(rt),
             None => bail!("Configuration file not found: {}", self.path.display()),
         }
+    }
+
+    /// 读取已有配置文件；若明确 `NotFound` 则在内存中构造默认配置，不写入磁盘（供 CLI 变更前校验使用）
+    pub fn load_existing_or_default(&self, self_ports: &[u16]) -> Result<RuntimeProfile> {
+        if let Some(runtime) = self.read_existing_opt(self_ports)? {
+            return Ok(runtime);
+        }
+        ProfileConfig::default_profile().into_runtime(self_ports)
     }
 
     /// 从磁盘加载配置；仅在明确 `NotFound` 时生成默认配置，其他 I/O 错误直接失败以免覆盖不可读配置

@@ -30,6 +30,17 @@ pub struct ProxyNodeEntry {
     pub client: ProxyNode,
 }
 
+impl ProxyNodeEntry {
+    /// 判断节点认证是否已完整配置：SOCKS4 仅需 UserID，HTTP/SOCKS5 需用户名与密码成对存在
+    pub fn is_auth_configured(&self) -> bool {
+        if self.protocol == "SOCKS4" {
+            self.username.is_some()
+        } else {
+            self.username.is_some() && self.client.auth_credentials().1.is_some()
+        }
+    }
+}
+
 /// 流量调度核心配置
 pub struct DispatcherConfig {
     pub bind_addr: SocketAddr,
