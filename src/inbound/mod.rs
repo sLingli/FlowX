@@ -392,9 +392,9 @@ where
             }
             content_length = parsed_cl;
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            if is_connect || transfer_encoding_seen {
+            if is_connect || transfer_encoding_seen || version == "HTTP/1.0" {
                 reply_http_error(stream, "400 Bad Request").await;
-                bail!("Forbidden or duplicate Transfer-Encoding header");
+                bail!("Transfer-Encoding is forbidden on HTTP/1.0, CONNECT, or duplicate headers");
             }
             let Ok(v) = std::str::from_utf8(val) else {
                 reply_http_error(stream, "400 Bad Request").await;
@@ -706,6 +706,7 @@ mod tests {
             b"GET http://example.com/ HTTP/1.1\r\nHost: other.com\r\n\r\n",
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: other.com:443\r\n\r\n",
             b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nContent-Length: 0\r\n\r\n",
+            b"POST http://example.com/upload HTTP/1.0\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
             b"GET http://example.com/ HTTP/1.9\r\nHost: example.com\r\n\r\n",
         ];
 

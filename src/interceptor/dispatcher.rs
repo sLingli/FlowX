@@ -472,7 +472,26 @@ mod tests {
         tokio::spawn(async move {
             let (mut s, _) = origin.accept().await.unwrap();
             let mut got = Vec::new();
-            s.read_to_end(&mut got).await.unwrap();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = s.read(&mut buf).await.unwrap();
+                assert!(n > 0, "Origin received premature FIN before full request");
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Wait briefly: must receive NEITHER premature FIN (Ok(0)) NOR smuggled 2nd request bytes
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_millis(80),
+                s.read(&mut buf),
+            )
+            .await;
+            assert!(
+                probe.is_err(),
+                "Origin expected neither premature EOF nor smuggled bytes, got: {:?}",
+                probe
+            );
             let _ = req_tx.send(got);
             s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
                 .await

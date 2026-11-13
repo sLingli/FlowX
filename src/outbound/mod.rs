@@ -350,7 +350,7 @@ async fn relay_downlink(
     start: tokio::time::Instant,
     last_activity_us: Arc<std::sync::atomic::AtomicU64>,
 ) -> std::io::Result<u64> {
-    let mut buf = [0u8; 16384];
+    let mut buf = vec![0u8; 16384];
     let mut total_down = 0u64;
     loop {
         let n = rr.read(&mut buf).await?;
@@ -369,17 +369,15 @@ async fn relay_downlink(
     Ok(total_down)
 }
 
-async fn run_relay_with_watchdog<FUp, FDown>(
-    up_task: FUp,
-    down_task: FDown,
+async fn await_relay_with_watchdog<FR>(
+    relay_fut: FR,
     start: tokio::time::Instant,
     last_activity_us: Arc<std::sync::atomic::AtomicU64>,
     conn: Option<&Arc<ActiveConnection>>,
     idle_timeout: std::time::Duration,
 ) -> Result<(u64, u64)>
 where
-    FUp: std::future::Future<Output = std::io::Result<u64>>,
-    FDown: std::future::Future<Output = std::io::Result<u64>>,
+    FR: std::future::Future<Output = std::io::Result<(u64, u64)>>,
 {
     use std::sync::atomic::Ordering;
 
@@ -400,9 +398,8 @@ where
     };
 
     tokio::select! {
-        res = async { tokio::try_join!(up_task, down_task) } => {
-            let (up, down) = res?;
-            Ok((up, down))
+        res = relay_fut => {
+            Ok(res?)
         }
         _ = idle_watchdog => {
             anyhow::bail!(std::io::Error::new(
@@ -424,6 +421,28 @@ where
             anyhow::bail!("Connection aborted by administrator");
         }
     }
+}
+
+async fn run_relay_with_watchdog<FUp, FDown>(
+    up_task: FUp,
+    down_task: FDown,
+    start: tokio::time::Instant,
+    last_activity_us: Arc<std::sync::atomic::AtomicU64>,
+    conn: Option<&Arc<ActiveConnection>>,
+    idle_timeout: std::time::Duration,
+) -> Result<(u64, u64)>
+where
+    FUp: std::future::Future<Output = std::io::Result<u64>>,
+    FDown: std::future::Future<Output = std::io::Result<u64>>,
+{
+    await_relay_with_watchdog(
+        async { tokio::try_join!(up_task, down_task) },
+        start,
+        last_activity_us,
+        conn,
+        idle_timeout,
+    )
+    .await
 }
 
 /// 全双工透明流中继对拷（带实时流量监视与主动熔断切断支持）
@@ -463,7 +482,7 @@ pub async fn relay_stream_monitored_with_timeout(
     let last_down = Arc::clone(&last_activity_us);
 
     let up_task = async move {
-        let mut buf = [0u8; 16384];
+        let mut buf = vec![0u8; 16384];
         let mut total_up = 0u64;
         loop {
             let n = lr.read(&mut buf).await?;
@@ -508,12 +527,10 @@ impl PrefixedTcpReader {
         }
         self.buf.clear();
         self.pos = 0;
-        let mut tmp = [0u8; 16384];
-        let n = self.inner.read(&mut tmp).await?;
-        if n > 0 {
-            self.buf.extend_from_slice(&tmp[..n]);
+        if self.buf.capacity() < 16384 {
+            self.buf.reserve(16384 - self.buf.capacity());
         }
-        Ok(n)
+        self.inner.read_buf(&mut self.buf).await
     }
 
     async fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
@@ -580,21 +597,50 @@ impl PrefixedTcpReader {
     }
 }
 
+enum UpBodyError {
+    RemoteWriteClosed(std::io::Error),
+    Fatal(std::io::Error),
+}
+
+impl From<std::io::Error> for UpBodyError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+async fn write_upstream_all(
+    rw: &mut tokio::net::tcp::OwnedWriteHalf,
+    bytes: &[u8],
+) -> std::result::Result<(), UpBodyError> {
+    rw.write_all(bytes).await.map_err(|e| {
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+        ) {
+            UpBodyError::RemoteWriteClosed(e)
+        } else {
+            UpBodyError::Fatal(e)
+        }
+    })
+}
+
 async fn write_remote_tracked(
     rw: &mut tokio::net::tcp::OwnedWriteHalf,
     bytes: &[u8],
-    total_up: &mut u64,
+    total_up: &std::sync::atomic::AtomicU64,
     conn: &Option<Arc<ActiveConnection>>,
     start: &tokio::time::Instant,
     last_up: &Arc<std::sync::atomic::AtomicU64>,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), UpBodyError> {
     if bytes.is_empty() {
         return Ok(());
     }
     record_activity_us(start, last_up);
-    rw.write_all(bytes).await?;
+    write_upstream_all(rw, bytes).await?;
     record_activity_us(start, last_up);
-    *total_up += bytes.len() as u64;
+    total_up.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
     if let Some(c) = conn {
         c.add_upload(bytes.len() as u64);
     }
@@ -605,26 +651,26 @@ async fn copy_exact_body(
     reader: &mut PrefixedTcpReader,
     rw: &mut tokio::net::tcp::OwnedWriteHalf,
     mut remaining: u64,
-    total_up: &mut u64,
+    total_up: &std::sync::atomic::AtomicU64,
     conn: &Option<Arc<ActiveConnection>>,
     start: &tokio::time::Instant,
     last_up: &Arc<std::sync::atomic::AtomicU64>,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), UpBodyError> {
     while remaining > 0 {
         let avail = reader.fill().await?;
         if avail == 0 {
-            return Err(std::io::Error::new(
+            return Err(UpBodyError::Fatal(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "Truncated HTTP request body before reaching declared length",
-            ));
+            )));
         }
         let take = (avail as u64).min(remaining) as usize;
         record_activity_us(start, last_up);
-        rw.write_all(&reader.buf[reader.pos..reader.pos + take]).await?;
+        write_upstream_all(rw, &reader.buf[reader.pos..reader.pos + take]).await?;
         record_activity_us(start, last_up);
         reader.pos += take;
         remaining -= take as u64;
-        *total_up += take as u64;
+        total_up.fetch_add(take as u64, std::sync::atomic::Ordering::Relaxed);
         if let Some(c) = conn {
             c.add_upload(take as u64);
         }
@@ -713,11 +759,11 @@ fn validate_chunk_trailer_line(line: &[u8]) -> std::io::Result<()> {
 async fn forward_chunked_body(
     reader: &mut PrefixedTcpReader,
     rw: &mut tokio::net::tcp::OwnedWriteHalf,
-    total_up: &mut u64,
+    total_up: &std::sync::atomic::AtomicU64,
     conn: &Option<Arc<ActiveConnection>>,
     start: &tokio::time::Instant,
     last_up: &Arc<std::sync::atomic::AtomicU64>,
-) -> std::io::Result<()> {
+) -> std::result::Result<(), UpBodyError> {
     const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
     const MAX_TRAILER_BYTES: usize = 16 * 1024;
 
@@ -737,10 +783,10 @@ async fn forward_chunked_body(
                 }
                 trailer_bytes = trailer_bytes.saturating_add(trailer.len() + 2);
                 if trailer_bytes > MAX_TRAILER_BYTES {
-                    return Err(std::io::Error::new(
+                    return Err(UpBodyError::Fatal(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "HTTP chunk trailers exceed size limit",
-                    ));
+                    )));
                 }
                 validate_chunk_trailer_line(&trailer)?;
                 write_remote_tracked(rw, &trailer, total_up, conn, start, last_up).await?;
@@ -752,17 +798,18 @@ async fn forward_chunked_body(
         let mut crlf = [0u8; 2];
         reader.read_exact_bytes(&mut crlf).await?;
         if &crlf != b"\r\n" {
-            return Err(std::io::Error::new(
+            return Err(UpBodyError::Fatal(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Missing CRLF terminator after HTTP chunk payload",
-            ));
+            )));
         }
         write_remote_tracked(rw, b"\r\n", total_up, conn, start, last_up).await?;
     }
 }
 
-/// 明文 HTTP 代理有界请求体中继：严格按 `Content-Length` 或 `chunked` 解析并仅转发单个请求体，
-/// 请求体结束后立即半关闭上游写方向，阻断客户端同连接流水线夹带第二条请求的走私/绕过。
+/// 明文 HTTP 代理有界请求体中继：严格按 `Content-Length` 或 `chunked` 解析并仅转发单个请求体；
+/// 请求体完成后停止继续读取客户端后续流水线字节以阻断走私，但保持上游写半部开启至响应结束以免触发提前 FIN 误判，
+/// 并在下行响应完成后立即结束中继（避免源站提前返回 4xx 并关闭时无谓阻塞上传至空闲超时）。
 pub async fn relay_http_forward_monitored(
     local: TcpStream,
     remote: TcpStream,
@@ -790,7 +837,7 @@ pub async fn relay_http_forward_monitored_with_timeout(
     body_prefix: Vec<u8>,
     idle_timeout: std::time::Duration,
 ) -> Result<(u64, u64)> {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     if conn.is_some_and(|c| c.is_cancelled()) {
         anyhow::bail!("Connection aborted by administrator");
@@ -806,17 +853,18 @@ pub async fn relay_http_forward_monitored_with_timeout(
     let last_activity_us = Arc::new(AtomicU64::new(0));
     let last_up = Arc::clone(&last_activity_us);
     let last_down = Arc::clone(&last_activity_us);
+    let up_bytes = Arc::new(AtomicU64::new(0));
+    let up_bytes_ref = Arc::clone(&up_bytes);
 
     let up_task = async move {
         let mut reader = PrefixedTcpReader::new(body_prefix, lr);
-        let mut total_up = 0u64;
         match framing {
             crate::inbound::HttpBodyFraming::ContentLength(len) => {
                 copy_exact_body(
                     &mut reader,
                     &mut rw,
                     len,
-                    &mut total_up,
+                    &up_bytes_ref,
                     &conn_up,
                     &start,
                     &last_up,
@@ -827,7 +875,7 @@ pub async fn relay_http_forward_monitored_with_timeout(
                 forward_chunked_body(
                     &mut reader,
                     &mut rw,
-                    &mut total_up,
+                    &up_bytes_ref,
                     &conn_up,
                     &start,
                     &last_up,
@@ -835,12 +883,50 @@ pub async fn relay_http_forward_monitored_with_timeout(
                 .await?;
             }
         }
-        rw.shutdown().await.ok();
-        Ok::<u64, std::io::Error>(total_up)
+        // 丢弃 client 读端（阻断后续流水线请求字节），同时保留 rw 至响应完成，不发送提前 FIN
+        drop(reader);
+        Ok::<tokio::net::tcp::OwnedWriteHalf, UpBodyError>(rw)
     };
 
     let down_task = relay_downlink(rr, lw, conn_down, start, last_down);
-    run_relay_with_watchdog(up_task, down_task, start, last_activity_us, conn, idle_timeout).await
+
+    let relay_fut = async {
+        tokio::pin!(up_task);
+        tokio::pin!(down_task);
+        let mut up_done = false;
+        let mut _rw_keepalive: Option<tokio::net::tcp::OwnedWriteHalf> = None;
+        let mut pending_up_write_err: Option<std::io::Error> = None;
+
+        loop {
+            tokio::select! {
+                up_res = &mut up_task, if !up_done => {
+                    match up_res {
+                        Ok(rw_done) => {
+                            _rw_keepalive = Some(rw_done);
+                            up_done = true;
+                        }
+                        Err(UpBodyError::RemoteWriteClosed(e)) => {
+                            // 源站可能已发送 4xx/413 响应并关闭接收端；继续完成下行读取以免吞掉响应体
+                            pending_up_write_err = Some(e);
+                            up_done = true;
+                        }
+                        Err(UpBodyError::Fatal(e)) => return Err(e),
+                    }
+                }
+                down_res = &mut down_task => {
+                    let down_bytes = down_res?;
+                    if down_bytes == 0
+                        && let Some(e) = pending_up_write_err
+                    {
+                        return Err(e);
+                    }
+                    return Ok((up_bytes.load(Ordering::Relaxed), down_bytes));
+                }
+            }
+        }
+    };
+
+    await_relay_with_watchdog(relay_fut, start, last_activity_us, conn, idle_timeout).await
 }
 
 pub async fn relay_stream(local: TcpStream, remote: TcpStream) -> Result<(u64, u64)> {
@@ -1022,13 +1108,13 @@ mod tests {
         // Client keeps socket open briefly attempting to send more data
         client_w.write_all(b"MORE_SMUGGLED").await.unwrap();
 
-        // Remote must receive EOF immediately on request direction without any smuggled bytes
-        let mut received_on_remote = Vec::new();
-        server_r.read_to_end(&mut received_on_remote).await.unwrap();
+        // Remote must receive NEITHER premature EOF (P1-1) NOR smuggled pipelined bytes
+        let mut probe = [0u8; 64];
+        let early = tokio::time::timeout(Duration::from_millis(80), server_r.read(&mut probe)).await;
         assert!(
-            received_on_remote.is_empty(),
-            "Smuggled pipelined bytes reached remote: {:?}",
-            String::from_utf8_lossy(&received_on_remote)
+            early.is_err(),
+            "Expected neither premature EOF nor smuggled bytes, got: {:?}",
+            early
         );
 
         server_w
@@ -1066,9 +1152,13 @@ mod tests {
         let (mut server_r, mut server_w) = server_app.into_split();
         client_w.write_all(b"lloGET /evil HTTP/1.1\r\n\r\n").await.unwrap();
 
-        let mut remote_body = Vec::new();
-        server_r.read_to_end(&mut remote_body).await.unwrap();
+        let mut remote_body = [0u8; 5];
+        server_r.read_exact(&mut remote_body).await.unwrap();
         assert_eq!(&remote_body, b"hello");
+        let mut probe = [0u8; 64];
+        let after_exact = tokio::time::timeout(Duration::from_millis(80), server_r.read(&mut probe)).await;
+        assert!(after_exact.is_err(), "Expected open write half and zero smuggling, got: {:?}", after_exact);
+
         server_w.write_all(b"resp1").await.unwrap();
         server_w.shutdown().await.unwrap();
         let mut client_resp = Vec::new();
@@ -1097,9 +1187,13 @@ mod tests {
             .await
             .unwrap();
 
-        let mut remote_chunked = Vec::new();
-        server_r2.read_to_end(&mut remote_chunked).await.unwrap();
-        assert_eq!(&remote_chunked, b"3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nX-Check: yes\r\n\r\n");
+        let expected_chunked = b"3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nX-Check: yes\r\n\r\n";
+        let mut remote_chunked = vec![0u8; expected_chunked.len()];
+        server_r2.read_exact(&mut remote_chunked).await.unwrap();
+        assert_eq!(&remote_chunked[..], expected_chunked);
+        let after_chunked = tokio::time::timeout(Duration::from_millis(80), server_r2.read(&mut probe)).await;
+        assert!(after_chunked.is_err(), "Expected open write half and zero chunked smuggling, got: {:?}", after_chunked);
+
         server_w2.write_all(b"resp2").await.unwrap();
         server_w2.shutdown().await.unwrap();
         let mut client_resp2 = Vec::new();
@@ -1109,5 +1203,47 @@ mod tests {
             relay2.await.unwrap().unwrap(),
             (remote_chunked.len() as u64, 5)
         );
+    }
+
+    #[tokio::test]
+    async fn test_http_forward_early_4xx_response_does_not_hang() {
+        let (client_app, local_relay) = tcp_pair().await;
+        let (remote_relay, server_app) = tcp_pair().await;
+
+        let relay = tokio::spawn(async move {
+            relay_http_forward_monitored_with_timeout(
+                local_relay,
+                remote_relay,
+                None,
+                crate::inbound::HttpBodyFraming::ContentLength(10_000_000),
+                b"part".to_vec(),
+                Duration::from_secs(10),
+            )
+            .await
+        });
+
+        let (mut client_r, _client_w_keepopen) = client_app.into_split();
+        let (mut server_r, mut server_w) = server_app.into_split();
+
+        let mut head_body = [0u8; 4];
+        server_r.read_exact(&mut head_body).await.unwrap();
+        assert_eq!(&head_body, b"part");
+
+        // Origin rejects upload early with 401 and closes without waiting for remaining 10MB body
+        let reject = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno";
+        server_w.write_all(reject).await.unwrap();
+        server_w.shutdown().await.unwrap();
+
+        let (up, down) = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("Early 4xx response must finish promptly instead of hanging for idle timeout")
+            .unwrap()
+            .unwrap();
+        assert_eq!(up, 4);
+        assert_eq!(down, reject.len() as u64);
+
+        let mut got_resp = Vec::new();
+        client_r.read_to_end(&mut got_resp).await.unwrap();
+        assert_eq!(&got_resp, reject);
     }
 }
