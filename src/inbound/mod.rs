@@ -35,14 +35,25 @@ impl InboundKind {
     }
 }
 
+/// 明文 HTTP 转发请求体帧边界（用于限制上游写入长度，阻断流水线走私）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpBodyFraming {
+    ContentLength(u64),
+    Chunked,
+}
+
 /// 一次入站握手解析的结果
 #[derive(Debug)]
 pub struct InboundRequest {
     pub kind: InboundKind,
     pub target: TargetAddr,
     /// 隧道建立后需要首先写往远端的数据
-    /// （HTTP 明文转发时为改写后的请求头 + 已读取的请求体；CONNECT 时为客户端提前发送的数据）
+    /// （HTTP 明文转发时仅为改写后的请求头；CONNECT 时为客户端提前发送的数据）
     pub pending: Vec<u8>,
+    /// 明文 HTTP 转发时的请求体帧边界；其余协议为 None
+    pub http_body_framing: Option<HttpBodyFraming>,
+    /// 解析 HTTP 请求头时已多读入的请求体前缀字节（仅用于受限帧转发，绝不无界透传）
+    pub body_prefix: Vec<u8>,
 }
 
 /// 读取并解析入站握手，返回目标地址（此时尚未向客户端回复成功）
@@ -163,7 +174,13 @@ where
         }
     };
 
-    Ok(InboundRequest { kind: InboundKind::Socks5, target, pending: Vec::new() })
+    Ok(InboundRequest {
+        kind: InboundKind::Socks5,
+        target,
+        pending: Vec::new(),
+        http_body_framing: None,
+        body_prefix: Vec::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +213,13 @@ where
         TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port))
     };
 
-    Ok(InboundRequest { kind: InboundKind::Socks4, target, pending: Vec::new() })
+    Ok(InboundRequest {
+        kind: InboundKind::Socks4,
+        target,
+        pending: Vec::new(),
+        http_body_framing: None,
+        body_prefix: Vec::new(),
+    })
 }
 
 async fn read_nul_terminated<S>(stream: &mut S, max: usize) -> Result<Vec<u8>>
@@ -317,7 +340,7 @@ where
     // 严格校验请求头，阻断请求走私（obs-fold、畸形字段名、CL/TE 冲突、Host 不一致等）
     let mut header_lines: Vec<(&[u8], &[u8])> = Vec::new();
     let mut host_header: Option<&str> = None;
-    let mut content_length_seen = false;
+    let mut content_length: Option<u64> = None;
     let mut transfer_encoding_seen = false;
     let mut upgrade_seen = false;
     let mut nominated_hop_headers: Vec<Vec<u8>> = Vec::new();
@@ -353,7 +376,7 @@ where
             };
             host_header = Some(v.trim_matches(|c| c == ' ' || c == '\t'));
         } else if name.eq_ignore_ascii_case(b"content-length") {
-            if is_connect || content_length_seen {
+            if is_connect || content_length.is_some() {
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Forbidden or duplicate Content-Length header");
             }
@@ -362,11 +385,12 @@ where
                 bail!("Invalid Content-Length header");
             };
             let trimmed = v.trim_matches(|c| c == ' ' || c == '\t');
-            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) || trimmed.parse::<u64>().is_err() {
+            let parsed_cl = trimmed.parse::<u64>().ok();
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) || parsed_cl.is_none() {
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Malformed Content-Length header: {:?}", trimmed);
             }
-            content_length_seen = true;
+            content_length = parsed_cl;
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             if is_connect || transfer_encoding_seen {
                 reply_http_error(stream, "400 Bad Request").await;
@@ -416,7 +440,7 @@ where
         header_lines.push((line, name));
     }
 
-    if content_length_seen && transfer_encoding_seen {
+    if content_length.is_some() && transfer_encoding_seen {
         reply_http_error(stream, "400 Bad Request").await;
         bail!("HTTP request contains both Content-Length and Transfer-Encoding");
     }
@@ -441,8 +465,20 @@ where
     }
 
     if is_connect {
-        return Ok(InboundRequest { kind: InboundKind::HttpConnect, target, pending: leftover });
+        return Ok(InboundRequest {
+            kind: InboundKind::HttpConnect,
+            target,
+            pending: leftover,
+            http_body_framing: None,
+            body_prefix: Vec::new(),
+        });
     }
+
+    let http_body_framing = if transfer_encoding_seen {
+        Some(HttpBodyFraming::Chunked)
+    } else {
+        Some(HttpBodyFraming::ContentLength(content_length.unwrap_or(0)))
+    };
 
     let path = origin_path.unwrap_or("/");
 
@@ -470,12 +506,17 @@ where
         }
     }
     rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
-    rewritten.extend_from_slice(&leftover);
 
-    Ok(InboundRequest { kind: InboundKind::HttpForward, target, pending: rewritten })
+    Ok(InboundRequest {
+        kind: InboundKind::HttpForward,
+        target,
+        pending: rewritten,
+        http_body_framing,
+        body_prefix: leftover,
+    })
 }
 
-fn is_http_token_byte(b: u8) -> bool {
+pub(crate) fn is_http_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
             b,
@@ -597,20 +638,47 @@ mod tests {
         let (mut client, mut server) = duplex(4096);
         client
             .write_all(
-                b"GET http://Example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop-Secret\r\nX-Hop-Secret: s\r\nUser-Agent: t\r\n\r\n",
+                b"GET http://Example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop-Secret\r\nX-Hop-Secret: s\r\nUser-Agent: t\r\n\r\nGET http://evil.example/smuggled HTTP/1.1\r\nHost: evil.example\r\n\r\n",
             )
             .await
             .unwrap();
         let r = read_request(&mut server).await.unwrap();
         assert_eq!(r.kind, InboundKind::HttpForward);
         assert_eq!(r.target, TargetAddr::Domain("example.com".into(), 80));
+        assert_eq!(r.http_body_framing, Some(HttpBodyFraming::ContentLength(0)));
         let text = String::from_utf8(r.pending).unwrap();
         assert!(text.starts_with("GET /a?b=1 HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.com\r\n"));
         assert!(text.contains("User-Agent: t\r\n"));
         assert!(!text.contains("X-Hop-Secret"));
+        assert!(!text.contains("smuggled"));
         assert!(!text.to_lowercase().contains("keep-alive"));
         assert!(text.ends_with("Connection: close\r\n\r\n"));
+        assert!(r.body_prefix.starts_with(b"GET http://evil.example/smuggled"));
+    }
+
+    #[tokio::test]
+    async fn test_http_forward_captures_content_length_and_chunked_framing() {
+        let (mut c1, mut s1) = duplex(4096);
+        c1.write_all(
+            b"POST http://example.com/submit HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhelloEXTRA",
+        )
+        .await
+        .unwrap();
+        let r1 = read_request(&mut s1).await.unwrap();
+        assert_eq!(r1.http_body_framing, Some(HttpBodyFraming::ContentLength(5)));
+        assert!(!r1.pending.ends_with(b"helloEXTRA"));
+        assert_eq!(r1.body_prefix, b"helloEXTRA");
+
+        let (mut c2, mut s2) = duplex(4096);
+        c2.write_all(
+            b"POST http://example.com/upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let r2 = read_request(&mut s2).await.unwrap();
+        assert_eq!(r2.http_body_framing, Some(HttpBodyFraming::Chunked));
+        assert_eq!(r2.body_prefix, b"3\r\nabc\r\n0\r\n\r\n");
     }
 
     #[tokio::test]

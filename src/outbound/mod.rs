@@ -338,87 +338,50 @@ impl TargetAddr {
     }
 }
 
-/// 全双工透明流中继对拷（带实时流量监视与主动熔断切断支持）
-pub async fn relay_stream_monitored(
-    local: TcpStream,
-    remote: TcpStream,
-    conn: Option<&Arc<ActiveConnection>>,
-) -> Result<(u64, u64)> {
-    const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-    relay_stream_monitored_with_timeout(local, remote, conn, RELAY_IDLE_TIMEOUT).await
+fn record_activity_us(start: &tokio::time::Instant, tracker: &std::sync::atomic::AtomicU64) {
+    let elapsed_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    tracker.store(elapsed_us, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// 可配置双向静默空闲超时的全双工对拷实现：
-/// 仅当上行与下行在 `idle_timeout` 内均无任何数据流动时才判定超时；
-/// 任一方向收到 EOF (n == 0) 半关闭后，仅关闭对端写方向并允许另一方向继续传输。
-pub async fn relay_stream_monitored_with_timeout(
-    local: TcpStream,
-    remote: TcpStream,
+async fn relay_downlink(
+    mut rr: tokio::net::tcp::OwnedReadHalf,
+    mut lw: tokio::net::tcp::OwnedWriteHalf,
+    conn: Option<Arc<ActiveConnection>>,
+    start: tokio::time::Instant,
+    last_activity_us: Arc<std::sync::atomic::AtomicU64>,
+) -> std::io::Result<u64> {
+    let mut buf = [0u8; 16384];
+    let mut total_down = 0u64;
+    loop {
+        let n = rr.read(&mut buf).await?;
+        if n == 0 {
+            lw.shutdown().await.ok();
+            break;
+        }
+        record_activity_us(&start, &last_activity_us);
+        lw.write_all(&buf[..n]).await?;
+        record_activity_us(&start, &last_activity_us);
+        total_down += n as u64;
+        if let Some(c) = &conn {
+            c.add_download(n as u64);
+        }
+    }
+    Ok(total_down)
+}
+
+async fn run_relay_with_watchdog<FUp, FDown>(
+    up_task: FUp,
+    down_task: FDown,
+    start: tokio::time::Instant,
+    last_activity_us: Arc<std::sync::atomic::AtomicU64>,
     conn: Option<&Arc<ActiveConnection>>,
     idle_timeout: std::time::Duration,
-) -> Result<(u64, u64)> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    if conn.is_some_and(|c| c.is_cancelled()) {
-        anyhow::bail!("Connection aborted by administrator");
-    }
-
-    let (mut lr, mut lw) = local.into_split();
-    let (mut rr, mut rw) = remote.into_split();
-
-    let conn_up = conn.cloned();
-    let conn_down = conn.cloned();
-
-    let start = tokio::time::Instant::now();
-    // Track microsecond timestamp of the most recent payload activity in either direction
-    let last_activity_us = Arc::new(AtomicU64::new(0));
-    let last_up = Arc::clone(&last_activity_us);
-    let last_down = Arc::clone(&last_activity_us);
-
-    let touch_activity = |tracker: &AtomicU64| {
-        let elapsed_us = start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        tracker.store(elapsed_us, Ordering::Relaxed);
-    };
-
-    let up_task = async move {
-        let mut buf = [0u8; 16384];
-        let mut total_up = 0u64;
-        loop {
-            let n = lr.read(&mut buf).await?;
-            if n == 0 {
-                rw.shutdown().await.ok();
-                break;
-            }
-            touch_activity(&last_up);
-            rw.write_all(&buf[..n]).await?;
-            touch_activity(&last_up);
-            total_up += n as u64;
-            if let Some(c) = &conn_up {
-                c.add_upload(n as u64);
-            }
-        }
-        Ok::<u64, std::io::Error>(total_up)
-    };
-
-    let down_task = async move {
-        let mut buf = [0u8; 16384];
-        let mut total_down = 0u64;
-        loop {
-            let n = rr.read(&mut buf).await?;
-            if n == 0 {
-                lw.shutdown().await.ok();
-                break;
-            }
-            touch_activity(&last_down);
-            lw.write_all(&buf[..n]).await?;
-            touch_activity(&last_down);
-            total_down += n as u64;
-            if let Some(c) = &conn_down {
-                c.add_download(n as u64);
-            }
-        }
-        Ok::<u64, std::io::Error>(total_down)
-    };
+) -> Result<(u64, u64)>
+where
+    FUp: std::future::Future<Output = std::io::Result<u64>>,
+    FDown: std::future::Future<Output = std::io::Result<u64>>,
+{
+    use std::sync::atomic::Ordering;
 
     let idle_watchdog = async {
         let timeout_us = idle_timeout.as_micros().min(u128::from(u64::MAX)) as u64;
@@ -437,9 +400,7 @@ pub async fn relay_stream_monitored_with_timeout(
     };
 
     tokio::select! {
-        res = async {
-            tokio::try_join!(up_task, down_task)
-        } => {
+        res = async { tokio::try_join!(up_task, down_task) } => {
             let (up, down) = res?;
             Ok((up, down))
         }
@@ -463,6 +424,423 @@ pub async fn relay_stream_monitored_with_timeout(
             anyhow::bail!("Connection aborted by administrator");
         }
     }
+}
+
+/// 全双工透明流中继对拷（带实时流量监视与主动熔断切断支持）
+pub async fn relay_stream_monitored(
+    local: TcpStream,
+    remote: TcpStream,
+    conn: Option<&Arc<ActiveConnection>>,
+) -> Result<(u64, u64)> {
+    const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    relay_stream_monitored_with_timeout(local, remote, conn, RELAY_IDLE_TIMEOUT).await
+}
+
+/// 可配置双向静默空闲超时的全双工对拷实现：
+/// 仅当上行与下行在 `idle_timeout` 内均无任何数据流动时才判定超时；
+/// 任一方向收到 EOF (n == 0) 半关闭后，仅关闭对端写方向并允许另一方向继续传输。
+pub async fn relay_stream_monitored_with_timeout(
+    local: TcpStream,
+    remote: TcpStream,
+    conn: Option<&Arc<ActiveConnection>>,
+    idle_timeout: std::time::Duration,
+) -> Result<(u64, u64)> {
+    use std::sync::atomic::AtomicU64;
+
+    if conn.is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!("Connection aborted by administrator");
+    }
+
+    let (mut lr, lw) = local.into_split();
+    let (rr, mut rw) = remote.into_split();
+
+    let conn_up = conn.cloned();
+    let conn_down = conn.cloned();
+
+    let start = tokio::time::Instant::now();
+    let last_activity_us = Arc::new(AtomicU64::new(0));
+    let last_up = Arc::clone(&last_activity_us);
+    let last_down = Arc::clone(&last_activity_us);
+
+    let up_task = async move {
+        let mut buf = [0u8; 16384];
+        let mut total_up = 0u64;
+        loop {
+            let n = lr.read(&mut buf).await?;
+            if n == 0 {
+                rw.shutdown().await.ok();
+                break;
+            }
+            record_activity_us(&start, &last_up);
+            rw.write_all(&buf[..n]).await?;
+            record_activity_us(&start, &last_up);
+            total_up += n as u64;
+            if let Some(c) = &conn_up {
+                c.add_upload(n as u64);
+            }
+        }
+        Ok::<u64, std::io::Error>(total_up)
+    };
+
+    let down_task = relay_downlink(rr, lw, conn_down, start, last_down);
+    run_relay_with_watchdog(up_task, down_task, start, last_activity_us, conn, idle_timeout).await
+}
+
+/// 预读前缀 + 底层的顺序流读取器，用于精确消费 HTTP 请求体边界而绝不溢出到后续流水线请求
+struct PrefixedTcpReader {
+    buf: Vec<u8>,
+    pos: usize,
+    inner: tokio::net::tcp::OwnedReadHalf,
+}
+
+impl PrefixedTcpReader {
+    fn new(prefix: Vec<u8>, inner: tokio::net::tcp::OwnedReadHalf) -> Self {
+        Self {
+            buf: prefix,
+            pos: 0,
+            inner,
+        }
+    }
+
+    async fn fill(&mut self) -> std::io::Result<usize> {
+        if self.pos < self.buf.len() {
+            return Ok(self.buf.len() - self.pos);
+        }
+        self.buf.clear();
+        self.pos = 0;
+        let mut tmp = [0u8; 16384];
+        let n = self.inner.read(&mut tmp).await?;
+        if n > 0 {
+            self.buf.extend_from_slice(&tmp[..n]);
+        }
+        Ok(n)
+    }
+
+    async fn read_byte(&mut self) -> std::io::Result<Option<u8>> {
+        if self.fill().await? == 0 {
+            return Ok(None);
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Ok(Some(b))
+    }
+
+    async fn read_exact_bytes(&mut self, dst: &mut [u8]) -> std::io::Result<()> {
+        let mut written = 0usize;
+        while written < dst.len() {
+            let n = self.fill().await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF while reading framed HTTP body",
+                ));
+            }
+            let take = n.min(dst.len() - written);
+            dst[written..written + take].copy_from_slice(&self.buf[self.pos..self.pos + take]);
+            self.pos += take;
+            written += take;
+        }
+        Ok(())
+    }
+
+    /// 读取一行 CRLF 结尾内容（返回不含 `\r\n` 的内容），拒绝裸 `\n` 与 NUL 字节
+    async fn read_crlf_line(&mut self, max_len: usize) -> std::io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        loop {
+            let Some(b) = self.read_byte().await? else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Unexpected EOF while reading HTTP chunk line",
+                ));
+            };
+            if b == b'\0' {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "NUL byte not allowed in HTTP chunked framing",
+                ));
+            }
+            if b == b'\n' {
+                if !line.ends_with(b"\r") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Bare LF line ending not allowed in HTTP chunked framing",
+                    ));
+                }
+                line.pop();
+                return Ok(line);
+            }
+            if line.len() >= max_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HTTP chunked line exceeds maximum allowed length",
+                ));
+            }
+            line.push(b);
+        }
+    }
+}
+
+async fn write_remote_tracked(
+    rw: &mut tokio::net::tcp::OwnedWriteHalf,
+    bytes: &[u8],
+    total_up: &mut u64,
+    conn: &Option<Arc<ActiveConnection>>,
+    start: &tokio::time::Instant,
+    last_up: &Arc<std::sync::atomic::AtomicU64>,
+) -> std::io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    record_activity_us(start, last_up);
+    rw.write_all(bytes).await?;
+    record_activity_us(start, last_up);
+    *total_up += bytes.len() as u64;
+    if let Some(c) = conn {
+        c.add_upload(bytes.len() as u64);
+    }
+    Ok(())
+}
+
+async fn copy_exact_body(
+    reader: &mut PrefixedTcpReader,
+    rw: &mut tokio::net::tcp::OwnedWriteHalf,
+    mut remaining: u64,
+    total_up: &mut u64,
+    conn: &Option<Arc<ActiveConnection>>,
+    start: &tokio::time::Instant,
+    last_up: &Arc<std::sync::atomic::AtomicU64>,
+) -> std::io::Result<()> {
+    while remaining > 0 {
+        let avail = reader.fill().await?;
+        if avail == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "Truncated HTTP request body before reaching declared length",
+            ));
+        }
+        let take = (avail as u64).min(remaining) as usize;
+        record_activity_us(start, last_up);
+        rw.write_all(&reader.buf[reader.pos..reader.pos + take]).await?;
+        record_activity_us(start, last_up);
+        reader.pos += take;
+        remaining -= take as u64;
+        *total_up += take as u64;
+        if let Some(c) = conn {
+            c.add_upload(take as u64);
+        }
+    }
+    Ok(())
+}
+
+fn parse_chunk_size_line(line: &[u8]) -> std::io::Result<u64> {
+    let size_part = match line.iter().position(|&b| b == b';') {
+        Some(idx) => {
+            let ext = &line[idx + 1..];
+            if ext.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Control character in HTTP chunk extension",
+                ));
+            }
+            &line[..idx]
+        }
+        None => line,
+    };
+    let trimmed = {
+        let mut end = size_part.len();
+        while end > 0 && matches!(size_part[end - 1], b' ' | b'\t') {
+            end -= 1;
+        }
+        &size_part[..end]
+    };
+    if trimmed.is_empty() || !trimmed.iter().all(|b| b.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid HTTP chunk size hex digits",
+        ));
+    }
+    let hex_str = std::str::from_utf8(trimmed).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "Non-ASCII HTTP chunk size")
+    })?;
+    u64::from_str_radix(hex_str, 16).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP chunk size overflows u64",
+        )
+    })
+}
+
+fn validate_chunk_trailer_line(line: &[u8]) -> std::io::Result<()> {
+    if line.is_empty() || matches!(line[0], b' ' | b'\t') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Malformed or folded HTTP chunk trailer header",
+        ));
+    }
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "HTTP chunk trailer missing colon",
+        ));
+    };
+    let name = &line[..colon];
+    let val = &line[colon + 1..];
+    if name.is_empty() || !name.iter().all(|&b| crate::inbound::is_http_token_byte(b)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid HTTP chunk trailer header name",
+        ));
+    }
+    if val.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid control character in HTTP chunk trailer value",
+        ));
+    }
+    if name.eq_ignore_ascii_case(b"host")
+        || name.eq_ignore_ascii_case(b"content-length")
+        || name.eq_ignore_ascii_case(b"transfer-encoding")
+        || name.eq_ignore_ascii_case(b"trailer")
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Forbidden framing header in HTTP chunk trailer",
+        ));
+    }
+    Ok(())
+}
+
+async fn forward_chunked_body(
+    reader: &mut PrefixedTcpReader,
+    rw: &mut tokio::net::tcp::OwnedWriteHalf,
+    total_up: &mut u64,
+    conn: &Option<Arc<ActiveConnection>>,
+    start: &tokio::time::Instant,
+    last_up: &Arc<std::sync::atomic::AtomicU64>,
+) -> std::io::Result<()> {
+    const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
+    const MAX_TRAILER_BYTES: usize = 16 * 1024;
+
+    loop {
+        let size_line = reader.read_crlf_line(MAX_CHUNK_LINE_BYTES).await?;
+        let chunk_size = parse_chunk_size_line(&size_line)?;
+        write_remote_tracked(rw, &size_line, total_up, conn, start, last_up).await?;
+        write_remote_tracked(rw, b"\r\n", total_up, conn, start, last_up).await?;
+
+        if chunk_size == 0 {
+            let mut trailer_bytes = 0usize;
+            loop {
+                let trailer = reader.read_crlf_line(MAX_CHUNK_LINE_BYTES).await?;
+                if trailer.is_empty() {
+                    write_remote_tracked(rw, b"\r\n", total_up, conn, start, last_up).await?;
+                    return Ok(());
+                }
+                trailer_bytes = trailer_bytes.saturating_add(trailer.len() + 2);
+                if trailer_bytes > MAX_TRAILER_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "HTTP chunk trailers exceed size limit",
+                    ));
+                }
+                validate_chunk_trailer_line(&trailer)?;
+                write_remote_tracked(rw, &trailer, total_up, conn, start, last_up).await?;
+                write_remote_tracked(rw, b"\r\n", total_up, conn, start, last_up).await?;
+            }
+        }
+
+        copy_exact_body(reader, rw, chunk_size, total_up, conn, start, last_up).await?;
+        let mut crlf = [0u8; 2];
+        reader.read_exact_bytes(&mut crlf).await?;
+        if &crlf != b"\r\n" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing CRLF terminator after HTTP chunk payload",
+            ));
+        }
+        write_remote_tracked(rw, b"\r\n", total_up, conn, start, last_up).await?;
+    }
+}
+
+/// 明文 HTTP 代理有界请求体中继：严格按 `Content-Length` 或 `chunked` 解析并仅转发单个请求体，
+/// 请求体结束后立即半关闭上游写方向，阻断客户端同连接流水线夹带第二条请求的走私/绕过。
+pub async fn relay_http_forward_monitored(
+    local: TcpStream,
+    remote: TcpStream,
+    conn: Option<&Arc<ActiveConnection>>,
+    framing: crate::inbound::HttpBodyFraming,
+    body_prefix: Vec<u8>,
+) -> Result<(u64, u64)> {
+    const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    relay_http_forward_monitored_with_timeout(
+        local,
+        remote,
+        conn,
+        framing,
+        body_prefix,
+        RELAY_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+pub async fn relay_http_forward_monitored_with_timeout(
+    local: TcpStream,
+    remote: TcpStream,
+    conn: Option<&Arc<ActiveConnection>>,
+    framing: crate::inbound::HttpBodyFraming,
+    body_prefix: Vec<u8>,
+    idle_timeout: std::time::Duration,
+) -> Result<(u64, u64)> {
+    use std::sync::atomic::AtomicU64;
+
+    if conn.is_some_and(|c| c.is_cancelled()) {
+        anyhow::bail!("Connection aborted by administrator");
+    }
+
+    let (lr, lw) = local.into_split();
+    let (rr, mut rw) = remote.into_split();
+
+    let conn_up = conn.cloned();
+    let conn_down = conn.cloned();
+
+    let start = tokio::time::Instant::now();
+    let last_activity_us = Arc::new(AtomicU64::new(0));
+    let last_up = Arc::clone(&last_activity_us);
+    let last_down = Arc::clone(&last_activity_us);
+
+    let up_task = async move {
+        let mut reader = PrefixedTcpReader::new(body_prefix, lr);
+        let mut total_up = 0u64;
+        match framing {
+            crate::inbound::HttpBodyFraming::ContentLength(len) => {
+                copy_exact_body(
+                    &mut reader,
+                    &mut rw,
+                    len,
+                    &mut total_up,
+                    &conn_up,
+                    &start,
+                    &last_up,
+                )
+                .await?;
+            }
+            crate::inbound::HttpBodyFraming::Chunked => {
+                forward_chunked_body(
+                    &mut reader,
+                    &mut rw,
+                    &mut total_up,
+                    &conn_up,
+                    &start,
+                    &last_up,
+                )
+                .await?;
+            }
+        }
+        rw.shutdown().await.ok();
+        Ok::<u64, std::io::Error>(total_up)
+    };
+
+    let down_task = relay_downlink(rr, lw, conn_down, start, last_down);
+    run_relay_with_watchdog(up_task, down_task, start, last_activity_us, conn, idle_timeout).await
 }
 
 pub async fn relay_stream(local: TcpStream, remote: TcpStream) -> Result<(u64, u64)> {
@@ -618,6 +996,118 @@ mod tests {
         assert_eq!(
             TargetAddr::from_host_port("0x7f000001", 80).unwrap(),
             TargetAddr::Ip("127.0.0.1:80".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_forward_content_length_zero_blocks_pipelined_second_request() {
+        let (client_app, local_relay) = tcp_pair().await;
+        let (remote_relay, server_app) = tcp_pair().await;
+
+        let relay = tokio::spawn(async move {
+            relay_http_forward_monitored_with_timeout(
+                local_relay,
+                remote_relay,
+                None,
+                crate::inbound::HttpBodyFraming::ContentLength(0),
+                b"GET /smuggled HTTP/1.1\r\nHost: evil\r\n\r\n".to_vec(),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+
+        let (mut client_r, mut client_w) = client_app.into_split();
+        let (mut server_r, mut server_w) = server_app.into_split();
+
+        // Client keeps socket open briefly attempting to send more data
+        client_w.write_all(b"MORE_SMUGGLED").await.unwrap();
+
+        // Remote must receive EOF immediately on request direction without any smuggled bytes
+        let mut received_on_remote = Vec::new();
+        server_r.read_to_end(&mut received_on_remote).await.unwrap();
+        assert!(
+            received_on_remote.is_empty(),
+            "Smuggled pipelined bytes reached remote: {:?}",
+            String::from_utf8_lossy(&received_on_remote)
+        );
+
+        server_w
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        server_w.shutdown().await.unwrap();
+
+        let mut resp = Vec::new();
+        client_r.read_to_end(&mut resp).await.unwrap();
+        assert_eq!(&resp, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+
+        let (up, down) = relay.await.unwrap().unwrap();
+        assert_eq!(up, 0);
+        assert_eq!(down, resp.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_http_forward_content_length_exact_and_chunked_stop_before_smuggling() {
+        // 1. Exact Content-Length: 5
+        let (client_app, local_relay) = tcp_pair().await;
+        let (remote_relay, server_app) = tcp_pair().await;
+        let relay = tokio::spawn(async move {
+            relay_http_forward_monitored_with_timeout(
+                local_relay,
+                remote_relay,
+                None,
+                crate::inbound::HttpBodyFraming::ContentLength(5),
+                b"he".to_vec(),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let (mut client_r, mut client_w) = client_app.into_split();
+        let (mut server_r, mut server_w) = server_app.into_split();
+        client_w.write_all(b"lloGET /evil HTTP/1.1\r\n\r\n").await.unwrap();
+
+        let mut remote_body = Vec::new();
+        server_r.read_to_end(&mut remote_body).await.unwrap();
+        assert_eq!(&remote_body, b"hello");
+        server_w.write_all(b"resp1").await.unwrap();
+        server_w.shutdown().await.unwrap();
+        let mut client_resp = Vec::new();
+        client_r.read_to_end(&mut client_resp).await.unwrap();
+        assert_eq!(&client_resp, b"resp1");
+        assert_eq!(relay.await.unwrap().unwrap(), (5, 5));
+
+        // 2. Chunked encoding with trailer + trailing pipelined request
+        let (client_app, local_relay) = tcp_pair().await;
+        let (remote_relay, server_app) = tcp_pair().await;
+        let relay2 = tokio::spawn(async move {
+            relay_http_forward_monitored_with_timeout(
+                local_relay,
+                remote_relay,
+                None,
+                crate::inbound::HttpBodyFraming::Chunked,
+                b"3;ext=1\r\nabc\r\n".to_vec(),
+                Duration::from_secs(2),
+            )
+            .await
+        });
+        let (mut client_r2, mut client_w2) = client_app.into_split();
+        let (mut server_r2, mut server_w2) = server_app.into_split();
+        client_w2
+            .write_all(b"2\r\nde\r\n0\r\nX-Check: yes\r\n\r\nGET /smuggled HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut remote_chunked = Vec::new();
+        server_r2.read_to_end(&mut remote_chunked).await.unwrap();
+        assert_eq!(&remote_chunked, b"3;ext=1\r\nabc\r\n2\r\nde\r\n0\r\nX-Check: yes\r\n\r\n");
+        server_w2.write_all(b"resp2").await.unwrap();
+        server_w2.shutdown().await.unwrap();
+        let mut client_resp2 = Vec::new();
+        client_r2.read_to_end(&mut client_resp2).await.unwrap();
+        assert_eq!(&client_resp2, b"resp2");
+        assert_eq!(
+            relay2.await.unwrap().unwrap(),
+            (remote_chunked.len() as u64, 5)
         );
     }
 }

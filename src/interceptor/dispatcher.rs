@@ -164,10 +164,15 @@ async fn handle_connection(
     let server_addr = local_stream.local_addr()?;
 
     // 1. Parse inbound proxy protocol handshake, obtain client target address
-    let InboundRequest { kind, target, pending } =
-        tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, inbound::read_request(&mut local_stream))
-            .await
-            .map_err(|_| anyhow!("Inbound handshake timed out ({:?}), peer {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
+    let InboundRequest {
+        kind,
+        target,
+        pending,
+        http_body_framing,
+        body_prefix,
+    } = tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, inbound::read_request(&mut local_stream))
+        .await
+        .map_err(|_| anyhow!("Inbound handshake timed out ({:?}), peer {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
 
     // 2. Reverse lookup caller process via TCP 4-tuple (async non-blocking)
     let proc_info = config.tracker.find_by_connection_async(peer_addr, server_addr).await;
@@ -294,8 +299,20 @@ async fn handle_connection(
         active_conn.add_upload(pending.len() as u64);
     }
 
-    // 9. Full-duplex relay (with live traffic monitoring)
-    let (up, down) = relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?;
+    // 9. Traffic relay (HTTP plain forward uses bounded request body framing; tunnel modes use full-duplex relay)
+    let (up, down) = match (kind, http_body_framing) {
+        (inbound::InboundKind::HttpForward, Some(framing)) => {
+            crate::outbound::relay_http_forward_monitored(
+                local_stream,
+                remote_stream,
+                Some(&active_conn),
+                framing,
+                body_prefix,
+            )
+            .await?
+        }
+        _ => relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?,
+    };
     info!(
         "[Relay Complete] [{}] {}:{} Upload: {} B, Download: {} B",
         action_str,
@@ -327,10 +344,20 @@ async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &T
                     None => bail!("Rule specifies non-existent proxy node ID: {}", node_id),
                 }
             };
+            let pool = Some(config.fake_ip_pool.as_ref());
             match &client {
-                ProxyNode::Socks5(s) => s.connect(target).await,
-                ProxyNode::Http(h) => h.connect(target).await,
-                ProxyNode::Socks4(s) => s.connect(target).await,
+                ProxyNode::Socks5(s) => {
+                    s.connect_with_policy(target, config.upstream_dns, pool, &config.self_ports)
+                        .await
+                }
+                ProxyNode::Http(h) => {
+                    h.connect_with_policy(target, config.upstream_dns, pool, &config.self_ports)
+                        .await
+                }
+                ProxyNode::Socks4(s) => {
+                    s.connect_with_policy(target, config.upstream_dns, pool, &config.self_ports)
+                        .await
+                }
             }
         }
         Action::Chain(chain_id) => {
@@ -338,7 +365,14 @@ async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &T
                 Some(c) => c,
                 None => bail!("Rule specifies non-existent proxy chain ID: {}", chain_id),
             };
-            chain.connect(target).await
+            chain
+                .connect_with_policy(
+                    target,
+                    config.upstream_dns,
+                    Some(config.fake_ip_pool.as_ref()),
+                    &config.self_ports,
+                )
+                .await
         }
     }
 }
@@ -427,5 +461,49 @@ mod tests {
         let mut buf = vec![0u8; 128];
         let n = c.read(&mut buf).await.unwrap();
         assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 403"));
+    }
+
+    #[tokio::test]
+    async fn test_http_forward_dispatcher_blocks_pipelined_smuggling_on_persistent_origin() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let (req_tx, req_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut got = Vec::new();
+            s.read_to_end(&mut got).await.unwrap();
+            let _ = req_tx.send(got);
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+                .await
+                .unwrap();
+            s.shutdown().await.unwrap();
+        });
+
+        let dispatcher = StreamDispatcher::new(test_config("127.0.0.1:0".parse().unwrap(), vec![]));
+        let listener = dispatcher.bind().await.unwrap();
+        let inbound_addr = listener.local_addr().unwrap();
+        let (_tx, rx) = watch::channel(false);
+        tokio::spawn(async move { dispatcher.run(listener, rx).await });
+
+        let mut c = TcpStream::connect(inbound_addr).await.unwrap();
+        let payload = format!(
+            "GET http://127.0.0.1:{}/first HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\nGET http://127.0.0.1:{}/smuggled HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            origin_addr.port(),
+            origin_addr.port(),
+            origin_addr.port(),
+            origin_addr.port(),
+        );
+        c.write_all(payload.as_bytes()).await.unwrap();
+
+        let forwarded = req_rx.await.unwrap();
+        let forwarded_str = String::from_utf8(forwarded).unwrap();
+        assert!(forwarded_str.starts_with("GET /first HTTP/1.1\r\n"));
+        assert!(forwarded_str.contains("Connection: close\r\n\r\n"));
+        assert!(!forwarded_str.contains("/smuggled"));
+
+        let mut resp = Vec::new();
+        c.read_to_end(&mut resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp).ends_with("done"));
     }
 }
