@@ -1867,6 +1867,8 @@
         toast_ping_network_err: '[{name}] 测速网络异常',
         toast_ping_all_done: '已完成 {count} 个节点的延迟探测',
         toast_node_required: '请填写节点名称与服务器地址',
+        toast_node_pass_requires_user: '填写密码时必须同时填写用户名',
+        toast_node_http_user_colon: 'HTTP 代理用户名不能包含冒号 (:)',
         toast_node_saved: '节点 [{name}] 已保存并写入配置',
         toast_node_add_fail: '添加节点失败',
         toast_node_deleted: '已删除节点 #{id}',
@@ -2094,6 +2096,8 @@
         toast_ping_network_err: '[{name}] Ping network error',
         toast_ping_all_done: 'Completed latency probes for {count} nodes',
         toast_node_required: 'Please provide both node name and server address',
+        toast_node_pass_requires_user: 'Username is required when a password is provided',
+        toast_node_http_user_colon: 'HTTP proxy username cannot contain a colon (:)',
         toast_node_saved: 'Node [{name}] saved and written to configuration',
         toast_node_add_fail: 'Failed to add node',
         toast_node_deleted: 'Deleted node #{id}',
@@ -2251,7 +2255,7 @@
       if (state.system && state.system.inbound_addr) {
         loadNodes();
         loadRules();
-        pollRealtime(true);
+        pollRealtime({ force: true, recordHistory: false });
         if (state.lastSimResult) runRouteSimulate(true);
       }
       const pauseBtn = document.getElementById('pause-poll-btn');
@@ -2401,7 +2405,7 @@
       }
     }
 
-    async function pollRealtime(force = false) {
+    async function pollRealtime({ force = false, recordHistory = false } = {}) {
       if ((!force && state.paused) || state.pollInFlight) return;
       state.pollInFlight = true;
       try {
@@ -2440,10 +2444,12 @@
         document.getElementById('val-total-bytes').textContent = formatBytes(totalDown + totalUp);
         document.getElementById('nav-count-conns').textContent = stats.active_connections_count || 0;
 
-        state.historyDown.push(downRate);
-        if (state.historyDown.length > MAX_HISTORY) state.historyDown.shift();
-        state.historyUp.push(upRate);
-        if (state.historyUp.length > MAX_HISTORY) state.historyUp.shift();
+        if (recordHistory && !state.paused) {
+          state.historyDown.push(downRate);
+          if (state.historyDown.length > MAX_HISTORY) state.historyDown.shift();
+          state.historyUp.push(upRate);
+          if (state.historyUp.length > MAX_HISTORY) state.historyUp.shift();
+        }
         renderChart();
 
         if (sysRes.ok) {
@@ -2469,7 +2475,7 @@
       }
       state.pollTimerId = setTimeout(async () => {
         state.pollTimerId = null;
-        await pollRealtime();
+        await pollRealtime({ force: false, recordHistory: true });
         schedulePoll();
       }, 1000);
     }
@@ -2576,7 +2582,7 @@
       btn.textContent = state.paused ? t('btn_resume_poll') : t('btn_pause_poll');
       btn.classList.toggle('btn-primary', state.paused);
       if (!state.paused) {
-        pollRealtime(true).then(schedulePoll);
+        pollRealtime({ force: true, recordHistory: false }).then(schedulePoll);
       }
     }
 
@@ -2655,7 +2661,7 @@
         const data = await res.json().catch(() => ({}));
         if (res.ok) {
           showToast(t('toast_conn_killed', { id }), 'info');
-          await pollRealtime(true);
+          await pollRealtime({ force: true, recordHistory: false });
         } else {
           showToast(data.error || t('toast_conn_kill_fail'), 'error');
         }
@@ -2869,6 +2875,14 @@
 
       if (!name || !addr) {
         showToast(t('toast_node_required'), 'error');
+        return;
+      }
+      if (protocol !== 'SOCKS4' && !user && pass.length > 0) {
+        showToast(t('toast_node_pass_requires_user'), 'error');
+        return;
+      }
+      if (protocol === 'HTTP' && user.includes(':')) {
+        showToast(t('toast_node_http_user_colon'), 'error');
         return;
       }
 
@@ -3399,7 +3413,7 @@
     });
 
     async function refreshAll() {
-      await Promise.all([loadNodes(), loadRules(), pollRealtime(true)]);
+      await Promise.all([loadNodes(), loadRules(), pollRealtime({ force: true, recordHistory: false })]);
     }
 
     (async function bootstrap() {

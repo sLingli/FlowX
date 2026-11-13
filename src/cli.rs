@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::sync::RwLock;
 use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
@@ -302,14 +303,89 @@ fn normalize_api_addr(raw: &str) -> Result<String> {
     if trimmed.is_empty() {
         bail!("--api value cannot be empty");
     }
-    if trimmed.starts_with("https://") {
-        bail!("--api does not support https:// (FlowX local API uses HTTP)");
+    if trimmed.starts_with('-') {
+        bail!(
+            "Invalid --api address '{}': expected HOST:PORT (got option-like token)",
+            raw
+        );
     }
-    let without_scheme = trimmed.strip_prefix("http://").unwrap_or(trimmed);
+
+    let bytes = trimmed.as_bytes();
+    let without_scheme = if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(b"https://") {
+        bail!("--api does not support https:// (FlowX local API uses HTTP)");
+    } else if bytes.len() >= 7 && bytes[..7].eq_ignore_ascii_case(b"http://") {
+        &trimmed[7..]
+    } else if trimmed.contains("://") {
+        bail!(
+            "Invalid --api address '{}': unsupported URL scheme (expected http:// or HOST:PORT)",
+            raw
+        );
+    } else {
+        trimmed
+    };
+
     let authority = without_scheme.trim_end_matches('/');
-    if authority.is_empty() || authority.contains('/') {
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.contains('@')
+        || authority.chars().any(char::is_whitespace)
+    {
         bail!("Invalid --api address '{}': expected HOST:PORT", raw);
     }
+
+    if let Ok(sock) = authority.parse::<std::net::SocketAddr>() {
+        if sock.port() == 0 {
+            bail!("Invalid --api address '{}': port cannot be 0", raw);
+        }
+        return Ok(authority.to_string());
+    }
+
+    let (host, port_str) = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once("]:").ok_or_else(|| {
+            anyhow!(
+                "Invalid --api address '{}': expected [IPv6]:PORT with non-zero port",
+                raw
+            )
+        })?
+    } else {
+        let (h, p) = authority.rsplit_once(':').ok_or_else(|| {
+            anyhow!(
+                "Invalid --api address '{}': missing :PORT (expected HOST:PORT)",
+                raw
+            )
+        })?;
+        if h.contains(':') {
+            bail!(
+                "Invalid --api address '{}': wrap IPv6 addresses in brackets as [HOST]:PORT",
+                raw
+            );
+        }
+        (h, p)
+    };
+
+    if host.is_empty() || host.contains('[') || host.contains(']') {
+        bail!("Invalid --api address '{}': invalid host in HOST:PORT", raw);
+    }
+    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        bail!(
+            "Invalid --api address '{}': invalid port '{}'",
+            raw,
+            port_str
+        );
+    }
+    let port: u16 = port_str.parse().map_err(|_| {
+        anyhow!(
+            "Invalid --api address '{}': port '{}' out of range",
+            raw,
+            port_str
+        )
+    })?;
+    if port == 0 {
+        bail!("Invalid --api address '{}': port cannot be 0", raw);
+    }
+
     Ok(authority.to_string())
 }
 
@@ -648,16 +724,155 @@ async fn api_request_or_offline(
     }
 }
 
+#[derive(Debug)]
+pub struct ApiHttpError {
+    pub status: u16,
+    pub code: Option<String>,
+    pub error: String,
+    pub body: Value,
+    pub offline: bool,
+}
+
+impl ApiHttpError {
+    fn from_value(status: u16, val: Value, offline: bool) -> Self {
+        let code = val
+            .get("code")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        let error = val
+            .get("error")
+            .and_then(|v| v.as_str())
+            .or_else(|| val.get("raw").and_then(|v| v.as_str()))
+            .unwrap_or("API request failed")
+            .to_string();
+        Self {
+            status,
+            code,
+            error,
+            body: val,
+            offline,
+        }
+    }
+}
+
+impl std::fmt::Display for ApiHttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.offline {
+            write!(f, "{}", self.error)
+        } else {
+            write!(f, "{} (HTTP {})", self.error, self.status)
+        }
+    }
+}
+
+impl std::error::Error for ApiHttpError {}
+
+pub fn wants_json_output(args: &[String]) -> bool {
+    if let Ok(parsed) = parse_cli_invocation(args) {
+        return parsed.opts.json_output;
+    }
+    let mut expect_value = false;
+    for arg in args.iter().skip(1) {
+        if expect_value {
+            expect_value = false;
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        if arg == "--json" {
+            return true;
+        }
+        if matches!(arg.as_str(), "-c" | "--config" | "--api") {
+            expect_value = true;
+            continue;
+        }
+        if let Some(flag_name) = arg.strip_prefix("--")
+            && !flag_name.contains('=')
+            && is_known_subcommand_value_flag(flag_name)
+        {
+            expect_value = true;
+        }
+    }
+    false
+}
+
+pub fn format_cli_error_json(err: &anyhow::Error) -> Value {
+    if let Some(api_err) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ApiHttpError>())
+    {
+        let mut obj = match api_err.body.as_object() {
+            Some(map) => map.clone(),
+            None => serde_json::Map::new(),
+        };
+        obj.insert("ok".to_string(), Value::Bool(false));
+        obj.insert(
+            "code".to_string(),
+            Value::String(
+                api_err
+                    .code
+                    .clone()
+                    .unwrap_or_else(|| format!("ERR_HTTP_{}", api_err.status)),
+            ),
+        );
+        obj.insert("error".to_string(), Value::String(api_err.error.clone()));
+        obj.insert(
+            "status".to_string(),
+            Value::Number(serde_json::Number::from(api_err.status)),
+        );
+        Value::Object(obj)
+    } else {
+        json!({
+            "ok": false,
+            "code": "ERR_CLI_ERROR",
+            "error": format!("{:#}", err),
+        })
+    }
+}
+
+pub fn emit_cli_error_and_exit(err: &anyhow::Error, json_output: bool) -> ! {
+    if json_output {
+        let payload = format_cli_error_json(err);
+        if let Ok(s) = serde_json::to_string_pretty(&payload) {
+            println!("{}", s);
+        } else {
+            println!(
+                "{{\"ok\":false,\"code\":\"ERR_CLI_ERROR\",\"error\":\"Failed to serialize error\"}}"
+            );
+        }
+        let _ = std::io::stdout().flush();
+    } else {
+        eprintln!("Error: {:?}", err);
+        let _ = std::io::stderr().flush();
+    }
+    std::process::exit(1);
+}
+
 fn ensure_api_ok(status: u16, val: Value) -> Result<Value> {
     if (200..300).contains(&status) {
         Ok(val)
     } else {
-        let err_msg = val
-            .get("error")
-            .and_then(|v| v.as_str())
-            .or_else(|| val.get("raw").and_then(|v| v.as_str()))
-            .unwrap_or("API request failed");
-        bail!("{} (HTTP {})", err_msg, status);
+        Err(anyhow::Error::new(ApiHttpError::from_value(
+            status, val, false,
+        )))
+    }
+}
+
+fn ensure_offline_handler_ok(status_line: &str, body: &str) -> Result<Value> {
+    let val: Value =
+        serde_json::from_str(body).unwrap_or_else(|_| json!({ "raw": body, "error": body }));
+    let status = status_line
+        .split_whitespace()
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(500);
+    if (200..300).contains(&status) {
+        Ok(val)
+    } else {
+        Err(anyhow::Error::new(ApiHttpError::from_value(
+            status, val, true,
+        )))
     }
 }
 
@@ -671,6 +886,16 @@ fn load_offline_runtime(config_path: &str) -> Result<OfflineRuntime> {
     let store = ConfigStore::new(config_path);
     let (rt, _) = store
         .load_or_init(&DEFAULT_SELF_PORTS)
+        .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
+    let nodes = RwLock::new(rt.proxy_nodes);
+    let engine = RuleEngine::new(rt.rules, rt.default_action);
+    Ok((store, nodes, engine))
+}
+
+fn load_offline_runtime_readonly(config_path: &str) -> Result<OfflineRuntime> {
+    let store = ConfigStore::new(config_path);
+    let rt = store
+        .load_existing(&DEFAULT_SELF_PORTS)
         .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
     let nodes = RwLock::new(rt.proxy_nodes);
     let engine = RuleEngine::new(rt.rules, rt.default_action);
@@ -922,7 +1147,7 @@ async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
         return Ok(());
     }
 
-    let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
+    let (store, nodes, engine) = load_offline_runtime_readonly(&opts.config_path)?;
     let nodes_count = nodes.read().unwrap_or_else(|e| e.into_inner()).len();
     let rules = engine.current_rules();
     let enabled_count = rules.iter().filter(|r| r.enabled).count();
@@ -981,7 +1206,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     let v = ensure_api_ok(st, val)?;
                     serde_json::from_value(v)?
                 } else {
-                    let (_, nodes, _) = load_offline_runtime(&opts.config_path)?;
+                    let (_, nodes, _) = load_offline_runtime_readonly(&opts.config_path)?;
                     let guard = nodes.read().unwrap_or_else(|e| e.into_inner());
                     let mut v: Vec<ProxyNodeView> = guard
                         .values()
@@ -1061,10 +1286,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
                 let req: AddNodeRequest = serde_json::from_value(payload)?;
                 let (st, _, body) = handle_add_node(req, &nodes, &DEFAULT_SELF_PORTS, Locale::Zh);
-                let val: Value = serde_json::from_str(&body)?;
-                if st != "200 OK" {
-                    bail!("{}", val["error"].as_str().unwrap_or(&body));
-                }
+                let val = ensure_offline_handler_ok(st, &body)?;
                 store.save_runtime(&nodes, &engine)?;
                 val
             };
@@ -1147,10 +1369,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
                 let (st, _, body) =
                     handle_patch_node(req, &nodes, &DEFAULT_SELF_PORTS, Locale::Zh);
-                let val: Value = serde_json::from_str(&body)?;
-                if st != "200 OK" {
-                    bail!("{}", val["error"].as_str().unwrap_or(&body));
-                }
+                let val = ensure_offline_handler_ok(st, &body)?;
                 store.save_runtime(&nodes, &engine)?;
                 val
             };
@@ -1249,7 +1468,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let (_, nodes, _) = load_offline_runtime(&opts.config_path)?;
+                let (_, nodes, _) = load_offline_runtime_readonly(&opts.config_path)?;
                 let addr = {
                     let guard = nodes.read().unwrap_or_else(|e| e.into_inner());
                     guard
@@ -1312,7 +1531,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 {
                     serde_json::from_value(ensure_api_ok(st, val)?)?
                 } else {
-                    let (_, _, engine) = load_offline_runtime(&opts.config_path)?;
+                    let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
                     engine.list_rules_view_with_locale(Locale::Zh)
                 };
 
@@ -1392,10 +1611,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
                 let req: AddRuleRequest = serde_json::from_value(payload)?;
                 let (st, _, body) = handle_add_rule(req, &engine, &nodes, Locale::Zh);
-                let val: Value = serde_json::from_str(&body)?;
-                if st != "200 OK" {
-                    bail!("{}", val["error"].as_str().unwrap_or(&body));
-                }
+                let val = ensure_offline_handler_ok(st, &body)?;
                 store.save_runtime(&nodes, &engine)?;
                 val
             };
@@ -1506,10 +1722,7 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     });
                     let req: PatchRuleRequest = serde_json::from_value(payload)?;
                     let (st, _, body) = handle_patch_rule(req, &engine, &nodes, Locale::Zh);
-                    let val: Value = serde_json::from_str(&body)?;
-                    if st != "200 OK" {
-                        bail!("{}", val["error"].as_str().unwrap_or(&body));
-                    }
+                    let val = ensure_offline_handler_ok(st, &body)?;
                     store.save_runtime(&nodes, &engine)?;
                     (resolved_id, val)
                 }
@@ -1764,10 +1977,7 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
             let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
             let req: SetDefaultActionRequest = serde_json::from_value(payload)?;
             let (st, _, body) = handle_set_default_action(req, &engine, &nodes, Locale::Zh);
-            let val: Value = serde_json::from_str(&body)?;
-            if st != "200 OK" {
-                bail!("{}", val["error"].as_str().unwrap_or(&body));
-            }
+            let val = ensure_offline_handler_ok(st, &body)?;
             store.save_runtime(&nodes, &engine)?;
             val
         };
@@ -1806,7 +2016,7 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         return Ok(());
     }
 
-    let (_, _, engine) = load_offline_runtime(&opts.config_path)?;
+    let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
     let act = engine.default_action();
     let desc = format_action_desc(&act, Locale::Zh);
     let out = json!({
@@ -1867,14 +2077,10 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
     {
         ensure_api_ok(st, val)?
     } else {
-        let (_, _, engine) = load_offline_runtime(&opts.config_path)?;
+        let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
         let req: SimulateRouteRequest = serde_json::from_value(payload)?;
         let (st, _, body) = handle_simulate_route(req, &engine, Locale::Zh);
-        let val: Value = serde_json::from_str(&body)?;
-        if st != "200 OK" {
-            bail!("{}", val["error"].as_str().unwrap_or(&body));
-        }
-        val
+        ensure_offline_handler_ok(st, &body)?
     };
 
     if opts.json_output {
@@ -2476,5 +2682,271 @@ mod tests {
 
         let _ = shutdown_tx.send(true);
         let _ = srv_handle.await;
+    }
+
+    #[test]
+    fn test_cli_normalize_api_addr_and_wants_json_output() {
+        assert_eq!(
+            normalize_api_addr("127.0.0.1:40080").unwrap(),
+            "127.0.0.1:40080"
+        );
+        assert_eq!(
+            normalize_api_addr("HTTP://127.0.0.1:40080/").unwrap(),
+            "127.0.0.1:40080"
+        );
+        assert_eq!(normalize_api_addr("[::1]:40080").unwrap(), "[::1]:40080");
+        assert_eq!(
+            normalize_api_addr("localhost:40080").unwrap(),
+            "localhost:40080"
+        );
+
+        for invalid in [
+            "",
+            "127.0.0.1",
+            "127.0.0.1:0",
+            "[::1]",
+            "[::1]:0",
+            "::1:40080",
+            "HTTPS://127.0.0.1:40080",
+            "ftp://127.0.0.1:40080",
+            "--offline",
+            "127.0.0.1:40080/api",
+            "127.0.0.1:40080?x=1",
+            "user@127.0.0.1:40080",
+            "localhost:99999",
+        ] {
+            assert!(
+                normalize_api_addr(invalid).is_err(),
+                "expected '{}' to be rejected",
+                invalid
+            );
+        }
+
+        assert!(wants_json_output(&[
+            "flowx".into(),
+            "--json".into(),
+            "status".into()
+        ]));
+        assert!(wants_json_output(&[
+            "flowx".into(),
+            "--json".into(),
+            "--api".into(),
+            "127.0.0.1".into(),
+            "status".into()
+        ]));
+        assert!(!wants_json_output(&[
+            "flowx".into(),
+            "node".into(),
+            "add".into(),
+            "--pass".into(),
+            "--json".into(),
+            "--api".into(),
+            "127.0.0.1".into()
+        ]));
+        assert!(!wants_json_output(&[
+            "flowx".into(),
+            "--api".into(),
+            "--json".into(),
+            "status".into()
+        ]));
+    }
+
+    #[tokio::test]
+    async fn test_cli_readonly_commands_do_not_create_missing_config() {
+        let mut path = std::env::current_dir().unwrap().join("target");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("flowx_cli_readonly_missing_{}.xml", ts));
+        let _ = std::fs::remove_file(&path);
+        let cfg_str = path.to_string_lossy().to_string();
+
+        let cmds: &[&[&str]] = &[
+            &["status"],
+            &["node", "list"],
+            &["node", "ping", "1"],
+            &["rule", "list"],
+            &["default"],
+            &["sim", "--app", "git.exe", "--target", "example.com:443"],
+        ];
+
+        for sub in cmds {
+            let mut argv = vec![
+                "flowx".to_string(),
+                "--config".to_string(),
+                cfg_str.clone(),
+                "--offline".to_string(),
+            ];
+            argv.extend(sub.iter().map(|s| (*s).to_string()));
+            let err = run_cli(&argv).await.unwrap_err();
+            let err_json = format_cli_error_json(&err);
+            assert_eq!(err_json["ok"], Value::Bool(false));
+            assert!(
+                !path.exists(),
+                "read-only command {:?} must not create {}",
+                sub,
+                cfg_str
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cli_json_errors_and_password_clear_rules() {
+        let mut path = std::env::current_dir().unwrap().join("target");
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("flowx_cli_pw_rules_{}.xml", ts));
+        let _ = std::fs::remove_file(&path);
+        let cfg_str = path.to_string_lossy().to_string();
+
+        // 1. Offline add with password but no username fails with structured ERR_PASSWORD_WITHOUT_USERNAME
+        let err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "NoUser".into(),
+            "--addr".into(),
+            "10.0.0.2:1080".into(),
+            "--pass".into(),
+            "secret".into(),
+        ])
+        .await
+        .unwrap_err();
+        let j = format_cli_error_json(&err);
+        assert_eq!(j["ok"], Value::Bool(false));
+        assert_eq!(j["code"], "ERR_PASSWORD_WITHOUT_USERNAME");
+        assert_eq!(j["status"], 400);
+
+        // 2. Offline add with username + empty password fails with ERR_EMPTY_PASSWORD
+        let err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "EmptyPass".into(),
+            "--addr".into(),
+            "10.0.0.2:1080".into(),
+            "--user".into(),
+            "alice".into(),
+            "--pass".into(),
+            "".into(),
+        ])
+        .await
+        .unwrap_err();
+        let j = format_cli_error_json(&err);
+        assert_eq!(j["code"], "ERR_EMPTY_PASSWORD");
+        assert_eq!(j["status"], 400);
+
+        // 3. Offline add HTTP node with colon in username fails with ERR_HTTP_USERNAME_COLON
+        let err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "BadHttp".into(),
+            "--protocol".into(),
+            "HTTP".into(),
+            "--addr".into(),
+            "10.0.0.2:8080".into(),
+            "--user".into(),
+            "bad:user".into(),
+            "--pass".into(),
+            "secret".into(),
+        ])
+        .await
+        .unwrap_err();
+        let j = format_cli_error_json(&err);
+        assert_eq!(j["code"], "ERR_HTTP_USERNAME_COLON");
+
+        // 4. Add valid node then clear password with explicit `--pass ""`
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "ValidNode".into(),
+            "--addr".into(),
+            "10.0.0.2:1080".into(),
+            "--user".into(),
+            "alice".into(),
+            "--pass".into(),
+            "secret".into(),
+        ])
+        .await
+        .unwrap();
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "node".into(),
+            "update".into(),
+            "102".into(),
+            "--pass".into(),
+            "".into(),
+        ])
+        .await
+        .unwrap();
+
+        let store = ConfigStore::new(&path);
+        let rt = store.load_existing(&DEFAULT_SELF_PORTS).unwrap();
+        let node = rt.proxy_nodes.get(&102).unwrap();
+        assert_eq!(node.username.as_deref(), Some("alice"));
+        assert_eq!(node.client.auth_credentials().1, None);
+
+        // 5. Online API HTTP 400 response preserves structured JSON error code/status
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap().to_string();
+        let srv = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut req_buf = [0u8; 2048];
+                let _ = sock.read(&mut req_buf).await;
+                let body = r#"{"ok":false,"code":"ERR_RULE_CONFLICT","error":"Conflict"}"#;
+                let resp = format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let api_err = run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            mock_addr,
+            "--json".into(),
+            "node".into(),
+            "list".into(),
+        ])
+        .await
+        .unwrap_err();
+        let _ = srv.await;
+        let j = format_cli_error_json(&api_err);
+        assert_eq!(j["ok"], Value::Bool(false));
+        assert_eq!(j["code"], "ERR_RULE_CONFLICT");
+        assert_eq!(j["error"], "Conflict");
+        assert_eq!(j["status"], 409);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

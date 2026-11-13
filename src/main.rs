@@ -29,9 +29,16 @@ use crate::router::RuleEngine;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
-    let config_path = match cli::resolve_launch_mode(&raw_args)? {
-        cli::LaunchMode::Serve { config_path } => config_path,
-        cli::LaunchMode::Cli => return cli::run_cli(&raw_args).await,
+    let wants_json = cli::wants_json_output(&raw_args);
+    let config_path = match cli::resolve_launch_mode(&raw_args) {
+        Ok(cli::LaunchMode::Serve { config_path }) => config_path,
+        Ok(cli::LaunchMode::Cli) => {
+            if let Err(err) = cli::run_cli(&raw_args).await {
+                cli::emit_cli_error_and_exit(&err, wants_json);
+            }
+            return Ok(());
+        }
+        Err(err) => cli::emit_cli_error_and_exit(&err, wants_json),
     };
 
     // 1. 初始化标准结构化日志
