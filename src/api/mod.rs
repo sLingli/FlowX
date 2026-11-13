@@ -1486,11 +1486,14 @@ fn resolve_updated_password(
         return Ok(None);
     }
 
-    if clear_password == Some(true) || explicit_empty || keep_password == Some(false) {
+    if clear_password == Some(true) || explicit_empty {
         return Ok(None);
     }
     if explicit_non_empty.is_some() {
         return Ok(explicit_non_empty);
+    }
+    if keep_password == Some(false) {
+        return Ok(None);
     }
 
     if keep_password.unwrap_or(default_keep_when_omitted) {
@@ -3305,6 +3308,83 @@ mod tests {
             api_nodes.read().unwrap().get(&101).unwrap().client.auth_credentials(),
             (None, None),
             "PATCH with explicit empty password string must clear stored password"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_update_and_patch_new_password_with_keep_false() {
+        let (api_addr, api_nodes, _api_re, _tx) = spawn_test_api().await;
+        let api_port = api_addr.port();
+
+        let add_body = r#"{"name":"s5p0","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","password":"pw1"}"#;
+        let r_add = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                add_body.len(),
+                add_body
+            ),
+        )
+        .await;
+        assert!(r_add.starts_with("HTTP/1.1 200 OK"));
+        let added_json: serde_json::Value =
+            serde_json::from_str(r_add.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let node_id = added_json["id"].as_u64().unwrap() as u32;
+
+        // P0: Web UI edits send explicit non-empty password alongside keep_password=false & clear_password=false
+        let put_body = format!(
+            r#"{{"id":{},"name":"s5p0","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","password":"new-put-secret","keep_password":false,"clear_password":false}}"#,
+            node_id
+        );
+        let r_put = raw_http(
+            api_addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                put_body.len(),
+                put_body
+            ),
+        )
+        .await;
+        assert!(r_put.starts_with("HTTP/1.1 200 OK"), "PUT failed: {}", r_put);
+        assert_eq!(
+            api_nodes
+                .read()
+                .unwrap()
+                .get(&node_id)
+                .unwrap()
+                .client
+                .auth_credentials(),
+            (Some("alice"), Some("new-put-secret")),
+            "PUT must preserve newly entered password even when keep_password=false"
+        );
+
+        let patch_body = format!(
+            r#"{{"id":{},"username":"bob","password":"new-patch-secret","keep_password":false,"clear_password":false}}"#,
+            node_id
+        );
+        let r_patch = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                patch_body.len(),
+                patch_body
+            ),
+        )
+        .await;
+        assert!(r_patch.starts_with("HTTP/1.1 200 OK"), "PATCH failed: {}", r_patch);
+        assert_eq!(
+            api_nodes
+                .read()
+                .unwrap()
+                .get(&node_id)
+                .unwrap()
+                .client
+                .auth_credentials(),
+            (Some("bob"), Some("new-patch-secret")),
+            "PATCH must preserve newly entered password even when keep_password=false"
         );
     }
 }
