@@ -23,7 +23,7 @@ use crate::dns::server::DnsServer;
 use crate::dns::FakeIpPool;
 use crate::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
 use crate::interceptor::process::ProcessTracker;
-use crate::monitor::ConnectionManager;
+use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::router::RuleEngine;
 
 fn resolve_config_path() -> String {
@@ -93,12 +93,15 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // 4. Fail-Fast 端口绑定阶段（确保核心服务端口可用，若被占用立即明确报错）
+    let in_flight = Arc::new(InFlightTracker::new());
+
     let dns_server = DnsServer::new(
         dns_bind,
         Arc::clone(&fake_ip_pool),
         upstream_dns,
         true, // 阻断 AAAA IPv6 泄漏
-    );
+    )
+    .with_in_flight(Arc::clone(&in_flight));
     let dns_socket = dns_server.bind().await?;
 
     let dispatcher = StreamDispatcher::new(DispatcherConfig {
@@ -111,7 +114,8 @@ async fn main() -> anyhow::Result<()> {
         proxy_nodes: Arc::clone(&proxy_nodes),
         proxy_chains: Arc::clone(&proxy_chains),
         self_ports: self_ports.clone(),
-    });
+    })
+    .with_in_flight(Arc::clone(&in_flight));
     let dispatcher_listener = dispatcher.bind().await?;
 
     let runtime_context = Arc::new(SystemRuntimeContext {
@@ -131,43 +135,46 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_self_ports(self_ports)
     .with_config_store(Arc::clone(&config_store))
-    .with_runtime_context(runtime_context);
+    .with_runtime_context(runtime_context)
+    .with_in_flight(Arc::clone(&in_flight));
     let api_listener = api_server.bind().await?;
 
     // 5. 初始化全局优雅停机广播通知通道
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // 6. 启动异步服务工作线程
+    // 6. 在托管 JoinSet 中启动异步核心服务任务，任一核心任务异常提前退出时触发停机并向上返回错误
+    let mut core_tasks: tokio::task::JoinSet<(&'static str, anyhow::Result<()>)> = tokio::task::JoinSet::new();
+
     let rx1 = shutdown_rx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = dns_server.run(dns_socket, rx1).await {
-            tracing::error!("[DNS] DNS service exited unexpectedly: {}", e);
-        }
+    core_tasks.spawn(async move {
+        let res = dns_server.run(dns_socket, rx1).await;
+        ("dns", res)
     });
 
     let rx2 = shutdown_rx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = dispatcher.run(dispatcher_listener, rx2).await {
-            tracing::error!("[Dispatcher] Transparent stream dispatcher exited unexpectedly: {}", e);
-        }
+    core_tasks.spawn(async move {
+        let res = dispatcher.run(dispatcher_listener, rx2).await;
+        ("dispatcher", res)
     });
 
     let rx3 = shutdown_rx.clone();
-    tokio::spawn(async move {
-        if let Err(e) = api_server.run(api_listener, rx3).await {
-            tracing::error!("[API] Web console API service exited unexpectedly: {}", e);
-        }
+    core_tasks.spawn(async move {
+        let res = api_server.run(api_listener, rx3).await;
+        ("api", res)
     });
 
     // 7. 启动周期性内存 GC 维护任务（每 3 秒通过 blocking 线程池异步清理过期 Fake-IP 与进程缓存，避免阻塞 Tokio Worker）
     let pool_gc = Arc::clone(&fake_ip_pool);
     let tracker_gc = Arc::clone(&process_tracker);
     let mut rx_gc = shutdown_rx.clone();
-    tokio::spawn(async move {
+    core_tasks.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(3));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
         loop {
+            if *rx_gc.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = interval.tick() => {
                     let pool_task = Arc::clone(&pool_gc);
@@ -194,29 +201,71 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        ("gc", Ok(()))
     });
 
     info!("[Ready] Web console ready at: http://127.0.0.1:40080");
     info!("[Ready] Press Ctrl+C (or send SIGTERM) to stop FlowX core");
 
-    // 8. 监听操作系统停机信号（Windows Ctrl+C / Unix SIGINT & SIGTERM）并执行优雅停机
-    let sig_name = wait_for_shutdown_signal().await?;
-    info!(
-        "[Shutdown] Received {} signal, stopping inbound traffic...",
-        sig_name
-    );
+    // 8. 同时等待 OS 停机信号与核心任务异常退出
+    let mut unexpected_exit: Option<anyhow::Error> = None;
+    tokio::select! {
+        sig_res = wait_for_shutdown_signal() => {
+            let sig_name = sig_res?;
+            info!("[Shutdown] Received {} signal, stopping inbound traffic...", sig_name);
+        }
+        joined = core_tasks.join_next() => {
+            match joined {
+                Some(Ok((name, Ok(())))) => {
+                    let err = anyhow::anyhow!("Core service task '{}' exited unexpectedly before shutdown signal", name);
+                    tracing::error!("[Shutdown] {:#}", err);
+                    unexpected_exit = Some(err);
+                }
+                Some(Ok((name, Err(e)))) => {
+                    let err = anyhow::anyhow!("Core service task '{}' failed: {:#}", name, e);
+                    tracing::error!("[Shutdown] {:#}", err);
+                    unexpected_exit = Some(err);
+                }
+                Some(Err(join_err)) => {
+                    let err = anyhow::anyhow!("Core service task panicked or was cancelled: {}", join_err);
+                    tracing::error!("[Shutdown] {:#}", err);
+                    unexpected_exit = Some(err);
+                }
+                None => {}
+            }
+        }
+    }
     let _ = shutdown_tx.send(true);
 
-    // 优雅排空：等待正在传输的活跃连接完成挥手（最多等待 10 秒）
+    // 优雅排空：等待所有核心循环退出且活跃连接 + 在途请求完全排空（最多等待 10 秒）
     let drain_start = std::time::Instant::now();
     let max_drain_wait = Duration::from_secs(10);
-    while drain_start.elapsed() < max_drain_wait {
-        let active = connection_manager.active_count();
-        if active == 0 {
+    while !core_tasks.is_empty() && drain_start.elapsed() < max_drain_wait {
+        let remaining = max_drain_wait.saturating_sub(drain_start.elapsed());
+        if tokio::time::timeout(remaining, core_tasks.join_next()).await.is_err() {
             break;
         }
-        info!("[Shutdown] Waiting for {} active connections to drain...", active);
-        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    while drain_start.elapsed() < max_drain_wait {
+        let active = connection_manager.active_count();
+        let pending = in_flight.count();
+        if active == 0 && pending == 0 {
+            break;
+        }
+        info!(
+            "[Shutdown] Waiting for {} active connections and {} in-flight tasks to drain...",
+            active,
+            pending
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if !core_tasks.is_empty() {
+        core_tasks.abort_all();
+        while core_tasks.join_next().await.is_some() {}
+    }
+
+    if let Some(err) = unexpected_exit {
+        return Err(err);
     }
     info!("[Shutdown] FlowX core stopped cleanly");
 

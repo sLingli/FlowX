@@ -247,21 +247,37 @@ where
     let head = &buf[..header_end - 4]; // 不含末尾空行
     let leftover = buf[header_end..].to_vec();
 
-    let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
-    let request_line = lines.next().unwrap_or_default();
-    let request_line = std::str::from_utf8(request_line).context("HTTP request line is not valid UTF-8")?;
+    let Some(lines) = split_crlf_lines(head) else {
+        reply_http_error(stream, "400 Bad Request").await;
+        bail!("HTTP request contains invalid line endings or NUL byte");
+    };
+    let mut lines_iter = lines.into_iter();
+    let request_line = lines_iter.next().unwrap_or_default();
+    let Ok(request_line) = std::str::from_utf8(request_line) else {
+        reply_http_error(stream, "400 Bad Request").await;
+        bail!("HTTP request line is not valid UTF-8");
+    };
     let mut parts = request_line.split(' ');
     let (Some(method), Some(uri), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         reply_http_error(stream, "400 Bad Request").await;
         bail!("Malformed HTTP request line: {:?}", request_line);
     };
-    if !version.starts_with("HTTP/1.") {
-        reply_http_error(stream, "505 HTTP Version Not Supported").await;
+    if method.is_empty() || !method.bytes().all(is_http_token_byte) {
+        reply_http_error(stream, "400 Bad Request").await;
+        bail!("Invalid HTTP method token: {:?}", method);
+    }
+    if version != "HTTP/1.1" && version != "HTTP/1.0" {
+        if version.starts_with("HTTP/") {
+            reply_http_error(stream, "505 HTTP Version Not Supported").await;
+        } else {
+            reply_http_error(stream, "400 Bad Request").await;
+        }
         bail!("Unsupported HTTP version: {}", version);
     }
 
-    if method.eq_ignore_ascii_case("CONNECT") {
+    let is_connect = method.eq_ignore_ascii_case("CONNECT");
+    let (target, origin_path) = if is_connect {
         let target = match parse_authority(uri, None) {
             Ok(t) => t,
             Err(e) => {
@@ -269,39 +285,186 @@ where
                 return Err(e);
             }
         };
+        (target, None)
+    } else {
+        // 明文代理请求必须使用绝对 URI：http://host[:port]/path，且禁止 fragment 或 authority 含 ?/#
+        if uri.contains('#') {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("HTTP proxy request URI must not contain fragment: {}", uri);
+        }
+        let Some(rest) = strip_prefix_ignore_case(uri, "http://") else {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("HTTP proxy request must use http:// absolute URI: {}", uri);
+        };
+        let (authority, path) = match rest.find('/') {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, "/"),
+        };
+        if authority.contains(['?', '#', '@', '\\']) {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("HTTP proxy authority contains forbidden delimiter: {}", authority);
+        }
+        let target = match parse_authority(authority, Some(80)) {
+            Ok(t) => t,
+            Err(e) => {
+                reply_http_error(stream, "400 Bad Request").await;
+                return Err(e);
+            }
+        };
+        (target, Some(path))
+    };
+
+    // 严格校验请求头，阻断请求走私（obs-fold、畸形字段名、CL/TE 冲突、Host 不一致等）
+    let mut header_lines: Vec<(&[u8], &[u8])> = Vec::new();
+    let mut host_header: Option<&str> = None;
+    let mut content_length_seen = false;
+    let mut transfer_encoding_seen = false;
+    let mut upgrade_seen = false;
+    let mut nominated_hop_headers: Vec<Vec<u8>> = Vec::new();
+
+    for line in lines_iter {
+        if line.is_empty() || line[0] == b' ' || line[0] == b'\t' {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("Malformed or obs-fold HTTP header line");
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("HTTP header line missing colon");
+        };
+        let name = &line[..colon];
+        let val = &line[colon + 1..];
+        if name.is_empty() || !name.iter().all(|&b| is_http_token_byte(b)) {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("Invalid HTTP header name");
+        }
+        if val.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("HTTP header value contains control characters");
+        }
+
+        if name.eq_ignore_ascii_case(b"host") {
+            if host_header.is_some() {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Duplicate Host header");
+            }
+            let Ok(v) = std::str::from_utf8(val) else {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Non-UTF-8 Host header");
+            };
+            host_header = Some(v.trim_matches(|c| c == ' ' || c == '\t'));
+        } else if name.eq_ignore_ascii_case(b"content-length") {
+            if is_connect || content_length_seen {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Forbidden or duplicate Content-Length header");
+            }
+            let Ok(v) = std::str::from_utf8(val) else {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Invalid Content-Length header");
+            };
+            let trimmed = v.trim_matches(|c| c == ' ' || c == '\t');
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) || trimmed.parse::<u64>().is_err() {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Malformed Content-Length header: {:?}", trimmed);
+            }
+            content_length_seen = true;
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            if is_connect || transfer_encoding_seen {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Forbidden or duplicate Transfer-Encoding header");
+            }
+            let Ok(v) = std::str::from_utf8(val) else {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Invalid Transfer-Encoding header");
+            };
+            let trimmed = v.trim_matches(|c| c == ' ' || c == '\t');
+            if !trimmed.eq_ignore_ascii_case("chunked") {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Unsupported Transfer-Encoding: {:?}", trimmed);
+            }
+            transfer_encoding_seen = true;
+        } else if name.eq_ignore_ascii_case(b"upgrade") {
+            if !is_connect {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Upgrade header is not supported on plain HTTP proxy requests");
+            }
+            upgrade_seen = true;
+        } else if name.eq_ignore_ascii_case(b"connection") || name.eq_ignore_ascii_case(b"proxy-connection") {
+            let Ok(v) = std::str::from_utf8(val) else {
+                reply_http_error(stream, "400 Bad Request").await;
+                bail!("Invalid Connection header");
+            };
+            for item in v.split(',') {
+                let token = item.trim_matches(|c| c == ' ' || c == '\t');
+                if token.is_empty() {
+                    continue;
+                }
+                if !token.bytes().all(is_http_token_byte) {
+                    reply_http_error(stream, "400 Bad Request").await;
+                    bail!("Malformed token in Connection header: {:?}", token);
+                }
+                let lower = token.to_ascii_lowercase();
+                if matches!(lower.as_str(), "host" | "content-length" | "transfer-encoding")
+                    || (!is_connect && lower == "upgrade")
+                {
+                    reply_http_error(stream, "400 Bad Request").await;
+                    bail!("Connection header must not nominate framing header: {}", lower);
+                }
+                nominated_hop_headers.push(lower.into_bytes());
+            }
+        }
+
+        header_lines.push((line, name));
+    }
+
+    if content_length_seen && transfer_encoding_seen {
+        reply_http_error(stream, "400 Bad Request").await;
+        bail!("HTTP request contains both Content-Length and Transfer-Encoding");
+    }
+    if is_connect && upgrade_seen {
+        reply_http_error(stream, "400 Bad Request").await;
+        bail!("Upgrade header is not allowed on CONNECT");
+    }
+
+    if version == "HTTP/1.1" && host_header.is_none() {
+        reply_http_error(stream, "400 Bad Request").await;
+        bail!("HTTP/1.1 request missing Host header");
+    }
+    if let Some(host_str) = host_header {
+        let Ok(host_target) = TargetAddr::parse_authority(host_str, Some(target.port()), false) else {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("Invalid Host header: {:?}", host_str);
+        };
+        if host_target != target {
+            reply_http_error(stream, "400 Bad Request").await;
+            bail!("Host header {:?} does not match request target {:?}", host_str, target);
+        }
+    }
+
+    if is_connect {
         return Ok(InboundRequest { kind: InboundKind::HttpConnect, target, pending: leftover });
     }
 
-    // 明文代理请求必须使用绝对 URI：http://host[:port]/path
-    let Some(rest) = strip_prefix_ignore_case(uri, "http://") else {
-        reply_http_error(stream, "400 Bad Request").await;
-        bail!("HTTP proxy request must use http:// absolute URI: {}", uri);
-    };
-    let (authority, path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], &rest[idx..]),
-        None => (rest, "/"),
-    };
-    let target = match parse_authority(authority, Some(80)) {
-        Ok(t) => t,
-        Err(e) => {
-            reply_http_error(stream, "400 Bad Request").await;
-            return Err(e);
-        }
-    };
+    let path = origin_path.unwrap_or("/");
 
-    // 改写为源站形式 (origin-form)，移除逐跳代理头，并强制 Connection: close，
+    // 改写为源站形式 (origin-form)，移除 RFC 9110 §7.6.1 与 Connection 指定的逐跳头，并强制 Connection: close，
     // 防止同一条 keep-alive 连接上的后续请求被误发往首个请求的目标主机
     let mut rewritten = Vec::with_capacity(head.len() + 32);
     rewritten.extend_from_slice(format!("{} {} {}\r\n", method, path, version).as_bytes());
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let name = line.split(|&b| b == b':').next().unwrap_or_default();
-        let skip = [&b"proxy-connection"[..], b"proxy-authorization", b"connection", b"keep-alive"]
-            .iter()
-            .any(|h| name.trim_ascii().eq_ignore_ascii_case(h));
-        if !skip {
+    for (line, name) in header_lines {
+        let is_fixed_hop = [
+            &b"proxy-connection"[..],
+            b"proxy-authorization",
+            b"proxy-authenticate",
+            b"connection",
+            b"keep-alive",
+            b"te",
+            b"trailer",
+            b"upgrade",
+        ]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h));
+        let is_nominated_hop = nominated_hop_headers.iter().any(|h| name.eq_ignore_ascii_case(h));
+        if !is_fixed_hop && !is_nominated_hop {
             rewritten.extend_from_slice(line);
             rewritten.extend_from_slice(b"\r\n");
         }
@@ -310,6 +473,40 @@ where
     rewritten.extend_from_slice(&leftover);
 
     Ok(InboundRequest { kind: InboundKind::HttpForward, target, pending: rewritten })
+}
+
+fn is_http_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+fn split_crlf_lines(head: &[u8]) -> Option<Vec<&[u8]>> {
+    if head.contains(&0) {
+        return None;
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < head.len() {
+        if head[i] == b'\n' {
+            return None;
+        }
+        if head[i] == b'\r' {
+            if i + 1 >= head.len() || head[i + 1] != b'\n' {
+                return None;
+            }
+            lines.push(&head[start..i]);
+            i += 2;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    lines.push(&head[start..]);
+    Some(lines)
 }
 
 async fn reply_http_error<S>(stream: &mut S, status: &str)
@@ -330,7 +527,7 @@ fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
 
 /// 解析 `host:port` / `[v6]:port` 形式的 authority；`default_port` 为 None 时端口必填
 pub fn parse_authority(authority: &str, default_port: Option<u16>) -> Result<TargetAddr> {
-    TargetAddr::parse_authority(authority, default_port, true)
+    TargetAddr::parse_authority(authority, default_port, false)
 }
 
 /// 由主机字符串构造目标地址：IP 字面量转为 Ip，否则校验为合法域名
@@ -386,7 +583,7 @@ mod tests {
     async fn test_http_connect_request() {
         let (mut client, mut server) = duplex(4096);
         client
-            .write_all(b"CONNECT [2001:db8::1]:8443 HTTP/1.1\r\nHost: x\r\n\r\nEARLY")
+            .write_all(b"CONNECT [2001:db8::1]:8443 HTTP/1.1\r\nHost: [2001:db8::1]:8443\r\n\r\nEARLY")
             .await
             .unwrap();
         let r = read_request(&mut server).await.unwrap();
@@ -400,7 +597,7 @@ mod tests {
         let (mut client, mut server) = duplex(4096);
         client
             .write_all(
-                b"GET http://Example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\nUser-Agent: t\r\n\r\n",
+                b"GET http://Example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive, X-Hop-Secret\r\nX-Hop-Secret: s\r\nUser-Agent: t\r\n\r\n",
             )
             .await
             .unwrap();
@@ -411,6 +608,7 @@ mod tests {
         assert!(text.starts_with("GET /a?b=1 HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.com\r\n"));
         assert!(text.contains("User-Agent: t\r\n"));
+        assert!(!text.contains("X-Hop-Secret"));
         assert!(!text.to_lowercase().contains("keep-alive"));
         assert!(text.ends_with("Connection: close\r\n\r\n"));
     }
@@ -425,11 +623,46 @@ mod tests {
         assert!(String::from_utf8_lossy(&resp[..n]).starts_with("HTTP/1.1 400"));
     }
 
+    #[tokio::test]
+    async fn test_http_smuggling_and_host_mismatch_rejected() {
+        let bad_cases: &[&[u8]] = &[
+            b"GET http://example.com/ HTTP/1.1\nHost: example.com\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n folded: 1\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length : 0\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            b"GET http://user:pass@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            b"GET http://good.com?@evil.com/ HTTP/1.1\r\nHost: good.com\r\n\r\n",
+            b"GET http://good.com#evil.com/ HTTP/1.1\r\nHost: good.com\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.1\r\nHost: other.com\r\n\r\n",
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: other.com:443\r\n\r\n",
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nContent-Length: 0\r\n\r\n",
+            b"GET http://example.com/ HTTP/1.9\r\nHost: example.com\r\n\r\n",
+        ];
+
+        for raw in bad_cases {
+            let (mut client, mut server) = duplex(4096);
+            client.write_all(raw).await.unwrap();
+            assert!(read_request(&mut server).await.is_err(), "expected err for {:?}", String::from_utf8_lossy(raw));
+            let mut resp = vec![0u8; 64];
+            let n = client.read(&mut resp).await.unwrap();
+            let text = String::from_utf8_lossy(&resp[..n]);
+            assert!(
+                text.starts_with("HTTP/1.1 400") || text.starts_with("HTTP/1.1 505"),
+                "unexpected status for {:?}: {}",
+                String::from_utf8_lossy(raw),
+                text
+            );
+        }
+    }
+
     #[test]
     fn test_parse_authority() {
         assert_eq!(parse_authority("a.com:443", None).unwrap(), TargetAddr::Domain("a.com".into(), 443));
         assert_eq!(parse_authority("a.com", Some(80)).unwrap(), TargetAddr::Domain("a.com".into(), 80));
         assert!(parse_authority("a.com", None).is_err());
+        assert!(parse_authority("user:pass@a.com:443", None).is_err());
         assert!(parse_authority("bad host:80", None).is_err());
         assert!(parse_authority("a.com:0", None).is_err());
         assert_eq!(

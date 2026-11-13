@@ -421,6 +421,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                             protocol: n.protocol.clone(),
                             server_addr: n.server_addr.clone(),
                             auth_configured: n.username.is_some(),
+                            password_configured: n.client.auth_credentials().1.is_some(),
                             username: n.username.clone(),
                         })
                         .collect();
@@ -518,6 +519,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                             protocol: n.protocol.clone(),
                             server_addr: n.server_addr.clone(),
                             auth_configured: n.username.is_some(),
+                            password_configured: n.client.auth_credentials().1.is_some(),
                             username: n.username.clone(),
                         })
                         .collect()

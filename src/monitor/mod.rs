@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use serde::{Deserialize, Serialize};
@@ -272,6 +272,51 @@ impl Default for ConnectionManager {
     }
 }
 
+/// 跟踪已接受但尚未结束的在途异步任务，确保优雅关闭前全部完成并执行 Drop 清理。
+#[derive(Default)]
+pub struct InFlightTracker {
+    count: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+/// 持有期间使 `InFlightTracker` 计数加 1，离开作用域或任务终止时自动减 1。
+pub struct InFlightGuard {
+    tracker: Arc<InFlightTracker>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.tracker.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.tracker.notify.notify_waiters();
+        }
+    }
+}
+
+impl InFlightTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        InFlightGuard { tracker: Arc::clone(self) }
+    }
+
+    pub fn count(&self) -> usize {
+        self.count.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_zero(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.count() == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +400,31 @@ mod tests {
         assert!(res.unwrap().unwrap());
 
         assert!(!mgr.kill_connection(9999));
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_tracker_wait_zero() {
+        let tracker = Arc::new(InFlightTracker::new());
+        assert_eq!(tracker.count(), 0);
+        let g1 = tracker.enter();
+        let g2 = tracker.enter();
+        assert_eq!(tracker.count(), 2);
+
+        let tracker_wait = Arc::clone(&tracker);
+        let waiter = tokio::spawn(async move {
+            tracker_wait.wait_zero().await;
+        });
+
+        drop(g1);
+        tokio::task::yield_now().await;
+        assert_eq!(tracker.count(), 1);
+        assert!(!waiter.is_finished());
+
+        drop(g2);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_zero timed out")
+            .unwrap();
+        assert_eq!(tracker.count(), 0);
     }
 }

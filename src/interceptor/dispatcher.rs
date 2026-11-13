@@ -11,7 +11,7 @@ use tracing::{error, info, warn};
 use crate::dns::FakeIpPool;
 use crate::inbound::{self, InboundRequest};
 use crate::interceptor::process::ProcessTracker;
-use crate::monitor::ConnectionManager;
+use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::outbound::chain::{ProxyChain, ProxyNode};
 use crate::outbound::direct::DirectOutbound;
 use crate::outbound::{is_local_or_loopback_ip, local_interface_ips, relay_stream_monitored, TargetAddr};
@@ -47,6 +47,7 @@ pub struct DispatcherConfig {
 pub struct StreamDispatcher {
     config: Arc<DispatcherConfig>,
     concurrency_limit: Arc<Semaphore>,
+    in_flight: Option<Arc<InFlightTracker>>,
 }
 
 impl StreamDispatcher {
@@ -54,7 +55,13 @@ impl StreamDispatcher {
         Self {
             config: Arc::new(config),
             concurrency_limit: Arc::new(Semaphore::new(10000)), // 最大并发连接保护
+            in_flight: None,
         }
+    }
+
+    pub fn with_in_flight(mut self, tracker: Arc<InFlightTracker>) -> Self {
+        self.in_flight = Some(tracker);
+        self
     }
 
     /// 同步绑定 TCP 监听器（Fail-Fast 检查端口占用）
@@ -72,12 +79,20 @@ impl StreamDispatcher {
     /// 启动本地入站连接调度监听服务（支持优雅停机）
     pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         loop {
+            if *shutdown_rx.borrow() {
+                info!("[Dispatcher] Shutdown signal already set, stopping accepting new streams");
+                break;
+            }
             let (local_stream, peer_addr) = tokio::select! {
                 res = listener.accept() => {
                     match res {
                         Ok(r) => r,
                         Err(e) => {
                             error!("[Dispatcher] Failed to accept new TCP connection: {}", e);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                _ = shutdown_rx.changed() => break,
+                            }
                             continue;
                         }
                     }
@@ -98,8 +113,10 @@ impl StreamDispatcher {
             };
 
             let config = Arc::clone(&self.config);
+            let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
             tokio::spawn(async move {
                 let _permit = permit;
+                let _in_flight = _in_flight;
                 if let Err(e) = handle_connection(local_stream, peer_addr, config).await {
                     warn!("[Dispatcher] Relay session closed or error: {:#}", e);
                 }
@@ -401,7 +418,11 @@ mod tests {
         tokio::spawn(async move { dispatcher.run(listener, rx).await });
 
         let mut c = TcpStream::connect(inbound_addr).await.unwrap();
-        let req = format!("CONNECT 127.0.0.1:{} HTTP/1.1\r\n\r\n", inbound_addr.port());
+        let req = format!(
+            "CONNECT 127.0.0.1:{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            inbound_addr.port(),
+            inbound_addr.port()
+        );
         c.write_all(req.as_bytes()).await.unwrap();
         let mut buf = vec![0u8; 128];
         let n = c.read(&mut buf).await.unwrap();

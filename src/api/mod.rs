@@ -6,22 +6,25 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex, Semaphore};
 use tracing::{error, info};
 
 use crate::config::ConfigStore;
 use crate::dns::FakeIpPool;
 use crate::i18n::{json_error, t, Locale};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
-use crate::monitor::ConnectionManager;
+use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::outbound::chain::{parse_target_addr, ProxyNode};
 use crate::outbound::http::HttpConnectClient;
 use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
+use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_SIZE: usize = 1024 * 1024; // 1MB 上限防 DoS
+const MAX_API_CONCURRENCY: usize = 128;
+const MAX_PING_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyNodeView {
@@ -30,6 +33,8 @@ pub struct ProxyNodeView {
     pub protocol: String,
     pub server_addr: String,
     pub auth_configured: bool,
+    #[serde(default)]
+    pub password_configured: bool,
     pub username: Option<String>,
 }
 
@@ -51,6 +56,20 @@ pub struct UpdateNodeRequest {
     pub username: Option<String>,
     pub password: Option<String>,
     pub keep_password: Option<bool>,
+    pub clear_password: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchNodeRequest {
+    pub id: u32,
+    pub name: Option<String>,
+    pub protocol: Option<String>,
+    pub server_addr: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub keep_password: Option<bool>,
+    pub clear_password: Option<bool>,
+    pub clear_username: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,6 +106,18 @@ pub struct UpdateRuleRequest {
     pub ports: Option<String>,
     pub action: String, // "Direct", "Block", "Proxy"
     pub node_id: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PatchRuleRequest {
+    pub id: u64,
+    pub name: Option<String>,
+    pub apps: Option<String>,
+    pub targets: Option<String>,
+    pub ports: Option<String>,
+    pub action: Option<String>,
+    pub node_id: Option<u32>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +199,10 @@ pub struct ApiServer {
     pub self_ports: Vec<u16>,
     pub config_store: Option<Arc<ConfigStore>>,
     pub runtime_context: Option<Arc<SystemRuntimeContext>>,
+    pub in_flight: Option<Arc<InFlightTracker>>,
+    conn_limit: Arc<Semaphore>,
+    ping_semaphore: Arc<Semaphore>,
+    mutation_lock: Arc<Mutex<()>>,
     started_at: Instant,
 }
 
@@ -186,6 +221,10 @@ impl ApiServer {
             self_ports: vec![bind_addr.port()],
             config_store: None,
             runtime_context: None,
+            in_flight: None,
+            conn_limit: Arc::new(Semaphore::new(MAX_API_CONCURRENCY)),
+            ping_semaphore: Arc::new(Semaphore::new(MAX_PING_CONCURRENCY)),
+            mutation_lock: Arc::new(Mutex::new(())),
             started_at: Instant::now(),
         }
     }
@@ -205,8 +244,19 @@ impl ApiServer {
         self
     }
 
-    /// 同步绑定 TCP 监听器（Fail-Fast 检查端口占用）
+    pub fn with_in_flight(mut self, tracker: Arc<InFlightTracker>) -> Self {
+        self.in_flight = Some(tracker);
+        self
+    }
+
+    /// 同步绑定 TCP 监听器（Fail-Fast 检查端口占用与回环地址限制）
     pub async fn bind(&self) -> Result<TcpListener> {
+        if !self.bind_addr.ip().is_loopback() {
+            anyhow::bail!(
+                "Refusing to bind HTTP API server on non-loopback address {}: local loopback only",
+                self.bind_addr
+            );
+        }
         let listener = TcpListener::bind(self.bind_addr)
             .await
             .with_context(|| format!("Failed to bind HTTP API server port ({})", self.bind_addr))?;
@@ -217,7 +267,7 @@ impl ApiServer {
         Ok(listener)
     }
 
-    /// 启动异步 HTTP API 监听服务（支持优雅停机）
+    /// 启动异步 HTTP API 监听服务（支持并发连接限流、任务追踪与优雅停机）
     pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let actual_port = listener.local_addr().unwrap_or(self.bind_addr).port();
         let mut self_ports = self.self_ports.clone();
@@ -227,12 +277,20 @@ impl ApiServer {
         let self_ports = Arc::new(self_ports);
 
         loop {
-            let (stream, _) = tokio::select! {
+            if *shutdown_rx.borrow() {
+                info!("[API] Shutdown signal already set, stopping API server");
+                break;
+            }
+            let (mut stream, _) = tokio::select! {
                 res = listener.accept() => {
                     match res {
                         Ok(r) => r,
                         Err(e) => {
                             error!("[API] Failed to accept HTTP API request: {}", e);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                _ = shutdown_rx.changed() => break,
+                            }
                             continue;
                         }
                     }
@@ -243,15 +301,34 @@ impl ApiServer {
                 }
             };
 
+            let permit = match self.conn_limit.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    let _ = send_http_response(
+                        &mut stream,
+                        "503 Service Unavailable",
+                        "application/json; charset=utf-8",
+                        r#"{"error":"Too many concurrent API requests","code":"ERR_OVERLOADED"}"#,
+                    )
+                    .await;
+                    continue;
+                }
+            };
+
             let monitor = Arc::clone(&self.monitor);
             let rule_engine = Arc::clone(&self.rule_engine);
             let proxy_nodes = Arc::clone(&self.proxy_nodes);
             let self_ports_clone = Arc::clone(&self_ports);
             let config_store = self.config_store.clone();
             let runtime_context = self.runtime_context.clone();
+            let ping_semaphore = Arc::clone(&self.ping_semaphore);
+            let mutation_lock = Arc::clone(&self.mutation_lock);
             let started_at = self.started_at;
+            let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
 
             tokio::spawn(async move {
+                let _permit = permit;
+                let _in_flight = _in_flight;
                 if let Err(e) = tokio::time::timeout(
                     API_TIMEOUT,
                     handle_api_request(
@@ -263,6 +340,8 @@ impl ApiServer {
                         proxy_nodes,
                         config_store,
                         runtime_context,
+                        ping_semaphore,
+                        mutation_lock,
                         started_at,
                     ),
                 )
@@ -282,6 +361,7 @@ async fn read_full_http_request(
 ) -> std::result::Result<(), RequestReadError> {
     buffer.clear();
     let mut temp = [0u8; 2048];
+    let mut expected_total: Option<usize> = None;
 
     loop {
         let n = match stream.read(&mut temp).await {
@@ -293,25 +373,32 @@ async fn read_full_http_request(
             }
         };
         if n == 0 {
-            break;
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            return Err(RequestReadError::IncompleteHeaders);
         }
         buffer.extend_from_slice(&temp[..n]);
         if buffer.len() > MAX_REQUEST_SIZE {
             return Err(RequestReadError::TooLarge);
         }
 
-        if let Some(header_end) = find_header_end(buffer) {
-            let header_str = String::from_utf8_lossy(&buffer[..header_end]);
-            let content_length =
-                parse_content_length(&header_str).ok_or(RequestReadError::InvalidContentLength)?;
+        if expected_total.is_none()
+            && let Some(header_end) = find_header_end(buffer)
+        {
+            let content_length = validate_and_parse_headers(&buffer[..header_end - 4])?;
             let total_needed = header_end
                 .checked_add(content_length)
                 .filter(|&t| t <= MAX_REQUEST_SIZE)
                 .ok_or(RequestReadError::TooLarge)?;
-            if buffer.len() >= total_needed {
-                buffer.truncate(total_needed);
-                break;
-            }
+            expected_total = Some(total_needed);
+        }
+
+        if let Some(total_needed) = expected_total
+            && buffer.len() >= total_needed
+        {
+            buffer.truncate(total_needed);
+            break;
         }
     }
 
@@ -323,23 +410,170 @@ async fn read_full_http_request(
 enum RequestReadError {
     /// 请求体（含头部）超过 1MB 上限
     TooLarge,
-    /// `Content-Length` 请求头缺失或非法
+    /// 请求头不完整、含早期 EOF 或缺少 \r\n\r\n
+    IncompleteHeaders,
+    /// 请求头包含非 UTF-8 字节
+    NonUtf8Headers,
+    /// HTTP 换行、obs-fold 或字段名不合法
+    InvalidFraming,
+    /// 不支持 Transfer-Encoding 请求传输编码
+    UnsupportedTransferEncoding,
+    /// 敏感请求头重复（Host / Content-Length / Origin / Referer / Sec-Fetch-Site / Content-Type）
+    DuplicateHeader,
+    /// `Content-Length` 请求头格式非法
     InvalidContentLength,
     /// 底层套接字读取失败（原始错误已记入 debug 日志）
     Io,
 }
 
 impl RequestReadError {
+    fn http_status(&self) -> &'static str {
+        match self {
+            RequestReadError::TooLarge => "413 Payload Too Large",
+            RequestReadError::UnsupportedTransferEncoding => "501 Not Implemented",
+            _ => "400 Bad Request",
+        }
+    }
+
     /// 返回（错误码, i18n 键）
     fn code_and_key(&self) -> (&'static str, &'static str) {
         match self {
             RequestReadError::TooLarge => ("ERR_REQUEST_TOO_LARGE", "error.request_too_large"),
+            RequestReadError::IncompleteHeaders => ("ERR_INCOMPLETE_HEADERS", "error.incomplete_headers"),
+            RequestReadError::NonUtf8Headers => ("ERR_NON_UTF8_HEADERS", "error.non_utf8_headers"),
+            RequestReadError::InvalidFraming => ("ERR_INVALID_REQUEST_FRAMING", "error.invalid_request_framing"),
+            RequestReadError::UnsupportedTransferEncoding => {
+                ("ERR_UNSUPPORTED_TE", "error.unsupported_transfer_encoding")
+            }
+            RequestReadError::DuplicateHeader => ("ERR_DUPLICATE_HEADER", "error.duplicate_header"),
             RequestReadError::InvalidContentLength => {
                 ("ERR_INVALID_CONTENT_LENGTH", "error.invalid_content_length")
             }
             RequestReadError::Io => ("ERR_REQUEST_READ_FAILED", "error.request_read_failed"),
         }
     }
+}
+
+fn is_http_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+        )
+}
+
+/// 严格校验原始请求头：拒绝 NUL、裸 CR/LF、obs-fold、畸形字段名、Transfer-Encoding 与重复敏感头，并解析 Content-Length。
+fn validate_and_parse_headers(raw_head: &[u8]) -> std::result::Result<usize, RequestReadError> {
+    if raw_head.contains(&0) {
+        return Err(RequestReadError::InvalidFraming);
+    }
+
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < raw_head.len() {
+        if raw_head[i] == b'\n' {
+            return Err(RequestReadError::InvalidFraming);
+        }
+        if raw_head[i] == b'\r' {
+            if i + 1 >= raw_head.len() || raw_head[i + 1] != b'\n' {
+                return Err(RequestReadError::InvalidFraming);
+            }
+            lines.push(&raw_head[start..i]);
+            i += 2;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    lines.push(&raw_head[start..]);
+
+    if lines.is_empty() || lines[0].is_empty() {
+        return Err(RequestReadError::InvalidFraming);
+    }
+    if std::str::from_utf8(lines[0]).is_err() {
+        return Err(RequestReadError::NonUtf8Headers);
+    }
+
+    let mut content_length: Option<usize> = None;
+    let mut host_seen = false;
+    let mut origin_seen = false;
+    let mut referer_seen = false;
+    let mut fetch_site_seen = false;
+    let mut content_type_seen = false;
+
+    for line in &lines[1..] {
+        if line.is_empty() || line[0] == b' ' || line[0] == b'\t' {
+            return Err(RequestReadError::InvalidFraming);
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            return Err(RequestReadError::InvalidFraming);
+        };
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().all(|&b| is_http_token_byte(b)) {
+            return Err(RequestReadError::InvalidFraming);
+        }
+        let val_bytes = &line[colon + 1..];
+        if val_bytes.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+            return Err(RequestReadError::InvalidFraming);
+        }
+        let Ok(val) = std::str::from_utf8(val_bytes) else {
+            return Err(RequestReadError::NonUtf8Headers);
+        };
+
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return Err(RequestReadError::UnsupportedTransferEncoding);
+        } else if name.eq_ignore_ascii_case(b"content-length") {
+            if content_length.is_some() {
+                return Err(RequestReadError::DuplicateHeader);
+            }
+            let trimmed = val.trim_matches(|c| c == ' ' || c == '\t');
+            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(RequestReadError::InvalidContentLength);
+            }
+            let parsed = trimmed
+                .parse::<usize>()
+                .map_err(|_| RequestReadError::InvalidContentLength)?;
+            content_length = Some(parsed);
+        } else if name.eq_ignore_ascii_case(b"host") {
+            if host_seen {
+                return Err(RequestReadError::DuplicateHeader);
+            }
+            host_seen = true;
+        } else if name.eq_ignore_ascii_case(b"origin") {
+            if origin_seen {
+                return Err(RequestReadError::DuplicateHeader);
+            }
+            origin_seen = true;
+        } else if name.eq_ignore_ascii_case(b"referer") {
+            if referer_seen {
+                return Err(RequestReadError::DuplicateHeader);
+            }
+            referer_seen = true;
+        } else if name.eq_ignore_ascii_case(b"sec-fetch-site") {
+            if fetch_site_seen {
+                return Err(RequestReadError::DuplicateHeader);
+            }
+            fetch_site_seen = true;
+        } else if name.eq_ignore_ascii_case(b"content-type") {
+            if content_type_seen {
+                return Err(RequestReadError::DuplicateHeader);
+            }
+            content_type_seen = true;
+        }
+    }
+
+    Ok(content_length.unwrap_or(0))
+}
+
+fn has_json_content_type(headers: &[&str]) -> bool {
+    extract_header(headers, "content-type").is_some_and(|ct| {
+        ct.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/json")
+    })
 }
 
 /// 在请求头尚未完整解析（或包含非 UTF-8 字节）时，尽力从已读到的字节中提取语言偏好，
@@ -367,18 +601,6 @@ fn best_effort_locale(buffer: &[u8]) -> Locale {
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
-
-/// 解析 `Content-Length` 请求头；缺失视为 0，格式非法返回 None。
-fn parse_content_length(headers: &str) -> Option<usize> {
-    for line in headers.lines() {
-        if let Some((k, v)) = line.split_once(':')
-            && k.trim().eq_ignore_ascii_case("content-length")
-        {
-            return v.trim().parse::<usize>().ok();
-        }
-    }
-    Some(0)
 }
 
 fn extract_header<'a>(headers: &[&'a str], target_name: &str) -> Option<&'a str> {
@@ -472,13 +694,15 @@ async fn handle_api_request(
     proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     config_store: Option<Arc<ConfigStore>>,
     runtime_context: Option<Arc<SystemRuntimeContext>>,
+    ping_semaphore: Arc<Semaphore>,
+    mutation_lock: Arc<Mutex<()>>,
     started_at: Instant,
 ) -> Result<()> {
     let mut req_bytes = Vec::with_capacity(4096);
     if let Err(e) = read_full_http_request(&mut stream, &mut req_bytes).await {
         let (code, key) = e.code_and_key();
         let msg = json_error(best_effort_locale(&req_bytes), code, key);
-        send_http_response(&mut stream, "400 Bad Request", "application/json; charset=utf-8", &msg).await?;
+        send_http_response(&mut stream, e.http_status(), "application/json; charset=utf-8", &msg).await?;
         return Ok(());
     }
     if req_bytes.is_empty() {
@@ -514,13 +738,36 @@ async fn handle_api_request(
     let first_line = header_lines.next().unwrap_or_default();
     let headers: Vec<&str> = header_lines.collect();
 
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 {
+    let mut line_parts = first_line.split(' ');
+    let (Some(method), Some(path_and_query), Some(version), None) = (
+        line_parts.next(),
+        line_parts.next(),
+        line_parts.next(),
+        line_parts.next(),
+    ) else {
+        send_http_response(
+            &mut stream,
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json_error(locale, "ERR_INVALID_REQUEST_LINE", "error.invalid_request_line"),
+        )
+        .await?;
+        return Ok(());
+    };
+    if method.is_empty()
+        || !method.bytes().all(is_http_token_byte)
+        || path_and_query.is_empty()
+        || !matches!(version, "HTTP/1.1" | "HTTP/1.0")
+    {
+        send_http_response(
+            &mut stream,
+            "400 Bad Request",
+            "application/json; charset=utf-8",
+            &json_error(locale, "ERR_INVALID_REQUEST_LINE", "error.invalid_request_line"),
+        )
+        .await?;
         return Ok(());
     }
-
-    let method = parts[0];
-    let path_and_query = parts[1];
     let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
 
     let accept_lang = extract_header(&headers, "accept-language");
@@ -584,6 +831,46 @@ async fn handle_api_request(
     }
 
     let body_bytes = &req_bytes[header_end..];
+    let requires_json_ct = matches!(
+        (method, path),
+        ("POST" | "PUT" | "PATCH", "/api/nodes" | "/api/rules")
+            | (
+                "POST",
+                "/api/rules/default"
+                    | "/api/rules/simulate"
+                    | "/api/rules/toggle"
+                    | "/api/rules/move"
+            )
+    ) || (matches!(
+        (method, path),
+        ("POST", "/api/connections/kill" | "/api/nodes/ping") | ("DELETE", "/api/nodes" | "/api/rules")
+    ) && (!body_bytes.is_empty() || parse_query_param(query, "id").is_none()));
+    if requires_json_ct && !has_json_content_type(&headers) {
+        send_http_response(
+            &mut stream,
+            "415 Unsupported Media Type",
+            "application/json; charset=utf-8",
+            &json_error(locale, "ERR_UNSUPPORTED_MEDIA_TYPE", "error.unsupported_media_type"),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let is_mutation = matches!(
+        (method, path),
+        ("POST" | "PUT" | "PATCH" | "DELETE", "/api/nodes")
+            | ("POST" | "PUT" | "PATCH" | "DELETE", "/api/rules")
+            | (
+                "POST",
+                "/api/rules/default" | "/api/rules/toggle" | "/api/rules/move"
+            )
+    );
+    let _mutation_guard = if is_mutation {
+        Some(mutation_lock.lock().await)
+    } else {
+        None
+    };
+
     let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
 
     let (status, content_type, body) = match (method, path) {
@@ -654,6 +941,7 @@ async fn handle_api_request(
                     protocol: n.protocol.clone(),
                     server_addr: n.server_addr.clone(),
                     auth_configured: n.username.is_some(),
+                    password_configured: n.client.auth_credentials().1.is_some(),
                     username: n.username.clone(),
                 })
                 .collect();
@@ -682,6 +970,20 @@ async fn handle_api_request(
             ),
             Ok(req) => {
                 let res = handle_update_node(req, &proxy_nodes, &self_ports, locale);
+                if res.0 == "200 OK" {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                }
+                res
+            }
+        },
+        ("PATCH", "/api/nodes") => match serde_json::from_str::<PatchNodeRequest>(req_body) {
+            Err(_) => (
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                json_error(locale, "ERR_INVALID_NODE_BODY", "error.invalid_node_body"),
+            ),
+            Ok(req) => {
+                let res = handle_patch_node(req, &proxy_nodes, &self_ports, locale);
                 if res.0 == "200 OK" {
                     persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
                 }
@@ -747,7 +1049,13 @@ async fn handle_api_request(
                     nodes_guard.get(&id).map(|n| n.server_addr.clone())
                 };
                 if let Some(addr) = target_addr {
-                    let (ok, ms, msg, detail) = ping_address(&addr, locale).await;
+                    let (ok, ms, msg, detail) = ping_address_with_context(
+                        &addr,
+                        runtime_context.as_deref(),
+                        Some(&ping_semaphore),
+                        locale,
+                    )
+                    .await;
                     let ping_res = PingResponse {
                         ok,
                         latency_ms: ms,
@@ -802,6 +1110,20 @@ async fn handle_api_request(
                 res
             }
         },
+        ("PATCH", "/api/rules") => match serde_json::from_str::<PatchRuleRequest>(req_body) {
+            Err(_) => (
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                json_error(locale, "ERR_INVALID_RULE_BODY", "error.invalid_rule_body"),
+            ),
+            Ok(req) => {
+                let res = handle_patch_rule(req, &rule_engine, &proxy_nodes, locale);
+                if res.0 == "200 OK" {
+                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                }
+                res
+            }
+        },
         ("POST", "/api/rules/default") => {
             match serde_json::from_str::<SetDefaultActionRequest>(req_body) {
                 Err(_) => (
@@ -833,7 +1155,12 @@ async fn handle_api_request(
                         "error.invalid_simulate_body",
                     ),
                 ),
-                Ok(req) => handle_simulate_route(req, &rule_engine, locale),
+                Ok(req) => handle_simulate_route_with_pool(
+                    req,
+                    &rule_engine,
+                    runtime_context.as_deref().map(|c| c.fake_ip_pool.as_ref()),
+                    locale,
+                ),
             }
         }
         ("POST", "/api/rules/toggle") => match serde_json::from_str::<ToggleRuleRequest>(req_body) {
@@ -934,6 +1261,117 @@ async fn handle_api_request(
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
+fn validate_node_base(
+    name_raw: &str,
+    protocol_raw: &str,
+    server_addr_raw: &str,
+    username_raw: Option<String>,
+    explicit_password: Option<String>,
+    self_ports: &[u16],
+    locale: Locale,
+) -> std::result::Result<(String, String, String, Option<String>, Option<String>), (&'static str, &'static str, String)> {
+    let ct = "application/json; charset=utf-8";
+    let name = name_raw.trim().to_string();
+    if name.is_empty() {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
+        ));
+    }
+
+    let protocol = protocol_raw.trim().to_ascii_uppercase();
+    if !matches!(protocol.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_UNSUPPORTED_PROTOCOL", "error.unsupported_protocol"),
+        ));
+    }
+
+    let server_addr = server_addr_raw.trim().to_string();
+    let Ok(target_parsed) = parse_target_addr(&server_addr) else {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_NODE_ADDR", "error.invalid_node_addr"),
+        ));
+    };
+    if target_parsed.port() == 0 || target_parsed.host_string().is_empty() {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_NODE_PORT", "error.invalid_node_port"),
+        ));
+    }
+
+    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
+        ));
+    }
+
+    let username = username_raw
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
+    let password = explicit_password.filter(|p| !p.is_empty());
+
+    if let Some(u) = &username
+        && (u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255)
+    {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
+        ));
+    }
+    if let Some(p) = &password
+        && (p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255)
+    {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
+        ));
+    }
+
+    Ok((name, protocol, server_addr, username, password))
+}
+
+fn build_proxy_client(
+    protocol: &str,
+    server_addr: &str,
+    username: &Option<String>,
+    password: &Option<String>,
+) -> ProxyNode {
+    match protocol {
+        "HTTP" => {
+            let mut c = HttpConnectClient::new(server_addr);
+            if let (Some(u), Some(p)) = (username, password) {
+                c = c.with_auth(u.clone(), p.clone());
+            }
+            ProxyNode::Http(c)
+        }
+        "SOCKS4" => {
+            let mut c = Socks4Client::new(server_addr);
+            if let Some(u) = username {
+                c = c.with_user_id(u.clone());
+            }
+            ProxyNode::Socks4(c)
+        }
+        _ => {
+            let mut c = Socks5Client::new(server_addr);
+            if let (Some(u), Some(p)) = (username, password) {
+                c = c.with_auth(u.clone(), p.clone());
+            }
+            ProxyNode::Socks5(c)
+        }
+    }
+}
+
 pub(crate) fn handle_add_node(
     req: AddNodeRequest,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
@@ -941,97 +1379,28 @@ pub(crate) fn handle_add_node(
     locale: Locale,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
-        );
-    }
-
-    let protocol = req.protocol.trim().to_ascii_uppercase();
-    if !matches!(protocol.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_UNSUPPORTED_PROTOCOL", "error.unsupported_protocol"),
-        );
-    }
-
-    let server_addr = req.server_addr.trim().to_string();
-    let Ok(target_parsed) = parse_target_addr(&server_addr) else {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_ADDR", "error.invalid_node_addr"),
-        );
-    };
-    if target_parsed.port() == 0 || target_parsed.host_string().is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_PORT", "error.invalid_node_port"),
-        );
-    }
-
-    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
-        );
-    }
-
-    let username = req
-        .username
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty());
-    let password = req.password.filter(|p| !p.is_empty());
-
-    if let Some(u) = &username
-        && (u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
-        );
-    }
-    if let Some(p) = &password
-        && (p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
-        );
-    }
-
-    let client = match protocol.as_str() {
-        "HTTP" => {
-            let mut c = HttpConnectClient::new(&server_addr);
-            if let (Some(u), Some(p)) = (&username, &password) {
-                c = c.with_auth(u.clone(), p.clone());
-            }
-            ProxyNode::Http(c)
-        }
-        "SOCKS4" => {
-            let mut c = Socks4Client::new(&server_addr);
-            if let Some(u) = &username {
-                c = c.with_user_id(u.clone());
-            }
-            ProxyNode::Socks4(c)
-        }
-        _ => {
-            let mut c = Socks5Client::new(&server_addr);
-            if let (Some(u), Some(p)) = (&username, &password) {
-                c = c.with_auth(u.clone(), p.clone());
-            }
-            ProxyNode::Socks5(c)
-        }
+    let (name, protocol, server_addr, username, password) = match validate_node_base(
+        &req.name,
+        &req.protocol,
+        &req.server_addr,
+        req.username,
+        req.password,
+        self_ports,
+        locale,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
+    if protocol == "SOCKS4" && password.is_some() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
+        );
+    }
+
+    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
     let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
     let new_id = nodes_guard.keys().max().copied().unwrap_or(100) + 1;
     nodes_guard.insert(
@@ -1055,70 +1424,27 @@ pub(crate) fn handle_update_node(
     locale: Locale,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
-        );
-    }
-
-    let protocol = req.protocol.trim().to_ascii_uppercase();
-    if !matches!(protocol.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_UNSUPPORTED_PROTOCOL", "error.unsupported_protocol"),
-        );
-    }
-
-    let server_addr = req.server_addr.trim().to_string();
-    let Ok(target_parsed) = parse_target_addr(&server_addr) else {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_ADDR", "error.invalid_node_addr"),
-        );
+    let (name, protocol, server_addr, username, explicit_password) = match validate_node_base(
+        &req.name,
+        &req.protocol,
+        &req.server_addr,
+        req.username,
+        req.password,
+        self_ports,
+        locale,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
-    if target_parsed.port() == 0 || target_parsed.host_string().is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_PORT", "error.invalid_node_port"),
-        );
-    }
 
-    if target_parsed.is_loopback_or_unspecified() && self_ports.contains(&target_parsed.port()) {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
-        );
-    }
-
-    let username = req
-        .username
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty());
-    let explicit_password = req.password.filter(|p| !p.is_empty());
-
-    if let Some(u) = &username
-        && (u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255)
+    if protocol == "SOCKS4"
+        && (explicit_password.is_some()
+            || (req.keep_password == Some(true) && req.clear_password != Some(true)))
     {
         return (
             "400 Bad Request",
             ct,
-            json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
-        );
-    }
-    if let Some(p) = &explicit_password
-        && (p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
+            json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
         );
     }
 
@@ -1131,42 +1457,117 @@ pub(crate) fn handle_update_node(
         );
     };
 
-    let password = if username.is_some() {
-        if explicit_password.is_some() {
-            explicit_password
-        } else if req.keep_password.unwrap_or(false) {
-            existing.client.auth_credentials().1.map(|s| s.to_string())
-        } else {
-            None
+    let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
+    let password = if protocol == "SOCKS4" || username.is_none() || req.clear_password == Some(true) {
+        None
+    } else if explicit_password.is_some() {
+        explicit_password
+    } else if req.keep_password.unwrap_or(false) {
+        if username != existing.username && existing_password.is_some() {
+            return (
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
+                    "error.password_required_on_user_change",
+                ),
+            );
         }
+        existing_password
     } else {
         None
     };
 
-    let client = match protocol.as_str() {
-        "HTTP" => {
-            let mut c = HttpConnectClient::new(&server_addr);
-            if let (Some(u), Some(p)) = (&username, &password) {
-                c = c.with_auth(u.clone(), p.clone());
-            }
-            ProxyNode::Http(c)
-        }
-        "SOCKS4" => {
-            let mut c = Socks4Client::new(&server_addr);
-            if let Some(u) = &username {
-                c = c.with_user_id(u.clone());
-            }
-            ProxyNode::Socks4(c)
-        }
-        _ => {
-            let mut c = Socks5Client::new(&server_addr);
-            if let (Some(u), Some(p)) = (&username, &password) {
-                c = c.with_auth(u.clone(), p.clone());
-            }
-            ProxyNode::Socks5(c)
-        }
+    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
+    nodes_guard.insert(
+        req.id,
+        ProxyNodeEntry {
+            id: req.id,
+            name,
+            protocol,
+            server_addr,
+            username,
+            client,
+        },
+    );
+    ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, req.id))
+}
+
+pub(crate) fn handle_patch_node(
+    req: PatchNodeRequest,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    self_ports: &[u16],
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+    let Some(existing) = nodes_guard.get(&req.id).cloned() else {
+        return (
+            "404 Not Found",
+            ct,
+            json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
+        );
     };
 
+    let name_raw = req.name.unwrap_or_else(|| existing.name.clone());
+    let protocol_raw = req.protocol.unwrap_or_else(|| existing.protocol.clone());
+    let server_addr_raw = req.server_addr.unwrap_or_else(|| existing.server_addr.clone());
+    let username_raw = if req.clear_username == Some(true) {
+        None
+    } else if req.username.is_some() {
+        req.username
+    } else {
+        existing.username.clone()
+    };
+
+    let (name, protocol, server_addr, username, explicit_password) = match validate_node_base(
+        &name_raw,
+        &protocol_raw,
+        &server_addr_raw,
+        username_raw,
+        req.password,
+        self_ports,
+        locale,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    if protocol == "SOCKS4"
+        && (explicit_password.is_some()
+            || (req.keep_password == Some(true) && req.clear_password != Some(true)))
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
+        );
+    }
+
+    let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
+    let password = if protocol == "SOCKS4" || username.is_none() || req.clear_password == Some(true) {
+        None
+    } else if explicit_password.is_some() {
+        explicit_password
+    } else if req.keep_password == Some(false) {
+        None
+    } else {
+        if username != existing.username && existing_password.is_some() {
+            return (
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
+                    "error.password_required_on_user_change",
+                ),
+            );
+        }
+        existing_password
+    };
+
+    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
     nodes_guard.insert(
         req.id,
         ProxyNodeEntry {
@@ -1224,6 +1625,43 @@ fn parse_and_validate_action(
     }
 }
 
+fn validate_rule_probe(
+    rule: &Rule,
+    apps_clean: Option<&str>,
+    targets_clean: Option<&str>,
+    ports_clean: Option<&str>,
+    locale: Locale,
+) -> std::result::Result<(), (&'static str, &'static str, String)> {
+    let ct = "application/json; charset=utf-8";
+    if apps_clean.is_some()
+        && rule.application_patterns.as_ref().is_some_and(Vec::is_empty)
+    {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_APP_PATTERN", "error.invalid_app_pattern"),
+        ));
+    }
+    if targets_clean.is_some()
+        && rule.target_subnets.is_none()
+        && rule.target_domains.as_ref().is_some_and(Vec::is_empty)
+    {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_TARGET_PATTERN", "error.invalid_target_pattern"),
+        ));
+    }
+    if ports_clean.is_some() && rule.ports.as_ref().is_some_and(Vec::is_empty) {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_PORT_FORMAT", "error.invalid_port_format"),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn handle_add_rule(
     req: AddRuleRequest,
     rule_engine: &RuleEngine,
@@ -1250,32 +1688,8 @@ pub(crate) fn handle_add_rule(
     let ports_clean = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
     let rule = Rule::from_raw(name, true, apps_clean, targets_clean, ports_clean, action);
-
-    if apps_clean.is_some()
-        && rule.application_patterns.as_ref().is_some_and(Vec::is_empty)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_APP_PATTERN", "error.invalid_app_pattern"),
-        );
-    }
-    if targets_clean.is_some()
-        && rule.target_subnets.is_none()
-        && rule.target_domains.as_ref().is_some_and(Vec::is_empty)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_TARGET_PATTERN", "error.invalid_target_pattern"),
-        );
-    }
-    if ports_clean.is_some() && rule.ports.as_ref().is_some_and(Vec::is_empty) {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_PORT_FORMAT", "error.invalid_port_format"),
-        );
+    if let Err(resp) = validate_rule_probe(&rule, apps_clean, targets_clean, ports_clean, locale) {
+        return resp;
     }
 
     let id = rule.id;
@@ -1317,35 +1731,106 @@ pub(crate) fn handle_update_rule(
         ports_clean,
         action.clone(),
     );
-
-    if apps_clean.is_some()
-        && probe.application_patterns.as_ref().is_some_and(Vec::is_empty)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_APP_PATTERN", "error.invalid_app_pattern"),
-        );
-    }
-    if targets_clean.is_some()
-        && probe.target_subnets.is_none()
-        && probe.target_domains.as_ref().is_some_and(Vec::is_empty)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_TARGET_PATTERN", "error.invalid_target_pattern"),
-        );
-    }
-    if ports_clean.is_some() && probe.ports.as_ref().is_some_and(Vec::is_empty) {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_PORT_FORMAT", "error.invalid_port_format"),
-        );
+    if let Err(resp) = validate_rule_probe(&probe, apps_clean, targets_clean, ports_clean, locale) {
+        return resp;
     }
 
     match rule_engine.update_rule(req.id, name, apps_clean, targets_clean, ports_clean, action) {
+        Some(updated) => ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, updated.id)),
+        None => (
+            "404 Not Found",
+            ct,
+            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
+        ),
+    }
+}
+
+pub(crate) fn handle_patch_rule(
+    req: PatchRuleRequest,
+    rule_engine: &RuleEngine,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let Some(existing) = rule_engine.current_rules().iter().find(|r| r.id == req.id).cloned() else {
+        return (
+            "404 Not Found",
+            ct,
+            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
+        );
+    };
+
+    let name = req.name.map(|s| s.trim().to_string()).unwrap_or_else(|| existing.name.clone());
+    if name.is_empty() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_RULE_NAME", "error.empty_rule_name"),
+        );
+    }
+
+    let action = if let Some(act_str) = req.action.as_deref() {
+        let effective_node_id = req.node_id.or_else(|| existing.action.target_id());
+        match parse_and_validate_action(act_str, effective_node_id, proxy_nodes, locale) {
+            Ok(a) => a,
+            Err(resp) => return resp,
+        }
+    } else if let Some(nid) = req.node_id {
+        if matches!(existing.action, Action::Proxy(_)) {
+            match parse_and_validate_action("Proxy", Some(nid), proxy_nodes, locale) {
+                Ok(a) => a,
+                Err(resp) => return resp,
+            }
+        } else {
+            return (
+                "400 Bad Request",
+                ct,
+                json_error(locale, "ERR_INVALID_RULE_ACTION", "error.invalid_rule_action"),
+            );
+        }
+    } else {
+        existing.action.clone()
+    };
+
+    let apps_clean_owned: Option<String> = match req.apps {
+        Some(v) => Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+        None => Some(existing.apps_raw.trim().to_string()).filter(|s| !s.is_empty()),
+    };
+    let targets_clean_owned: Option<String> = match req.targets {
+        Some(v) => Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+        None => Some(existing.targets_raw.trim().to_string()).filter(|s| !s.is_empty()),
+    };
+    let ports_clean_owned: Option<String> = match req.ports {
+        Some(v) => Some(v.trim().to_string()).filter(|s| !s.is_empty()),
+        None => Some(existing.ports_raw.trim().to_string()).filter(|s| !s.is_empty()),
+    };
+
+    let apps_clean = apps_clean_owned.as_deref();
+    let targets_clean = targets_clean_owned.as_deref();
+    let ports_clean = ports_clean_owned.as_deref();
+
+    let probe = Rule::from_raw_with_id(
+        req.id,
+        &name,
+        req.enabled.unwrap_or(existing.enabled),
+        apps_clean,
+        targets_clean,
+        ports_clean,
+        action.clone(),
+    );
+    if let Err(resp) = validate_rule_probe(&probe, apps_clean, targets_clean, ports_clean, locale) {
+        return resp;
+    }
+
+    match rule_engine.update_rule_with_enabled(
+        req.id,
+        name,
+        apps_clean,
+        targets_clean,
+        ports_clean,
+        action,
+        req.enabled,
+    ) {
         Some(updated) => ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, updated.id)),
         None => (
             "404 Not Found",
@@ -1389,30 +1874,17 @@ pub(crate) fn parse_simulate_target(
         return None;
     }
 
-    let (host_str, inline_port) = if trimmed.starts_with('[') {
-        if let Some((bracket_host, port_str)) = trimmed.split_once("]:") {
-            let host_inner = bracket_host.strip_prefix('[')?.trim();
-            let p = port_str.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
-            (host_inner, Some(p))
-        } else {
-            let host_inner = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']'))?;
-            (host_inner.trim(), None)
-        }
-    } else if trimmed.parse::<std::net::IpAddr>().is_ok() {
-        (trimmed, None)
-    } else if let Some((h, p_str)) = trimmed.rsplit_once(':') {
-        let p = p_str.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
-        (h.trim(), Some(p))
-    } else {
-        (trimmed, None)
-    };
-
-    if host_str.is_empty() {
-        return None;
+    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+        let port = explicit_port.unwrap_or(443);
+        return Some((ip.to_string(), Some(ip), port));
     }
-    let port = explicit_port.or(inline_port).unwrap_or(443);
-    let ip_opt = host_str.parse::<std::net::IpAddr>().ok();
-    Some((host_str.to_string(), ip_opt, port))
+
+    let parsed = TargetAddr::parse_authority(trimmed, Some(explicit_port.unwrap_or(443)), false).ok()?;
+    let port = explicit_port.unwrap_or_else(|| parsed.port());
+    match parsed {
+        TargetAddr::Ip(addr) => Some((addr.ip().to_string(), Some(addr.ip()), port)),
+        TargetAddr::Domain(host, _) => Some((host, None, port)),
+    }
 }
 
 pub(crate) fn handle_simulate_route(
@@ -1420,13 +1892,34 @@ pub(crate) fn handle_simulate_route(
     rule_engine: &RuleEngine,
     locale: Locale,
 ) -> (&'static str, &'static str, String) {
+    handle_simulate_route_with_pool(req, rule_engine, None, locale)
+}
+
+pub(crate) fn handle_simulate_route_with_pool(
+    req: SimulateRouteRequest,
+    rule_engine: &RuleEngine,
+    fake_ip_pool: Option<&FakeIpPool>,
+    locale: Locale,
+) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
-    let Some((target_host, target_ip, target_port)) = parse_simulate_target(&req.target, req.port) else {
+    let Some((parsed_host, ip_opt, target_port)) = parse_simulate_target(&req.target, req.port) else {
         return (
             "400 Bad Request",
             ct,
             json_error(locale, "ERR_INVALID_SIMULATE_TARGET", "error.invalid_simulate_target"),
         );
+    };
+
+    // 与真实流量调度保持完全一致：Fake-IP 还原为原域名；真实 IP 字面量不设 target_host（仅传 target_ip）
+    let (target_host, target_ip) = match ip_opt {
+        Some(std::net::IpAddr::V4(v4)) if fake_ip_pool.is_some_and(|p| p.is_fake_ip(&v4)) => {
+            match fake_ip_pool.and_then(|p| p.restore(&v4)) {
+                Some(domain) => (Some(domain), None),
+                None => (None, Some(std::net::IpAddr::V4(v4))),
+            }
+        }
+        Some(ip) => (None, Some(ip)),
+        None => (Some(parsed_host), None),
     };
 
     let proc_raw = req
@@ -1447,7 +1940,7 @@ pub(crate) fn handle_simulate_route(
     let ctx = crate::router::RouteContext {
         process_path: process_path.as_deref(),
         process_name: process_name.as_deref(),
-        target_host: Some(target_host.as_str()),
+        target_host: target_host.as_deref(),
         target_ip,
         target_port,
     };
@@ -1471,7 +1964,7 @@ pub(crate) fn handle_simulate_route(
         node_id,
         process_name,
         process_path,
-        target_host: Some(target_host),
+        target_host,
         target_ip: target_ip.map(|ip| ip.to_string()),
         target_port,
         trace: sim.trace,
@@ -1569,6 +2062,8 @@ async fn send_http_response(
         "HTTP/1.1 {}\r\n\
 Content-Type: {}\r\n\
 X-Content-Type-Options: nosniff\r\n\
+X-Frame-Options: DENY\r\n\
+Content-Security-Policy: frame-ancestors 'none'\r\n\
 Cache-Control: no-store\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\
@@ -1614,9 +2109,85 @@ fn localize_connection_view(conn: &mut crate::monitor::ConnectionSnapshot, local
 }
 
 pub(crate) async fn ping_address(addr: &str, locale: Locale) -> (bool, u64, String, Option<String>) {
-    let start = std::time::Instant::now();
-    let res = tokio::time::timeout(Duration::from_millis(2000), TcpStream::connect(addr)).await;
-    match res {
+    ping_address_with_context(addr, None, None, locale).await
+}
+
+async fn ping_address_with_context(
+    addr: &str,
+    runtime_ctx: Option<&SystemRuntimeContext>,
+    ping_semaphore: Option<&Semaphore>,
+    locale: Locale,
+) -> (bool, u64, String, Option<String>) {
+    const PING_TIMEOUT: Duration = Duration::from_millis(2000);
+    let start = Instant::now();
+
+    let _permit = if let Some(sem) = ping_semaphore {
+        match tokio::time::timeout(PING_TIMEOUT, sem.acquire()).await {
+            Ok(Ok(p)) => Some(p),
+            Ok(Err(e)) => {
+                return (
+                    false,
+                    0,
+                    t(locale, "error.ping_failed").to_string(),
+                    Some(e.to_string()),
+                );
+            }
+            Err(_) => return (false, 0, t(locale, "ping.timeout").to_string(), None),
+        }
+    } else {
+        None
+    };
+
+    let parsed = match parse_target_addr(addr) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                false,
+                0,
+                t(locale, "error.ping_failed").to_string(),
+                Some(e.to_string()),
+            );
+        }
+    };
+
+    let target_addrs: Vec<SocketAddr> = match parsed {
+        TargetAddr::Ip(sock_addr) => vec![sock_addr],
+        TargetAddr::Domain(domain, port) => {
+            if crate::outbound::is_loopback_domain(&domain) {
+                vec![
+                    SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port),
+                    SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+                ]
+            } else {
+                let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
+                if remaining.is_zero() {
+                    return (false, 0, t(locale, "ping.timeout").to_string(), None);
+                }
+                let upstream_dns = runtime_ctx
+                    .map(|c| c.upstream_dns)
+                    .unwrap_or_else(|| "223.5.5.5:53".parse().unwrap());
+                let fake_pool = runtime_ctx.map(|c| c.fake_ip_pool.as_ref());
+                match crate::dns::server::resolve_via_upstream_dns(&domain, upstream_dns, fake_pool, remaining).await {
+                    Ok(ips) => ips.into_iter().map(|ip| SocketAddr::new(ip, port)).collect(),
+                    Err(e) => {
+                        return (
+                            false,
+                            0,
+                            t(locale, "error.ping_failed").to_string(),
+                            Some(e.to_string()),
+                        );
+                    }
+                }
+            }
+        }
+    };
+
+    let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
+    if remaining.is_zero() {
+        return (false, 0, t(locale, "ping.timeout").to_string(), None);
+    }
+
+    match tokio::time::timeout(remaining, TcpStream::connect(target_addrs.as_slice())).await {
         Ok(Ok(stream)) => {
             drop(stream);
             let ms = start.elapsed().as_millis() as u64;
@@ -1690,10 +2261,12 @@ mod tests {
         let (addr, _nodes, _re, _shutdown_tx) = spawn_test_api().await;
         let port = addr.port();
 
-        // 1. 无通配 CORS 且拦截 DNS Rebinding / 跨源请求
+        // 1. 无通配 CORS 且拦截 DNS Rebinding / 跨源请求，并包含反点击劫持头
         let ok_resp = raw_http(addr, &format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port)).await;
         assert!(ok_resp.starts_with("HTTP/1.1 200 OK"));
         assert!(!ok_resp.contains("Access-Control-Allow-Origin"));
+        assert!(ok_resp.contains("X-Frame-Options: DENY"));
+        assert!(ok_resp.contains("Content-Security-Policy: frame-ancestors 'none'"));
 
         let evil_host = raw_http(addr, &format!("GET /api/health HTTP/1.1\r\nHost: evil.com:{}\r\n\r\n", port)).await;
         assert!(evil_host.starts_with("HTTP/1.1 403 Forbidden"));
@@ -1701,19 +2274,33 @@ mod tests {
         let evil_origin = raw_http(
             addr,
             &format!(
-                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://evil.com\r\nContent-Length: 2\r\n\r\n{{}}",
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: http://evil.com\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
                 port
             ),
         )
         .await;
         assert!(evil_origin.starts_with("HTTP/1.1 403 Forbidden"));
 
+        // 1.5 缺失 Content-Type: application/json 时拒绝 415 Unsupported Media Type
+        let missing_ct_body = r#"{"name":"n1","protocol":"SOCKS5","server_addr":"1.2.3.4:1080"}"#;
+        let missing_ct = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                missing_ct_body.len(),
+                missing_ct_body
+            ),
+        )
+        .await;
+        assert!(missing_ct.starts_with("HTTP/1.1 415 Unsupported Media Type"));
+
         // 2. 拒绝未知代理协议
         let bad_proto_body = r#"{"name":"n1","protocol":"VMESS","server_addr":"1.2.3.4:1080"}"#;
         let bad_proto = raw_http(
             addr,
             &format!(
-                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_proto_body.len(),
                 bad_proto_body
@@ -1727,7 +2314,7 @@ mod tests {
         let bad_rule = raw_http(
             addr,
             &format!(
-                "POST /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_rule_body.len(),
                 bad_rule_body
@@ -1740,7 +2327,7 @@ mod tests {
         let bad_port = raw_http(
             addr,
             &format!(
-                "POST /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_port_body.len(),
                 bad_port_body
@@ -1754,7 +2341,7 @@ mod tests {
         let ping_missing = raw_http(
             addr,
             &format!(
-                "POST /api/nodes/ping HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes/ping HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 ping_missing_body.len(),
                 ping_missing_body
@@ -1767,7 +2354,7 @@ mod tests {
         let ping_ssrf = raw_http(
             addr,
             &format!(
-                "POST /api/nodes/ping HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes/ping HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 ping_ssrf_body.len(),
                 ping_ssrf_body
@@ -1803,7 +2390,7 @@ mod tests {
         let resp = raw_http(
             addr,
             &format!(
-                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 add_node_body.len(),
                 add_node_body
@@ -1871,7 +2458,7 @@ mod tests {
         let toggle_resp = raw_http(
             addr,
             &format!(
-                "POST /api/rules/toggle HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/rules/toggle HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 toggle_body.len(),
                 toggle_body
@@ -1885,7 +2472,7 @@ mod tests {
         let move_resp = raw_http(
             addr,
             &format!(
-                "POST /api/rules/move HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/rules/move HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 move_body.len(),
                 move_body
@@ -1948,7 +2535,7 @@ mod tests {
         let del_resp = raw_http(
             addr,
             &format!(
-                "DELETE /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "DELETE /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 del_body.len(),
                 del_body
@@ -1966,7 +2553,7 @@ mod tests {
         let kill_resp = raw_http(
             addr,
             &format!(
-                "POST /api/connections/kill HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/connections/kill HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 kill_body.len(),
                 kill_body
@@ -1991,7 +2578,7 @@ mod tests {
         let resp_zh = raw_http(
             addr,
             &format!(
-                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN,zh;q=0.9\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN,zh;q=0.9\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_proto_body.len(),
                 bad_proto_body
@@ -2007,7 +2594,7 @@ mod tests {
         let resp_en = raw_http(
             addr,
             &format!(
-                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US,en;q=0.9\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US,en;q=0.9\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_proto_body.len(),
                 bad_proto_body
@@ -2023,7 +2610,7 @@ mod tests {
         let resp_query_zh = raw_http(
             addr,
             &format!(
-                "POST /api/nodes?lang=zh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes?lang=zh HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_proto_body.len(),
                 bad_proto_body
@@ -2036,7 +2623,7 @@ mod tests {
         let resp_query_en = raw_http(
             addr,
             &format!(
-                "POST /api/nodes?lang=en HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/nodes?lang=en HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 bad_proto_body.len(),
                 bad_proto_body
@@ -2161,7 +2748,7 @@ mod tests {
         let resp1 = raw_http(
             addr,
             &format!(
-                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 put_node1.len(),
                 put_node1
@@ -2174,7 +2761,7 @@ mod tests {
         let resp2 = raw_http(
             addr,
             &format!(
-                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 put_node2.len(),
                 put_node2
@@ -2191,7 +2778,7 @@ mod tests {
         let resp_rule = raw_http(
             addr,
             &format!(
-                "PUT /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: {}\r\n\r\n{}",
+                "PUT /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 put_rule.len(),
                 put_rule
@@ -2205,7 +2792,7 @@ mod tests {
         let resp_def = raw_http(
             addr,
             &format!(
-                "POST /api/rules/default HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/rules/default HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 def_body.len(),
                 def_body
@@ -2221,7 +2808,7 @@ mod tests {
         let resp_sim = raw_http(
             addr,
             &format!(
-                "POST /api/rules/simulate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Length: {}\r\n\r\n{}",
+                "POST /api/rules/simulate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
                 port,
                 sim_body.len(),
                 sim_body
@@ -2243,5 +2830,212 @@ mod tests {
         assert_eq!(reloaded.default_action, Action::Proxy(101));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_api_bind_non_loopback_and_framing_hardening() {
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let non_loopback = ApiServer::new("0.0.0.0:40080".parse().unwrap(), mgr, re, nodes);
+        assert!(non_loopback.bind().await.is_err());
+
+        let (addr, _nodes, _re, _tx) = spawn_test_api().await;
+        let port = addr.port();
+
+        // 1. 拒绝 Transfer-Encoding (501)
+        let te_resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                port
+            ),
+        )
+        .await;
+        assert!(te_resp.starts_with("HTTP/1.1 501 Not Implemented"), "te_resp: {te_resp}");
+
+        // 2. 拒绝重复 Host 头 (400)
+        let dup_host = raw_http(
+            addr,
+            &format!(
+                "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                port, port
+            ),
+        )
+        .await;
+        assert!(dup_host.starts_with("HTTP/1.1 400 Bad Request"), "dup_host: {dup_host}");
+
+        // 3. 拒绝在 EOF 前截断 Content-Length 的不完整请求
+        {
+            let mut s = TcpStream::connect(addr).await.unwrap();
+            s.write_all(
+                format!(
+                    "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n{{\"name\":\"x\"}}",
+                    port
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            s.shutdown().await.unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).await.unwrap();
+            let txt = String::from_utf8(buf).unwrap();
+            assert!(txt.starts_with("HTTP/1.1 400 Bad Request"), "trunc eof: {txt}");
+        }
+
+        // 4. 拒绝无效请求行
+        let bad_rl = raw_http(
+            addr,
+            &format!("GET  /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        )
+        .await;
+        assert!(bad_rl.starts_with("HTTP/1.1 400 Bad Request"), "bad_rl: {bad_rl}");
+    }
+
+    #[tokio::test]
+    async fn test_api_patch_and_auth_and_simulate_parity() {
+        let (addr, nodes, re, _tx) = spawn_test_api().await;
+        let port = addr.port();
+
+        // 1. SOCKS4 带密码必须显式报错拒绝
+        let s4_pw = r#"{"name":"s4","protocol":"SOCKS4","server_addr":"10.0.0.3:1080","username":"u","password":"p"}"#;
+        let resp_s4 = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                s4_pw.len(),
+                s4_pw
+            ),
+        )
+        .await;
+        assert!(resp_s4.starts_with("HTTP/1.1 400 Bad Request"), "s4_pw: {resp_s4}");
+        assert!(resp_s4.contains("ERR_SOCKS4_PASSWORD_UNSUPPORTED"));
+
+        // 2. 添加带密码 SOCKS5 节点并验证 GET /api/nodes 返回 password_configured=true
+        let add_s5 = r#"{"name":"s5","protocol":"SOCKS5","server_addr":"10.0.0.4:1080","username":"alice","password":"pw1"}"#;
+        let r_add = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                add_s5.len(),
+                add_s5
+            ),
+        )
+        .await;
+        assert!(r_add.starts_with("HTTP/1.1 200 OK"), "r_add: {r_add}");
+
+        let list_nodes = raw_http(
+            addr,
+            &format!("GET /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        )
+        .await;
+        assert!(list_nodes.contains("\"password_configured\":true"));
+
+        // 3. PATCH 仅改名保留凭证；修改用户名未给新密码则报错；clear_password=true 清除密码
+        let patch_name = r#"{"id":101,"name":"s5-patched"}"#;
+        let r_patch_name = raw_http(
+            addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                patch_name.len(),
+                patch_name
+            ),
+        )
+        .await;
+        assert!(r_patch_name.starts_with("HTTP/1.1 200 OK"), "r_patch_name: {r_patch_name}");
+        assert_eq!(
+            nodes.read().unwrap().get(&101).unwrap().client.auth_credentials(),
+            (Some("alice"), Some("pw1"))
+        );
+
+        let patch_user_only = r#"{"id":101,"username":"bob"}"#;
+        let r_user_only = raw_http(
+            addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                patch_user_only.len(),
+                patch_user_only
+            ),
+        )
+        .await;
+        assert!(r_user_only.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_user_only.contains("ERR_PASSWORD_REQUIRED_ON_USER_CHANGE"));
+
+        let clear_pw = r#"{"id":101,"clear_password":true}"#;
+        let r_clear = raw_http(
+            addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                clear_pw.len(),
+                clear_pw
+            ),
+        )
+        .await;
+        assert!(r_clear.starts_with("HTTP/1.1 200 OK"), "r_clear: {r_clear}");
+        {
+            let guard = nodes.read().unwrap();
+            let n = guard.get(&101).unwrap();
+            assert_eq!(n.username.as_deref(), Some("alice"));
+            assert_eq!(n.client.auth_credentials(), (None, None));
+        }
+
+        // 4. PATCH /api/rules 保留未修改条件字段
+        let add_r = Rule::from_raw("R1", true, Some("curl"), Some("*.example.com"), Some("443"), Action::Direct);
+        let rid = add_r.id;
+        re.add_rule(add_r);
+        let patch_rule_body = format!(r#"{{"id":{},"name":"R1-Renamed"}}"#, rid);
+        let r_patch_rule = raw_http(
+            addr,
+            &format!(
+                "PATCH /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                patch_rule_body.len(),
+                patch_rule_body
+            ),
+        )
+        .await;
+        assert!(r_patch_rule.starts_with("HTTP/1.1 200 OK"), "r_patch_rule: {r_patch_rule}");
+        let cur_r = re.current_rules();
+        let patched_r = cur_r.iter().find(|r| r.id == rid).unwrap();
+        assert_eq!(patched_r.name, "R1-Renamed");
+        assert_eq!(patched_r.targets_raw, "*.example.com");
+        assert_eq!(patched_r.ports_raw, "443");
+
+        // 5. Simulate parity: IP literal sets target_host=None, Fake-IP restores original domain
+        let pool = FakeIpPool::new_default();
+        let fake_ip = pool.allocate("secret.internal");
+        let sim_ip = handle_simulate_route_with_pool(
+            SimulateRouteRequest {
+                process: None,
+                target: "8.8.8.8:443".into(),
+                port: None,
+            },
+            &re,
+            Some(&pool),
+            Locale::En,
+        );
+        let ip_val: serde_json::Value = serde_json::from_str(&sim_ip.2).unwrap();
+        assert!(ip_val["target_host"].is_null(), "IP literal must keep target_host null: {ip_val}");
+        assert_eq!(ip_val["target_ip"], "8.8.8.8");
+
+        let sim_fake = handle_simulate_route_with_pool(
+            SimulateRouteRequest {
+                process: None,
+                target: format!("{}:443", fake_ip),
+                port: None,
+            },
+            &re,
+            Some(&pool),
+            Locale::En,
+        );
+        let fake_val: serde_json::Value = serde_json::from_str(&sim_fake.2).unwrap();
+        assert_eq!(fake_val["target_host"], "secret.internal");
+        assert!(fake_val["target_ip"].is_null());
     }
 }

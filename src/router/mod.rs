@@ -335,13 +335,28 @@ impl RuleEngine {
         ports_raw: Option<&str>,
         action: Action,
     ) -> Option<Rule> {
+        self.update_rule_with_enabled(rule_id, name, apps_raw, targets_raw, ports_raw, action, None)
+    }
+
+    /// 原地更新规则，并可选原子修改启用状态（供 PATCH 端点使用）
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_rule_with_enabled(
+        &self,
+        rule_id: u64,
+        name: String,
+        apps_raw: Option<&str>,
+        targets_raw: Option<&str>,
+        ports_raw: Option<&str>,
+        action: Action,
+        enabled: Option<bool>,
+    ) -> Option<Rule> {
         let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
         let mut new_rules = (**guard).clone();
         let slot = new_rules.iter_mut().find(|r| r.id == rule_id)?;
         let updated = Rule::from_raw_with_id(
             rule_id,
             name,
-            slot.enabled,
+            enabled.unwrap_or(slot.enabled),
             apps_raw,
             targets_raw,
             ports_raw,

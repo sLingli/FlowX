@@ -62,7 +62,7 @@ impl HttpConnectClient {
         );
 
         if let Some((user, pass)) = &self.auth {
-            if user.contains('\r') || user.contains('\n') || pass.contains('\r') || pass.contains('\n') {
+            if user.chars().any(char::is_control) || pass.chars().any(char::is_control) {
                 bail!("HTTP proxy credentials contain invalid control characters");
             }
             let encoded = base64_encode(format!("{}:{}", user, pass).as_bytes());
@@ -88,20 +88,9 @@ impl HttpConnectClient {
             }
         }
 
-        let resp_str = String::from_utf8_lossy(&response_buf);
-        let first_line = resp_str.lines().next().unwrap_or_default();
+        let status_code = parse_connect_response_head(&response_buf)?;
 
-        // Expect first line like: "HTTP/1.1 200 Connection established"
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        if parts.len() < 2 {
-            bail!("HTTP proxy returned invalid status line: {}", first_line);
-        }
-
-        let status_code: u16 = parts[1].parse().with_context(|| {
-            format!("Failed to parse HTTP proxy response status code: {}", parts[1])
-        })?;
-
-        // Follow RFC 7231: allow all 2xx status codes
+        // Follow RFC 9110: allow 2xx status codes for CONNECT tunnel establishment
         if !(200..=299).contains(&status_code) {
             let reason = match status_code {
                 407 => "Proxy Authentication Required",
@@ -116,6 +105,83 @@ impl HttpConnectClient {
 
         Ok(())
     }
+}
+
+/// 严格校验上游 CONNECT 响应头（仅接受 \r\n\r\n 结尾、无 NUL/孤立换行，严格 HTTP/1.0 或 HTTP/1.1 与三位状态码）
+fn parse_connect_status_line(first_line: &str) -> Result<u16> {
+    let rest = first_line
+        .strip_prefix("HTTP/1.1 ")
+        .or_else(|| first_line.strip_prefix("HTTP/1.0 "))
+        .ok_or_else(|| anyhow::anyhow!("HTTP proxy returned invalid status line version: {:?}", first_line))?;
+
+    let bytes = rest.as_bytes();
+    if bytes.len() < 3 || !bytes[..3].iter().all(|b| b.is_ascii_digit()) {
+        bail!("HTTP proxy returned malformed status code: {:?}", first_line);
+    }
+    if bytes.len() > 3 && bytes[3] != b' ' {
+        bail!("HTTP proxy status code must be 3 digits: {:?}", first_line);
+    }
+    // Reject leading zero like 0200 (handled above via len>3 != ' '), or 020 (< 100)
+    if bytes[0] == b'0' {
+        bail!("HTTP proxy returned invalid status code leading zero: {:?}", first_line);
+    }
+    let code: u16 = rest[..3]
+        .parse()
+        .with_context(|| format!("Failed to parse HTTP proxy status code: {:?}", first_line))?;
+    Ok(code)
+}
+
+fn parse_connect_response_head(response_buf: &[u8]) -> Result<u16> {
+    let Some(head) = response_buf.strip_suffix(b"\r\n\r\n") else {
+        bail!("HTTP proxy response did not end with CRLFCRLF");
+    };
+    if head.contains(&0) {
+        bail!("HTTP proxy response contains NUL byte");
+    }
+
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < head.len() {
+        if head[i] == b'\n' {
+            bail!("HTTP proxy response contains bare LF");
+        }
+        if head[i] == b'\r' {
+            if i + 1 >= head.len() || head[i + 1] != b'\n' {
+                bail!("HTTP proxy response contains bare CR");
+            }
+            lines.push(&head[start..i]);
+            i += 2;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    lines.push(&head[start..]);
+
+    let first_line = std::str::from_utf8(lines.first().copied().unwrap_or_default())
+        .context("HTTP proxy status line is not valid UTF-8")?;
+    let status_code = parse_connect_status_line(first_line)?;
+
+    // Ensure 2xx CONNECT responses do not carry Content-Length / Transfer-Encoding framing headers
+    let is_2xx = (200..=299).contains(&status_code);
+    for line in &lines[1..] {
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            bail!("HTTP proxy response header missing colon");
+        };
+        let name = &line[..colon];
+        if name.is_empty() || name.iter().any(|&b| b == b' ' || b == b'\t') {
+            bail!("HTTP proxy response contains malformed header name");
+        }
+        if is_2xx
+            && (name.eq_ignore_ascii_case(b"content-length")
+                || name.eq_ignore_ascii_case(b"transfer-encoding"))
+        {
+            bail!("HTTP proxy 2xx CONNECT response must not contain body framing headers");
+        }
+    }
+
+    Ok(status_code)
 }
 
 /// Minimal zero-dependency Base64 encoder
@@ -162,5 +228,29 @@ mod tests {
     fn test_base64_encode() {
         assert_eq!(base64_encode(b"admin:123456"), "YWRtaW46MTIzNDU2");
         assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn test_parse_connect_status_line_strict() {
+        assert_eq!(parse_connect_status_line("HTTP/1.1 200 Connection established").unwrap(), 200);
+        assert_eq!(parse_connect_status_line("HTTP/1.0 200").unwrap(), 200);
+        assert_eq!(parse_connect_status_line("HTTP/1.1 407 Proxy Authentication Required").unwrap(), 407);
+
+        for bad in [
+            "HTTP/1.1 +200 OK",
+            "HTTP/1.1 0200 OK",
+            "HTTP/1.1 2000 OK",
+            "HTTP/1.1 020 OK",
+            "HTTP/1.1  200 OK",
+            "HTTP/2 200 OK",
+            "HTTP/1.1 200OK",
+            "NOTHTTP 200 OK",
+        ] {
+            assert!(parse_connect_status_line(bad).is_err(), "expected err for {:?}", bad);
+        }
+
+        assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\r\nProxy-Agent: x\r\n\r\n").is_ok());
+        assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\n\r\n\r\n").is_err());
+        assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").is_err());
     }
 }

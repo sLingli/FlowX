@@ -7,6 +7,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{watch, Semaphore};
 use tracing::{debug, error, info, warn};
 use super::FakeIpPool;
+use crate::monitor::InFlightTracker;
 
 const MAX_DNS_UPSTREAM_CONCURRENCY: usize = 1024;
 const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -235,6 +236,7 @@ pub struct DnsServer {
     pub block_ipv6: bool,
     concurrency_limit: Arc<Semaphore>,
     upstream_limit: Arc<Semaphore>,
+    in_flight: Option<Arc<InFlightTracker>>,
 }
 
 /// 规范化套接字地址，避免双栈环境下的 IPv4-mapped IPv6 形式影响源地址核验
@@ -576,7 +578,13 @@ impl DnsServer {
             block_ipv6,
             concurrency_limit: Arc::new(Semaphore::new(5000)),
             upstream_limit: Arc::new(Semaphore::new(MAX_DNS_UPSTREAM_CONCURRENCY)),
+            in_flight: None,
         }
+    }
+
+    pub fn with_in_flight(mut self, tracker: Arc<InFlightTracker>) -> Self {
+        self.in_flight = Some(tracker);
+        self
     }
 
     /// Synchronously bind socket (Fail-Fast port check)
@@ -593,12 +601,20 @@ impl DnsServer {
         let mut buf = [0u8; 1500];
 
         loop {
+            if *shutdown_rx.borrow() {
+                info!("[DNS Engine] Shutdown signal already set, stopping DNS listener");
+                break;
+            }
             let (len, peer) = tokio::select! {
                 res = socket.recv_from(&mut buf) => {
                     match res {
                         Ok(r) => r,
                         Err(e) => {
                             error!("[DNS Engine] Failed to receive UDP DNS packet: {}", e);
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                                _ = shutdown_rx.changed() => break,
+                            }
                             continue;
                         }
                     }
@@ -623,9 +639,11 @@ impl DnsServer {
             let upstream_dns = self.upstream_dns;
             let block_ipv6 = self.block_ipv6;
             let upstream_limit = Arc::clone(&self.upstream_limit);
+            let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
 
             tokio::spawn(async move {
                 let _permit = permit;
+                let _in_flight = _in_flight;
                 match DnsPacketParser::parse_question(&query_bytes) {
                     Ok((client_tx_id, question)) => {
                         debug!(
