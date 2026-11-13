@@ -314,7 +314,7 @@ fn extract_process_name(path: &str) -> String {
         .to_string()
 }
 
-#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn normalize_ipv4_pair(client: SocketAddr, server: SocketAddr) -> Option<(SocketAddrV4, SocketAddrV4)> {
     let to_v4 = |addr: SocketAddr| -> Option<SocketAddrV4> {
         match addr {
@@ -325,7 +325,7 @@ fn normalize_ipv4_pair(client: SocketAddr, server: SocketAddr) -> Option<(Socket
     Some((to_v4(client)?, to_v4(server)?))
 }
 
-#[cfg(any(windows, target_os = "linux", target_os = "macos", test))]
+#[cfg(any(windows, target_os = "linux", test))]
 fn normalize_ipv6_pair(client: SocketAddr, server: SocketAddr) -> Option<(SocketAddrV6, SocketAddrV6)> {
     let to_v6 = |addr: SocketAddr| -> SocketAddrV6 {
         match addr {
@@ -1199,13 +1199,17 @@ mod macos_proc_info {
         if ini.insi_vflag & INI_IPV4 != 0 {
             let local_ip = IpAddr::V4(Ipv4Addr::from(unsafe { ini.insi_laddr.ina_46.i46a_addr4 }));
             let remote_ip = IpAddr::V4(Ipv4Addr::from(unsafe { ini.insi_faddr.ina_46.i46a_addr4 }));
-            return local_ip == target_local && remote_ip == target_remote;
+            if local_ip == target_local && remote_ip == target_remote {
+                return true;
+            }
         }
 
         if ini.insi_vflag & INI_IPV6 != 0 {
             let local_ip = canonical_ip(IpAddr::V6(Ipv6Addr::from(unsafe { ini.insi_laddr.ina_6 })));
             let remote_ip = canonical_ip(IpAddr::V6(Ipv6Addr::from(unsafe { ini.insi_faddr.ina_6 })));
-            return local_ip == target_local && remote_ip == target_remote;
+            if local_ip == target_local && remote_ip == target_remote {
+                return true;
+            }
         }
 
         false
@@ -1226,14 +1230,21 @@ fn macos_pid_owns_socket(
         return false;
     }
 
+    let check_pidinfo = |ret: libc::c_int| -> bool {
+        if ret < 0 {
+            if let Some(errno) = std::io::Error::last_os_error().raw_os_error()
+                && (errno == libc::EPERM || errno == libc::EACCES)
+            {
+                neg_cache.insert(pid, (), now);
+            }
+            return false;
+        }
+        ret > 0
+    };
+
     let c_pid = pid as libc::c_int;
     let buf_bytes = unsafe { libc::proc_pidinfo(c_pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if buf_bytes <= 0 {
-        if let Some(errno) = std::io::Error::last_os_error().raw_os_error()
-            && (errno == libc::EPERM || errno == libc::EACCES)
-        {
-            neg_cache.insert(pid, (), now);
-        }
+    if !check_pidinfo(buf_bytes) {
         return false;
     }
 
@@ -1249,12 +1260,7 @@ fn macos_pid_owns_socket(
             (fds.len() * elem_size) as libc::c_int,
         )
     };
-    if actual_bytes <= 0 {
-        if let Some(errno) = std::io::Error::last_os_error().raw_os_error()
-            && (errno == libc::EPERM || errno == libc::EACCES)
-        {
-            neg_cache.insert(pid, (), now);
-        }
+    if !check_pidinfo(actual_bytes) {
         return false;
     }
 
@@ -1757,6 +1763,21 @@ mod tests {
         assert!(matches_macos_socket_info(
             &info,
             "[::1]:51234".parse().unwrap(),
+            "[::1]:40081".parse().unwrap(),
+            6
+        ));
+
+        // Dual-stack INI_IPV4 | INI_IPV6 socket with IPv6 addresses must NOT early-return false on INI_IPV4 mismatch
+        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_vflag = INI_IPV4 | INI_IPV6;
+        assert!(matches_macos_socket_info(
+            &info,
+            "[::1]:51234".parse().unwrap(),
+            "[::1]:40081".parse().unwrap(),
+            6
+        ));
+        assert!(!matches_macos_socket_info(
+            &info,
+            "[::1]:51235".parse().unwrap(),
             "[::1]:40081".parse().unwrap(),
             6
         ));
