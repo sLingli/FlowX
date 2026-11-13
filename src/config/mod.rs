@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,8 +15,10 @@ use crate::outbound::socks5::Socks5Client;
 use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
 
+static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename = "Profile")]
+#[serde(rename = "Profile", deny_unknown_fields)]
 pub struct ProfileConfig {
     #[serde(rename = "@version", default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -27,12 +31,14 @@ pub struct ProfileConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyList {
     #[serde(rename = "Proxy", default)]
     pub proxies: Vec<ProxyItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyItem {
     #[serde(rename = "@id")]
     pub id: u32,
@@ -53,12 +59,14 @@ pub struct ProxyItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RuleList {
     #[serde(rename = "Rule", default)]
     pub rules: Vec<RuleItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuleItem {
     #[serde(rename = "@enabled", default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -75,6 +83,7 @@ pub struct RuleItem {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuleActionItem {
     #[serde(rename = "@type")]
     pub action_type: String,
@@ -280,8 +289,7 @@ fn parse_action(item: &RuleActionItem, proxy_nodes: &HashMap<u32, ProxyNodeEntry
             Ok(Action::Proxy(id))
         }
         "CHAIN" => {
-            let id = item.value.context("Chain action missing chain ID")?;
-            Ok(Action::Chain(id))
+            bail!("Proxy chain action (Chain) is not supported yet; use Direct, Block, or Proxy");
         }
         other => bail!("Unsupported rule action type: {}", other),
     }
@@ -384,20 +392,22 @@ impl ConfigStore {
         &self.path
     }
 
-    /// 从磁盘加载配置；若文件不存在则生成默认配置并写入磁盘
+    /// 从磁盘加载配置；仅在明确 `NotFound` 时生成默认配置，其他 I/O 错误直接失败以免覆盖不可读配置
     pub fn load_or_init(&self, self_ports: &[u16]) -> Result<(RuntimeProfile, bool)> {
-        if self.path.exists() {
-            let xml = std::fs::read_to_string(&self.path)
-                .with_context(|| format!("Failed to read configuration file: {}", self.path.display()))?;
-            let cfg = ProfileConfig::from_xml(&xml)
-                .with_context(|| format!("Failed to parse XML configuration file: {}", self.path.display()))?;
-            let runtime = cfg.into_runtime(self_ports)?;
-            Ok((runtime, false))
-        } else {
-            let default_cfg = ProfileConfig::default_profile();
-            self.write_config_atomic(&default_cfg)?;
-            let runtime = default_cfg.into_runtime(self_ports)?;
-            Ok((runtime, true))
+        match std::fs::read_to_string(&self.path) {
+            Ok(xml) => {
+                let cfg = ProfileConfig::from_xml(&xml)
+                    .with_context(|| format!("Failed to parse XML configuration file: {}", self.path.display()))?;
+                let runtime = cfg.into_runtime(self_ports)?;
+                Ok((runtime, false))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let default_cfg = ProfileConfig::default_profile();
+                self.write_config_atomic(&default_cfg)?;
+                let runtime = default_cfg.into_runtime(self_ports)?;
+                Ok((runtime, true))
+            }
+            Err(e) => Err(e).with_context(|| format!("Failed to read configuration file: {}", self.path.display())),
         }
     }
 
@@ -419,18 +429,94 @@ impl ConfigStore {
 
     fn write_config_atomic(&self, cfg: &ProfileConfig) -> Result<()> {
         let xml = cfg.to_xml()?;
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
+        let parent_dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = parent_dir {
             std::fs::create_dir_all(parent)?;
         }
-        let mut tmp_os = self.path.as_os_str().to_os_string();
-        tmp_os.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_os);
-        std::fs::write(&tmp_path, xml.as_bytes())
-            .with_context(|| format!("Failed to write temporary configuration file: {}", tmp_path.display()))?;
-        std::fs::rename(&tmp_path, &self.path)
-            .with_context(|| format!("Failed to atomically replace configuration file: {}", self.path.display()))?;
+
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("flowx.xml");
+        let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_name = format!(".{}.tmp.{}.{}", file_name, std::process::id(), seq);
+        let tmp_path = match parent_dir {
+            Some(parent) => parent.join(&tmp_name),
+            None => PathBuf::from(&tmp_name),
+        };
+
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+
+        let mut file = opts
+            .open(&tmp_path)
+            .with_context(|| format!("Failed to create temporary configuration file: {}", tmp_path.display()))?;
+
+        let write_result: Result<()> = (|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                    .context("Failed to restrict temporary configuration file permissions to 0600")?;
+            }
+            file.write_all(xml.as_bytes())
+                .with_context(|| format!("Failed to write temporary configuration file: {}", tmp_path.display()))?;
+            file.sync_all()
+                .with_context(|| format!("Failed to fsync temporary configuration file: {}", tmp_path.display()))?;
+            Ok(())
+        })();
+
+        drop(file);
+        if let Err(e) = write_result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+
+        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to atomically replace configuration file: {}",
+                    self.path.display()
+                )
+            });
+        }
+
+        #[cfg(unix)]
+        {
+            let dir_to_sync = parent_dir.unwrap_or_else(|| Path::new("."));
+            match std::fs::File::open(dir_to_sync) {
+                Ok(dir_file) => match dir_file.sync_all() {
+                    Ok(()) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+                        ) => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("Failed to fsync configuration directory: {}", dir_to_sync.display())
+                        });
+                    }
+                },
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to open configuration directory for sync: {}",
+                            dir_to_sync.display()
+                        )
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -535,5 +621,46 @@ mod tests {
         "#;
         let cfg = ProfileConfig::from_xml(bad_xml).unwrap();
         assert!(cfg.into_runtime(&[]).is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_fields_and_unsupported_chain() {
+        let typo_tag_xml = r#"
+        <Profile version="1">
+          <RuleList>
+            <Rule enabled="true">
+              <Name>TypoRule</Name>
+              <Target>*.evil.com</Target>
+              <Action type="Block"/>
+            </Rule>
+          </RuleList>
+        </Profile>
+        "#;
+        assert!(ProfileConfig::from_xml(typo_tag_xml).is_err());
+
+        let typo_attr_xml = r#"
+        <Profile version="1">
+          <RuleList>
+            <Rule enable="false">
+              <Name>TypoAttr</Name>
+              <Action type="Block"/>
+            </Rule>
+          </RuleList>
+        </Profile>
+        "#;
+        assert!(ProfileConfig::from_xml(typo_attr_xml).is_err());
+
+        let chain_xml = r#"
+        <Profile version="1">
+          <RuleList>
+            <Rule enabled="true">
+              <Name>BrokenChain</Name>
+              <Action type="Chain">1</Action>
+            </Rule>
+          </RuleList>
+        </Profile>
+        "#;
+        let parsed = ProfileConfig::from_xml(chain_xml).unwrap();
+        assert!(parsed.into_runtime(&[]).is_err());
     }
 }

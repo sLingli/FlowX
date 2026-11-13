@@ -1,7 +1,34 @@
 use std::net::IpAddr;
-use glob::Pattern;
+use glob::{MatchOptions, Pattern};
 use ipnet::IpNet;
 use super::PortRange;
+
+pub const APP_MATCH_OPTIONS: MatchOptions = MatchOptions {
+    case_sensitive: false,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+#[derive(Debug, Clone)]
+pub enum AppMatcher {
+    /// 不含路径分隔符，仅匹配进程文件名（不扫完整路径，防止目录名误命中）
+    Name(Pattern),
+    /// 含路径分隔符，按字面分隔符 `/` 严格匹配完整进程路径
+    Path(Pattern),
+}
+
+impl AppMatcher {
+    pub fn matches(&self, name_candidates: &[&str], path_candidates: &[&str]) -> bool {
+        match self {
+            AppMatcher::Name(pat) => name_candidates
+                .iter()
+                .any(|cand| pat.matches_with(cand, APP_MATCH_OPTIONS)),
+            AppMatcher::Path(pat) => path_candidates
+                .iter()
+                .any(|cand| pat.matches_with(cand, APP_MATCH_OPTIONS)),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum DomainMatcher {
@@ -12,17 +39,20 @@ pub enum DomainMatcher {
 
 impl DomainMatcher {
     pub fn parse(raw: &str) -> Option<Self> {
-        let s = raw.trim().to_lowercase();
+        // 统一去除末尾 FQDN 根点 `.` 并转小写，防止 `evil.com.` / `localhost.` 绕过匹配
+        let s = raw.trim().trim_end_matches('.').to_ascii_lowercase();
         if s.is_empty() {
             return None;
         }
-        if let Some(stripped) = s.strip_prefix("*.") {
-            if stripped.is_empty() {
-                None
-            } else {
-                Some(DomainMatcher::Suffix(stripped.to_string()))
-            }
-        } else if s.contains('*') || s.contains('?') || s.contains('[') {
+        if let Some(stripped) = s.strip_prefix("*.")
+            && !stripped.is_empty()
+            && !stripped.contains('*')
+            && !stripped.contains('?')
+            && !stripped.contains('[')
+        {
+            return Some(DomainMatcher::Suffix(stripped.to_string()));
+        }
+        if s.contains('*') || s.contains('?') || s.contains('[') {
             Pattern::new(&s).ok().map(DomainMatcher::Pattern)
         } else {
             Some(DomainMatcher::Exact(s))
@@ -30,6 +60,10 @@ impl DomainMatcher {
     }
 
     pub fn matches(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.');
+        if host.is_empty() {
+            return false;
+        }
         match self {
             DomainMatcher::Exact(exact) => host.eq_ignore_ascii_case(exact),
             DomainMatcher::Suffix(suffix) => {
@@ -58,14 +92,23 @@ impl DomainMatcher {
     }
 }
 
+/// 规则主干至少包含一个具体（非纯通配符）文件名字符时，才在规则编译期补充无 `.exe` 变体，
+/// 避免 `*.exe` / `/usr/bin/*.exe` 退化为 `*` 或 `/usr/bin/*` 全匹配。
+fn has_concrete_filename_chars(stem_after_slash: &str) -> bool {
+    !stem_after_slash.is_empty()
+        && stem_after_slash
+            .chars()
+            .any(|c| !matches!(c, '*' | '?' | '[' | ']' | '.'))
+}
+
 /// 解析以分号分隔的应用程序路径/通配符（支持引号与 Fail-Closed 约束模式）
-pub fn parse_applications(raw: &str) -> Option<Vec<Pattern>> {
+pub fn parse_applications(raw: &str) -> Option<Vec<AppMatcher>> {
     let trimmed_raw = raw.trim();
     if trimmed_raw.is_empty() {
         return None; // 无约束：匹配所有应用
     }
 
-    let mut patterns = Vec::new();
+    let mut matchers = Vec::new();
     let tokens = split_quoted_tokens(trimmed_raw, ';');
 
     for token in tokens {
@@ -75,12 +118,30 @@ pub fn parse_applications(raw: &str) -> Option<Vec<Pattern>> {
         }
         // 统一转换为小写并处理路径分隔符为 '/'
         let normalized = trimmed.to_lowercase().replace('\\', "/");
+        let is_path = normalized.contains('/');
+        let wrap = |pat: Pattern| {
+            if is_path {
+                AppMatcher::Path(pat)
+            } else {
+                AppMatcher::Name(pat)
+            }
+        };
+
         if let Ok(pat) = Pattern::new(&normalized) {
-            patterns.push(pat);
+            matchers.push(wrap(pat));
+        }
+
+        if let Some(stem) = normalized.strip_suffix(".exe") {
+            let file_stem = stem.rsplit('/').next().unwrap_or(stem);
+            if has_concrete_filename_chars(file_stem)
+                && let Ok(stem_pat) = Pattern::new(stem)
+            {
+                matchers.push(wrap(stem_pat));
+            }
         }
     }
 
-    Some(patterns) // 即使为空也是 Some(vec![])，实现 Fail-Closed
+    Some(matchers) // 即使为空也是 Some(vec![])，实现 Fail-Closed
 }
 
 /// 大小写不敏感替换纯 ASCII 占位符（利用 ASCII 字节在 UTF-8 中绝不与多字节序列重叠的性质确保切片安全）
@@ -308,10 +369,21 @@ mod tests {
     #[test]
     fn test_parse_applications() {
         let pats = parse_applications(r#"node.exe; *chrome*.exe; "C:\Program Files\App\app.exe""#).unwrap();
-        assert_eq!(pats.len(), 3);
-        assert!(pats[0].matches("node.exe"));
-        assert!(pats[1].matches("google-chrome.exe"));
-        assert!(pats[2].matches("c:/program files/app/app.exe"));
+        // node.exe(+node), *chrome*.exe(+*chrome*), c:/program files/app/app.exe(+c:/program files/app/app)
+        assert_eq!(pats.len(), 6);
+        assert!(pats[0].matches(&["node.exe"], &[]));
+        assert!(pats[1].matches(&["node"], &[]));
+        assert!(pats[2].matches(&["google-chrome.exe"], &[]));
+        assert!(pats[3].matches(&["google-chrome"], &[]));
+        assert!(!pats[3].matches(&["curl"], &["/opt/google-chrome/curl"]));
+        assert!(pats[4].matches(&[], &["c:/program files/app/app.exe"]));
+        assert!(pats[5].matches(&[], &["c:/program files/app/app"]));
+
+        // `*.exe` 与 `/usr/bin/*.exe` 绝不可降级为 `*` 或 `/usr/bin/*`
+        let wild_exe = parse_applications("*.exe; /usr/bin/*.exe").unwrap();
+        assert_eq!(wild_exe.len(), 2);
+        assert!(!wild_exe.iter().any(|m| m.matches(&["curl"], &["/usr/bin/curl"])));
+        assert!(wild_exe.iter().any(|m| m.matches(&["curl.exe"], &[])));
     }
 
     #[test]
@@ -345,6 +417,21 @@ mod tests {
         let exact = DomainMatcher::parse("Api.GitHub.com").unwrap();
         assert!(exact.matches("api.github.com"));
         assert!(exact.matches("API.GITHUB.COM"));
+        assert!(exact.matches("api.github.com."));
         assert!(!exact.matches("v2.api.github.com"));
+
+        // P1-6 回归：尾点与多重通配符不应误落入 Suffix 字面比较
+        let trailing = DomainMatcher::parse("evil.com.").unwrap();
+        assert!(trailing.matches("evil.com"));
+        assert!(trailing.matches("evil.com."));
+
+        let multi_wild = DomainMatcher::parse("*.google.*").unwrap();
+        assert!(multi_wild.matches("mail.google.com"));
+        assert!(multi_wild.matches("mail.google.co.uk."));
+        assert!(!multi_wild.matches("google.com"));
+
+        let double_star = DomainMatcher::parse("*.*.example.com").unwrap();
+        assert!(double_star.matches("a.b.example.com"));
+        assert!(!double_star.matches("example.com"));
     }
 }
