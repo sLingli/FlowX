@@ -116,6 +116,7 @@ fn translate_zh(key: &str) -> &'static str {
         "error.request_too_large" => "HTTP 请求体超出 1MB 上限",
         "error.invalid_content_length" => "无效的 Content-Length 请求头",
         "error.request_read_failed" => "读取 HTTP 请求失败",
+        "error.request_timeout" => "读取 HTTP 请求超时",
         "error.not_found" => "请求的资源未找到",
 
         // 连接管理
@@ -191,6 +192,7 @@ fn translate_en(key: &str) -> &'static str {
         "error.request_too_large" => "HTTP request body exceeds 1MB limit",
         "error.invalid_content_length" => "Invalid Content-Length header",
         "error.request_read_failed" => "Failed to read HTTP request",
+        "error.request_timeout" => "HTTP request read timed out",
         "error.not_found" => "Requested resource not found",
 
         // Connection management

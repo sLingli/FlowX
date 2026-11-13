@@ -304,13 +304,20 @@ impl ApiServer {
             let permit = match self.conn_limit.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    let _ = send_http_response(
-                        &mut stream,
-                        "503 Service Unavailable",
-                        "application/json; charset=utf-8",
-                        r#"{"error":"Too many concurrent API requests","code":"ERR_OVERLOADED"}"#,
-                    )
-                    .await;
+                    let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
+                    tokio::spawn(async move {
+                        let _in_flight = _in_flight;
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            send_http_response(
+                                &mut stream,
+                                "503 Service Unavailable",
+                                "application/json; charset=utf-8",
+                                r#"{"error":"Too many concurrent API requests","code":"ERR_OVERLOADED"}"#,
+                            ),
+                        )
+                        .await;
+                    });
                     continue;
                 }
             };
@@ -329,25 +336,22 @@ impl ApiServer {
             tokio::spawn(async move {
                 let _permit = permit;
                 let _in_flight = _in_flight;
-                if let Err(e) = tokio::time::timeout(
-                    API_TIMEOUT,
-                    handle_api_request(
-                        stream,
-                        actual_port,
-                        self_ports_clone,
-                        monitor,
-                        rule_engine,
-                        proxy_nodes,
-                        config_store,
-                        runtime_context,
-                        ping_semaphore,
-                        mutation_lock,
-                        started_at,
-                    ),
+                if let Err(e) = handle_api_request(
+                    stream,
+                    actual_port,
+                    self_ports_clone,
+                    monitor,
+                    rule_engine,
+                    proxy_nodes,
+                    config_store,
+                    runtime_context,
+                    ping_semaphore,
+                    mutation_lock,
+                    started_at,
                 )
                 .await
                 {
-                    error!("[API] Request processing timed out or failed: {}", e);
+                    error!("[API] Request processing failed: {}", e);
                 }
             });
         }
@@ -359,50 +363,64 @@ async fn read_full_http_request(
     stream: &mut TcpStream,
     buffer: &mut Vec<u8>,
 ) -> std::result::Result<(), RequestReadError> {
-    buffer.clear();
-    let mut temp = [0u8; 2048];
-    let mut expected_total: Option<usize> = None;
+    read_full_http_request_with_timeout(stream, buffer, API_TIMEOUT).await
+}
 
-    loop {
-        let n = match stream.read(&mut temp).await {
-            Ok(n) => n,
-            Err(e) => {
-                // 客户端提前断开等读错误较常见，保留原始错误到 debug 日志，对外只返回本地化文案
-                tracing::debug!("[API] HTTP request read failed: {}", e);
-                return Err(RequestReadError::Io);
+async fn read_full_http_request_with_timeout(
+    stream: &mut TcpStream,
+    buffer: &mut Vec<u8>,
+    timeout: Duration,
+) -> std::result::Result<(), RequestReadError> {
+    let read_fut = async {
+        buffer.clear();
+        let mut temp = [0u8; 2048];
+        let mut expected_total: Option<usize> = None;
+
+        loop {
+            let n = match stream.read(&mut temp).await {
+                Ok(n) => n,
+                Err(e) => {
+                    // 客户端提前断开等读错误较常见，保留原始错误到 debug 日志，对外只返回本地化文案
+                    tracing::debug!("[API] HTTP request read failed: {}", e);
+                    return Err(RequestReadError::Io);
+                }
+            };
+            if n == 0 {
+                if buffer.is_empty() {
+                    return Ok(());
+                }
+                return Err(RequestReadError::IncompleteHeaders);
             }
-        };
-        if n == 0 {
-            if buffer.is_empty() {
-                return Ok(());
+            buffer.extend_from_slice(&temp[..n]);
+            if buffer.len() > MAX_REQUEST_SIZE {
+                return Err(RequestReadError::TooLarge);
             }
-            return Err(RequestReadError::IncompleteHeaders);
-        }
-        buffer.extend_from_slice(&temp[..n]);
-        if buffer.len() > MAX_REQUEST_SIZE {
-            return Err(RequestReadError::TooLarge);
+
+            if expected_total.is_none()
+                && let Some(header_end) = find_header_end(buffer)
+            {
+                let content_length = validate_and_parse_headers(&buffer[..header_end - 4])?;
+                let total_needed = header_end
+                    .checked_add(content_length)
+                    .filter(|&t| t <= MAX_REQUEST_SIZE)
+                    .ok_or(RequestReadError::TooLarge)?;
+                expected_total = Some(total_needed);
+            }
+
+            if let Some(total_needed) = expected_total
+                && buffer.len() >= total_needed
+            {
+                buffer.truncate(total_needed);
+                break;
+            }
         }
 
-        if expected_total.is_none()
-            && let Some(header_end) = find_header_end(buffer)
-        {
-            let content_length = validate_and_parse_headers(&buffer[..header_end - 4])?;
-            let total_needed = header_end
-                .checked_add(content_length)
-                .filter(|&t| t <= MAX_REQUEST_SIZE)
-                .ok_or(RequestReadError::TooLarge)?;
-            expected_total = Some(total_needed);
-        }
+        Ok(())
+    };
 
-        if let Some(total_needed) = expected_total
-            && buffer.len() >= total_needed
-        {
-            buffer.truncate(total_needed);
-            break;
-        }
-    }
-
-    Ok(())
+    tokio::time::timeout(timeout, read_fut)
+        .await
+        .map_err(|_| RequestReadError::TimedOut)?
 }
 
 /// HTTP 请求读取阶段的可分类错误，用于生成本地化且机器可读的错误响应。
@@ -422,6 +440,8 @@ enum RequestReadError {
     DuplicateHeader,
     /// `Content-Length` 请求头格式非法
     InvalidContentLength,
+    /// 请求读取阶段超时
+    TimedOut,
     /// 底层套接字读取失败（原始错误已记入 debug 日志）
     Io,
 }
@@ -431,6 +451,7 @@ impl RequestReadError {
         match self {
             RequestReadError::TooLarge => "413 Payload Too Large",
             RequestReadError::UnsupportedTransferEncoding => "501 Not Implemented",
+            RequestReadError::TimedOut => "408 Request Timeout",
             _ => "400 Bad Request",
         }
     }
@@ -449,6 +470,7 @@ impl RequestReadError {
             RequestReadError::InvalidContentLength => {
                 ("ERR_INVALID_CONTENT_LENGTH", "error.invalid_content_length")
             }
+            RequestReadError::TimedOut => ("ERR_REQUEST_TIMEOUT", "error.request_timeout"),
             RequestReadError::Io => ("ERR_REQUEST_READ_FAILED", "error.request_read_failed"),
         }
     }
@@ -871,15 +893,20 @@ async fn handle_api_request(
         None
     };
 
-    let rollback_snapshot = if is_mutation && config_store.is_some() {
-        let nodes_bak = proxy_nodes
+    let live_proxy_nodes = Arc::clone(&proxy_nodes);
+    let live_rule_engine = Arc::clone(&rule_engine);
+    let (proxy_nodes, rule_engine) = if is_mutation {
+        let nodes_copy = live_proxy_nodes
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let (rules_bak, default_bak) = rule_engine.snapshot_state();
-        Some((nodes_bak, rules_bak, default_bak))
+        let (rules_copy, default_copy) = live_rule_engine.snapshot_state();
+        (
+            Arc::new(RwLock::new(nodes_copy)),
+            Arc::new(RuleEngine::new(rules_copy, default_copy)),
+        )
     } else {
-        None
+        (Arc::clone(&live_proxy_nodes), Arc::clone(&live_rule_engine))
     };
 
     let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
@@ -1269,28 +1296,34 @@ async fn handle_api_request(
         ),
     };
 
-    if should_persist
-        && let Some(store) = config_store.as_ref()
-        && let Err(e) = persist_config_async(Arc::clone(store), &proxy_nodes, &rule_engine).await
-    {
-        error!(
-            "[API] Failed to write updated config to disk, rolling back in-memory mutation: {:#}",
-            e
-        );
-        if let Some((nodes_bak, rules_bak, default_bak)) = rollback_snapshot {
-            {
-                let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-                *nodes_guard = nodes_bak;
-            }
-            rule_engine.restore_state(rules_bak, default_bak);
+    if should_persist {
+        let mut persisted_ok = true;
+        if let Some(store) = config_store.as_ref()
+            && let Err(e) = persist_config_async(Arc::clone(store), &proxy_nodes, &rule_engine).await
+        {
+            error!(
+                "[API] Failed to write updated config to disk, aborting commit: {:#}",
+                e
+            );
+            status = "500 Internal Server Error";
+            content_type = "application/json; charset=utf-8";
+            body = json_error(
+                locale,
+                "ERR_CONFIG_PERSIST_FAILED",
+                "error.config_persist_failed",
+            );
+            persisted_ok = false;
         }
-        status = "500 Internal Server Error";
-        content_type = "application/json; charset=utf-8";
-        body = json_error(
-            locale,
-            "ERR_CONFIG_PERSIST_FAILED",
-            "error.config_persist_failed",
-        );
+        if persisted_ok {
+            let committed_nodes =
+                std::mem::take(&mut *proxy_nodes.write().unwrap_or_else(|e| e.into_inner()));
+            {
+                let mut live_nodes = live_proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+                *live_nodes = committed_nodes;
+            }
+            let (committed_rules, committed_default) = rule_engine.snapshot_state();
+            live_rule_engine.restore_state(committed_rules, committed_default);
+        }
     }
 
     send_http_response(&mut stream, status, content_type, &body).await?;
@@ -1886,7 +1919,10 @@ pub(crate) fn handle_patch_rule(
     }
 
     let action = if let Some(act_str) = req.action.as_deref() {
-        let effective_node_id = req.node_id.or_else(|| existing.action.target_id());
+        let effective_node_id = req.node_id.or_else(|| match existing.action {
+            Action::Proxy(id) if act_str.trim().eq_ignore_ascii_case("Proxy") => Some(id),
+            _ => None,
+        });
         match parse_and_validate_action(act_str, effective_node_id, proxy_nodes, locale) {
             Ok(a) => a,
             Err(resp) => return resp,
@@ -2186,7 +2222,13 @@ Connection: close\r\n\
         body.len(),
         body
     );
-    stream.write_all(response.as_bytes()).await
+    match tokio::time::timeout(API_TIMEOUT, stream.write_all(response.as_bytes())).await {
+        Ok(res) => res,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "HTTP response write timed out",
+        )),
+    }
 }
 
 fn parse_query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -3386,5 +3428,121 @@ mod tests {
             (Some("bob"), Some("new-patch-secret")),
             "PATCH must preserve newly entered password even when keep_password=false"
         );
+    }
+
+    #[tokio::test]
+    async fn test_api_staged_persist_failure_read_timeout_and_chain_to_proxy_patch() {
+        // 1. Chain -> Proxy PATCH without node_id must NOT reuse Chain ID even if Proxy node shares that ID
+        let (api_addr, api_nodes, api_re, _tx) = spawn_test_api().await;
+        let api_port = api_addr.port();
+
+        let add_node = r#"{"name":"n101","protocol":"SOCKS5","server_addr":"10.0.0.2:1080"}"#;
+        let r_node = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                add_node.len(),
+                add_node
+            ),
+        )
+        .await;
+        assert!(r_node.starts_with("HTTP/1.1 200 OK"));
+        let node_id = serde_json::from_str::<serde_json::Value>(r_node.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"]
+            .as_u64()
+            .unwrap() as u32;
+        assert!(api_nodes.read().unwrap().contains_key(&node_id));
+
+        let chain_rule = Rule::from_raw(
+            "ChainRule".to_string(),
+            true,
+            None,
+            Some("example.com"),
+            None,
+            Action::Chain(node_id),
+        );
+        let chain_rule_id = chain_rule.id;
+        api_re.add_rule(chain_rule);
+
+        let switch_missing_node = format!(r#"{{"id":{},"action":"Proxy"}}"#, chain_rule_id);
+        let r_bad_switch = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                switch_missing_node.len(),
+                switch_missing_node
+            ),
+        )
+        .await;
+        assert!(r_bad_switch.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_bad_switch.contains("ERR_MISSING_NODE_FOR_PROXY"));
+        assert_eq!(
+            api_re.current_rules().iter().find(|r| r.id == chain_rule_id).unwrap().action,
+            Action::Chain(node_id)
+        );
+
+        let switch_with_node = format!(r#"{{"id":{},"action":"Proxy","node_id":{}}}"#, chain_rule_id, node_id);
+        let r_ok_switch = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                switch_with_node.len(),
+                switch_with_node
+            ),
+        )
+        .await;
+        assert!(r_ok_switch.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            api_re.current_rules().iter().find(|r| r.id == chain_rule_id).unwrap().action,
+            Action::Proxy(node_id)
+        );
+
+        // 2. Request read timeout produces 408 / ERR_REQUEST_TIMEOUT cleanly
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let l_addr = l.local_addr().unwrap();
+        let srv_task = tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = Vec::new();
+            read_full_http_request_with_timeout(&mut s, &mut buf, Duration::from_millis(40)).await
+        });
+        let mut slow_client = TcpStream::connect(l_addr).await.unwrap();
+        slow_client.write_all(b"POST /api/nodes HTTP/1.1\r\n").await.unwrap();
+        let read_err = srv_task.await.unwrap().unwrap_err();
+        assert_eq!(read_err.http_status(), "408 Request Timeout");
+        assert_eq!(read_err.code_and_key().0, "ERR_REQUEST_TIMEOUT");
+
+        // 3. Staged persist-before-commit leaves default action untouched when disk write fails
+        let mut blocker = std::env::current_dir().unwrap().join("target");
+        blocker.push(format!("flowx_staged_persist_{}.tmp", std::process::id()));
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let store = Arc::new(ConfigStore::new(blocker.join("flowx.xml")));
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_config_store(store);
+        let listener = srv.bind().await.unwrap();
+        let s_addr = listener.local_addr().unwrap();
+        let s_port = s_addr.port();
+        let (_tx2, rx2) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx2).await });
+
+        let set_def = r#"{"action":"Block"}"#;
+        let r_def = raw_http(
+            s_addr,
+            &format!(
+                "POST /api/rules/default HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                s_port,
+                set_def.len(),
+                set_def
+            ),
+        )
+        .await;
+        assert!(r_def.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(r_def.contains("ERR_CONFIG_PERSIST_FAILED"));
+        assert_eq!(re.default_action(), Action::Direct);
+        let _ = std::fs::remove_file(&blocker);
     }
 }
