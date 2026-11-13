@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,10 +17,10 @@ pub enum TargetAddr {
     Domain(String, u16),
 }
 
-fn is_loopback_or_unspecified_ip(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_loopback_or_unspecified_ip(ip: IpAddr) -> bool {
     match ip {
-        std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
-        std::net::IpAddr::V6(v6) => {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+        IpAddr::V6(v6) => {
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6
@@ -30,12 +30,219 @@ fn is_loopback_or_unspecified_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn is_loopback_domain(host: &str) -> bool {
-    let h = host.trim_end_matches('.');
-    h.eq_ignore_ascii_case("localhost")
-        || (h.len() > 10 && h[h.len() - 10..].eq_ignore_ascii_case(".localhost"))
-        || h == "127.0.0.1"
-        || h == "::1"
+/// 解析非规范 / 缩写 IPv4 主机形式（如 `127.1`、`0177.0.0.1`、`0x7f000001`、`2130706433`），
+/// 防止绕过字面量 `IpAddr` 检查与自连环路防护。
+pub(crate) fn parse_noncanonical_ipv4(host: &str) -> Option<Ipv4Addr> {
+    let trimmed = host.trim().trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.contains(':') {
+        return None;
+    }
+
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+
+    let parse_part = |part: &str| -> Option<u64> {
+        let b = part.as_bytes();
+        if b.starts_with(b"0x") || b.starts_with(b"0X") {
+            let hex = &part[2..];
+            if hex.is_empty() || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            u64::from_str_radix(hex, 16).ok()
+        } else if b.len() > 1 && b[0] == b'0' {
+            let oct = &part[1..];
+            if !oct.bytes().all(|c| matches!(c, b'0'..=b'7')) {
+                return None;
+            }
+            u64::from_str_radix(oct, 8).ok()
+        } else {
+            if !part.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            part.parse::<u64>().ok()
+        }
+    };
+
+    let mut nums = Vec::with_capacity(parts.len());
+    for part in &parts {
+        nums.push(parse_part(part)?);
+    }
+
+    let addr_u32 = match nums.as_slice() {
+        [a] => {
+            if *a > u32::MAX as u64 {
+                return None;
+            }
+            *a as u32
+        }
+        [a, b] => {
+            if *a > 0xFF || *b > 0x00FF_FFFF {
+                return None;
+            }
+            ((*a as u32) << 24) | (*b as u32)
+        }
+        [a, b, c] => {
+            if *a > 0xFF || *b > 0xFF || *c > 0xFFFF {
+                return None;
+            }
+            ((*a as u32) << 24) | ((*b as u32) << 16) | (*c as u32)
+        }
+        [a, b, c, d] => {
+            if nums.iter().any(|n| *n > 0xFF) {
+                return None;
+            }
+            ((*a as u32) << 24) | ((*b as u32) << 16) | ((*c as u32) << 8) | (*d as u32)
+        }
+        _ => return None,
+    };
+
+    Some(Ipv4Addr::from(addr_u32))
+}
+
+pub(crate) fn is_loopback_domain(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.');
+    let unbracketed = h
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(h);
+
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        return is_loopback_or_unspecified_ip(ip);
+    }
+    if let Some(v4) = parse_noncanonical_ipv4(unbracketed) {
+        return is_loopback_or_unspecified_ip(IpAddr::V4(v4));
+    }
+
+    let bytes = h.as_bytes();
+    bytes.eq_ignore_ascii_case(b"localhost")
+        || (bytes.len() > 10 && bytes[bytes.len() - 10..].eq_ignore_ascii_case(b".localhost"))
+}
+
+/// 枚举本机网络接口上的所有 IP 地址（用于防 DNS 重绑定直连本机开放端口）
+pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        };
+        use windows_sys::Win32::Networking::WinSock::{
+            AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+        };
+
+        let mut ips = Vec::new();
+        let mut buf_len: u32 = 16 * 1024;
+        let mut buf: Vec<u8> = Vec::new();
+
+        for _ in 0..4 {
+            buf.resize(buf_len as usize, 0);
+            let ret = unsafe {
+                GetAdaptersAddresses(
+                    AF_UNSPEC as u32,
+                    0,
+                    std::ptr::null(),
+                    buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                    &mut buf_len,
+                )
+            };
+            if ret == 0 {
+                let mut adapter_ptr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+                while !adapter_ptr.is_null() {
+                    let mut unicast_ptr = unsafe { (*adapter_ptr).FirstUnicastAddress };
+                    while !unicast_ptr.is_null() {
+                        let sock_addr = unsafe { (*unicast_ptr).Address };
+                        if !sock_addr.lpSockaddr.is_null() && sock_addr.iSockaddrLength > 0 {
+                            let family = unsafe { (*sock_addr.lpSockaddr).sa_family };
+                            if family == AF_INET
+                                && sock_addr.iSockaddrLength as usize
+                                    >= std::mem::size_of::<SOCKADDR_IN>()
+                            {
+                                let sin = unsafe {
+                                    (sock_addr.lpSockaddr as *const SOCKADDR_IN).read_unaligned()
+                                };
+                                let addr = u32::from_be(unsafe { sin.sin_addr.S_un.S_addr });
+                                ips.push(IpAddr::V4(Ipv4Addr::from(addr)));
+                            } else if family == AF_INET6
+                                && sock_addr.iSockaddrLength as usize
+                                    >= std::mem::size_of::<SOCKADDR_IN6>()
+                            {
+                                let sin6 = unsafe {
+                                    (sock_addr.lpSockaddr as *const SOCKADDR_IN6).read_unaligned()
+                                };
+                                let bytes = unsafe { sin6.sin6_addr.u.Byte };
+                                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
+                            }
+                        }
+                        unicast_ptr = unsafe { (*unicast_ptr).Next };
+                    }
+                    adapter_ptr = unsafe { (*adapter_ptr).Next };
+                }
+                return ips;
+            } else if ret == ERROR_BUFFER_OVERFLOW && buf_len > 0 {
+                continue;
+            } else {
+                break;
+            }
+        }
+        ips
+    }
+
+    #[cfg(unix)]
+    {
+        let mut ips = Vec::new();
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if unsafe { libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
+            return ips;
+        }
+        let mut cur = ifap;
+        while !cur.is_null() {
+            let addr_ptr = unsafe { (*cur).ifa_addr };
+            if !addr_ptr.is_null() {
+                let family = unsafe { (*addr_ptr).sa_family } as i32;
+                if family == libc::AF_INET {
+                    let sin = unsafe { (addr_ptr as *const libc::sockaddr_in).read_unaligned() };
+                    let addr = u32::from_be(sin.sin_addr.s_addr);
+                    ips.push(IpAddr::V4(Ipv4Addr::from(addr)));
+                } else if family == libc::AF_INET6 {
+                    let sin6 = unsafe { (addr_ptr as *const libc::sockaddr_in6).read_unaligned() };
+                    ips.push(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                }
+            }
+            cur = unsafe { (*cur).ifa_next };
+        }
+        unsafe { libc::freeifaddrs(ifap) };
+        ips
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        Vec::new()
+    }
+}
+
+pub(crate) fn is_local_or_loopback_ip(ip: IpAddr, local_ips: &[IpAddr]) -> bool {
+    if is_loopback_or_unspecified_ip(ip) {
+        return true;
+    }
+    let canonical = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    };
+    local_ips.iter().any(|local| {
+        let local_canon = match local {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6(*v6),
+            },
+            other => *other,
+        };
+        local_canon == canonical
+    })
 }
 
 impl TargetAddr {
@@ -44,8 +251,11 @@ impl TargetAddr {
         if port == 0 {
             anyhow::bail!("Target port cannot be 0");
         }
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(TargetAddr::Ip(SocketAddr::new(ip, port)));
+        }
+        if let Some(v4) = parse_noncanonical_ipv4(host) {
+            return Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V4(v4), port)));
         }
         let valid = !host.is_empty()
             && host.len() <= 253
@@ -382,5 +592,32 @@ mod tests {
         .await;
 
         assert!(res.is_err(), "Prolonged mutual silence should trigger idle timeout cleanup");
+    }
+
+    #[test]
+    fn test_loopback_domain_utf8_safe_and_noncanonical_ipv4() {
+        // P0-3: multi-byte UTF-8 host must never slice-panic
+        assert!(!is_loopback_domain("élocalhost"));
+        assert!(!is_loopback_domain("中文.example"));
+        assert!(is_loopback_domain("localhost."));
+        assert!(is_loopback_domain("sub.LOCALHOST."));
+        assert!(is_loopback_domain("[::ffff:127.0.0.1]"));
+        assert!(is_loopback_domain("0.0.0.0"));
+        assert!(is_loopback_domain("::"));
+        assert!(is_loopback_domain("127.1"));
+        assert!(is_loopback_domain("0x7f000001"));
+        assert!(is_loopback_domain("0177.0.0.1"));
+        assert!(is_loopback_domain("2130706433"));
+        assert!(!is_loopback_domain("example.com"));
+
+        // Non-canonical IPv4 normalized into Ip variant in TargetAddr::from_host_port
+        assert_eq!(
+            TargetAddr::from_host_port("127.1", 40080).unwrap(),
+            TargetAddr::Ip("127.0.0.1:40080".parse().unwrap())
+        );
+        assert_eq!(
+            TargetAddr::from_host_port("0x7f000001", 80).unwrap(),
+            TargetAddr::Ip("127.0.0.1:80".parse().unwrap())
+        );
     }
 }

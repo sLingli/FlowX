@@ -49,7 +49,7 @@ impl FakeIpPool {
     ///
     /// 命中已有映射时会滑动续期 TTL，保证仍在被查询的活跃域名不会因固定 TTL 到期而被回收重分配。
     pub fn allocate(&self, domain: &str) -> Ipv4Addr {
-        let domain_lower = domain.to_lowercase();
+        let domain_lower = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let now = Instant::now();
         let refresh_threshold = now + self.ttl / 2;
 
@@ -75,16 +75,41 @@ impl FakeIpPool {
                 return ip;
             }
 
-        let raw_ip = state.current;
-        if state.current >= self.max {
-            state.current = self.min; // 环形复用
-        } else {
-            state.current += 1;
+        // 从环形游标起探测首个空闲或已过期槽位，避免在池未满时直接覆写仍活跃的旧映射
+        let cap = (self.max - self.min) as usize + 1;
+        let mut cursor = state.current;
+        let mut chosen_ip = None;
+        for _ in 0..cap {
+            let candidate = Ipv4Addr::from(cursor);
+            cursor = if cursor >= self.max { self.min } else { cursor + 1 };
+            match state.ip_to_domain.get(&candidate) {
+                None => {
+                    chosen_ip = Some(candidate);
+                    break;
+                }
+                Some((_, old_expire)) if *old_expire <= now => {
+                    chosen_ip = Some(candidate);
+                    break;
+                }
+                Some(_) => {}
+            }
         }
+        state.current = cursor;
 
-        let ip = Ipv4Addr::from(raw_ip);
+        let ip = match chosen_ip {
+            Some(ip) => ip,
+            None => {
+                // 所有槽位均被未过期映射占满：按最早到期（等效 LRU）淘汰
+                state
+                    .ip_to_domain
+                    .iter()
+                    .min_by_key(|(_, (_, exp))| *exp)
+                    .map(|(candidate, _)| *candidate)
+                    .unwrap_or_else(|| Ipv4Addr::from(self.min))
+            }
+        };
 
-        // 若当前轮转到的 IP 之前绑定过其它域名，清理其旧的逆向映射
+        // 若当前选中的 IP 之前绑定过其它域名，清理其旧的逆向映射
         let old_domain_opt = state.ip_to_domain.get(&ip).map(|(d, _)| d.clone());
         if let Some(old_domain) = old_domain_opt {
             state.domain_to_ip.remove(&old_domain);
@@ -191,5 +216,61 @@ mod tests {
         // 过期但 IP 未被转让时重新查询应复用原 IP
         std::thread::sleep(Duration::from_millis(120));
         assert_eq!(pool.allocate("busy.com"), ip);
+    }
+
+    #[test]
+    fn test_fake_ip_wraparound_skips_active_and_uses_lru_when_full() {
+        let small_pool = FakeIpPool {
+            min: u32::from(Ipv4Addr::new(198, 18, 0, 1)),
+            max: u32::from(Ipv4Addr::new(198, 18, 0, 3)),
+            inner: RwLock::new(PoolState {
+                current: u32::from(Ipv4Addr::new(198, 18, 0, 1)),
+                ip_to_domain: HashMap::new(),
+                domain_to_ip: HashMap::new(),
+            }),
+            ttl: Duration::from_millis(120),
+        };
+
+        let ip_a = small_pool.allocate("a.example");
+        let ip_b = small_pool.allocate("b.example");
+        let ip_c = small_pool.allocate("c.example");
+        assert_eq!(ip_a, Ipv4Addr::new(198, 18, 0, 1));
+        assert_eq!(ip_b, Ipv4Addr::new(198, 18, 0, 2));
+        assert_eq!(ip_c, Ipv4Addr::new(198, 18, 0, 3));
+
+        // 等过半 TTL 仅续期 a 和 c，让 b 先到期
+        std::thread::sleep(Duration::from_millis(75));
+        assert_eq!(small_pool.restore(&ip_a).as_deref(), Some("a.example"));
+        assert_eq!(small_pool.restore(&ip_c).as_deref(), Some("c.example"));
+        std::thread::sleep(Duration::from_millis(60));
+
+        // 此时游标位于 .1 (a.example 仍活跃)，应跳过 .1/.3 命中已过期的 .2
+        let ip_d = small_pool.allocate("d.example");
+        assert_eq!(ip_d, ip_b);
+        assert_eq!(small_pool.restore(&ip_a).as_deref(), Some("a.example"));
+        assert_eq!(small_pool.restore(&ip_c).as_deref(), Some("c.example"));
+
+        // 全满未过期场景：刷新 p1 后，p2 成为最旧未过期项 (LRU) 淘汰目标
+        let lru_pool = FakeIpPool {
+            min: u32::from(Ipv4Addr::new(198, 18, 2, 1)),
+            max: u32::from(Ipv4Addr::new(198, 18, 2, 3)),
+            inner: RwLock::new(PoolState {
+                current: u32::from(Ipv4Addr::new(198, 18, 2, 1)),
+                ip_to_domain: HashMap::new(),
+                domain_to_ip: HashMap::new(),
+            }),
+            ttl: Duration::from_millis(100),
+        };
+        let p1 = lru_pool.allocate("old.example");
+        std::thread::sleep(Duration::from_millis(15));
+        let p2 = lru_pool.allocate("mid.example");
+        std::thread::sleep(Duration::from_millis(15));
+        let p3 = lru_pool.allocate("new.example");
+        std::thread::sleep(Duration::from_millis(45));
+        assert_eq!(lru_pool.restore(&p1).as_deref(), Some("old.example"));
+        let p4 = lru_pool.allocate("newest.example");
+        assert_eq!(p4, p2);
+        assert_eq!(lru_pool.restore(&p1).as_deref(), Some("old.example"));
+        assert_eq!(lru_pool.restore(&p3).as_deref(), Some("new.example"));
     }
 }

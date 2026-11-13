@@ -14,7 +14,7 @@ use crate::interceptor::process::ProcessTracker;
 use crate::monitor::ConnectionManager;
 use crate::outbound::chain::{ProxyChain, ProxyNode};
 use crate::outbound::direct::DirectOutbound;
-use crate::outbound::{relay_stream_monitored, TargetAddr};
+use crate::outbound::{is_local_or_loopback_ip, local_interface_ips, relay_stream_monitored, TargetAddr};
 use crate::router::{Action, RouteContext, RuleEngine};
 
 /// 入站协议握手的最长等待时间（防止慢速握手占满并发名额）
@@ -35,6 +35,7 @@ pub struct DispatcherConfig {
     pub bind_addr: SocketAddr,
     pub tracker: Arc<ProcessTracker>,
     pub fake_ip_pool: Arc<FakeIpPool>,
+    pub upstream_dns: SocketAddr,
     pub rule_engine: Arc<RuleEngine>,
     pub monitor: Arc<ConnectionManager>,
     pub proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
@@ -125,8 +126,17 @@ fn is_self_target(target: &TargetAddr, server_addr: &SocketAddr, self_ports: &[u
     if !self_ports.contains(&target.port()) {
         return false;
     }
-    target.is_loopback_or_unspecified()
-        || matches!(target, TargetAddr::Ip(addr) if addr.ip() == server_addr.ip())
+    if target.is_loopback_or_unspecified() {
+        return true;
+    }
+    if let TargetAddr::Ip(addr) = target {
+        if addr.ip() == server_addr.ip() {
+            return true;
+        }
+        let local_ips = local_interface_ips();
+        return is_local_or_loopback_ip(addr.ip(), &local_ips);
+    }
+    false
 }
 
 async fn handle_connection(
@@ -283,7 +293,15 @@ async fn handle_connection(
 async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &TargetAddr) -> Result<TcpStream> {
     match action {
         Action::Block => bail!("Connection blocked by rule"),
-        Action::Direct => DirectOutbound::connect(target).await,
+        Action::Direct => {
+            DirectOutbound::connect(
+                target,
+                config.upstream_dns,
+                Some(config.fake_ip_pool.as_ref()),
+                &config.self_ports,
+            )
+            .await
+        }
         Action::Proxy(node_id) => {
             let client = {
                 let nodes_guard = config.proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
@@ -318,6 +336,7 @@ mod tests {
             bind_addr: bind,
             tracker: Arc::new(ProcessTracker::new()),
             fake_ip_pool: Arc::new(FakeIpPool::new_default()),
+            upstream_dns: "223.5.5.5:53".parse().unwrap(),
             rule_engine: Arc::new(RuleEngine::new(rules, Action::Direct)),
             monitor: Arc::new(ConnectionManager::new()),
             proxy_nodes: Arc::new(RwLock::new(HashMap::new())),

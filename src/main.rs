@@ -105,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         bind_addr: dispatcher_bind,
         tracker: Arc::clone(&process_tracker),
         fake_ip_pool: Arc::clone(&fake_ip_pool),
+        upstream_dns,
         rule_engine: Arc::clone(&rule_engine),
         monitor: Arc::clone(&connection_manager),
         proxy_nodes: Arc::clone(&proxy_nodes),

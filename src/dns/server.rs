@@ -1,11 +1,15 @@
-use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, watch, Semaphore};
+use tokio::sync::{watch, Semaphore};
 use tracing::{debug, error, info, warn};
 use super::FakeIpPool;
+
+const MAX_DNS_UPSTREAM_CONCURRENCY: usize = 1024;
+const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 极简、零外部依赖的 RFC 1035 DNS 报文解析与构造器
 #[derive(Debug, Clone)]
@@ -17,6 +21,78 @@ pub struct DnsQuestion {
 }
 
 pub struct DnsPacketParser;
+
+fn is_valid_dns_label_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// 安全解码 DNS 报文中的域名（支持指针压缩，防越界与指针循环）
+fn decode_dns_name(packet: &[u8], start: usize) -> Result<(String, usize)> {
+    if start >= packet.len() {
+        bail!("DNS domain offset exceeds packet length");
+    }
+
+    let mut offset = start;
+    let mut next_offset: Option<usize> = None;
+    let mut total_len = 0usize;
+    let mut labels = Vec::new();
+    let mut jumps = 0usize;
+
+    loop {
+        if offset >= packet.len() {
+            bail!("DNS domain truncated before root label");
+        }
+        let len_byte = packet[offset];
+        if len_byte == 0 {
+            let end_pos = next_offset.unwrap_or(offset + 1);
+            return Ok((labels.join("."), end_pos));
+        }
+
+        if (len_byte & 0xC0) == 0xC0 {
+            if offset + 1 >= packet.len() {
+                bail!("DNS compression pointer truncated");
+            }
+            let ptr = (((len_byte & 0x3F) as usize) << 8) | (packet[offset + 1] as usize);
+            if ptr < 12 || ptr >= packet.len() {
+                bail!("DNS compression pointer out of range: {}", ptr);
+            }
+            jumps += 1;
+            if jumps > 32 {
+                bail!("DNS compression pointer loop detected");
+            }
+            if next_offset.is_none() {
+                next_offset = Some(offset + 2);
+            }
+            offset = ptr;
+            continue;
+        }
+
+        if (len_byte & 0xC0) != 0 {
+            bail!("Unsupported DNS label type flags: 0x{:02x}", len_byte);
+        }
+
+        let len = len_byte as usize;
+        offset += 1;
+        if len > 63 {
+            bail!("DNS domain label exceeds 63 bytes: {}", len);
+        }
+        if offset + len > packet.len() {
+            bail!("DNS domain label exceeds packet boundary");
+        }
+        total_len += len + 1;
+        if total_len > 255 {
+            bail!("DNS total domain length exceeds RFC 1035 limit");
+        }
+
+        let raw_label = &packet[offset..offset + len];
+        if !raw_label.iter().all(|b| is_valid_dns_label_byte(*b)) {
+            bail!("DNS domain label contains invalid or non-ASCII bytes");
+        }
+        let label = std::str::from_utf8(raw_label)?;
+        labels.push(label.to_string());
+        offset += len;
+    }
+}
 
 impl DnsPacketParser {
     pub fn parse_question(buf: &[u8]) -> Result<(u16, DnsQuestion)> {
@@ -37,8 +113,8 @@ impl DnsPacketParser {
 
         let tx_id = u16::from_be_bytes([buf[0], buf[1]]);
         let qdcount = u16::from_be_bytes([buf[4], buf[5]]);
-        if qdcount == 0 {
-            bail!("DNS query does not contain any Question entries");
+        if qdcount != 1 {
+            bail!("DNS query must contain exactly 1 Question entry (got {})", qdcount);
         }
 
         let mut offset = 12;
@@ -66,7 +142,11 @@ impl DnsPacketParser {
             if total_domain_len > 255 {
                 bail!("DNS total domain length exceeds RFC 1035 limit of 253 bytes");
             }
-            let label = std::str::from_utf8(&buf[offset..offset + len])
+            let raw_label = &buf[offset..offset + len];
+            if !raw_label.iter().all(|b| is_valid_dns_label_byte(*b)) {
+                bail!("DNS domain label contains invalid or non-ASCII characters");
+            }
+            let label = std::str::from_utf8(raw_label)
                 .context("DNS domain contains non-UTF-8 characters")?;
             domain_parts.push(label.to_string());
             offset += len;
@@ -154,6 +234,7 @@ pub struct DnsServer {
     pub upstream_dns: SocketAddr,
     pub block_ipv6: bool,
     concurrency_limit: Arc<Semaphore>,
+    upstream_limit: Arc<Semaphore>,
 }
 
 /// 规范化套接字地址，避免双栈环境下的 IPv4-mapped IPv6 形式影响源地址核验
@@ -161,7 +242,7 @@ fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     match addr {
         SocketAddr::V6(v6) => {
             if let Some(v4) = v6.ip().to_ipv4_mapped() {
-                SocketAddr::new(std::net::IpAddr::V4(v4), v6.port())
+                SocketAddr::new(IpAddr::V4(v4), v6.port())
             } else {
                 SocketAddr::V6(v6)
             }
@@ -170,57 +251,315 @@ fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-/// 从 OS CSPRNG 种子随机挑选未占用的 16 位内部事务 ID，避免不同客户端 TxID 冲突串包
-fn allocate_internal_tx_id(
-    pending: &Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>,
-    sender: oneshot::Sender<Vec<u8>>,
-) -> Option<u16> {
-    use std::collections::hash_map::{Entry, RandomState};
+/// 使用系统级 CSPRNG 生成强随机 16 位事务 ID（用于上游 DNS 查询防欺骗）
+pub(crate) fn csprng_u16() -> u16 {
+    let mut bytes = [0u8; 2];
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        };
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status == 0 {
+            return u16::from_be_bytes(bytes);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::sync::OnceLock;
+        static URANDOM: OnceLock<Option<std::fs::File>> = OnceLock::new();
+        if let Some(mut f) = URANDOM
+            .get_or_init(|| std::fs::File::open("/dev/urandom").ok())
+            .as_ref()
+            && f.read_exact(&mut bytes).is_ok()
+        {
+            return u16::from_be_bytes(bytes);
+        }
+    }
+
+    use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
-
-    let seed = RandomState::new().build_hasher().finish();
-    let start = ((seed ^ (seed >> 16) ^ (seed >> 32)) & 0xFFFF) as u16;
-    let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
-    for offset in 0..=u16::MAX {
-        let candidate = start.wrapping_add(offset);
-        if let Entry::Vacant(entry) = guard.entry(candidate) {
-            entry.insert(sender);
-            return Some(candidate);
-        }
-    }
-    None
+    let h = RandomState::new().build_hasher().finish();
+    ((h ^ (h >> 16) ^ (h >> 32)) & 0xFFFF) as u16
 }
 
-/// RAII 守卫：在超时、发送失败或任务取消时自动回收挂起的内部事务 ID
-struct PendingQueryGuard {
+/// 严格校验上游 DNS 响应头部、QR=1、TxID 以及 Question 元组一致性
+fn validate_upstream_dns_response(
+    expected_tx_id: u16,
+    expected_question: &DnsQuestion,
+    resp: &[u8],
+) -> Result<usize> {
+    if resp.len() < 12 {
+        bail!("Upstream DNS response shorter than 12 bytes header");
+    }
+    let resp_tx_id = u16::from_be_bytes([resp[0], resp[1]]);
+    if resp_tx_id != expected_tx_id {
+        bail!("Upstream DNS TxID mismatch");
+    }
+    if (resp[2] & 0x80) == 0 {
+        bail!("Upstream DNS packet missing QR=1 response bit");
+    }
+    let qdcount = u16::from_be_bytes([resp[4], resp[5]]);
+    if qdcount < 1 {
+        bail!("Upstream DNS response missing Question section");
+    }
+
+    let (qname, next_off) = decode_dns_name(resp, 12)?;
+    if next_off + 4 > resp.len() {
+        bail!("Upstream DNS response Question missing QTYPE/QCLASS");
+    }
+    let qtype = u16::from_be_bytes([resp[next_off], resp[next_off + 1]]);
+    let qclass = u16::from_be_bytes([resp[next_off + 2], resp[next_off + 3]]);
+
+    if !qname.eq_ignore_ascii_case(&expected_question.name)
+        || qtype != expected_question.qtype
+        || qclass != expected_question.qclass
+    {
+        bail!(
+            "Upstream DNS response Question mismatch: got ({}, {}, {}), expected ({}, {}, {})",
+            qname,
+            qtype,
+            qclass,
+            expected_question.name,
+            expected_question.qtype,
+            expected_question.qclass
+        );
+    }
+
+    Ok(next_off + 4)
+}
+
+/// 构造标准 DNS 查询报文
+fn build_dns_query_packet(tx_id: u16, domain: &str, qtype: u16) -> Result<(Vec<u8>, DnsQuestion)> {
+    let clean = domain.trim().trim_end_matches('.');
+    if clean.is_empty() || clean.len() > 253 {
+        bail!("Invalid domain length for DNS query: {:?}", domain);
+    }
+    let mut pkt = Vec::with_capacity(clean.len() + 18);
+    pkt.extend_from_slice(&tx_id.to_be_bytes());
+    pkt.extend_from_slice(&[0x01, 0x00]); // Standard query, RD=1
+    pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QDCOUNT=1
+
+    for label in clean.split('.') {
+        if label.is_empty() || label.len() > 63 || !label.bytes().all(is_valid_dns_label_byte) {
+            bail!("Invalid DNS query label: {:?}", label);
+        }
+        pkt.push(label.len() as u8);
+        pkt.extend_from_slice(label.as_bytes());
+    }
+    pkt.push(0);
+    pkt.extend_from_slice(&qtype.to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
+
+    let q = DnsQuestion {
+        name: clean.to_string(),
+        qtype,
+        qclass: 1,
+        raw_len: pkt.len(),
+    };
+    Ok((pkt, q))
+}
+
+/// 解析 DNS 应答中的 A / AAAA（跟踪 CNAME 链），并过滤任何 Fake-IP 防止自环路
+fn parse_answer_ips(
+    resp: &[u8],
+    question: &DnsQuestion,
+    first_answer_offset: usize,
+    fake_ip_pool: Option<&FakeIpPool>,
+) -> Result<Vec<IpAddr>> {
+    let rcode = resp[3] & 0x0F;
+    if rcode != 0 && rcode != 3 {
+        bail!("Upstream DNS returned error RCODE={}", rcode);
+    }
+
+    let qdcount = u16::from_be_bytes([resp[4], resp[5]]) as usize;
+    let ancount = u16::from_be_bytes([resp[6], resp[7]]) as usize;
+
+    // first_answer_offset 已经跳过第一个 Question；若还有额外 Question 继续跳过
+    let mut offset = first_answer_offset;
+    for _ in 1..qdcount {
+        let (_, next) = decode_dns_name(resp, offset)?;
+        if next + 4 > resp.len() {
+            bail!("Upstream DNS extra Question truncated");
+        }
+        offset = next + 4;
+    }
+
+    let mut allowed_names: HashSet<String> = HashSet::new();
+    allowed_names.insert(question.name.to_ascii_lowercase());
+    let mut ips = Vec::new();
+
+    for _ in 0..ancount {
+        if offset >= resp.len() {
+            break;
+        }
+        let (owner, next) = decode_dns_name(resp, offset)?;
+        if next + 10 > resp.len() {
+            bail!("Upstream DNS Answer RR header truncated");
+        }
+        let rtype = u16::from_be_bytes([resp[next], resp[next + 1]]);
+        let rclass = u16::from_be_bytes([resp[next + 2], resp[next + 3]]);
+        let rdlength = u16::from_be_bytes([resp[next + 8], resp[next + 9]]) as usize;
+        let rdata_start = next + 10;
+        let rdata_end = rdata_start + rdlength;
+        if rdata_end > resp.len() {
+            bail!("Upstream DNS Answer RDATA exceeds packet length");
+        }
+
+        let owner_lower = owner.to_ascii_lowercase();
+        if rclass == 1 && allowed_names.contains(&owner_lower) {
+            match rtype {
+                5 => {
+                    // CNAME
+                    if let Ok((cname, _)) = decode_dns_name(resp, rdata_start) {
+                        allowed_names.insert(cname.to_ascii_lowercase());
+                    }
+                }
+                1 if rdlength == 4 => {
+                    let v4 = Ipv4Addr::new(
+                        resp[rdata_start],
+                        resp[rdata_start + 1],
+                        resp[rdata_start + 2],
+                        resp[rdata_start + 3],
+                    );
+                    if fake_ip_pool.is_none_or(|p| !p.is_fake_ip(&v4)) {
+                        ips.push(IpAddr::V4(v4));
+                    }
+                }
+                28 if rdlength == 16 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&resp[rdata_start..rdata_end]);
+                    ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                }
+                _ => {}
+            }
+        }
+        offset = rdata_end;
+    }
+
+    Ok(ips)
+}
+
+async fn forward_upstream_udp(
+    upstream_dns: SocketAddr,
+    query_bytes: &[u8],
     tx_id: u16,
-    pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
-    active: bool,
+    question: &DnsQuestion,
+    timeout: Duration,
+) -> Result<Option<(Vec<u8>, usize)>> {
+    let local_bind = if upstream_dns.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let sock = UdpSocket::bind(local_bind)
+        .await
+        .context("Failed to bind ephemeral upstream DNS socket")?;
+    sock.send_to(query_bytes, upstream_dns)
+        .await
+        .context("Failed to send upstream DNS query")?;
+
+    let expected_upstream = normalize_socket_addr(upstream_dns);
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        let rem = deadline - now;
+        match tokio::time::timeout(rem, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, src_addr))) => {
+                if normalize_socket_addr(src_addr) != expected_upstream {
+                    warn!(
+                        "[DNS Engine] Dropped response packet from unexpected upstream source {} (expected {})",
+                        src_addr, expected_upstream
+                    );
+                    continue;
+                }
+                match validate_upstream_dns_response(tx_id, question, &buf[..n]) {
+                    Ok(answer_off) => return Ok(Some((buf[..n].to_vec(), answer_off))),
+                    Err(e) => {
+                        debug!("[DNS Engine] Ignored invalid upstream packet from {}: {}", src_addr, e);
+                        continue;
+                    }
+                }
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                debug!("[DNS Engine] Upstream UDP endpoint unreachable: {}", e);
+                return Ok(None);
+            }
+            Ok(Err(e)) => {
+                debug!("[DNS Engine] Upstream UDP receive error: {}", e);
+                return Ok(None);
+            }
+            Err(_) => return Ok(None),
+        }
+    }
 }
 
-impl PendingQueryGuard {
-    fn new(tx_id: u16, pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>) -> Self {
-        Self {
-            tx_id,
-            pending,
-            active: true,
+/// 显式经由上游 DNS 解析域名的 A + AAAA 记录（完全绕过 OS getaddrinfo 与 Fake-IP 冲突）
+pub(crate) async fn resolve_via_upstream_dns(
+    domain: &str,
+    upstream_dns: SocketAddr,
+    fake_ip_pool: Option<&FakeIpPool>,
+    timeout: Duration,
+) -> Result<Vec<IpAddr>> {
+    let tx_a = csprng_u16();
+    let tx_aaaa = csprng_u16();
+    let (pkt_a, q_a) = build_dns_query_packet(tx_a, domain, 1)?;
+    let (pkt_aaaa, q_aaaa) = build_dns_query_packet(tx_aaaa, domain, 28)?;
+
+    let (res_a, res_aaaa) = tokio::join!(
+        forward_upstream_udp(upstream_dns, &pkt_a, tx_a, &q_a, timeout),
+        forward_upstream_udp(upstream_dns, &pkt_aaaa, tx_aaaa, &q_aaaa, timeout),
+    );
+
+    let mut ips = Vec::new();
+    let mut got_response = false;
+    let mut last_err: Option<anyhow::Error> = None;
+
+    for (res, q) in [(res_a, &q_a), (res_aaaa, &q_aaaa)] {
+        match res {
+            Ok(Some((resp, ans_off))) => {
+                got_response = true;
+                match parse_answer_ips(&resp, q, ans_off, fake_ip_pool) {
+                    Ok(parsed) => {
+                        for ip in parsed {
+                            if !ips.contains(&ip) {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Ok(None) => {}
+            Err(e) => last_err = Some(e),
         }
     }
 
-    fn disarm(&mut self) {
-        self.active = false;
+    if !ips.is_empty() {
+        return Ok(ips);
     }
-}
-
-impl Drop for PendingQueryGuard {
-    fn drop(&mut self) {
-        if self.active {
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&self.tx_id);
-        }
+    if let Some(err) = last_err {
+        return Err(err);
     }
+    if !got_response {
+        bail!("Upstream DNS resolution timed out for {}", domain);
+    }
+    bail!("No usable IP records returned by upstream DNS for {}", domain)
 }
 
 impl DnsServer {
@@ -236,6 +575,7 @@ impl DnsServer {
             upstream_dns,
             block_ipv6,
             concurrency_limit: Arc::new(Semaphore::new(5000)),
+            upstream_limit: Arc::new(Semaphore::new(MAX_DNS_UPSTREAM_CONCURRENCY)),
         }
     }
 
@@ -248,66 +588,9 @@ impl DnsServer {
         Ok(Arc::new(socket))
     }
 
-    /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and upstream multiplexing)
+    /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and ephemeral upstream isolation)
     pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let mut buf = [0u8; 1500];
-
-        // Bind single multiplexed upstream DNS client socket matching address family
-        let upstream_bind = if self.upstream_dns.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let upstream_client = Arc::new(
-            UdpSocket::bind(upstream_bind)
-                .await
-                .context("Failed to bind upstream DNS client socket")?,
-        );
-        let pending_queries: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
-
-        // Start background upstream DNS response multiplexing receiver loop
-        let uc = Arc::clone(&upstream_client);
-        let pq = Arc::clone(&pending_queries);
-        let expected_upstream = normalize_socket_addr(self.upstream_dns);
-        let mut shutdown_rx_upstream = shutdown_rx.clone();
-        tokio::spawn(async move {
-            let mut up_buf = [0u8; 1500];
-            loop {
-                tokio::select! {
-                    res = uc.recv_from(&mut up_buf) => {
-                        match res {
-                            Ok((n, src_addr)) if n >= 2 => {
-                                if normalize_socket_addr(src_addr) != expected_upstream {
-                                    warn!(
-                                        "[DNS Engine] Dropped response packet from unexpected upstream source address {} (expected {})",
-                                        src_addr, expected_upstream
-                                    );
-                                    continue;
-                                }
-                                let internal_id = u16::from_be_bytes([up_buf[0], up_buf[1]]);
-                                let sender = pq
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .remove(&internal_id);
-                                if let Some(sender) = sender {
-                                    let _ = sender.send(up_buf[..n].to_vec());
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                                debug!("[DNS Engine] Upstream UDP endpoint temporarily unreachable: {}", e);
-                            }
-                            Err(e) => {
-                                error!("[DNS Engine] Upstream response receive error: {}", e);
-                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            }
-                        }
-                    }
-                    _ = shutdown_rx_upstream.changed() => break,
-                }
-            }
-        });
 
         loop {
             let (len, peer) = tokio::select! {
@@ -339,8 +622,7 @@ impl DnsServer {
             let pool_clone = self.pool.clone();
             let upstream_dns = self.upstream_dns;
             let block_ipv6 = self.block_ipv6;
-            let uc_clone = Arc::clone(&upstream_client);
-            let pq_clone = Arc::clone(&pending_queries);
+            let upstream_limit = Arc::clone(&self.upstream_limit);
 
             tokio::spawn(async move {
                 let _permit = permit;
@@ -375,25 +657,26 @@ impl DnsServer {
                             return;
                         }
 
-                        // 3. Forward other queries to upstream DNS with isolated internal TxID
-                        let (tx, rx) = oneshot::channel();
-                        let Some(internal_tx_id) = allocate_internal_tx_id(&pq_clone, tx) else {
-                            warn!("[DNS Engine] Upstream transaction ID mapping table full, dropping query: {}", question.name);
+                        // 3. Forward other queries to upstream DNS via per-query ephemeral UDP socket & CSPRNG TxID
+                        let Ok(_up_permit) = upstream_limit.try_acquire_owned() else {
+                            warn!("[DNS Engine] Upstream forwarding limit reached, dropping query: {}", question.name);
                             return;
                         };
-                        let mut pending_guard = PendingQueryGuard::new(internal_tx_id, Arc::clone(&pq_clone));
+                        let upstream_tx_id = csprng_u16();
                         let mut forward_bytes = query_bytes;
-                        forward_bytes[0..2].copy_from_slice(&internal_tx_id.to_be_bytes());
+                        forward_bytes[0..2].copy_from_slice(&upstream_tx_id.to_be_bytes());
 
-                        if uc_clone.send_to(&forward_bytes, upstream_dns).await.is_ok()
-                            && let Ok(Ok(mut resp_bytes)) =
-                                tokio::time::timeout(std::time::Duration::from_secs(2), rx).await
+                        if let Ok(Some((mut resp_bytes, _))) = forward_upstream_udp(
+                            upstream_dns,
+                            &forward_bytes,
+                            upstream_tx_id,
+                            &question,
+                            UPSTREAM_DNS_TIMEOUT,
+                        )
+                        .await
                         {
-                            pending_guard.disarm();
-                            if resp_bytes.len() >= 2 {
-                                resp_bytes[0..2].copy_from_slice(&client_tx_id.to_be_bytes());
-                                let _ = socket_clone.send_to(&resp_bytes, peer).await;
-                            }
+                            resp_bytes[0..2].copy_from_slice(&client_tx_id.to_be_bytes());
+                            let _ = socket_clone.send_to(&resp_bytes, peer).await;
                         }
                     }
                     Err(e) => {
@@ -460,6 +743,14 @@ mod tests {
         // 测试空域名 (Root Query) 被拒绝
         let query_empty = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 1, 0, 1];
         assert!(DnsPacketParser::parse_question(&query_empty).is_err());
+
+        // P0-3 回归测试：包含非 ASCII UTF-8（如 "élocalhost"）的 DNS 查询必须在入口被拒绝
+        let mut query_utf8 = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let utf8_label = "élocalhost".as_bytes();
+        query_utf8.push(utf8_label.len() as u8);
+        query_utf8.extend_from_slice(utf8_label);
+        query_utf8.extend_from_slice(&[0, 0, 1, 0, 1]);
+        assert!(DnsPacketParser::parse_question(&query_utf8).is_err());
     }
 
     /// P0-3 回归测试：开启防泄露模式下，AAAA (28)、SVCB (64) 与 HTTPS (65) 均返回空应答且不泄露给上游 DNS
@@ -505,7 +796,7 @@ mod tests {
         assert_eq!(upstream_hits.load(Ordering::Relaxed), 0, "SVCB/HTTPS/AAAA queries must not leak to public DNS");
     }
 
-    /// P0-2 Regression Test: Concurrent upstream queries with same client TxID isolated by internal TxID, rejecting spoofed responses
+    /// P0-2 / P1-5 Regression Test: Concurrent upstream queries use isolated ephemeral sockets & strict QR/Question/TxID/source validation
     #[tokio::test]
     async fn test_dns_upstream_txid_isolation_and_source_verification() {
         let mock_upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
@@ -520,17 +811,29 @@ mod tests {
                 let mut buf2 = [0u8; 512];
                 let (n2, src2) = mock_upstream.recv_from(&mut buf2).await.unwrap();
 
-                let id1 = u16::from_be_bytes([buf1[0], buf1[1]]);
-                let id2 = u16::from_be_bytes([buf2[0], buf2[1]]);
-                assert_ne!(id1, id2, "Internal transaction IDs forwarded to upstream must be distinct even with identical client TxID");
+                assert_ne!(src1.port(), src2.port(), "Each forwarded query should bind an isolated ephemeral source port");
 
-                // 构造一个来自错误源地址的伪造响应（复刻 id1），应被接收器直接丢弃
-                let mut spoof_resp = vec![0u8; n1];
-                spoof_resp[..n1].copy_from_slice(&buf1[..n1]);
+                // 1. 错误源地址伪造包应被丢弃
+                let mut spoof_resp = buf1[..n1].to_vec();
                 spoof_resp[2] = 0x81;
                 spoof_resp[3] = 0x80;
                 spoof_resp.extend_from_slice(b"SPOOFED");
                 let _ = spoof_socket.send_to(&spoof_resp, src1).await;
+
+                // 2. 来自真实上游 IP 但缺少 QR=1 位（反射查询）与 Question 不一致的假包也应被忽略
+                let mut qr0_resp = buf1[..n1].to_vec();
+                qr0_resp[2] = 0x01; // QR=0
+                qr0_resp.extend_from_slice(b"SPOOFED");
+                let _ = mock_upstream.send_to(&qr0_resp, src1).await;
+
+                let mut wrong_q_resp = build_sample_query(
+                    u16::from_be_bytes([buf1[0], buf1[1]]),
+                    "wrong.example",
+                    16,
+                );
+                wrong_q_resp[2] = 0x81;
+                wrong_q_resp.extend_from_slice(b"SPOOFED");
+                let _ = mock_upstream.send_to(&wrong_q_resp, src1).await;
 
                 let (_, q1) = DnsPacketParser::parse_question(&buf1[..n1]).unwrap();
                 let (_, q2) = DnsPacketParser::parse_question(&buf2[..n2]).unwrap();
@@ -544,7 +847,6 @@ mod tests {
                     }
                 };
 
-                // 先乱序回复第二个查询，再回复第一个查询，验证各自精准对应到原域名与原客户端
                 let build_marked_resp = |req: &[u8], tag: &[u8]| {
                     let mut r = req.to_vec();
                     r[2] = 0x81;
@@ -569,7 +871,6 @@ mod tests {
         let client1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        // 两个独立客户端故意发送完全相同的客户端 TxID (0x1234)
         let q1 = build_sample_query(0x1234, "alpha.example", 16);
         let q2 = build_sample_query(0x1234, "beta.example", 16);
         client1.send_to(&q1, dns_addr).await.unwrap();
@@ -597,5 +898,61 @@ mod tests {
         assert!(!p1.windows(9).any(|w| w == b"ANS-BETA!"), "Client 1 must not receive beta response");
         assert!(p2.windows(9).any(|w| w == b"ANS-BETA!"), "Client 2 must receive beta response");
         assert!(!p2.windows(9).any(|w| w == b"ANS-ALPHA"), "Client 2 must not receive alpha response");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_via_upstream_dns_follows_cname_and_filters_fake_ip() {
+        let mock_upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let upstream_addr = mock_upstream.local_addr().unwrap();
+
+        let up_task = {
+            let mock_upstream = Arc::clone(&mock_upstream);
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    let mut buf = [0u8; 512];
+                    let (n, src) = mock_upstream.recv_from(&mut buf).await.unwrap();
+                    let (tx, q) = DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                    let mut resp = Vec::new();
+                    resp.extend_from_slice(&tx.to_be_bytes());
+                    resp.extend_from_slice(&[0x81, 0x80]);
+                    if q.qtype == 1 {
+                        // QD=1, AN=3: CNAME -> Fake-IP (filtered) + Real IP 93.184.216.34
+                        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00]);
+                        resp.extend_from_slice(&buf[12..q.raw_len]);
+                        // Answer 1: CNAME alias.example
+                        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0, 0, 0, 60]);
+                        let alias = [5u8, b'a', b'l', b'i', b'a', b's', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0];
+                        resp.extend_from_slice(&(alias.len() as u16).to_be_bytes());
+                        let alias_offset = resp.len() as u16;
+                        resp.extend_from_slice(&alias);
+                        let ptr_alias = (0xC000u16 | alias_offset).to_be_bytes();
+                        // Answer 2: Fake-IP 198.18.0.55 (should be dropped)
+                        resp.extend_from_slice(&ptr_alias);
+                        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0, 0, 0, 10, 0, 4, 198, 18, 0, 55]);
+                        // Answer 3: Real IP 93.184.216.34
+                        resp.extend_from_slice(&ptr_alias);
+                        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+                    } else {
+                        // AAAA empty NOERROR
+                        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                        resp.extend_from_slice(&buf[12..q.raw_len]);
+                    }
+                    mock_upstream.send_to(&resp, src).await.unwrap();
+                }
+            })
+        };
+
+        let pool = FakeIpPool::new_default();
+        let ips = resolve_via_upstream_dns(
+            "cdn.example",
+            upstream_addr,
+            Some(&pool),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        up_task.await.unwrap();
+
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
     }
 }
