@@ -29,12 +29,9 @@ pub(crate) fn check_direct_ips_violation(
     self_ports: &[u16],
     fake_ip_pool: Option<&FakeIpPool>,
 ) -> Option<DirectIpViolation> {
-    if let Some(fake_ip) = ips.iter().copied().find(|ip| match ip {
-        IpAddr::V4(v4) => {
-            fake_ip_pool.is_some_and(|pool| pool.is_fake_ip(v4))
-                || FakeIpPool::is_default_fake_ip(v4)
-        }
-        IpAddr::V6(_) => false,
+    if let Some(fake_ip) = ips.iter().copied().find(|ip| {
+        fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(*ip))
+            || FakeIpPool::is_default_fake_ip_addr(*ip)
     }) {
         return Some(DirectIpViolation::FakeIp(fake_ip));
     }
@@ -231,12 +228,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_outbound_blocks_fake_ip_and_multi_ip_failover() {
-        // 1. Default Fake-IP CIDR literal blocked even when fake_ip_pool is None
+        // 1. Default Fake-IP literal (both plain IPv4 and IPv4-mapped IPv6) blocked even when fake_ip_pool is None
         let fake_target = TargetAddr::Ip("198.18.0.42:443".parse().unwrap());
         let err = DirectOutbound::connect(&fake_target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Fake-IP"));
+
+        let fake_mapped_target = TargetAddr::Ip("[::ffff:198.18.0.10]:1080".parse().unwrap());
+        let err_mapped =
+            DirectOutbound::connect(&fake_mapped_target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
+                .await
+                .unwrap_err();
+        assert!(err_mapped.to_string().contains("Fake-IP"));
+        let pool = FakeIpPool::new_default();
+        assert!(matches!(
+            check_direct_ips_violation(
+                &["::ffff:198.18.0.10".parse().unwrap()],
+                1080,
+                &[],
+                Some(&pool),
+            ),
+            Some(DirectIpViolation::FakeIp(_))
+        ));
 
         // 2. Multi-IP DNS result falls through closed candidate to listening candidate
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

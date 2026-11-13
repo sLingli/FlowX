@@ -439,14 +439,17 @@ fn parse_answer_ips(
                         resp[rdata_start + 2],
                         resp[rdata_start + 3],
                     );
-                    if fake_ip_pool.is_none_or(|p| !p.is_fake_ip(&v4)) {
+                    if fake_ip_pool.is_none_or(|p| !p.is_fake_ip_addr(IpAddr::V4(v4))) {
                         ips.push(IpAddr::V4(v4));
                     }
                 }
                 28 if rdlength == 16 => {
                     let mut octets = [0u8; 16];
                     octets.copy_from_slice(&resp[rdata_start..rdata_end]);
-                    ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
+                    let v6 = Ipv6Addr::from(octets);
+                    if fake_ip_pool.is_none_or(|p| !p.is_fake_ip_addr(IpAddr::V6(v6))) {
+                        ips.push(IpAddr::V6(v6));
+                    }
                 }
                 _ => {}
             }

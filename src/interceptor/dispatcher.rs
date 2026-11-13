@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
@@ -198,19 +198,18 @@ async fn handle_connection(
         .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
 
-    // 3. If target is Fake-IP, restore original domain (prevent DNS leak, let upstream proxy resolve)
+    // 3. If target is Fake-IP (IPv4 or IPv4-mapped IPv6), restore original domain (prevent DNS leak, let upstream proxy resolve)
     let target = match &target {
-        TargetAddr::Ip(addr) => match addr.ip() {
-            IpAddr::V4(v4) if config.fake_ip_pool.is_fake_ip(&v4) => match config.fake_ip_pool.restore(&v4) {
+        TargetAddr::Ip(addr) if config.fake_ip_pool.is_fake_ip_addr(addr.ip()) => {
+            match config.fake_ip_pool.restore_ip(addr.ip()) {
                 Some(domain) => TargetAddr::Domain(domain, addr.port()),
                 None => {
                     inbound::send_failure(&mut local_stream, kind, false).await.ok();
-                    bail!("Fake-IP {} domain mapping expired or does not exist", v4);
+                    bail!("Fake-IP {} domain mapping expired or does not exist", addr.ip());
                 }
-            },
-            _ => target,
-        },
-        TargetAddr::Domain(..) => target,
+            }
+        }
+        _ => target,
     };
 
     // 4. Loop prevention: reject requests targeting FlowX internal service ports

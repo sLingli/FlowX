@@ -180,6 +180,7 @@ pub struct SystemRuntimeContext {
     pub upstream_dns: SocketAddr,
     pub api_addr: SocketAddr,
     pub fake_ip_pool: Arc<FakeIpPool>,
+    /// 本地 Fake-IP DNS 服务是否拦截 `AAAA`/`SVCB`/`HTTPS` 防泄漏（仅作用于本地 DNS 入站）
     pub block_ipv6: bool,
     pub started_at: Instant,
 }
@@ -2156,12 +2157,12 @@ pub(crate) fn handle_simulate_route_with_pool(
         );
     };
 
-    // 与真实流量调度保持完全一致：Fake-IP 还原为原域名；真实 IP 字面量不设 target_host（仅传 target_ip）
+    // 与真实流量调度保持完全一致：Fake-IP（含 IPv4 映射 IPv6）还原为原域名；真实 IP 字面量不设 target_host（仅传 target_ip）
     let (target_host, target_ip) = match ip_opt {
-        Some(std::net::IpAddr::V4(v4)) if fake_ip_pool.is_some_and(|p| p.is_fake_ip(&v4)) => {
-            match fake_ip_pool.and_then(|p| p.restore(&v4)) {
+        Some(ip) if fake_ip_pool.is_some_and(|p| p.is_fake_ip_addr(ip)) => {
+            match fake_ip_pool.and_then(|p| p.restore_ip(ip)) {
                 Some(domain) => (Some(domain), None),
-                None => (None, Some(std::net::IpAddr::V4(v4))),
+                None => (None, Some(ip)),
             }
         }
         Some(ip) => (None, Some(ip)),
@@ -2431,13 +2432,12 @@ async fn ping_address_with_context(
                 let upstream_dns = runtime_ctx
                     .map(|c| c.upstream_dns)
                     .unwrap_or_else(|| "223.5.5.5:53".parse().unwrap());
-                let include_ipv6 = runtime_ctx.is_none_or(|c| !c.block_ipv6);
-                match crate::dns::server::resolve_via_upstream_dns_with_options(
+                // block_ipv6 仅用于本地 Fake-IP DNS 防泄漏；在线节点 Ping 与 DirectOutbound 统一允许 A + AAAA 解析与拨号
+                match crate::dns::server::resolve_via_upstream_dns(
                     domain,
                     upstream_dns,
                     Some(fake_pool),
                     remaining,
-                    include_ipv6,
                 )
                 .await
                 {
@@ -3770,6 +3770,61 @@ mod tests {
         .await;
         assert!(!ok_iface);
         assert!(msg_iface.contains("internal service"));
+
+        // 4. Online ping_address_with_context resolves pure-AAAA domain even when runtime_ctx.block_ipv6 == true
+        if let Ok(v6_listener) = TcpListener::bind("[::1]:0").await {
+            let v6_port = v6_listener.local_addr().unwrap().port();
+            let accept_v6 = tokio::spawn(async move {
+                let _ = v6_listener.accept().await;
+            });
+            let mock_dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mock_dns_addr = mock_dns.local_addr().unwrap();
+            let dns_task = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let mut buf = [0u8; 512];
+                    let (n, src) = mock_dns.recv_from(&mut buf).await.unwrap();
+                    let (tx, q) = crate::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                    let resp = if q.qtype == 28 {
+                        let mut r = Vec::new();
+                        r.extend_from_slice(&tx.to_be_bytes());
+                        r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                        r.extend_from_slice(&buf[12..q.raw_len]);
+                        r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0, 0, 0, 5, 0, 16]);
+                        r.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                        r
+                    } else {
+                        crate::dns::server::DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)
+                    };
+                    mock_dns.send_to(&resp, src).await.unwrap();
+                }
+            });
+            let ctx = SystemRuntimeContext {
+                dns_addr: "127.0.0.1:1053".parse().unwrap(),
+                upstream_dns: mock_dns_addr,
+                inbound_addr: "127.0.0.1:40001".parse().unwrap(),
+                api_addr: "127.0.0.1:40080".parse().unwrap(),
+                fake_ip_pool: Arc::new(FakeIpPool::new_default()),
+                block_ipv6: true,
+                started_at: Instant::now(),
+            };
+            let (ok_aaaa, _, msg_aaaa, _) = ping_address_with_context(
+                &format!("v6only.example:{}", v6_port),
+                &[40080],
+                Some(&ctx),
+                None,
+                Locale::En,
+            )
+            .await;
+            assert!(ok_aaaa, "pure-AAAA ping should succeed when block_ipv6=true: {}", msg_aaaa);
+            let _ = tokio::time::timeout(Duration::from_secs(1), dns_task).await;
+            let _ = tokio::time::timeout(Duration::from_secs(1), accept_v6).await;
+        }
+
+        // Mapped Fake-IP literal also rejected in ping
+        let (ok_mapped_fake, _, msg_mapped_fake, _) =
+            ping_address("[::ffff:198.18.0.10]:1080", &[bound_port], Locale::En).await;
+        assert!(!ok_mapped_fake);
+        assert!(msg_mapped_fake.contains("Fake-IP"));
     }
 
     #[tokio::test]

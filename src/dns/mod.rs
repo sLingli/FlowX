@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -142,15 +142,38 @@ impl FakeIpPool {
         Some(domain)
     }
 
+    /// 将 `IpAddr` 中的原生 IPv4 或 IPv4-mapped IPv6 (`::ffff:a.b.c.d`) 统一解包为 IPv4
+    pub fn unwrap_ipv4(ip: IpAddr) -> Option<Ipv4Addr> {
+        match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(v6) => v6.to_ipv4_mapped(),
+        }
+    }
+
     /// 判断指定 IP 是否落在 Fake-IP 保留网段内
     pub fn is_fake_ip(&self, ip: &Ipv4Addr) -> bool {
         let raw = u32::from(*ip);
         raw >= self.min && raw <= self.max
     }
 
+    /// 判断任意 IPv4 / IPv4-mapped IPv6 地址是否落在当前 Fake-IP 池内
+    pub fn is_fake_ip_addr(&self, ip: IpAddr) -> bool {
+        Self::unwrap_ipv4(ip).is_some_and(|v4| self.is_fake_ip(&v4))
+    }
+
+    /// 从任意 IPv4 / IPv4-mapped IPv6 中还原 Fake-IP 对应的原始域名
+    pub fn restore_ip(&self, ip: IpAddr) -> Option<String> {
+        Self::unwrap_ipv4(ip).and_then(|v4| self.restore(&v4))
+    }
+
     /// 判断 IPv4 地址是否落在默认 Fake-IP 保留网段 (`198.18.0.0/15`)
     pub fn is_default_fake_ip(ip: &Ipv4Addr) -> bool {
         (u32::from(*ip) & 0xFFFE_0000) == 0xC612_0000
+    }
+
+    /// 判断任意 IPv4 / IPv4-mapped IPv6 地址是否落在默认 Fake-IP 保留网段
+    pub fn is_default_fake_ip_addr(ip: IpAddr) -> bool {
+        Self::unwrap_ipv4(ip).is_some_and(|v4| Self::is_default_fake_ip(&v4))
     }
 
     /// 返回当前池中映射条目数
