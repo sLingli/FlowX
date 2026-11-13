@@ -54,6 +54,8 @@ pub struct InboundRequest {
     pub http_body_framing: Option<HttpBodyFraming>,
     /// 解析 HTTP 请求头时已多读入的请求体前缀字节（仅用于受限帧转发，绝不无界透传）
     pub body_prefix: Vec<u8>,
+    /// 明文 HTTP 转发时原始请求方法是否为 HEAD（用于下行响应确定 0 字节响应体）
+    pub http_is_head: bool,
 }
 
 /// 读取并解析入站握手，返回目标地址（此时尚未向客户端回复成功）
@@ -180,6 +182,7 @@ where
         pending: Vec::new(),
         http_body_framing: None,
         body_prefix: Vec::new(),
+        http_is_head: false,
     })
 }
 
@@ -219,6 +222,7 @@ where
         pending: Vec::new(),
         http_body_framing: None,
         body_prefix: Vec::new(),
+        http_is_head: false,
     })
 }
 
@@ -471,6 +475,7 @@ where
             pending: leftover,
             http_body_framing: None,
             body_prefix: Vec::new(),
+            http_is_head: false,
         });
     }
 
@@ -513,6 +518,7 @@ where
         pending: rewritten,
         http_body_framing,
         body_prefix: leftover,
+        http_is_head: method.eq_ignore_ascii_case("HEAD"),
     })
 }
 
@@ -524,7 +530,7 @@ pub(crate) fn is_http_token_byte(b: u8) -> bool {
         )
 }
 
-fn split_crlf_lines(head: &[u8]) -> Option<Vec<&[u8]>> {
+pub(crate) fn split_crlf_lines(head: &[u8]) -> Option<Vec<&[u8]>> {
     if head.contains(&0) {
         return None;
     }

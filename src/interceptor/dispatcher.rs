@@ -181,6 +181,7 @@ async fn handle_connection(
         pending,
         http_body_framing,
         body_prefix,
+        http_is_head,
     } = tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, inbound::read_request(&mut local_stream))
         .await
         .map_err(|_| anyhow!("Inbound handshake timed out ({:?}), peer {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
@@ -319,6 +320,7 @@ async fn handle_connection(
                 Some(&active_conn),
                 framing,
                 body_prefix,
+                http_is_head,
             )
             .await?
         }
