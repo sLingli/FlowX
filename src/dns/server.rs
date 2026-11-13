@@ -564,6 +564,15 @@ pub(crate) async fn resolve_via_upstream_dns(
     bail!("No usable IP records returned by upstream DNS for {}", domain)
 }
 
+fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    )
+}
+
 impl DnsServer {
     pub fn new(
         bind_addr: SocketAddr,
@@ -609,6 +618,12 @@ impl DnsServer {
                 res = socket.recv_from(&mut buf) => {
                     match res {
                         Ok(r) => r,
+                        Err(e) if is_transient_udp_recv_error(&e) => {
+                            // Windows returns WSAECONNRESET when a local UDP peer closes early after querying;
+                            // exempt transient socket errors from backoff so throughput is not capped at ~20 qps.
+                            debug!("[DNS Engine] Transient UDP receive error ignored: {}", e);
+                            continue;
+                        }
                         Err(e) => {
                             error!("[DNS Engine] Failed to receive UDP DNS packet: {}", e);
                             tokio::select! {
@@ -972,5 +987,64 @@ mod tests {
         up_task.await.unwrap();
 
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    #[test]
+    fn test_transient_udp_recv_error_classification() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::ConnectionReset)));
+        assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::Interrupted)));
+        assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::InvalidInput)));
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_fast_burst_with_dropped_peers() {
+        let pool = Arc::new(FakeIpPool::new_default());
+        let server = DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&pool),
+            "127.0.0.1:53".parse().unwrap(),
+            true,
+        );
+        let socket = server.bind().await.unwrap();
+        let dns_addr = socket.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let srv_handle = tokio::spawn(async move {
+            let _ = server.run(socket, rx).await;
+        });
+
+        // Fire 20 queries from ephemeral sockets that immediately close before receiving reply,
+        // which triggers WSAECONNRESET on Windows when send_to lands after socket closure.
+        for i in 0..20u16 {
+            let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let q = build_sample_query(0x3000 + i, &format!("drop{}.example.com", i), 1);
+            c.send_to(&q, dns_addr).await.unwrap();
+            drop(c);
+        }
+
+        // Subsequent queries must still complete well under 250ms total (no 50ms-per-reset stall).
+        let started = std::time::Instant::now();
+        let c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for i in 0..5u16 {
+            let q = build_sample_query(0x4000 + i, &format!("ok{}.example.com", i), 1);
+            c.send_to(&q, dns_addr).await.unwrap();
+            let mut resp = [0u8; 512];
+            let (n, _) = tokio::time::timeout(Duration::from_millis(200), c.recv_from(&mut resp))
+                .await
+                .expect("DNS response timed out after peer resets")
+                .unwrap();
+            assert_eq!(&resp[0..2], &(0x4000 + i).to_be_bytes());
+            assert!(n > 12);
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "Queries took too long ({:?}), transient error backoff leaked",
+            started.elapsed()
+        );
+
+        let _ = tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), srv_handle).await;
     }
 }
