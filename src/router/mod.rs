@@ -309,6 +309,22 @@ impl RuleEngine {
         Arc::clone(&*guard)
     }
 
+    /// 捕获规则列表与默认兜底动作的一致性快照，供持久化失败时回滚
+    pub fn snapshot_state(&self) -> (Vec<Rule>, Action) {
+        let rules = self.current_rules();
+        let default_action = self.default_action();
+        ((*rules).clone(), default_action)
+    }
+
+    /// 将内存规则列表与默认兜底动作回滚到先前快照
+    pub fn restore_state(&self, rules: Vec<Rule>, default_action: Action) {
+        {
+            let mut r_guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
+            *r_guard = Arc::new(rules);
+        }
+        self.set_default_action(default_action);
+    }
+
     pub fn list_rules_view(&self) -> Vec<RuleView> {
         self.list_rules_view_with_locale(crate::i18n::Locale::Zh)
     }

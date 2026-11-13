@@ -871,9 +871,21 @@ async fn handle_api_request(
         None
     };
 
-    let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
+    let rollback_snapshot = if is_mutation && config_store.is_some() {
+        let nodes_bak = proxy_nodes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (rules_bak, default_bak) = rule_engine.snapshot_state();
+        Some((nodes_bak, rules_bak, default_bak))
+    } else {
+        None
+    };
 
-    let (status, content_type, body) = match (method, path) {
+    let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
+    let mut should_persist = false;
+
+    let (mut status, mut content_type, mut body) = match (method, path) {
         ("OPTIONS", _) => ("204 No Content", "text/plain", String::new()),
         ("GET", "/") | ("GET", "/dashboard") => {
             let html = include_str!("../../frontend/index.html");
@@ -957,7 +969,7 @@ async fn handle_api_request(
             Ok(req) => {
                 let res = handle_add_node(req, &proxy_nodes, &self_ports, locale);
                 if res.0 == "200 OK" {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                 }
                 res
             }
@@ -971,7 +983,7 @@ async fn handle_api_request(
             Ok(req) => {
                 let res = handle_update_node(req, &proxy_nodes, &self_ports, locale);
                 if res.0 == "200 OK" {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                 }
                 res
             }
@@ -985,7 +997,7 @@ async fn handle_api_request(
             Ok(req) => {
                 let res = handle_patch_node(req, &proxy_nodes, &self_ports, locale);
                 if res.0 == "200 OK" {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                 }
                 res
             }
@@ -1019,7 +1031,7 @@ async fn handle_api_request(
                         nodes_guard.remove(&node_id).is_some()
                     };
                     if removed {
-                        persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                        should_persist = true;
                         ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
                     } else {
                         (
@@ -1091,7 +1103,7 @@ async fn handle_api_request(
             Ok(req) => {
                 let res = handle_add_rule(req, &rule_engine, &proxy_nodes, locale);
                 if res.0 == "200 OK" {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                 }
                 res
             }
@@ -1105,7 +1117,7 @@ async fn handle_api_request(
             Ok(req) => {
                 let res = handle_update_rule(req, &rule_engine, &proxy_nodes, locale);
                 if res.0 == "200 OK" {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                 }
                 res
             }
@@ -1119,7 +1131,7 @@ async fn handle_api_request(
             Ok(req) => {
                 let res = handle_patch_rule(req, &rule_engine, &proxy_nodes, locale);
                 if res.0 == "200 OK" {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                 }
                 res
             }
@@ -1138,7 +1150,7 @@ async fn handle_api_request(
                 Ok(req) => {
                     let res = handle_set_default_action(req, &rule_engine, &proxy_nodes, locale);
                     if res.0 == "200 OK" {
-                        persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                        should_persist = true;
                     }
                     res
                 }
@@ -1171,7 +1183,7 @@ async fn handle_api_request(
             ),
             Ok(req) => match rule_engine.toggle_rule(req.id, req.enabled) {
                 Some(enabled) => {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                     (
                         "200 OK",
                         "application/json; charset=utf-8",
@@ -1205,7 +1217,7 @@ async fn handle_api_request(
                     match rule_engine.move_rule(req.id, &req.direction) {
                         Some(changed) => {
                             if changed {
-                                persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                                should_persist = true;
                             }
                             (
                                 "200 OK",
@@ -1233,7 +1245,7 @@ async fn handle_api_request(
             if let Some(rule_id) = id {
                 let ok = rule_engine.delete_rule(rule_id);
                 if ok {
-                    persist_config(config_store.as_deref(), &proxy_nodes, &rule_engine);
+                    should_persist = true;
                     ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
                 } else {
                     (
@@ -1256,6 +1268,30 @@ async fn handle_api_request(
             json_error(locale, "ERR_NOT_FOUND", "error.not_found"),
         ),
     };
+
+    if should_persist
+        && let Some(store) = config_store.as_ref()
+        && let Err(e) = persist_config_async(Arc::clone(store), &proxy_nodes, &rule_engine).await
+    {
+        error!(
+            "[API] Failed to write updated config to disk, rolling back in-memory mutation: {:#}",
+            e
+        );
+        if let Some((nodes_bak, rules_bak, default_bak)) = rollback_snapshot {
+            {
+                let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
+                *nodes_guard = nodes_bak;
+            }
+            rule_engine.restore_state(rules_bak, default_bak);
+        }
+        status = "500 Internal Server Error";
+        content_type = "application/json; charset=utf-8";
+        body = json_error(
+            locale,
+            "ERR_CONFIG_PERSIST_FAILED",
+            "error.config_persist_failed",
+        );
+    }
 
     send_http_response(&mut stream, status, content_type, &body).await?;
     Ok(())
@@ -1317,28 +1353,46 @@ fn validate_node_base(
     let username = username_raw
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty());
-    let password = explicit_password.filter(|p| !p.is_empty());
 
-    if let Some(u) = &username
-        && (u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255)
-    {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
-        ));
-    }
-    if let Some(p) = &password
-        && (p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255)
-    {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
-        ));
+    if let Some(u) = &username {
+        if u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255 {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
+            ));
+        }
+        if protocol == "HTTP" && u.contains(':') {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(locale, "ERR_HTTP_USERNAME_COLON", "error.http_username_colon"),
+            ));
+        }
     }
 
-    Ok((name, protocol, server_addr, username, password))
+    if let Some(p) = &explicit_password {
+        if p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255 {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
+            ));
+        }
+        if protocol != "SOCKS4" && username.is_none() && !p.is_empty() {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_PASSWORD_WITHOUT_USERNAME",
+                    "error.password_without_username",
+                ),
+            ));
+        }
+    }
+
+    Ok((name, protocol, server_addr, username, explicit_password))
 }
 
 fn build_proxy_client(
@@ -1372,6 +1426,91 @@ fn build_proxy_client(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_updated_password(
+    protocol: &str,
+    username: &Option<String>,
+    existing_username: &Option<String>,
+    existing_password: Option<String>,
+    explicit_password: Option<String>,
+    keep_password: Option<bool>,
+    default_keep_when_omitted: bool,
+    clear_password: Option<bool>,
+    locale: Locale,
+) -> std::result::Result<Option<String>, (&'static str, &'static str, String)> {
+    let ct = "application/json; charset=utf-8";
+    let explicit_empty = explicit_password.as_deref() == Some("");
+    let explicit_non_empty = explicit_password.filter(|p| !p.is_empty());
+
+    if clear_password == Some(true) && (keep_password == Some(true) || explicit_non_empty.is_some()) {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_CONFLICTING_PASSWORD_OPTIONS",
+                "error.conflicting_password_options",
+            ),
+        ));
+    }
+    if explicit_empty && (keep_password == Some(true) || clear_password == Some(false)) {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_CONFLICTING_PASSWORD_OPTIONS",
+                "error.conflicting_password_options",
+            ),
+        ));
+    }
+
+    if protocol == "SOCKS4" {
+        if explicit_non_empty.is_some()
+            || (keep_password == Some(true) && clear_password != Some(true))
+        {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
+                    "error.socks4_password_unsupported",
+                ),
+            ));
+        }
+        return Ok(None);
+    }
+
+    if username.is_none() {
+        return Ok(None);
+    }
+
+    if clear_password == Some(true) || explicit_empty || keep_password == Some(false) {
+        return Ok(None);
+    }
+    if explicit_non_empty.is_some() {
+        return Ok(explicit_non_empty);
+    }
+
+    if keep_password.unwrap_or(default_keep_when_omitted) {
+        if username != existing_username && existing_password.is_some() {
+            return Err((
+                "400 Bad Request",
+                ct,
+                json_error(
+                    locale,
+                    "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
+                    "error.password_required_on_user_change",
+                ),
+            ));
+        }
+        return Ok(existing_password);
+    }
+
+    Ok(None)
+}
+
 pub(crate) fn handle_add_node(
     req: AddNodeRequest,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
@@ -1379,7 +1518,7 @@ pub(crate) fn handle_add_node(
     locale: Locale,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
-    let (name, protocol, server_addr, username, password) = match validate_node_base(
+    let (name, protocol, server_addr, username, explicit_password) = match validate_node_base(
         &req.name,
         &req.protocol,
         &req.server_addr,
@@ -1392,13 +1531,21 @@ pub(crate) fn handle_add_node(
         Err(resp) => return resp,
     };
 
-    if protocol == "SOCKS4" && password.is_some() {
+    if protocol == "SOCKS4" && explicit_password.is_some() {
         return (
             "400 Bad Request",
             ct,
             json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
         );
     }
+    if explicit_password.as_deref() == Some("") {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_EMPTY_PASSWORD", "error.empty_password"),
+        );
+    }
+    let password = explicit_password;
 
     let client = build_proxy_client(&protocol, &server_addr, &username, &password);
     let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
@@ -1437,17 +1584,6 @@ pub(crate) fn handle_update_node(
         Err(resp) => return resp,
     };
 
-    if protocol == "SOCKS4"
-        && (explicit_password.is_some()
-            || (req.keep_password == Some(true) && req.clear_password != Some(true)))
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
-        );
-    }
-
     let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
     let Some(existing) = nodes_guard.get(&req.id) else {
         return (
@@ -1458,25 +1594,19 @@ pub(crate) fn handle_update_node(
     };
 
     let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
-    let password = if protocol == "SOCKS4" || username.is_none() || req.clear_password == Some(true) {
-        None
-    } else if explicit_password.is_some() {
-        explicit_password
-    } else if req.keep_password.unwrap_or(false) {
-        if username != existing.username && existing_password.is_some() {
-            return (
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
-                    "error.password_required_on_user_change",
-                ),
-            );
-        }
-        existing_password
-    } else {
-        None
+    let password = match resolve_updated_password(
+        &protocol,
+        &username,
+        &existing.username,
+        existing_password,
+        explicit_password,
+        req.keep_password,
+        false,
+        req.clear_password,
+        locale,
+    ) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
 
     let client = build_proxy_client(&protocol, &server_addr, &username, &password);
@@ -1534,37 +1664,20 @@ pub(crate) fn handle_patch_node(
         Err(resp) => return resp,
     };
 
-    if protocol == "SOCKS4"
-        && (explicit_password.is_some()
-            || (req.keep_password == Some(true) && req.clear_password != Some(true)))
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
-        );
-    }
-
     let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
-    let password = if protocol == "SOCKS4" || username.is_none() || req.clear_password == Some(true) {
-        None
-    } else if explicit_password.is_some() {
-        explicit_password
-    } else if req.keep_password == Some(false) {
-        None
-    } else {
-        if username != existing.username && existing_password.is_some() {
-            return (
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
-                    "error.password_required_on_user_change",
-                ),
-            );
-        }
-        existing_password
+    let password = match resolve_updated_password(
+        &protocol,
+        &username,
+        &existing.username,
+        existing_password,
+        explicit_password,
+        req.keep_password,
+        true,
+        req.clear_password,
+        locale,
+    ) {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
 
     let client = build_proxy_client(&protocol, &server_addr, &username, &password);
@@ -2036,20 +2149,16 @@ fn build_system_info(
     }
 }
 
-fn persist_config(
-    config_store: Option<&ConfigStore>,
+async fn persist_config_async(
+    store: Arc<ConfigStore>,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     rule_engine: &RuleEngine,
-) {
-    if let Some(store) = config_store
-        && let Err(e) = store.save_runtime(proxy_nodes, rule_engine)
-    {
-        error!(
-            "[Config] Auto-persisting config file ({}) failed: {:#}",
-            store.path().display(),
-            e
-        );
-    }
+) -> Result<()> {
+    let cfg = ConfigStore::snapshot_runtime(proxy_nodes, rule_engine);
+    tokio::task::spawn_blocking(move || store.save_profile(&cfg))
+        .await
+        .context("Configuration persistence background task failed")??;
+    Ok(())
 }
 
 async fn send_http_response(
@@ -2757,7 +2866,7 @@ mod tests {
         .await;
         assert!(resp1.starts_with("HTTP/1.1 200 OK"), "resp1: {resp1}");
 
-        let put_node2 = r#"{"id":101,"name":"SG-Auth-Renamed","protocol":"SOCKS5","server_addr":"10.10.0.1:1080","username":"alice","password":"","keep_password":true}"#;
+        let put_node2 = r#"{"id":101,"name":"SG-Auth-Renamed","protocol":"SOCKS5","server_addr":"10.10.0.1:1080","username":"alice","password":null,"keep_password":true}"#;
         let resp2 = raw_http(
             addr,
             &format!(
@@ -3037,5 +3146,165 @@ mod tests {
         let fake_val: serde_json::Value = serde_json::from_str(&sim_fake.2).unwrap();
         assert_eq!(fake_val["target_host"], "secret.internal");
         assert!(fake_val["target_ip"].is_null());
+    }
+
+    #[tokio::test]
+    async fn test_api_persist_failure_rolls_back_and_returns_500_and_auth_validation() {
+        // 1. Unwritable parent path (regular file used as parent directory) forces save_profile to fail
+        let mut blocker = std::env::current_dir().unwrap().join("target");
+        blocker.push(format!("flowx_readonly_parent_{}.tmp", std::process::id()));
+        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let bad_cfg_path = blocker.join("flowx.xml");
+        let store = Arc::new(ConfigStore::new(&bad_cfg_path));
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let srv = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            mgr,
+            Arc::clone(&re),
+            Arc::clone(&nodes),
+        )
+        .with_self_ports(vec![40001, 40080, 1053])
+        .with_config_store(store);
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (tx, rx) = watch::channel(false);
+        tokio::spawn(async move { srv.run(listener, rx).await });
+        let _keep_tx = tx;
+
+        let add_node_body =
+            r#"{"name":"Node-Rollback","protocol":"SOCKS5","server_addr":"10.0.0.1:1080"}"#;
+        let r_node_fail = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                add_node_body.len(),
+                add_node_body
+            ),
+        )
+        .await;
+        assert!(
+            r_node_fail.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "Persist failure must return HTTP 500: {r_node_fail}"
+        );
+        assert!(r_node_fail.contains("ERR_CONFIG_PERSIST_FAILED"));
+        assert!(
+            nodes.read().unwrap().is_empty(),
+            "Failed disk persistence must roll back added proxy node"
+        );
+
+        let add_rule_body = r#"{"name":"Rule-Rollback","action":"Block","targets":"example.com"}"#;
+        let r_rule_fail = raw_http(
+            addr,
+            &format!(
+                "POST /api/rules HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                add_rule_body.len(),
+                add_rule_body
+            ),
+        )
+        .await;
+        assert!(r_rule_fail.starts_with("HTTP/1.1 500 Internal Server Error"));
+        assert!(
+            re.current_rules().is_empty(),
+            "Failed disk persistence must roll back added rule"
+        );
+        let _ = std::fs::remove_file(&blocker);
+
+        // 2. Password without username / HTTP ':' in username / empty string password semantics (P1-5 + P1-6b)
+        let (api_addr, api_nodes, _api_re, _tx2) = spawn_test_api().await;
+        let api_port = api_addr.port();
+
+        let pw_only = r#"{"name":"bad","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","password":"secret"}"#;
+        let r_pw_only = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                pw_only.len(),
+                pw_only
+            ),
+        )
+        .await;
+        assert!(r_pw_only.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_pw_only.contains("ERR_PASSWORD_WITHOUT_USERNAME"));
+
+        let http_colon = r#"{"name":"badhttp","protocol":"HTTP","server_addr":"10.0.0.2:8080","username":"a:b","password":"secret"}"#;
+        let r_colon = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                http_colon.len(),
+                http_colon
+            ),
+        )
+        .await;
+        assert!(r_colon.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_colon.contains("ERR_HTTP_USERNAME_COLON"));
+
+        let empty_add_pw = r#"{"name":"badadd","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","password":""}"#;
+        let r_empty_add = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                empty_add_pw.len(),
+                empty_add_pw
+            ),
+        )
+        .await;
+        assert!(r_empty_add.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_empty_add.contains("ERR_EMPTY_PASSWORD"));
+
+        // Create node with credentials, then PATCH {"password": ""} clears password instead of keeping old one
+        let ok_add = r#"{"name":"s5ok","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","username":"alice","password":"pw1"}"#;
+        let r_ok_add = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                ok_add.len(),
+                ok_add
+            ),
+        )
+        .await;
+        assert!(r_ok_add.starts_with("HTTP/1.1 200 OK"));
+
+        let conflict_patch = r#"{"id":101,"password":"","keep_password":true}"#;
+        let r_conflict = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                conflict_patch.len(),
+                conflict_patch
+            ),
+        )
+        .await;
+        assert!(r_conflict.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_conflict.contains("ERR_CONFLICTING_PASSWORD_OPTIONS"));
+
+        let clear_via_empty_str = r#"{"id":101,"password":""}"#;
+        let r_clear = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                clear_via_empty_str.len(),
+                clear_via_empty_str
+            ),
+        )
+        .await;
+        assert!(r_clear.starts_with("HTTP/1.1 200 OK"));
+        assert_eq!(
+            api_nodes.read().unwrap().get(&101).unwrap().client.auth_credentials(),
+            (None, None),
+            "PATCH with explicit empty password string must clear stored password"
+        );
     }
 }

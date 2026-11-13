@@ -334,6 +334,12 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty());
     let password = item.password.filter(|p| !p.is_empty());
+    if proto == "HTTP" && username.as_deref().is_some_and(|u| u.contains(':')) {
+        bail!("Node #{} HTTP proxy username cannot contain ':' (RFC 7617)", item.id);
+    }
+    if proto != "SOCKS4" && username.is_none() && password.is_some() {
+        bail!("Node #{} has a password configured without a username", item.id);
+    }
     let name = item
         .name
         .map(|n| n.trim().to_string())
@@ -392,23 +398,53 @@ impl ConfigStore {
         &self.path
     }
 
-    /// 从磁盘加载配置；仅在明确 `NotFound` 时生成默认配置，其他 I/O 错误直接失败以免覆盖不可读配置
-    pub fn load_or_init(&self, self_ports: &[u16]) -> Result<(RuntimeProfile, bool)> {
+    fn read_existing_opt(&self, self_ports: &[u16]) -> Result<Option<RuntimeProfile>> {
         match std::fs::read_to_string(&self.path) {
             Ok(xml) => {
                 let cfg = ProfileConfig::from_xml(&xml)
                     .with_context(|| format!("Failed to parse XML configuration file: {}", self.path.display()))?;
                 let runtime = cfg.into_runtime(self_ports)?;
-                Ok((runtime, false))
+                Ok(Some(runtime))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let default_cfg = ProfileConfig::default_profile();
-                self.write_config_atomic(&default_cfg)?;
-                let runtime = default_cfg.into_runtime(self_ports)?;
-                Ok((runtime, true))
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).with_context(|| format!("Failed to read configuration file: {}", self.path.display())),
         }
+    }
+
+    /// 仅读取并解析已有配置文件；文件不存在时直接报错，绝不新建或修改磁盘文件（供只读 CLI 命令使用）
+    pub fn load_existing(&self, self_ports: &[u16]) -> Result<RuntimeProfile> {
+        match self.read_existing_opt(self_ports)? {
+            Some(rt) => Ok(rt),
+            None => bail!("Configuration file not found: {}", self.path.display()),
+        }
+    }
+
+    /// 从磁盘加载配置；仅在明确 `NotFound` 时生成默认配置，其他 I/O 错误直接失败以免覆盖不可读配置
+    pub fn load_or_init(&self, self_ports: &[u16]) -> Result<(RuntimeProfile, bool)> {
+        if let Some(runtime) = self.read_existing_opt(self_ports)? {
+            return Ok((runtime, false));
+        }
+        let default_cfg = ProfileConfig::default_profile();
+        self.write_config_atomic(&default_cfg)?;
+        let runtime = default_cfg.into_runtime(self_ports)?;
+        Ok((runtime, true))
+    }
+
+    /// 构造当前运行时状态的配置快照（仅在内存中读锁获取后立即释放）
+    pub fn snapshot_runtime(
+        proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+        rule_engine: &RuleEngine,
+    ) -> ProfileConfig {
+        let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
+        let rules = rule_engine.current_rules();
+        let default_action = rule_engine.default_action();
+        ProfileConfig::from_runtime(&nodes_guard, &rules, &default_action)
+    }
+
+    /// 串行加锁后将已构建的配置快照原子写入磁盘（适合在 `tokio::task::spawn_blocking` 中调用）
+    pub fn save_profile(&self, cfg: &ProfileConfig) -> Result<()> {
+        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_config_atomic(cfg)
     }
 
     /// 串行化读取当前内存快照并原子写回 XML 文件
@@ -417,14 +453,8 @@ impl ConfigStore {
         proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
         rule_engine: &RuleEngine,
     ) -> Result<()> {
-        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let cfg = {
-            let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-            let rules = rule_engine.current_rules();
-            let default_action = rule_engine.default_action();
-            ProfileConfig::from_runtime(&nodes_guard, &rules, &default_action)
-        };
-        self.write_config_atomic(&cfg)
+        let cfg = Self::snapshot_runtime(proxy_nodes, rule_engine);
+        self.save_profile(&cfg)
     }
 
     fn write_config_atomic(&self, cfg: &ProfileConfig) -> Result<()> {
