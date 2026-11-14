@@ -24,6 +24,10 @@ quick-xml = { version = "0.36", features = ["serialize"] }
 ipnet = "2.9"
 glob = "0.3"
 
+# 透明代理协议栈与报文解析（纯 Rust 无 C 构建依赖）
+smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
+etherparse = "0.21.0"
+
 # Windows 原生网络/进程 API 交互（仅在 Windows 目标平台编译）
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -31,8 +35,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    "Win32_Security",
     "Win32_Security_Cryptography",
-    "Win32_System_Threading"
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging"
 ] }
 
 [target.'cfg(unix)'.dependencies]

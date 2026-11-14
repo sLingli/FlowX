@@ -1,1 +1,1072 @@
+pub mod dns_hijack;
+pub mod netstack;
 pub mod sniffer;
+
+#[cfg(windows)]
+pub mod pid_table;
+#[cfg(windows)]
+pub mod windivert_ffi;
+
+use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
+
+use crate::dns::server::DnsServer;
+use crate::interceptor::dispatcher::{dispatch_transparent_stream, DispatcherConfig};
+
+/// 透明代理配置（持久化至 `<TransparentProxy>`）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransparentSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub hijack_dns: bool,
+    #[serde(default = "default_true")]
+    pub block_quic_for_proxied: bool,
+    #[serde(default)]
+    pub dll_path: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for TransparentSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            hijack_dns: true,
+            block_quic_for_proxied: true,
+            dll_path: None,
+        }
+    }
+}
+
+/// 透明代理运行时诊断与流量统计快照
+#[derive(Debug, Clone, Serialize)]
+pub struct TransparentRuntimeStatus {
+    pub supported: bool,
+    pub enabled: bool,
+    pub running: bool,
+    pub elevated: bool,
+    pub dll_found: bool,
+    pub sys_found: bool,
+    pub dll_path: Option<String>,
+    pub sys_path: Option<String>,
+    pub searched_dirs: Vec<String>,
+    pub driver_version: Option<String>,
+    pub active_flows: usize,
+    pub tcp_intercepted_total: u64,
+    pub tcp_passthrough_total: u64,
+    pub tcp_blocked_rst_total: u64,
+    pub dns_hijacked_total: u64,
+    pub quic_blocked_total: u64,
+    pub hijack_dns: bool,
+    pub block_quic_for_proxied: bool,
+    pub configured_dll_path: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct TransparentStatsCounters {
+    active_flows: AtomicUsize,
+    tcp_intercepted_total: AtomicU64,
+    tcp_passthrough_total: AtomicU64,
+    tcp_blocked_rst_total: AtomicU64,
+    dns_hijacked_total: AtomicU64,
+    quic_blocked_total: AtomicU64,
+}
+
+/// 检测当前进程是否拥有 Windows 管理员提升令牌（非 Windows 返回 `false`）
+pub fn is_process_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0
+                || token.is_null()
+            {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut ret_len = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut ret_len,
+            );
+            CloseHandle(token);
+            ok != 0 && elevation.TokenIsElevated != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 刷新 Windows 系统 DNS 缓存，确保切入/退出透明模式时清理陈旧解析记录及 Fake-IP 残留
+pub fn flush_dns_cache() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::ffi::CString;
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+
+        type FnDnsFlushResolverCache = unsafe extern "system" fn() -> i32;
+        let dll_wide: Vec<u16> = "dnsapi.dll\0".encode_utf16().collect();
+        let module = unsafe { LoadLibraryW(dll_wide.as_ptr()) };
+        if !module.is_null() {
+            let sym = CString::new("DnsFlushResolverCache").unwrap();
+            let proc = unsafe { GetProcAddress(module, sym.as_ptr() as *const u8) };
+            let flushed = if let Some(ptr) = proc {
+                let func: FnDnsFlushResolverCache =
+                    unsafe { std::mem::transmute_copy(&ptr) };
+                unsafe { func() != 0 }
+            } else {
+                false
+            };
+            unsafe {
+                FreeLibrary(module);
+            }
+            if flushed {
+                return Ok(());
+            }
+        }
+
+        // 后备方案：静默执行 ipconfig /flushdns（隐藏控制台窗口）
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let status = std::process::Command::new("ipconfig")
+            .arg("/flushdns")
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other("Failed to flush Windows DNS cache"))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
+/// 按 Windows `CommandLineToArgvW` 规范转义命令行参数
+pub fn quote_windows_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"')) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+            }
+            '"' => {
+                for _ in 0..(backslashes * 2 + 1) {
+                    out.push('\\');
+                }
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// 基于现有命令行参数重建提权重启参数：剔除旧的 `--replace-pid`/`--no-transparent`，并注入 `--transparent --replace-pid <pid>`
+pub fn build_elevated_relaunch_args(
+    raw_args: &[String],
+    current_pid: u32,
+    extra_args: &[String],
+) -> String {
+    let mut preserved: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+    // 跳过 argv[0] 若它看上去像可执行路径
+    if raw_args.first().is_some() {
+        idx = 1;
+    }
+
+    while idx < raw_args.len() {
+        let arg = &raw_args[idx];
+        if arg == "--replace-pid" {
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--replace-pid=")
+            || arg == "--transparent"
+            || arg == "--no-transparent"
+        {
+            idx += 1;
+            continue;
+        }
+        preserved.push(arg.clone());
+        idx += 1;
+    }
+
+    preserved.push("--transparent".to_string());
+    preserved.push("--replace-pid".to_string());
+    preserved.push(current_pid.to_string());
+    for extra in extra_args {
+        if !extra.is_empty() {
+            preserved.push(extra.clone());
+        }
+    }
+
+    preserved
+        .into_iter()
+        .map(|a| quote_windows_arg(&a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 触发 Windows UAC 提权以 `--transparent --replace-pid <当前PID>` 重启 FlowX，由新实例平滑接管配置与端口
+pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        if is_process_elevated() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Process is already running with Administrator privileges",
+            ));
+        }
+
+        let exe_path = std::env::current_exe()?;
+        let cwd = std::env::current_dir().ok();
+        let raw_args: Vec<String> = std::env::args().collect();
+        let params = build_elevated_relaunch_args(&raw_args, std::process::id(), extra_args);
+
+        let verb_w: Vec<u16> = "runas\0".encode_utf16().collect();
+        let exe_w: Vec<u16> = exe_path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
+        let cwd_w: Option<Vec<u16>> = cwd.map(|p| {
+            p.to_string_lossy()
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect()
+        });
+
+        let ret = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb_w.as_ptr(),
+                exe_w.as_ptr(),
+                params_w.as_ptr(),
+                cwd_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                SW_SHOWNORMAL,
+            )
+        };
+        let code = ret as isize;
+        if code <= 32 {
+            let msg = match code {
+                5 | 1223 => "ERR_TRANSPARENT_UAC_CANCELLED: Administrator elevation prompt was cancelled or denied.",
+                2 | 3 => "Failed to locate executable path while requesting elevation.",
+                _ => "ShellExecuteW(runas) failed to launch elevated FlowX instance.",
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{msg} (ShellExecute code {code})"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = extra_args;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "ERR_TRANSPARENT_UNSUPPORTED_OS: Elevated WinDivert relaunch is only supported on Windows.",
+        ))
+    }
+}
+
+#[cfg(windows)]
+struct ActiveRuntime {
+    stop_flag: Arc<AtomicBool>,
+    signal: Arc<netstack::NetstackSignal>,
+    socket_handle: Arc<windivert_ffi::WinDivertHandle>,
+    network_handle: Arc<windivert_ffi::WinDivertHandle>,
+    threads: Vec<JoinHandle<()>>,
+    driver_version: Option<String>,
+}
+
+/// 透明代理全生命周期管理器：负责 WinDivert 驱动加载、双层截获线程调度、错误诊断与 Drop 安全回收
+pub struct TransparentManager {
+    dispatcher_config: Arc<DispatcherConfig>,
+    dns_server: Arc<DnsServer>,
+    settings: Mutex<TransparentSettings>,
+    live_hijack_dns: Arc<AtomicBool>,
+    live_block_quic: Arc<AtomicBool>,
+    stats: Arc<TransparentStatsCounters>,
+    last_error: Mutex<Option<String>>,
+    lifecycle_lock: Mutex<()>,
+    #[cfg(windows)]
+    runtime: Mutex<Option<ActiveRuntime>>,
+}
+
+impl TransparentManager {
+    pub fn new(
+        dispatcher_config: Arc<DispatcherConfig>,
+        dns_server: Arc<DnsServer>,
+        initial_settings: TransparentSettings,
+    ) -> Arc<Self> {
+        let hijack = initial_settings.hijack_dns;
+        let block_quic = initial_settings.block_quic_for_proxied;
+        Arc::new(Self {
+            dispatcher_config,
+            dns_server,
+            settings: Mutex::new(initial_settings),
+            live_hijack_dns: Arc::new(AtomicBool::new(hijack)),
+            live_block_quic: Arc::new(AtomicBool::new(block_quic)),
+            stats: Arc::new(TransparentStatsCounters::default()),
+            last_error: Mutex::new(None),
+            lifecycle_lock: Mutex::new(()),
+            #[cfg(windows)]
+            runtime: Mutex::new(None),
+        })
+    }
+
+    pub fn settings(&self) -> TransparentSettings {
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn is_running(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.runtime
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    pub fn status(&self) -> TransparentRuntimeStatus {
+        let cfg = self.settings();
+        let last_error = self
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        #[cfg(windows)]
+        let (dll_found, sys_found, dll_path, sys_path, searched_dirs) = {
+            let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
+            (
+                avail.dll_found,
+                avail.sys_found,
+                avail.dll_path,
+                avail.sys_path,
+                avail.searched_dirs,
+            )
+        };
+        #[cfg(not(windows))]
+        let (dll_found, sys_found, dll_path, sys_path, searched_dirs) =
+            (false, false, None, None, Vec::new());
+
+        #[cfg(windows)]
+        let (running, driver_version) = {
+            let guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                guard.is_some(),
+                guard.as_ref().and_then(|rt| rt.driver_version.clone()),
+            )
+        };
+        #[cfg(not(windows))]
+        let (running, driver_version) = (false, None);
+
+        TransparentRuntimeStatus {
+            supported: cfg!(windows),
+            enabled: cfg.enabled,
+            running,
+            elevated: is_process_elevated(),
+            dll_found,
+            sys_found,
+            dll_path,
+            sys_path,
+            searched_dirs,
+            driver_version,
+            active_flows: self.stats.active_flows.load(Ordering::Relaxed),
+            tcp_intercepted_total: self.stats.tcp_intercepted_total.load(Ordering::Relaxed),
+            tcp_passthrough_total: self.stats.tcp_passthrough_total.load(Ordering::Relaxed),
+            tcp_blocked_rst_total: self.stats.tcp_blocked_rst_total.load(Ordering::Relaxed),
+            dns_hijacked_total: self.stats.dns_hijacked_total.load(Ordering::Relaxed),
+            quic_blocked_total: self.stats.quic_blocked_total.load(Ordering::Relaxed),
+            hijack_dns: cfg.hijack_dns,
+            block_quic_for_proxied: cfg.block_quic_for_proxied,
+            configured_dll_path: cfg.dll_path,
+            last_error,
+        }
+    }
+
+    /// 根据新配置热启/热停透明代理或更新实时开关；若启用失败返回明确错误码字符串
+    pub fn apply_settings(
+        &self,
+        next: TransparentSettings,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<(), String> {
+        let _guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let prev = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = next.clone();
+        self.live_hijack_dns
+            .store(next.hijack_dns, Ordering::Release);
+        self.live_block_quic
+            .store(next.block_quic_for_proxied, Ordering::Release);
+
+        if !next.enabled {
+            self.stop_locked();
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            return Ok(());
+        }
+
+        if prev.dll_path != next.dll_path && self.is_running() {
+            self.stop_locked();
+        }
+
+        self.start_locked(rt_handle, &next)
+    }
+
+    /// 尝试按照当前 `settings` 启动透明代理
+    pub fn start(&self, rt_handle: &tokio::runtime::Handle) -> Result<(), String> {
+        let _guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cfg = self.settings();
+        self.live_hijack_dns
+            .store(cfg.hijack_dns, Ordering::Release);
+        self.live_block_quic
+            .store(cfg.block_quic_for_proxied, Ordering::Release);
+        self.start_locked(rt_handle, &cfg)
+    }
+
+    /// 幂等关闭所有 WinDivert 句柄并等待工作线程退出、冲刷 DNS 缓存
+    pub fn stop(&self) {
+        let _guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.stop_locked();
+    }
+
+    fn set_error(&self, msg: String) -> String {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.clone());
+        msg
+    }
+
+    #[cfg(not(windows))]
+    fn start_locked(
+        &self,
+        _rt_handle: &tokio::runtime::Handle,
+        _cfg: &TransparentSettings,
+    ) -> Result<(), String> {
+        Err(self.set_error(
+            "ERR_TRANSPARENT_UNSUPPORTED_OS: WinDivert transparent proxy is only supported on Windows."
+                .to_string(),
+        ))
+    }
+
+    #[cfg(not(windows))]
+    fn stop_locked(&self) {}
+
+    #[cfg(windows)]
+    fn start_locked(
+        &self,
+        rt_handle: &tokio::runtime::Handle,
+        cfg: &TransparentSettings,
+    ) -> Result<(), String> {
+        if self.runtime.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return Ok(());
+        }
+
+        if !is_process_elevated() {
+            return Err(self.set_error(
+                "ERR_TRANSPARENT_REQUIRES_ADMIN: Transparent proxy requires Administrator privileges to open WinDivert."
+                    .to_string(),
+            ));
+        }
+
+        let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
+        if !avail.dll_found || !avail.sys_found {
+            let searched = if avail.searched_dirs.is_empty() {
+                "current directory".to_string()
+            } else {
+                avail.searched_dirs.join(", ")
+            };
+            return Err(self.set_error(format!(
+                "ERR_TRANSPARENT_MISSING_DRIVER: Missing WinDivert.dll (found={}) or WinDivert64.sys (found={}). Place both files next to flowx.exe. Searched: {}",
+                avail.dll_found, avail.sys_found, searched
+            )));
+        }
+
+        let api = windivert_ffi::WinDivertApi::load(cfg.dll_path.as_deref()).map_err(|e| {
+            self.set_error(format!(
+                "ERR_TRANSPARENT_LOAD_FAILED: Failed to load WinDivert.dll: {e}"
+            ))
+        })?;
+
+        let socket_filter =
+            "(tcp or udp) and (event == BIND or event == CONNECT or event == LISTEN or event == ACCEPT or event == CLOSE)";
+        let socket_handle = Arc::new(
+            windivert_ffi::WinDivertHandle::open(
+                Arc::clone(&api),
+                socket_filter,
+                windivert_ffi::WinDivertLayer::Socket,
+                0,
+                windivert_ffi::WINDIVERT_FLAG_RECV_ONLY,
+            )
+            .map_err(|e| {
+                self.set_error(format!(
+                    "ERR_TRANSPARENT_OPEN_SOCKET_LAYER: {e}"
+                ))
+            })?,
+        );
+
+        let network_filter =
+            "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443)";
+        let network_handle = Arc::new(
+            windivert_ffi::WinDivertHandle::open(
+                Arc::clone(&api),
+                network_filter,
+                windivert_ffi::WinDivertLayer::Network,
+                0,
+                0,
+            )
+            .map_err(|e| {
+                self.set_error(format!(
+                    "ERR_TRANSPARENT_OPEN_NETWORK_LAYER: {e}"
+                ))
+            })?,
+        );
+
+        let _ = network_handle.set_param(
+            windivert_ffi::WinDivertParam::QueueLength,
+            windivert_ffi::WINDIVERT_PARAM_QUEUE_LENGTH_MAX,
+        );
+        let _ = network_handle.set_param(
+            windivert_ffi::WinDivertParam::QueueTime,
+            windivert_ffi::WINDIVERT_PARAM_QUEUE_TIME_DEFAULT,
+        );
+        let _ = network_handle.set_param(windivert_ffi::WinDivertParam::QueueSize, 16_777_216);
+
+        let driver_version = network_handle
+            .version()
+            .map(|(maj, min)| format!("{maj}.{min}"));
+
+        // 启动前刷新本机 DNS 缓存，确保系统不继续使用开启前的直连 IP 缓存绕开 Fake-IP
+        if let Err(e) = flush_dns_cache() {
+            warn!(error = %e, "Failed to flush Windows DNS cache before starting transparent mode");
+        }
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let pid_table = Arc::new(pid_table::SocketPidTable::new());
+        let signal = Arc::new(netstack::NetstackSignal::new());
+
+        let mut threads = Vec::with_capacity(3);
+
+        // 1. SOCKET 层监听线程：高速维护 (proto, local_ip, local_port) -> PID
+        {
+            let stop = Arc::clone(&stop_flag);
+            let sock_h = Arc::clone(&socket_handle);
+            let table = Arc::clone(&pid_table);
+            let handle = std::thread::Builder::new()
+                .name("flowx-windivert-socket".to_string())
+                .spawn(move || {
+                    let mut dummy = [0u8; 64];
+                    while !stop.load(Ordering::Acquire) {
+                        match sock_h.recv(&mut dummy) {
+                            Ok((_, addr)) => {
+                                let Some(event) =
+                                    windivert_ffi::WinDivertEvent::from_u8(addr.event())
+                                else {
+                                    continue;
+                                };
+                                let s = addr.socket_data();
+                                let local_ip = windivert_ffi::decode_windivert_addr(
+                                    &s.local_addr,
+                                    addr.ipv6(),
+                                );
+                                table.record_event(
+                                    event,
+                                    s.protocol,
+                                    local_ip,
+                                    s.local_port,
+                                    s.process_id,
+                                );
+                            }
+                            Err(e) => {
+                                if stop.load(Ordering::Acquire)
+                                    || matches!(e.raw_os_error(), Some(6 | 232 | 995))
+                                {
+                                    break;
+                                }
+                                debug!(error = %e, "WinDivert SOCKET recv returned transient error");
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
+                })
+                .map_err(|e| self.set_error(format!("Failed to spawn socket monitor thread: {e}")))?;
+            threads.push(handle);
+        }
+
+        // 2. NETWORK 层抓包线程：快速分流自环放行 / UDP(DNS & QUIC) / TCP 入协议栈
+        {
+            let stop = Arc::clone(&stop_flag);
+            let net_h = Arc::clone(&network_handle);
+            let table = Arc::clone(&pid_table);
+            let sig = Arc::clone(&signal);
+            let dispatcher_cfg = Arc::clone(&self.dispatcher_config);
+            let dns_srv = Arc::clone(&self.dns_server);
+            let stats = Arc::clone(&self.stats);
+            let live_dns = Arc::clone(&self.live_hijack_dns);
+            let live_quic = Arc::clone(&self.live_block_quic);
+            let rt = rt_handle.clone();
+
+            let handle = std::thread::Builder::new()
+                .name("flowx-windivert-net-rx".to_string())
+                .spawn(move || {
+                    let mut buf = vec![0u8; 65_536];
+                    while !stop.load(Ordering::Acquire) {
+                        let (len, addr) = match net_h.recv(&mut buf) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                if stop.load(Ordering::Acquire)
+                                    || matches!(e.raw_os_error(), Some(6 | 232 | 995))
+                                {
+                                    break;
+                                }
+                                debug!(error = %e, "WinDivert NETWORK recv transient error");
+                                std::thread::yield_now();
+                                continue;
+                            }
+                        };
+                        if len == 0 {
+                            continue;
+                        }
+                        let raw = &buf[..len];
+                        let net_data = addr.network();
+
+                        if let Some(udp) = dns_hijack::parse_udp_packet(raw) {
+                            let pid = table.lookup(17, udp.src_ip, udp.src_port);
+                            let decision = dns_hijack::decide_udp_packet(
+                                &udp,
+                                pid,
+                                live_dns.load(Ordering::Acquire),
+                                live_quic.load(Ordering::Acquire),
+                                Some(&dispatcher_cfg.rule_engine),
+                                Some(&dispatcher_cfg.tracker),
+                                Some(&dispatcher_cfg.fake_ip_pool),
+                            );
+                            match decision {
+                                dns_hijack::UdpDecision::Passthrough => {
+                                    let _ = net_h.send(raw, &addr);
+                                }
+                                dns_hijack::UdpDecision::DropQuic => {
+                                    stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
+                                }
+                                dns_hijack::UdpDecision::HandleDns => {
+                                    stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
+                                    let owned_payload = udp.payload.to_vec();
+                                    let req_meta = (
+                                        udp.src_ip,
+                                        udp.dst_ip,
+                                        udp.src_port,
+                                        udp.dst_port,
+                                        udp.is_ipv6,
+                                    );
+                                    let net_inj = Arc::clone(&net_h);
+                                    let dns = Arc::clone(&dns_srv);
+                                    let loopback = addr.loopback();
+                                    rt.spawn(async move {
+                                        if let Some(resp_payload) =
+                                            dns.process_query_bytes(&owned_payload).await
+                                        {
+                                            let pseudo_req = dns_hijack::ParsedUdpPacket {
+                                                src_ip: req_meta.0,
+                                                dst_ip: req_meta.1,
+                                                src_port: req_meta.2,
+                                                dst_port: req_meta.3,
+                                                payload: &[],
+                                                is_ipv6: req_meta.4,
+                                            };
+                                            if let Ok(mut reply_ip) =
+                                                dns_hijack::build_udp_reply_ip_packet(
+                                                    &pseudo_req,
+                                                    &resp_payload,
+                                                )
+                                            {
+                                                let mut inj_addr = windivert_ffi::WinDivertAddress::inbound_injection(
+                                                    net_data.if_idx,
+                                                    net_data.sub_if_idx,
+                                                    loopback,
+                                                    req_meta.4,
+                                                );
+                                                net_inj.calc_checksums(&mut reply_ip, &mut inj_addr);
+                                                let _ = net_inj.send(&reply_ip, &inj_addr);
+                                            }
+                                        }
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+
+                        if let Some(tcp) = netstack::parse_tcp_packet(raw) {
+                            let pid = table.lookup(6, tcp.src_ip, tcp.src_port);
+                            if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port)
+                                || pid.is_some_and(pid_table::SocketPidTable::is_self_pid)
+                            {
+                                stats.tcp_passthrough_total.fetch_add(1, Ordering::Relaxed);
+                                let _ = net_h.send(raw, &addr);
+                                continue;
+                            }
+
+                            let meta = netstack::PacketInterfaceMeta {
+                                if_idx: net_data.if_idx,
+                                sub_if_idx: net_data.sub_if_idx,
+                                loopback: addr.loopback(),
+                                is_ipv6: tcp.is_ipv6,
+                                bitfield: addr.raw_bitfield(),
+                            };
+                            sig.push_outbound_tcp(raw.to_vec(), meta, pid);
+                            continue;
+                        }
+
+                        // 其余异常/分片报文安全放行
+                        let _ = net_h.send(raw, &addr);
+                    }
+                })
+                .map_err(|e| self.set_error(format!("Failed to spawn network recv thread: {e}")))?;
+            threads.push(handle);
+        }
+
+        // 3. 用户态协议栈 Actor 线程：单所有权运行 smoltcp 并协调 AsyncRead/AsyncWrite 与入站注入
+        {
+            let stop = Arc::clone(&stop_flag);
+            let net_h = Arc::clone(&network_handle);
+            let sig = Arc::clone(&signal);
+            let dispatcher_cfg = Arc::clone(&self.dispatcher_config);
+            let stats = Arc::clone(&self.stats);
+            let rt = rt_handle.clone();
+
+            let handle = std::thread::Builder::new()
+                .name("flowx-windivert-netstack".to_string())
+                .spawn(move || {
+                    let mut engine = netstack::NetstackEngine::new(Arc::clone(&sig));
+                    let mut batch = Vec::with_capacity(64);
+                    let mut accepted = Vec::with_capacity(16);
+                    let mut tx_packets = Vec::with_capacity(64);
+                    let mut wait_budget = std::time::Duration::from_millis(20);
+
+                    while !stop.load(Ordering::Acquire) {
+                        let alive = sig.wait_drain_or_timeout(wait_budget, &mut batch);
+                        if !alive || stop.load(Ordering::Acquire) {
+                            break;
+                        }
+
+                        for (raw_ip, meta, pid) in batch.drain(..) {
+                            match engine.ingest_outbound_tcp(
+                                raw_ip,
+                                meta,
+                                pid,
+                                Some(&dispatcher_cfg.rule_engine),
+                                Some(&dispatcher_cfg.tracker),
+                                Some(&dispatcher_cfg.fake_ip_pool),
+                                &mut accepted,
+                                &mut tx_packets,
+                            ) {
+                                netstack::TcpIngestOutcome::Intercepted => {}
+                                netstack::TcpIngestOutcome::Passthrough(pkt) => {
+                                    stats.tcp_passthrough_total.fetch_add(1, Ordering::Relaxed);
+                                    let passthru_addr =
+                                        windivert_ffi::WinDivertAddress::outbound_passthrough(
+                                            pkt.meta.if_idx,
+                                            pkt.meta.sub_if_idx,
+                                            pkt.meta.bitfield,
+                                        );
+                                    let _ = net_h.send(&pkt.data, &passthru_addr);
+                                }
+                                netstack::TcpIngestOutcome::InjectRst(mut rst_pkt) => {
+                                    stats.tcp_blocked_rst_total.fetch_add(1, Ordering::Relaxed);
+                                    let mut rst_addr =
+                                        windivert_ffi::WinDivertAddress::inbound_injection(
+                                            rst_pkt.meta.if_idx,
+                                            rst_pkt.meta.sub_if_idx,
+                                            rst_pkt.meta.loopback,
+                                            rst_pkt.meta.is_ipv6,
+                                        );
+                                    net_h.calc_checksums(&mut rst_pkt.data, &mut rst_addr);
+                                    let _ = net_h.send(&rst_pkt.data, &rst_addr);
+                                }
+                            }
+                        }
+
+                        for flow in accepted.drain(..) {
+                            stats.tcp_intercepted_total.fetch_add(1, Ordering::Relaxed);
+                            let dcfg = Arc::clone(&dispatcher_cfg);
+                            rt.spawn(async move {
+                                if let Err(e) = dispatch_transparent_stream(
+                                    dcfg,
+                                    flow.stream,
+                                    flow.peer_addr,
+                                    flow.orig_dst,
+                                    flow.pid_hint,
+                                    flow.needs_domain_sniff,
+                                )
+                                .await
+                                {
+                                    debug!(
+                                        orig_dst = %flow.orig_dst,
+                                        error = %e,
+                                        "Transparent TCP stream finished with error"
+                                    );
+                                }
+                            });
+                        }
+
+                        wait_budget = engine.pump(&mut tx_packets);
+                        stats
+                            .active_flows
+                            .store(engine.active_flow_count(), Ordering::Relaxed);
+
+                        for mut tx_pkt in tx_packets.drain(..) {
+                            let mut inj_addr = windivert_ffi::WinDivertAddress::inbound_injection(
+                                tx_pkt.meta.if_idx,
+                                tx_pkt.meta.sub_if_idx,
+                                tx_pkt.meta.loopback,
+                                tx_pkt.meta.is_ipv6,
+                            );
+                            net_h.calc_checksums(&mut tx_pkt.data, &mut inj_addr);
+                            let _ = net_h.send(&tx_pkt.data, &inj_addr);
+                        }
+                    }
+                })
+                .map_err(|e| self.set_error(format!("Failed to spawn netstack actor thread: {e}")))?;
+            threads.push(handle);
+        }
+
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.runtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActiveRuntime {
+            stop_flag,
+            signal,
+            socket_handle,
+            network_handle,
+            threads,
+            driver_version: driver_version.clone(),
+        });
+
+        info!(
+            loaded_from = %api.loaded_from(),
+            driver_version = driver_version.as_deref().unwrap_or("unknown"),
+            "Transparent proxy started via WinDivert"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn stop_locked(&self) {
+        let rt_opt = self.runtime.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let Some(rt) = rt_opt else {
+            return;
+        };
+
+        rt.stop_flag.store(true, Ordering::Release);
+        rt.signal.close();
+        let _ = rt
+            .socket_handle
+            .shutdown(windivert_ffi::WinDivertShutdownMode::Both);
+        let _ = rt
+            .network_handle
+            .shutdown(windivert_ffi::WinDivertShutdownMode::Both);
+
+        for th in rt.threads {
+            let _ = th.join();
+        }
+        drop(rt.socket_handle);
+        drop(rt.network_handle);
+        self.stats.active_flows.store(0, Ordering::Relaxed);
+
+        if let Err(e) = flush_dns_cache() {
+            warn!(error = %e, "Failed to flush Windows DNS cache while stopping transparent mode");
+        }
+        info!("Transparent proxy stopped cleanly and DNS cache flushed");
+    }
+}
+
+impl Drop for TransparentManager {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_transparent_settings_defaults_and_elevation_arg_quoting() {
+        let def = TransparentSettings::default();
+        assert!(!def.enabled);
+        assert!(def.hijack_dns);
+        assert!(def.block_quic_for_proxied);
+        assert!(def.dll_path.is_none());
+
+        assert_eq!(quote_windows_arg("--transparent"), "--transparent");
+        assert_eq!(quote_windows_arg(r"C:\Dir\"), r"C:\Dir\");
+        assert_eq!(
+            quote_windows_arg(r"C:\Program Files\FlowX\profile.xml"),
+            r#""C:\Program Files\FlowX\profile.xml""#
+        );
+        assert_eq!(
+            quote_windows_arg(r"C:\My Dir\"),
+            r#""C:\My Dir\\""#
+        );
+
+        let args = vec![
+            r"C:\FlowX\flowx.exe".to_string(),
+            "--config".to_string(),
+            r"C:\My Config\p.xml".to_string(),
+            "--no-transparent".to_string(),
+            "--replace-pid".to_string(),
+            "111".to_string(),
+            "--replace-pid=222".to_string(),
+            "--api-addr=127.0.0.1:19999".to_string(),
+        ];
+        let rebuilt = build_elevated_relaunch_args(&args, 4321, &[]);
+        assert_eq!(
+            rebuilt,
+            r#"--config "C:\My Config\p.xml" --api-addr=127.0.0.1:19999 --transparent --replace-pid 4321"#
+        );
+    }
+
+    #[test]
+    fn test_transparent_manager_status_and_driver_diagnostics() {
+        use crate::dns::FakeIpPool;
+        use crate::interceptor::process::ProcessTracker;
+        use crate::monitor::ConnectionManager;
+        use crate::router::{Action, RuleEngine};
+        use std::collections::HashMap;
+        use std::sync::RwLock;
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let fake_ip_pool = Arc::new(FakeIpPool::new_default());
+        let tracker = Arc::new(ProcessTracker::new());
+        let rule_engine = Arc::new(RuleEngine::new(vec![], Action::Direct));
+        let upstream_dns = "223.5.5.5:53".parse().unwrap();
+
+        let dispatcher_cfg = Arc::new(DispatcherConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            tracker,
+            fake_ip_pool: Arc::clone(&fake_ip_pool),
+            upstream_dns,
+            rule_engine,
+            monitor: Arc::new(ConnectionManager::new()),
+            proxy_nodes: Arc::new(RwLock::new(HashMap::new())),
+            proxy_chains: Arc::new(HashMap::new()),
+            self_ports: Vec::new(),
+        });
+        let dns_server = Arc::new(DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            fake_ip_pool,
+            upstream_dns,
+            true,
+        ));
+
+        // 指定一个明确不存在的 WinDivert 目录以确定性地测试缺驱动诊断分支（不触及系统驱动）
+        let mgr = TransparentManager::new(
+            dispatcher_cfg,
+            dns_server,
+            TransparentSettings {
+                enabled: false,
+                hijack_dns: true,
+                block_quic_for_proxied: true,
+                dll_path: Some(r"Z:\__nonexistent_windivert_test_dir__\WinDivert.dll".to_string()),
+            },
+        );
+
+        let st = mgr.status();
+        assert_eq!(st.supported, cfg!(windows));
+        assert!(!st.running);
+        assert!(!st.dll_found);
+        assert!(!st.sys_found);
+        assert_eq!(
+            st.configured_dll_path.as_deref(),
+            Some(r"Z:\__nonexistent_windivert_test_dir__\WinDivert.dll")
+        );
+
+        let _guard = rt.enter();
+        let err = mgr
+            .apply_settings(
+                TransparentSettings {
+                    enabled: true,
+                    hijack_dns: true,
+                    block_quic_for_proxied: true,
+                    dll_path: Some(r"Z:\__nonexistent_windivert_test_dir__\WinDivert.dll".to_string()),
+                },
+                rt.handle(),
+            )
+            .expect_err("Missing driver or non-admin must fail cleanly");
+        assert!(
+            err.contains("ERR_TRANSPARENT_"),
+            "Unexpected error code: {err}"
+        );
+        assert_eq!(mgr.status().last_error.as_deref(), Some(err.as_str()));
+        assert!(!mgr.is_running());
+
+        // 关闭应幂等清理 last_error
+        mgr.apply_settings(TransparentSettings::default(), rt.handle())
+            .unwrap();
+        assert!(mgr.status().last_error.is_none());
+    }
+}
