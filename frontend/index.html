@@ -1521,7 +1521,7 @@
               <span data-i18n="default_rule_desc">Default (Fallback Action) · Applied when no enabled rule above matches</span>
               <div class="default-rule-controls">
                 <span class="badge badge-muted" id="rules-default-badge" data-i18n="filter_direct">Direct</span>
-                <select class="form-select default-select" id="default-action-select" onchange="changeDefaultAction(this.value)" aria-label="Default Fallback Action"></select>
+                <select class="form-select default-select" id="default-action-select" onchange="changeDefaultAction(this.value)" aria-label="Default Fallback Action" data-i18n-aria-label="aria_default_action"></select>
               </div>
             </div>
           </div>
@@ -1687,6 +1687,7 @@
         lang_toggle_title: '切换语言 (Switch Language)',
         aria_menu: '菜单',
         aria_close: '关闭',
+        aria_default_action: '默认兜底策略',
         btn_refresh: '立即刷新',
 
         kpi_down_speed: '实时下载速率',
@@ -1758,6 +1759,8 @@
         node_latency_untested: '未测速',
         node_latency_testing: '测速中...',
         node_latency_unreachable: '不可达',
+        node_ping_timeout: '连接超时 (2000ms)',
+        node_latency_http_err: 'HTTP {status}',
         btn_ping: '测速',
         btn_edit: '编辑',
         btn_delete: '删除',
@@ -1918,6 +1921,7 @@
         lang_toggle_title: 'Switch Language / 切换语言',
         aria_menu: 'Menu',
         aria_close: 'Close',
+        aria_default_action: 'Default Fallback Action',
         btn_refresh: 'Refresh Now',
 
         kpi_down_speed: 'Live Download',
@@ -1989,6 +1993,8 @@
         node_latency_untested: 'Untested',
         node_latency_testing: 'Testing...',
         node_latency_unreachable: 'Unreachable',
+        node_ping_timeout: 'Connection timed out (2000ms)',
+        node_latency_http_err: 'HTTP {status}',
         btn_ping: 'Ping',
         btn_edit: 'Edit',
         btn_delete: 'Delete',
@@ -2182,11 +2188,26 @@
       return msg || t('toast_err_unknown');
     }
 
+    function classifyPingError(rawMsg) {
+      if (!rawMsg) return { errorKey: 'node_latency_unreachable' };
+      if (rawMsg === '连接超时 (2000ms)' || rawMsg === 'Connection timed out (2000ms)') {
+        return { errorKey: 'node_ping_timeout' };
+      }
+      if (rawMsg === '节点连通性探测失败' || rawMsg === 'Node connectivity probe failed') {
+        return { errorKey: 'node_latency_unreachable' };
+      }
+      return { serverError: true, errorText: rawMsg };
+    }
+
     // 节点测速结果只保存结构化状态，展示文案在渲染时按当前语言生成
     function latencyText(lat) {
       if (!lat) return t('node_latency_untested');
       if (lat.status === 'testing') return t('node_latency_testing');
-      if (lat.status === 'err') return lat.error || t('node_latency_unreachable');
+      if (lat.status === 'err') {
+        if (lat.errorKey) return t(lat.errorKey, lat.errorParams);
+        if (lat.errorText) return lat.errorText;
+        return t('node_latency_unreachable');
+      }
       return `${lat.ms} ms`;
     }
 
@@ -2276,6 +2297,13 @@
         loadRules();
         pollRealtime({ force: true, recordHistory: false });
         if (state.lastSimResult) runRouteSimulate(true);
+        Object.keys(state.latencies).forEach(rawId => {
+          const id = Number(rawId);
+          const lat = state.latencies[id];
+          if (lat && lat.status === 'err' && lat.serverError) {
+            pingNode(id, true);
+          }
+        });
       }
       const pauseBtn = document.getElementById('pause-poll-btn');
       if (pauseBtn) {
@@ -2827,19 +2855,21 @@
           state.latencies[id] = { status: ms < 150 ? 'ok' : 'warn', ms };
           if (!silent) showToast(t('toast_ping_handshake', { name: node.name, ms }));
         } else if (res.ok && data) {
-          const errText = data.message || data.error || t('node_latency_unreachable');
-          state.latencies[id] = { status: 'err', error: errText };
-          if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: errText }), 'error');
+          const rawMsg = data.message || data.error || '';
+          state.latencies[id] = { status: 'err', ...classifyPingError(rawMsg) };
+          if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: rawMsg || t('node_latency_unreachable') }), 'error');
         } else {
-          const errText = (data && (data.error || data.message)) || ('HTTP ' + res.status);
-          state.latencies[id] = { status: 'err', error: errText };
-          if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: errText }), 'error');
+          const rawMsg = (data && (data.error || data.message)) || '';
+          state.latencies[id] = rawMsg
+            ? { status: 'err', ...classifyPingError(rawMsg) }
+            : { status: 'err', errorKey: 'node_latency_http_err', errorParams: { status: res.status } };
+          if (!silent) showToast(t('toast_ping_fail', { name: node.name, error: rawMsg || ('HTTP ' + res.status) }), 'error');
         }
       } catch (e) {
         const isTimeout = e && e.name === 'AbortError';
         state.latencies[id] = {
           status: 'err',
-          error: isTimeout ? t('toast_ping_timeout') : t('toast_err_network')
+          errorKey: isTimeout ? 'toast_ping_timeout' : 'toast_err_network'
         };
         if (!silent) {
           showToast(
