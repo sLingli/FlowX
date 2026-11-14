@@ -8,6 +8,7 @@ pub mod interceptor;
 pub mod monitor;
 pub mod outbound;
 pub mod router;
+pub mod transparent;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

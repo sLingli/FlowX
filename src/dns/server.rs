@@ -622,6 +622,79 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
     false
 }
 
+/// 处理单条原始 DNS 查询报文并生成响应（未就绪或限流丢弃时返回 `None`）
+pub async fn handle_dns_query_bytes(
+    pool: &FakeIpPool,
+    upstream_dns: SocketAddr,
+    block_ipv6: bool,
+    upstream_limit: &Arc<Semaphore>,
+    query_bytes: &[u8],
+    peer_label: Option<SocketAddr>,
+) -> Option<Vec<u8>> {
+    match DnsPacketParser::parse_question(query_bytes) {
+        Ok((client_tx_id, question)) => {
+            debug!(
+                "[DNS Query] Client: {}, Domain: {}, QType: {}",
+                peer_label
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "transparent-udp53".to_string()),
+                question.name,
+                question.qtype
+            );
+
+            // 1. In anti-leak mode, block AAAA (28), SVCB (64), and HTTPS (65) queries
+            if block_ipv6 && matches!(question.qtype, 28 | 64 | 65) {
+                return Some(DnsPacketParser::build_empty_response(
+                    client_tx_id,
+                    query_bytes,
+                    question.raw_len,
+                ));
+            }
+
+            // 2. For A (IPv4) queries, allocate Fake-IP and respond
+            if question.qtype == 1 && question.qclass == 1 {
+                let fake_ip = pool.allocate(&question.name);
+                return Some(DnsPacketParser::build_a_response(
+                    client_tx_id,
+                    query_bytes,
+                    question.raw_len,
+                    fake_ip,
+                ));
+            }
+
+            // 3. Forward other queries to upstream DNS via per-query ephemeral UDP socket & CSPRNG TxID
+            let Ok(_up_permit) = Arc::clone(upstream_limit).try_acquire_owned() else {
+                warn!(
+                    "[DNS Engine] Upstream forwarding limit reached, dropping query: {}",
+                    question.name
+                );
+                return None;
+            };
+            let upstream_tx_id = csprng_u16();
+            let mut forward_bytes = query_bytes.to_vec();
+            forward_bytes[0..2].copy_from_slice(&upstream_tx_id.to_be_bytes());
+
+            if let Ok(Some((mut resp_bytes, _))) = forward_upstream_udp(
+                upstream_dns,
+                &forward_bytes,
+                upstream_tx_id,
+                &question,
+                UPSTREAM_DNS_TIMEOUT,
+            )
+            .await
+            {
+                resp_bytes[0..2].copy_from_slice(&client_tx_id.to_be_bytes());
+                return Some(resp_bytes);
+            }
+            None
+        }
+        Err(e) => {
+            warn!("[DNS Engine] Failed to parse DNS query packet: {}", e);
+            None
+        }
+    }
+}
+
 impl DnsServer {
     pub fn new(
         bind_addr: SocketAddr,
@@ -652,6 +725,24 @@ impl DnsServer {
             .with_context(|| format!("Failed to bind DNS server socket ({})", self.bind_addr))?;
         info!("[DNS Engine] Local DNS hijack and leak-prevention service bound on {}", self.bind_addr);
         Ok(Arc::new(socket))
+    }
+
+    /// 直接处理原始 DNS 查询报文（与 UDP 监听端共用 Fake-IP 分配、IPv6/HTTPS 防泄漏屏蔽及上游受控转发逻辑）
+    pub async fn process_query_bytes(&self, query_bytes: &[u8]) -> Option<Vec<u8>> {
+        let Ok(_permit) = self.concurrency_limit.clone().try_acquire_owned() else {
+            warn!("[DNS Engine] Dropped transparent DNS query exceeding concurrency limit (5000)");
+            return None;
+        };
+        let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
+        handle_dns_query_bytes(
+            &self.pool,
+            self.upstream_dns,
+            self.block_ipv6,
+            &self.upstream_limit,
+            query_bytes,
+            None,
+        )
+        .await
     }
 
     /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and ephemeral upstream isolation)
@@ -718,62 +809,17 @@ impl DnsServer {
             tokio::spawn(async move {
                 let _permit = permit;
                 let _in_flight = _in_flight;
-                match DnsPacketParser::parse_question(&query_bytes) {
-                    Ok((client_tx_id, question)) => {
-                        debug!(
-                            "[DNS Query] Client: {}, Domain: {}, QType: {}",
-                            peer, question.name, question.qtype
-                        );
-
-                        // 1. In anti-leak mode, block AAAA (28), SVCB (64), and HTTPS (65) queries
-                        if block_ipv6 && matches!(question.qtype, 28 | 64 | 65) {
-                            let empty_resp = DnsPacketParser::build_empty_response(
-                                client_tx_id,
-                                &query_bytes,
-                                question.raw_len,
-                            );
-                            let _ = socket_clone.send_to(&empty_resp, peer).await;
-                            return;
-                        }
-
-                        // 2. For A (IPv4) queries, allocate Fake-IP and respond
-                        if question.qtype == 1 && question.qclass == 1 {
-                            let fake_ip = pool_clone.allocate(&question.name);
-                            let resp = DnsPacketParser::build_a_response(
-                                client_tx_id,
-                                &query_bytes,
-                                question.raw_len,
-                                fake_ip,
-                            );
-                            let _ = socket_clone.send_to(&resp, peer).await;
-                            return;
-                        }
-
-                        // 3. Forward other queries to upstream DNS via per-query ephemeral UDP socket & CSPRNG TxID
-                        let Ok(_up_permit) = upstream_limit.try_acquire_owned() else {
-                            warn!("[DNS Engine] Upstream forwarding limit reached, dropping query: {}", question.name);
-                            return;
-                        };
-                        let upstream_tx_id = csprng_u16();
-                        let mut forward_bytes = query_bytes;
-                        forward_bytes[0..2].copy_from_slice(&upstream_tx_id.to_be_bytes());
-
-                        if let Ok(Some((mut resp_bytes, _))) = forward_upstream_udp(
-                            upstream_dns,
-                            &forward_bytes,
-                            upstream_tx_id,
-                            &question,
-                            UPSTREAM_DNS_TIMEOUT,
-                        )
-                        .await
-                        {
-                            resp_bytes[0..2].copy_from_slice(&client_tx_id.to_be_bytes());
-                            let _ = socket_clone.send_to(&resp_bytes, peer).await;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("[DNS Engine] Failed to parse DNS query packet: {}", e);
-                    }
+                if let Some(resp_bytes) = handle_dns_query_bytes(
+                    &pool_clone,
+                    upstream_dns,
+                    block_ipv6,
+                    &upstream_limit,
+                    &query_bytes,
+                    Some(peer),
+                )
+                .await
+                {
+                    let _ = socket_clone.send_to(&resp_bytes, peer).await;
                 }
             });
         }
@@ -1183,5 +1229,42 @@ mod tests {
         .unwrap();
         up_task.await.unwrap();
         assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    #[tokio::test]
+    async fn test_process_query_bytes_allocates_fake_ip_and_blocks_aaaa() {
+        let pool = Arc::new(FakeIpPool::new_default());
+        let server = DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&pool),
+            "223.5.5.5:53".parse().unwrap(),
+            true,
+        );
+
+        let a_query = build_sample_query(0x55AA, "transparent.example", 1);
+        let a_resp = server
+            .process_query_bytes(&a_query)
+            .await
+            .expect("A query should yield Fake-IP response");
+        assert_eq!(&a_resp[0..2], &[0x55, 0xAA]);
+        assert_eq!(&a_resp[6..8], &[0x00, 0x01]);
+        let assigned_ip = Ipv4Addr::new(
+            a_resp[a_resp.len() - 4],
+            a_resp[a_resp.len() - 3],
+            a_resp[a_resp.len() - 2],
+            a_resp[a_resp.len() - 1],
+        );
+        assert_eq!(
+            pool.restore_ip(IpAddr::V4(assigned_ip)).as_deref(),
+            Some("transparent.example")
+        );
+
+        let aaaa_query = build_sample_query(0x66BB, "transparent.example", 28);
+        let aaaa_resp = server
+            .process_query_bytes(&aaaa_query)
+            .await
+            .expect("AAAA query with block_ipv6=true should yield empty answer response");
+        assert_eq!(&aaaa_resp[0..2], &[0x66, 0xBB]);
+        assert_eq!(&aaaa_resp[6..8], &[0x00, 0x00]);
     }
 }

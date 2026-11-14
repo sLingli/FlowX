@@ -153,9 +153,10 @@ impl Rule {
         }
     }
 
-    /// 评估当前规则是否命中给定流量上下文；命中返回 `Ok(())`，未命中返回原因码：
-    /// `"disabled"` | `"app_mismatch"` | `"port_mismatch"` | `"target_mismatch"`
-    pub fn check_match(&self, ctx: &RouteContext) -> Result<(), &'static str> {
+    /// 仅评估启用状态、应用进程与端口约束，不校验目标域名或 IP/CIDR（供透明代理预判是否需嗅探域名）
+    ///
+    /// 命中返回 `Ok(())`，未命中返回 `"disabled"` | `"app_mismatch"` | `"port_mismatch"`。
+    pub fn matches_app_and_port(&self, ctx: &RouteContext) -> Result<(), &'static str> {
         if !self.enabled {
             return Err("disabled");
         }
@@ -213,6 +214,14 @@ impl Rule {
                 return Err("port_mismatch");
             }
         }
+
+        Ok(())
+    }
+
+    /// 评估当前规则是否命中给定流量上下文；命中返回 `Ok(())`，未命中返回原因码：
+    /// `"disabled"` | `"app_mismatch"` | `"port_mismatch"` | `"target_mismatch"`
+    pub fn check_match(&self, ctx: &RouteContext) -> Result<(), &'static str> {
+        self.matches_app_and_port(ctx)?;
 
         // 3. 匹配目标地址 (域名通配或 IP/CIDR)
         if self.target_domains.is_some() || self.target_subnets.is_some() {
@@ -279,6 +288,14 @@ pub struct RouteContext<'a> {
 pub struct RuleEngine {
     rules: RwLock<Arc<Vec<Rule>>>,
     default_action: RwLock<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DomainNeedDecision {
+    /// 无需域名嗅探即可立即确定路由动作（命中靠前无域名依赖规则、已命中 IP 规则或后续无可能命中该端口/进程的域名规则）
+    Immediate(Action),
+    /// 存在靠前的按域名匹配规则可能命中当前进程/端口，需等待客户端首包并嗅探 SNI / Host
+    NeedsDomainSniff,
 }
 
 impl RuleEngine {
@@ -451,6 +468,49 @@ impl RuleEngine {
         }
 
         (self.default_action(), DEFAULT_RULE_NAME.to_string())
+    }
+
+    /// 判断仅依据进程、端口与目标 IP 是否已可安全决定动作，或前方是否存在可能匹配当前流的域名规则
+    ///
+    /// 仅当返回 `DomainNeedDecision::Immediate(Action::Direct)` 且目标非 Fake-IP 时，
+    /// 透明代理旁路才可直接在驱动层零拷贝放行真实 IP 连接；一旦存在靠前且适用当前进程/端口的域名规则，
+    /// 必须返回 `DomainNeedDecision::NeedsDomainSniff` 以便先接入用户态嗅探 SNI / Host。
+    pub fn needs_domain_for_routing(
+        &self,
+        process_path: Option<&str>,
+        process_name: Option<&str>,
+        target_ip: Option<std::net::IpAddr>,
+        target_port: u16,
+    ) -> DomainNeedDecision {
+        let ctx = RouteContext {
+            process_path,
+            process_name,
+            target_host: None,
+            target_ip,
+            target_port,
+        };
+        let rules = self.current_rules();
+        for rule in rules.iter() {
+            if rule.matches_app_and_port(&ctx).is_err() {
+                continue;
+            }
+            if rule.target_domains.is_none() && rule.target_subnets.is_none() {
+                return DomainNeedDecision::Immediate(rule.action.clone());
+            }
+            if let Some(subnets) = &rule.target_subnets
+                && let Some(ip) = target_ip
+                && subnets.iter().any(|subnet| subnet.contains(&ip))
+            {
+                return DomainNeedDecision::Immediate(rule.action.clone());
+            }
+            if let Some(domains) = &rule.target_domains
+                && !domains.is_empty()
+            {
+                return DomainNeedDecision::NeedsDomainSniff;
+            }
+        }
+
+        DomainNeedDecision::Immediate(self.default_action())
     }
 
     /// 模拟流量路由并返回完整的逐条规则匹配与跳过原因诊断轨迹
@@ -826,5 +886,51 @@ mod tests {
         };
         assert_eq!(win_rule.check_match(&ctx_other), Err("app_mismatch"));
         assert_eq!(linux_rule.check_match(&ctx_other), Err("app_mismatch"));
+    }
+
+    #[test]
+    fn test_needs_domain_for_routing_decisions() {
+        let engine = RuleEngine::new(
+            vec![
+                Rule::from_raw("DisabledDomain", false, None, Some("disabled.example"), None, Action::Proxy(1)),
+                Rule::from_raw("GameDirect", true, Some("game.exe"), None, None, Action::Direct),
+                Rule::from_raw("LanDirect", true, None, Some("192.168.0.0/16"), None, Action::Direct),
+                Rule::from_raw("ChromeSniProxy", true, Some("chrome.exe"), Some("*.google.com"), Some("443"), Action::Proxy(1)),
+            ],
+            Action::Direct,
+        );
+
+        let public_ip: std::net::IpAddr = "8.8.8.8".parse().unwrap();
+        let lan_ip: std::net::IpAddr = "192.168.1.10".parse().unwrap();
+
+        // GameDirect matches app cleanly before any domain rule -> Immediate(Direct)
+        assert_eq!(
+            engine.needs_domain_for_routing(Some(r"C:\Games\game.exe"), Some("game.exe"), Some(public_ip), 443),
+            DomainNeedDecision::Immediate(Action::Direct)
+        );
+
+        // LAN IP matches earlier CIDR rule even for Chrome:443 -> Immediate(Direct)
+        assert_eq!(
+            engine.needs_domain_for_routing(Some(r"C:\Program Files\chrome.exe"), Some("chrome.exe"), Some(lan_ip), 443),
+            DomainNeedDecision::Immediate(Action::Direct)
+        );
+
+        // Chrome on 443 to public IP can match ChromeSniProxy if domain is google.com -> NeedsDomainSniff
+        assert_eq!(
+            engine.needs_domain_for_routing(Some(r"C:\Program Files\chrome.exe"), Some("chrome.exe"), Some(public_ip), 443),
+            DomainNeedDecision::NeedsDomainSniff
+        );
+
+        // Chrome on port 22 cannot match ChromeSniProxy (port 443) and DisabledDomain is ignored -> Immediate(Direct)
+        assert_eq!(
+            engine.needs_domain_for_routing(Some(r"C:\Program Files\chrome.exe"), Some("chrome.exe"), Some(public_ip), 22),
+            DomainNeedDecision::Immediate(Action::Direct)
+        );
+
+        // Unrelated app on 443 cannot match ChromeSniProxy -> Immediate(Direct default)
+        assert_eq!(
+            engine.needs_domain_for_routing(Some("/usr/bin/ssh"), Some("ssh"), Some(public_ip), 443),
+            DomainNeedDecision::Immediate(Action::Direct)
+        );
     }
 }

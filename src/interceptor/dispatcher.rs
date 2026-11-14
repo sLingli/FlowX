@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
@@ -10,15 +10,19 @@ use tracing::{error, info, warn};
 
 use crate::dns::FakeIpPool;
 use crate::inbound::{self, InboundRequest};
-use crate::interceptor::process::ProcessTracker;
+use crate::interceptor::process::{ProcessInfo, ProcessTracker};
 use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::outbound::chain::{ProxyChain, ProxyNode};
 use crate::outbound::direct::DirectOutbound;
-use crate::outbound::{is_local_or_loopback_ip, local_interface_ips, relay_stream_monitored, TargetAddr};
+use crate::outbound::{
+    is_local_or_loopback_ip, local_interface_ips, relay_stream_monitored, RelayStream, TargetAddr,
+};
 use crate::router::{Action, RouteContext, RuleEngine};
 
 /// 入站协议握手的最长等待时间（防止慢速握手占满并发名额）
 const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 透明代理首包域名嗅探的最长等待时间（仅在规则需要域名或 HTTP/TLS 默认端口启用，避免拖慢服务端先说话协议）
+const TRANSPARENT_SNIFF_TIMEOUT: Duration = Duration::from_millis(120);
 
 #[derive(Debug, Clone)]
 pub struct ProxyNodeEntry {
@@ -167,6 +171,263 @@ fn is_self_target(target: &TargetAddr, server_addr: &SocketAddr, self_ports: &[u
     false
 }
 
+fn is_sniffable_default_port(port: u16) -> bool {
+    matches!(port, 80 | 443 | 8080 | 8443)
+}
+
+struct DispatchSession {
+    inbound_label: &'static str,
+    inbound_kind: Option<inbound::InboundKind>,
+    proc_info: Option<ProcessInfo>,
+    display_target: TargetAddr,
+    route_ip: Option<IpAddr>,
+    dial_ip_on_direct: Option<SocketAddr>,
+    pending: Vec<u8>,
+    http_body_framing: Option<inbound::HttpBodyFraming>,
+    body_prefix: Vec<u8>,
+    http_is_head: bool,
+}
+
+async fn evaluate_and_relay_stream<S: RelayStream>(
+    config: &DispatcherConfig,
+    mut local_stream: S,
+    session: DispatchSession,
+) -> Result<()> {
+    let proc_name = session
+        .proc_info
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
+    let proc_path = session
+        .proc_info
+        .as_ref()
+        .map(|p| p.path.clone())
+        .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
+    let pid = session.proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
+
+    // 5. Build route context and evaluate rules (`None` when process is unattributed so app rules like `*` or `*.exe` don't match "Unknown")
+    let target_host = match &session.display_target {
+        TargetAddr::Domain(host, _) => Some(host.as_str()),
+        TargetAddr::Ip(_) => None,
+    };
+    let ctx = RouteContext {
+        process_path: session.proc_info.as_ref().map(|p| p.path.as_str()),
+        process_name: session.proc_info.as_ref().map(|p| p.name.as_str()),
+        target_host,
+        target_ip: session.route_ip,
+        target_port: session.display_target.port(),
+    };
+
+    let (action, rule_name) = config.rule_engine.evaluate(&ctx);
+
+    // 若透明代理面对真实 IP + 嗅探域名且最终命中的是 Direct，直接拨号原始真实 IP，避免多余的上游 DNS 解析开销
+    let dial_target = match (&action, session.dial_ip_on_direct) {
+        (Action::Direct, Some(real_addr)) => TargetAddr::Ip(real_addr),
+        _ => session.display_target.clone(),
+    };
+
+    let action_str = match &action {
+        Action::Direct => "Direct".to_string(),
+        Action::Block => "Block".to_string(),
+        Action::Proxy(id) => format!("Proxy({})", id),
+        Action::Chain(id) => format!("Chain({})", id),
+    };
+
+    info!(
+        "[Route Match] [{}] Process: {} (PID: {}) -> Target: {}:{} => Rule: {} => Action: {}",
+        session.inbound_label,
+        proc_name,
+        pid,
+        session.display_target.host_string(),
+        session.display_target.port(),
+        rule_name,
+        action_str
+    );
+
+    // 6. 注册到连接监视器并使用 RAII 守卫
+    // 注意：连接快照只保存机器可读的 action_type / action_id，展示文案由 API 层按请求语言本地化
+    let active_conn = config.monitor.register(
+        proc_name,
+        proc_path,
+        pid,
+        session.display_target.to_authority_string(),
+        rule_name,
+        action.type_str().to_string(),
+        action.target_id(),
+    );
+
+    let _guard = ConnectionGuard {
+        id: active_conn.id,
+        monitor: Arc::clone(&config.monitor),
+    };
+
+    // 7. 按动作建立出站连接
+    if action == Action::Block {
+        if let Some(kind) = session.inbound_kind {
+            inbound::send_failure(&mut local_stream, kind, true).await.ok();
+        }
+        return Ok(());
+    }
+
+    let cancel_token = Arc::clone(&active_conn);
+    let mut remote_stream = tokio::select! {
+        res = connect_outbound(config, &action, &dial_target) => {
+            match res {
+                Ok(s) => s,
+                Err(e) => {
+                    if let Some(kind) = session.inbound_kind {
+                        inbound::send_failure(&mut local_stream, kind, false).await.ok();
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        _ = cancel_token.cancelled() => {
+            if let Some(kind) = session.inbound_kind {
+                inbound::send_failure(&mut local_stream, kind, true).await.ok();
+            }
+            bail!("Connection aborted by administrator during establishment");
+        }
+    };
+
+    // 8. Reply to client that tunnel is ready (explicit proxy protocols only), and forward buffered payload
+    if let Some(kind) = session.inbound_kind {
+        inbound::send_success(&mut local_stream, kind).await?;
+    }
+    if !session.pending.is_empty() {
+        remote_stream.write_all(&session.pending).await?;
+        active_conn.add_upload(session.pending.len() as u64);
+    }
+
+    // 9. Traffic relay (HTTP plain forward uses bounded request body framing; tunnel/transparent modes use full-duplex relay)
+    let (up, down) = match (session.inbound_kind, session.http_body_framing) {
+        (Some(inbound::InboundKind::HttpForward), Some(framing)) => {
+            crate::outbound::relay_http_forward_monitored(
+                local_stream,
+                remote_stream,
+                Some(&active_conn),
+                framing,
+                session.body_prefix,
+                session.http_is_head,
+            )
+            .await?
+        }
+        _ => relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?,
+    };
+    info!(
+        "[Relay Complete] [{}] {}:{} Upload: {} B, Download: {} B",
+        action_str,
+        session.display_target.host_string(),
+        session.display_target.port(),
+        up + session.pending.len() as u64,
+        down
+    );
+    Ok(())
+}
+
+/// 透明代理 TCP 流统一调度入口：复用 PID 反查、Fake-IP 还原、按需 TLS SNI / HTTP Host 嗅探、
+/// 规则求值、连接监视与全双工中继逻辑
+pub async fn dispatch_transparent_stream<S: RelayStream>(
+    config: Arc<DispatcherConfig>,
+    mut local_stream: S,
+    peer_addr: SocketAddr,
+    orig_dst: SocketAddr,
+    pid_hint: Option<u32>,
+    needs_domain_sniff: bool,
+) -> Result<()> {
+    // 1. 先检查原始目标是否指向 FlowX 自身监听端口，防止回环自连（无需额外等待嗅探）
+    let raw_ip_target = TargetAddr::Ip(orig_dst);
+    if is_self_target(&raw_ip_target, &config.bind_addr, &config.self_ports) {
+        bail!(
+            "Transparent loopback request rejected: peer {} attempted to access internal port {}",
+            peer_addr,
+            orig_dst
+        );
+    }
+
+    // 2. 按驱动缓存的 PID 提示解析进程信息；若缺失或未命中则回退到四元组查表
+    let proc_info = match pid_hint {
+        Some(pid) => match config.tracker.resolve_pid_async(pid).await {
+            Some(info) => Some(info),
+            None => config.tracker.find_by_connection_async(peer_addr, orig_dst).await,
+        },
+        None => config.tracker.find_by_connection_async(peer_addr, orig_dst).await,
+    };
+
+    // 3. 若命中 Fake-IP 池直接还原域名；否则在规则需要或常见 HTTP/TLS 端口上非破坏性嗅探 SNI / Host
+    let (display_target, route_ip, dial_ip_on_direct, pending) =
+        if config.fake_ip_pool.is_fake_ip_addr(orig_dst.ip()) {
+            let domain = config.fake_ip_pool.restore_ip(orig_dst.ip()).ok_or_else(|| {
+                anyhow!("Fake-IP {} domain mapping expired or does not exist", orig_dst.ip())
+            })?;
+            let target = TargetAddr::Domain(domain, orig_dst.port());
+            (target, None, None, Vec::new())
+        } else {
+            let need_sniff = needs_domain_sniff
+                || is_sniffable_default_port(orig_dst.port())
+                || matches!(
+                    config.rule_engine.needs_domain_for_routing(
+                        proc_info.as_ref().map(|p| p.path.as_str()),
+                        proc_info.as_ref().map(|p| p.name.as_str()),
+                        Some(orig_dst.ip()),
+                        orig_dst.port(),
+                    ),
+                    crate::router::DomainNeedDecision::NeedsDomainSniff
+                );
+            let (sniffed_host, buffered) = if need_sniff {
+                let outcome = crate::transparent::sniffer::peek_host_prefix(
+                    &mut local_stream,
+                    TRANSPARENT_SNIFF_TIMEOUT,
+                )
+                .await?;
+                (outcome.host, outcome.buffered)
+            } else {
+                (None, Vec::new())
+            };
+            match sniffed_host {
+                Some(host) => (
+                    TargetAddr::Domain(host, orig_dst.port()),
+                    Some(orig_dst.ip()),
+                    Some(orig_dst),
+                    buffered,
+                ),
+                None => (
+                    TargetAddr::Ip(orig_dst),
+                    Some(orig_dst.ip()),
+                    Some(orig_dst),
+                    buffered,
+                ),
+            }
+        };
+
+    // 4. 域名还原或嗅探后再次校验是否指向自身服务端口（例如 Host: localhost:<api_port>）
+    if is_self_target(&display_target, &config.bind_addr, &config.self_ports) {
+        bail!(
+            "Transparent loopback request rejected after target resolution: {}:{}",
+            display_target.host_string(),
+            display_target.port()
+        );
+    }
+
+    evaluate_and_relay_stream(
+        &config,
+        local_stream,
+        DispatchSession {
+            inbound_label: "TRANSPARENT",
+            inbound_kind: None,
+            proc_info,
+            display_target,
+            route_ip,
+            dial_ip_on_direct,
+            pending,
+            http_body_framing: None,
+            body_prefix: Vec::new(),
+            http_is_head: false,
+        },
+    )
+    .await
+}
+
 async fn handle_connection(
     mut local_stream: TcpStream,
     peer_addr: SocketAddr,
@@ -191,10 +452,6 @@ async fn handle_connection(
     let proc_name = proc_info
         .as_ref()
         .map(|p| p.name.clone())
-        .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
-    let proc_path = proc_info
-        .as_ref()
-        .map(|p| p.path.clone())
         .unwrap_or_else(|| crate::i18n::UNKNOWN_PROCESS.to_string());
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
 
@@ -224,110 +481,28 @@ async fn handle_connection(
         );
     }
 
-    // 5. Build route context and evaluate rules (`None` when process is unattributed so app rules like `*` or `*.exe` don't match "Unknown")
-    let (target_host, target_ip) = match &target {
-        TargetAddr::Ip(addr) => (None, Some(addr.ip())),
-        TargetAddr::Domain(host, _) => (Some(host.as_str()), None),
-    };
-    let ctx = RouteContext {
-        process_path: proc_info.as_ref().map(|p| p.path.as_str()),
-        process_name: proc_info.as_ref().map(|p| p.name.as_str()),
-        target_host,
-        target_ip,
-        target_port: target.port(),
+    let route_ip = match &target {
+        TargetAddr::Ip(addr) => Some(addr.ip()),
+        TargetAddr::Domain(_, _) => None,
     };
 
-    let (action, rule_name) = config.rule_engine.evaluate(&ctx);
-
-    let action_str = match &action {
-        Action::Direct => "Direct".to_string(),
-        Action::Block => "Block".to_string(),
-        Action::Proxy(id) => format!("Proxy({})", id),
-        Action::Chain(id) => format!("Chain({})", id),
-    };
-
-    info!(
-        "[Route Match] [{}] Process: {} (PID: {}) -> Target: {}:{} => Rule: {} => Action: {}",
-        kind.as_str(),
-        proc_name,
-        pid,
-        target.host_string(),
-        target.port(),
-        rule_name,
-        action_str
-    );
-
-    // 6. 注册到连接监视器并使用 RAII 守卫
-    // 注意：连接快照只保存机器可读的 action_type / action_id，展示文案由 API 层按请求语言本地化
-    let active_conn = config.monitor.register(
-        proc_name,
-        proc_path,
-        pid,
-        target.to_authority_string(),
-        rule_name,
-        action.type_str().to_string(),
-        action.target_id(),
-    );
-
-    let _guard = ConnectionGuard {
-        id: active_conn.id,
-        monitor: Arc::clone(&config.monitor),
-    };
-
-    // 7. 按动作建立出站连接
-    if action == Action::Block {
-        inbound::send_failure(&mut local_stream, kind, true).await.ok();
-        return Ok(());
-    }
-
-    let cancel_token = Arc::clone(&active_conn);
-    let mut remote_stream = tokio::select! {
-        res = connect_outbound(&config, &action, &target) => {
-            match res {
-                Ok(s) => s,
-                Err(e) => {
-                    inbound::send_failure(&mut local_stream, kind, false).await.ok();
-                    return Err(e);
-                }
-            }
-        }
-        _ = cancel_token.cancelled() => {
-            inbound::send_failure(&mut local_stream, kind, true).await.ok();
-            bail!("Connection aborted by administrator during establishment");
-        }
-    };
-
-    // 8. Reply to client that tunnel is ready, and forward buffered payload from handshake
-    inbound::send_success(&mut local_stream, kind).await?;
-    if !pending.is_empty() {
-        remote_stream.write_all(&pending).await?;
-        active_conn.add_upload(pending.len() as u64);
-    }
-
-    // 9. Traffic relay (HTTP plain forward uses bounded request body framing; tunnel modes use full-duplex relay)
-    let (up, down) = match (kind, http_body_framing) {
-        (inbound::InboundKind::HttpForward, Some(framing)) => {
-            crate::outbound::relay_http_forward_monitored(
-                local_stream,
-                remote_stream,
-                Some(&active_conn),
-                framing,
-                body_prefix,
-                http_is_head,
-            )
-            .await?
-        }
-        _ => relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?,
-    };
-    info!(
-        "[Relay Complete] [{}] {}:{} Upload: {} B, Download: {} B",
-        action_str,
-        target.host_string(),
-        target.port(),
-        up + pending.len() as u64,
-        down
-    );
-    Ok(())
+    evaluate_and_relay_stream(
+        &config,
+        local_stream,
+        DispatchSession {
+            inbound_label: kind.as_str(),
+            inbound_kind: Some(kind),
+            proc_info,
+            display_target: target,
+            route_ip,
+            dial_ip_on_direct: None,
+            pending,
+            http_body_framing,
+            body_prefix,
+            http_is_head,
+        },
+    )
+    .await
 }
 
 async fn connect_outbound(
@@ -534,5 +709,197 @@ mod tests {
         let mut resp = Vec::new();
         c.read_to_end(&mut resp).await.unwrap();
         assert!(String::from_utf8_lossy(&resp).ends_with("done"));
+    }
+
+    fn build_test_tls_client_hello(sni: &str) -> Vec<u8> {
+        let host_bytes = sni.as_bytes();
+        let sni_entry_len = 1 + 2 + host_bytes.len();
+        let mut ext_sni = Vec::new();
+        ext_sni.extend_from_slice(&0x0000u16.to_be_bytes());
+        ext_sni.extend_from_slice(&((2 + sni_entry_len) as u16).to_be_bytes());
+        ext_sni.extend_from_slice(&(sni_entry_len as u16).to_be_bytes());
+        ext_sni.push(0x00);
+        ext_sni.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+        ext_sni.extend_from_slice(host_bytes);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x13, 0x01]);
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&(ext_sni.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext_sni);
+
+        let mut hs = Vec::new();
+        hs.push(0x01);
+        let hs_len = body.len() as u32;
+        hs.extend_from_slice(&hs_len.to_be_bytes()[1..4]);
+        hs.extend_from_slice(&body);
+
+        let mut rec = Vec::new();
+        rec.push(0x16);
+        rec.extend_from_slice(&[0x03, 0x01]);
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_sniffs_sni_evaluates_rule_and_preserves_bytes() {
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let client_hello = build_test_tls_client_hello("sniffed.example.org");
+        let expected_hello = client_hello.clone();
+
+        let srv_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut got = vec![0u8; expected_hello.len()];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected_hello, "Original TLS ClientHello bytes must arrive intact");
+            s.write_all(b"SERVER_OK").await.unwrap();
+        });
+
+        let mut cfg = test_config("127.0.0.1:40001".parse().unwrap(), vec![]);
+        cfg.rule_engine = Arc::new(RuleEngine::new(
+            vec![
+                crate::router::Rule::from_raw(
+                    "BlockOther",
+                    true,
+                    None,
+                    Some("blocked.example.org"),
+                    None,
+                    Action::Block,
+                ),
+                crate::router::Rule::from_raw(
+                    "AllowSniffedSni",
+                    true,
+                    None,
+                    Some("sniffed.example.org"),
+                    None,
+                    Action::Direct,
+                ),
+            ],
+            Action::Block,
+        ));
+        let cfg = Arc::new(cfg);
+
+        let (mut app_side, disp_side) = tokio::io::duplex(8192);
+        let peer_addr: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+        let disp_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                cfg,
+                disp_side,
+                peer_addr,
+                origin_addr,
+                None,
+                true,
+            )
+            .await
+        });
+
+        app_side.write_all(&client_hello).await.unwrap();
+        let mut ack = [0u8; 9];
+        app_side.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"SERVER_OK");
+        drop(app_side);
+
+        disp_handle.await.unwrap().unwrap();
+        srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_blocks_matched_rule() {
+        let rules = vec![crate::router::Rule::from_raw(
+            "BlockSniffed",
+            true,
+            None,
+            Some("forbidden.example"),
+            None,
+            Action::Block,
+        )];
+        let cfg = Arc::new(test_config("127.0.0.1:40001".parse().unwrap(), rules));
+        let orig_dst: SocketAddr = "93.184.216.34:443".parse().unwrap();
+        let (mut app_side, disp_side) = tokio::io::duplex(8192);
+        let disp_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                cfg,
+                disp_side,
+                "127.0.0.1:55556".parse().unwrap(),
+                orig_dst,
+                None,
+                true,
+            )
+            .await
+        });
+
+        let hello = build_test_tls_client_hello("forbidden.example");
+        app_side.write_all(&hello).await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = app_side.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0, "Blocked transparent flow must close without replying");
+        disp_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_restores_fake_ip_and_rejects_self_port() {
+        let cfg = Arc::new(test_config("127.0.0.1:40001".parse().unwrap(), vec![]));
+        let (_app_self, disp_self) = tokio::io::duplex(1024);
+        let err = dispatch_transparent_stream(
+            Arc::clone(&cfg),
+            disp_self,
+            "127.0.0.1:50000".parse().unwrap(),
+            "127.0.0.1:40001".parse().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{:#}", err).contains("loopback"));
+
+        // Fake-IP domain without explicit port or expired should error cleanly; valid Fake-IP resolves & dials localhost test server?
+        // Actually localhost rule check + expired Fake-IP error verifies Fake-IP branch without needing an external DNS server:
+        let (_app_fake, disp_fake) = tokio::io::duplex(1024);
+        let fake_err = dispatch_transparent_stream(
+            Arc::clone(&cfg),
+            disp_fake,
+            "127.0.0.1:50001".parse().unwrap(),
+            "198.18.0.55:443".parse().unwrap(),
+            None,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{:#}", fake_err).contains("Fake-IP"));
+
+        // Mapped Fake-IP restores original domain and matches domain rules directly without sniffing
+        let mapped_ip = cfg.fake_ip_pool.allocate("fakeip-blocked.example");
+        let mut mapped_cfg = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "BlockRestoredFakeIp",
+                true,
+                None,
+                Some("fakeip-blocked.example"),
+                None,
+                Action::Block,
+            )],
+        );
+        mapped_cfg.fake_ip_pool = Arc::clone(&cfg.fake_ip_pool);
+        let (mut app_mapped, disp_mapped) = tokio::io::duplex(1024);
+        let mapped_res = dispatch_transparent_stream(
+            Arc::new(mapped_cfg),
+            disp_mapped,
+            "127.0.0.1:50002".parse().unwrap(),
+            SocketAddr::new(std::net::IpAddr::V4(mapped_ip), 443),
+            None,
+            true,
+        )
+        .await;
+        assert!(mapped_res.is_ok(), "Fake-IP domain restore should trigger Action::Block cleanly");
+        let mut probe = [0u8; 8];
+        assert_eq!(app_mapped.read(&mut probe).await.unwrap(), 0);
     }
 }

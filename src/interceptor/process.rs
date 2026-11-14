@@ -255,6 +255,36 @@ impl ProcessTracker {
         )
     }
 
+    /// 直接按已知 PID 解析进程信息（复用进程启动时间防 PID 复用校验与 TTL 缓存）
+    pub fn resolve_pid(&self, pid: u32) -> Option<ProcessInfo> {
+        self.resolve_pid_with(
+            pid,
+            Instant::now(),
+            get_process_start_time,
+            get_process_identity,
+        )
+    }
+
+    /// 异步非阻塞按已知 PID 查询进程信息：通过信号量限流 `spawn_blocking` 并发度
+    pub async fn resolve_pid_async(self: &Arc<Self>, pid: u32) -> Option<ProcessInfo> {
+        let permit = tokio::time::timeout(
+            LOOKUP_SEMAPHORE_TIMEOUT,
+            Arc::clone(&self.lookup_semaphore).acquire_owned(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        let tracker = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            tracker.resolve_pid(pid)
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     /// 异步非阻塞查询进程信息：通过信号量限流 `spawn_blocking` 并发度，超时则优雅返回 `None`
     pub async fn find_by_connection_async(
         self: &Arc<Self>,
@@ -1891,5 +1921,22 @@ mod tests {
             "[::1]:40081".parse().unwrap(),
             6
         ));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_pid_and_async_caches_current_process() {
+        let tracker = Arc::new(ProcessTracker::new());
+        let pid = std::process::id();
+        let sync_info = tracker.resolve_pid(pid).expect("current pid should resolve synchronously");
+        assert_eq!(sync_info.pid, pid);
+        assert!(!sync_info.path.is_empty());
+        assert!(!sync_info.name.is_empty());
+
+        let async_info = tracker
+            .resolve_pid_async(pid)
+            .await
+            .expect("current pid should resolve asynchronously");
+        assert_eq!(async_info.pid, pid);
+        assert_eq!(async_info.path, sync_info.path);
     }
 }

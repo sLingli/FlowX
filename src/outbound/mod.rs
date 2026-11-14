@@ -42,6 +42,16 @@ impl RelayStream for OutboundTcpStream {
     }
 }
 
+#[cfg(test)]
+impl RelayStream for tokio::io::DuplexStream {
+    type ReadHalf = tokio::io::ReadHalf<tokio::io::DuplexStream>;
+    type WriteHalf = tokio::io::WriteHalf<tokio::io::DuplexStream>;
+
+    fn split_stream(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        tokio::io::split(self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TargetAddr {
     Ip(SocketAddr),
