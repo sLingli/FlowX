@@ -273,16 +273,17 @@ where
     let mut buf = Vec::with_capacity(2048);
     buf.push(first);
     let mut tmp = [0u8; 4096];
+    let mut scanned_len = 0usize;
 
     let header_end = loop {
-        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            let end = pos + 4;
+        if let Some(end) = crate::outbound::find_http_header_end(&buf, scanned_len) {
             if end > MAX_HTTP_HEADER {
                 reply_http_error(stream, "431 Request Header Fields Too Large").await;
                 bail!("HTTP headers exceed {} bytes limit", MAX_HTTP_HEADER);
             }
             break end;
         }
+        scanned_len = buf.len();
         if buf.len() >= MAX_HTTP_HEADER {
             reply_http_error(stream, "431 Request Header Fields Too Large").await;
             bail!("HTTP headers exceed {} bytes limit", MAX_HTTP_HEADER);

@@ -523,6 +523,16 @@ pub async fn relay_stream_monitored_with_timeout(
     run_relay_with_watchdog(up_task, down_task, start, last_activity_us, conn, idle_timeout).await
 }
 
+/// Incrementally locate the end offset (right after `\r\n\r\n`) of an HTTP header block.
+/// Scans from `scanned_len.saturating_sub(3)` so repeated calls across chunked reads stay O(N).
+pub(crate) fn find_http_header_end(buf: &[u8], scanned_len: usize) -> Option<usize> {
+    let start = scanned_len.min(buf.len()).saturating_sub(3);
+    buf[start..]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|rel| start + rel + 4)
+}
+
 /// 预读前缀 + 底层的顺序流读取器，用于精确消费 HTTP 请求/响应体边界而绝不溢出到后续流水线报文
 struct PrefixedTcpReader {
     buf: Vec<u8>,
@@ -618,19 +628,21 @@ impl PrefixedTcpReader {
     /// 若在首字节前即遇到 clean EOF，则返回 `Ok(None)`
     async fn read_http_header_block(&mut self, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
         let mut tmp = [0u8; 4096];
+        let mut scanned_len = 0usize;
         loop {
             let unconsumed = &self.buf[self.pos..];
-            if let Some(rel) = unconsumed.windows(4).position(|w| w == b"\r\n\r\n") {
-                if rel + 4 > max_bytes {
+            if let Some(end) = find_http_header_end(unconsumed, scanned_len) {
+                if end > max_bytes {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "HTTP response headers exceed maximum allowed size",
                     ));
                 }
-                let head = unconsumed[..rel].to_vec();
-                self.pos += rel + 4;
+                let head = unconsumed[..end - 4].to_vec();
+                self.pos += end;
                 return Ok(Some(head));
             }
+            scanned_len = unconsumed.len();
             if self.pos > 0 {
                 self.buf.drain(..self.pos);
                 self.pos = 0;
@@ -1736,5 +1748,36 @@ mod tests {
 
         let raw_v6_domain = TargetAddr::Domain("2001:db8::2".to_string(), 8443);
         assert_eq!(raw_v6_domain.to_authority_string(), "[2001:db8::2]:8443");
+    }
+
+    #[test]
+    fn test_find_http_header_end_incremental_boundary_splits() {
+        let req = b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\nbody";
+        // Simulate byte-by-byte reads advancing scanned_len after each append
+        let mut buf = Vec::new();
+        let mut scanned = 0usize;
+        let mut found = None;
+        for &b in req {
+            buf.push(b);
+            if let Some(end) = find_http_header_end(&buf, scanned) {
+                found = Some(end);
+                break;
+            }
+            scanned = buf.len();
+        }
+        assert_eq!(found, Some(b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n".len()));
+
+        // Split right before each byte of `\r\n\r\n`
+        let sample = b"GET / HTTP/1.1\r\n\r\n";
+        let head_len = sample.len();
+        for split in (head_len - 4)..head_len {
+            assert_eq!(find_http_header_end(&sample[..split], 0), None);
+            assert_eq!(find_http_header_end(sample, split), Some(head_len));
+        }
+
+        // Clamping out-of-range scanned_len does not panic and preserves the 3-byte overlap invariant
+        assert_eq!(find_http_header_end(b"\r\n\r\n", 3), Some(4));
+        assert_eq!(find_http_header_end(b"Host: x\r\n\r\n", 999), None);
+        assert_eq!(find_http_header_end(b"abc", 999), None);
     }
 }

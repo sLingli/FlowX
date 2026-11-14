@@ -389,6 +389,7 @@ async fn read_full_http_request_with_timeout(
         buffer.clear();
         let mut temp = [0u8; 2048];
         let mut expected_total: Option<usize> = None;
+        let mut scanned_len = 0usize;
 
         loop {
             let n = match stream.read(&mut temp).await {
@@ -410,15 +411,16 @@ async fn read_full_http_request_with_timeout(
                 return Err(RequestReadError::TooLarge);
             }
 
-            if expected_total.is_none()
-                && let Some(header_end) = find_header_end(buffer)
-            {
-                let content_length = validate_and_parse_headers(&buffer[..header_end - 4])?;
-                let total_needed = header_end
-                    .checked_add(content_length)
-                    .filter(|&t| t <= MAX_REQUEST_SIZE)
-                    .ok_or(RequestReadError::TooLarge)?;
-                expected_total = Some(total_needed);
+            if expected_total.is_none() {
+                if let Some(header_end) = crate::outbound::find_http_header_end(buffer, scanned_len) {
+                    let content_length = validate_and_parse_headers(&buffer[..header_end - 4])?;
+                    let total_needed = header_end
+                        .checked_add(content_length)
+                        .filter(|&t| t <= MAX_REQUEST_SIZE)
+                        .ok_or(RequestReadError::TooLarge)?;
+                    expected_total = Some(total_needed);
+                }
+                scanned_len = buffer.len();
             }
 
             if let Some(total_needed) = expected_total
@@ -635,10 +637,6 @@ fn best_effort_locale(buffer: &[u8]) -> Locale {
     Locale::from_header_or_query(accept_language, parse_query_param(query, "lang"))
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
-}
-
 fn extract_header<'a>(headers: &[&'a str], target_name: &str) -> Option<&'a str> {
     for line in headers {
         if let Some((k, v)) = line.split_once(':')
@@ -748,7 +746,7 @@ async fn handle_api_request(
     // 协议早期错误（头部不完整/非 UTF-8）同样按 best-effort 语言偏好本地化
     let locale = best_effort_locale(&req_bytes);
 
-    let Some(header_end) = find_header_end(&req_bytes) else {
+    let Some(header_end) = crate::outbound::find_http_header_end(&req_bytes, 0) else {
         send_http_response(
             &mut stream,
             "400 Bad Request",

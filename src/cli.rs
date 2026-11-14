@@ -564,9 +564,9 @@ impl<'a> ResponseCursor<'a> {
 
     async fn read_headers(&mut self, max_header: usize, api_addr: &str) -> Result<Vec<u8>> {
         let mut tmp = [0u8; 4096];
+        let mut scanned_len = 0usize;
         loop {
-            if let Some(rel) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let end = rel + 4;
+            if let Some(end) = crate::outbound::find_http_header_end(&self.buf, scanned_len) {
                 if end > max_header {
                     bail!(
                         "HTTP response headers from {} exceed {} bytes limit",
@@ -575,8 +575,9 @@ impl<'a> ResponseCursor<'a> {
                     );
                 }
                 self.pos = end;
-                return Ok(self.buf[..rel].to_vec());
+                return Ok(self.buf[..end - 4].to_vec());
             }
+            scanned_len = self.buf.len();
             if self.buf.len() >= max_header {
                 bail!(
                     "HTTP response headers from {} exceed {} bytes limit",
