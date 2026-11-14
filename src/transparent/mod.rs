@@ -81,6 +81,47 @@ struct TransparentStatsCounters {
     quic_blocked_total: AtomicU64,
 }
 
+/// 基于给定静态配置构建驱动探测快照（供 CLI 离线查询与测试降级复用）
+pub fn probe_status(cfg: &TransparentSettings) -> TransparentRuntimeStatus {
+    #[cfg(windows)]
+    let (dll_found, sys_found, dll_path, sys_path, searched_dirs) = {
+        let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
+        (
+            avail.dll_found,
+            avail.sys_found,
+            avail.dll_path,
+            avail.sys_path,
+            avail.searched_dirs,
+        )
+    };
+    #[cfg(not(windows))]
+    let (dll_found, sys_found, dll_path, sys_path, searched_dirs) =
+        (false, false, None, None, Vec::new());
+
+    TransparentRuntimeStatus {
+        supported: cfg!(windows),
+        enabled: cfg.enabled,
+        running: false,
+        elevated: is_process_elevated(),
+        dll_found,
+        sys_found,
+        dll_path,
+        sys_path,
+        searched_dirs,
+        driver_version: None,
+        active_flows: 0,
+        tcp_intercepted_total: 0,
+        tcp_passthrough_total: 0,
+        tcp_blocked_rst_total: 0,
+        dns_hijacked_total: 0,
+        quic_blocked_total: 0,
+        hijack_dns: cfg.hijack_dns,
+        block_quic_for_proxied: cfg.block_quic_for_proxied,
+        configured_dll_path: cfg.dll_path.clone(),
+        last_error: None,
+    }
+}
+
 /// 检测当前进程是否拥有 Windows 管理员提升令牌（非 Windows 返回 `false`）
 pub fn is_process_elevated() -> bool {
     #[cfg(windows)]
@@ -211,7 +252,7 @@ pub fn build_elevated_relaunch_args(
     let mut preserved: Vec<String> = Vec::new();
     let mut idx = 0usize;
     // 跳过 argv[0] 若它看上去像可执行路径
-    if raw_args.first().is_some() {
+    if !raw_args.is_empty() {
         idx = 1;
     }
 
@@ -252,7 +293,8 @@ pub fn build_elevated_relaunch_args(
 pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<()> {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::Foundation::{FreeLibrary, HINSTANCE, HWND};
+        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
         if is_process_elevated() {
@@ -262,7 +304,42 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
             ));
         }
 
-        let exe_path = std::env::current_exe()?;
+        type ShellExecuteWFn = unsafe extern "system" fn(
+            hwnd: HWND,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> HINSTANCE;
+
+        // 按需延迟加载 shell32.dll，避免无头服务/CLI 或受限桌面环境在进程启动阶段触发 GUI DLL 初始化失败
+        let shell32_w: Vec<u16> = "shell32.dll\0".encode_utf16().collect();
+        let shell32_mod = unsafe { LoadLibraryW(shell32_w.as_ptr()) };
+        if shell32_mod.is_null() {
+            let os_err = io::Error::last_os_error();
+            return Err(io::Error::new(
+                os_err.kind(),
+                format!("Failed to load shell32.dll for UAC elevation: {os_err}"),
+            ));
+        }
+
+        let proc_ptr = unsafe { GetProcAddress(shell32_mod, c"ShellExecuteW".as_ptr().cast()) };
+        let Some(proc_fn) = proc_ptr else {
+            let os_err = io::Error::last_os_error();
+            unsafe {
+                FreeLibrary(shell32_mod);
+            }
+            return Err(io::Error::new(
+                os_err.kind(),
+                format!("Failed to resolve ShellExecuteW from shell32.dll: {os_err}"),
+            ));
+        };
+        let shell_execute_w: ShellExecuteWFn = unsafe { std::mem::transmute(proc_fn) };
+
+        let exe_path = std::env::current_exe().inspect_err(|_| unsafe {
+            FreeLibrary(shell32_mod);
+        })?;
         let cwd = std::env::current_dir().ok();
         let raw_args: Vec<String> = std::env::args().collect();
         let params = build_elevated_relaunch_args(&raw_args, std::process::id(), extra_args);
@@ -282,7 +359,7 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
         });
 
         let ret = unsafe {
-            ShellExecuteW(
+            shell_execute_w(
                 std::ptr::null_mut(),
                 verb_w.as_ptr(),
                 exe_w.as_ptr(),
@@ -291,6 +368,9 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
                 SW_SHOWNORMAL,
             )
         };
+        unsafe {
+            FreeLibrary(shell32_mod);
+        }
         let code = ret as isize;
         if code <= 32 {
             let msg = match code {
@@ -391,21 +471,6 @@ impl TransparentManager {
             .clone();
 
         #[cfg(windows)]
-        let (dll_found, sys_found, dll_path, sys_path, searched_dirs) = {
-            let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
-            (
-                avail.dll_found,
-                avail.sys_found,
-                avail.dll_path,
-                avail.sys_path,
-                avail.searched_dirs,
-            )
-        };
-        #[cfg(not(windows))]
-        let (dll_found, sys_found, dll_path, sys_path, searched_dirs) =
-            (false, false, None, None, Vec::new());
-
-        #[cfg(windows)]
         let (running, driver_version) = {
             let guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -416,28 +481,17 @@ impl TransparentManager {
         #[cfg(not(windows))]
         let (running, driver_version) = (false, None);
 
-        TransparentRuntimeStatus {
-            supported: cfg!(windows),
-            enabled: cfg.enabled,
-            running,
-            elevated: is_process_elevated(),
-            dll_found,
-            sys_found,
-            dll_path,
-            sys_path,
-            searched_dirs,
-            driver_version,
-            active_flows: self.stats.active_flows.load(Ordering::Relaxed),
-            tcp_intercepted_total: self.stats.tcp_intercepted_total.load(Ordering::Relaxed),
-            tcp_passthrough_total: self.stats.tcp_passthrough_total.load(Ordering::Relaxed),
-            tcp_blocked_rst_total: self.stats.tcp_blocked_rst_total.load(Ordering::Relaxed),
-            dns_hijacked_total: self.stats.dns_hijacked_total.load(Ordering::Relaxed),
-            quic_blocked_total: self.stats.quic_blocked_total.load(Ordering::Relaxed),
-            hijack_dns: cfg.hijack_dns,
-            block_quic_for_proxied: cfg.block_quic_for_proxied,
-            configured_dll_path: cfg.dll_path,
-            last_error,
-        }
+        let mut st = probe_status(&cfg);
+        st.running = running;
+        st.driver_version = driver_version;
+        st.active_flows = self.stats.active_flows.load(Ordering::Relaxed);
+        st.tcp_intercepted_total = self.stats.tcp_intercepted_total.load(Ordering::Relaxed);
+        st.tcp_passthrough_total = self.stats.tcp_passthrough_total.load(Ordering::Relaxed);
+        st.tcp_blocked_rst_total = self.stats.tcp_blocked_rst_total.load(Ordering::Relaxed);
+        st.dns_hijacked_total = self.stats.dns_hijacked_total.load(Ordering::Relaxed);
+        st.quic_blocked_total = self.stats.quic_blocked_total.load(Ordering::Relaxed);
+        st.last_error = last_error;
+        st
     }
 
     /// 根据新配置热启/热停透明代理或更新实时开关；若启用失败返回明确错误码字符串
@@ -473,7 +527,18 @@ impl TransparentManager {
             self.stop_locked();
         }
 
-        self.start_locked(rt_handle, &next)
+        if let Err(err) = self.start_locked(rt_handle, &next) {
+            *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = prev.clone();
+            self.live_hijack_dns
+                .store(prev.hijack_dns, Ordering::Release);
+            self.live_block_quic
+                .store(prev.block_quic_for_proxied, Ordering::Release);
+            if prev.enabled && prev.dll_path != next.dll_path {
+                let _ = self.start_locked(rt_handle, &prev);
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// 尝试按照当前 `settings` 启动透明代理

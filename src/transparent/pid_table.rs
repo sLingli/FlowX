@@ -122,12 +122,11 @@ impl SocketPidTable {
                 shard.maybe_evict(now);
             }
             WinDivertEvent::SocketClose => {
-                if !norm_ip.is_unspecified() {
-                    if let Some(existing) = shard.exact.get(&(protocol, norm_ip, local_port))
-                        && (pid == 0 || existing.pid == pid)
-                    {
-                        shard.exact.remove(&(protocol, norm_ip, local_port));
-                    }
+                if !norm_ip.is_unspecified()
+                    && let Some(existing) = shard.exact.get(&(protocol, norm_ip, local_port))
+                    && (pid == 0 || existing.pid == pid)
+                {
+                    shard.exact.remove(&(protocol, norm_ip, local_port));
                 }
                 if let Some(existing) = shard.wild.get(&(protocol, local_port))
                     && (pid == 0 || existing.pid == pid)

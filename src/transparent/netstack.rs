@@ -1044,6 +1044,7 @@ mod tests {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_ack(
         src: [u8; 4],
         sport: u16,

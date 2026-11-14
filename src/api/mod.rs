@@ -20,6 +20,10 @@ use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
 use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
+use crate::transparent::{
+    probe_status, relaunch_elevated_with_replace_pid, TransparentManager,
+    TransparentRuntimeStatus, TransparentSettings,
+};
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const CONFIG_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -175,6 +179,19 @@ pub struct MoveRuleRequest {
     pub direction: String, // "up" | "down" | "top" | "bottom"
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TransparentToggleRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransparentConfigRequest {
+    pub hijack_dns: Option<bool>,
+    pub block_quic_for_proxied: Option<bool>,
+    pub dll_path: Option<String>,
+    pub clear_dll_path: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SystemRuntimeContext {
     pub inbound_addr: SocketAddr,
@@ -205,6 +222,7 @@ pub struct SystemInfoResponse {
     pub nodes_count: usize,
     pub rules_count: usize,
     pub enabled_rules_count: usize,
+    pub transparent: TransparentRuntimeStatus,
 }
 
 pub struct ApiServer {
@@ -216,6 +234,8 @@ pub struct ApiServer {
     pub config_store: Option<Arc<ConfigStore>>,
     pub runtime_context: Option<Arc<SystemRuntimeContext>>,
     pub in_flight: Option<Arc<InFlightTracker>>,
+    pub transparent_manager: Option<Arc<TransparentManager>>,
+    pub shutdown_tx: Option<watch::Sender<bool>>,
     conn_limit: Arc<Semaphore>,
     ping_semaphore: Arc<Semaphore>,
     mutation_semaphore: Arc<Semaphore>,
@@ -240,6 +260,8 @@ impl ApiServer {
             config_store: None,
             runtime_context: None,
             in_flight: None,
+            transparent_manager: None,
+            shutdown_tx: None,
             conn_limit: Arc::new(Semaphore::new(MAX_API_CONCURRENCY)),
             ping_semaphore: Arc::new(Semaphore::new(MAX_PING_CONCURRENCY)),
             mutation_semaphore: Arc::new(Semaphore::new(MAX_MUTATION_CONCURRENCY)),
@@ -272,6 +294,16 @@ impl ApiServer {
 
     pub fn with_in_flight(mut self, tracker: Arc<InFlightTracker>) -> Self {
         self.in_flight = Some(tracker);
+        self
+    }
+
+    pub fn with_transparent_manager(mut self, mgr: Arc<TransparentManager>) -> Self {
+        self.transparent_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_shutdown_sender(mut self, tx: watch::Sender<bool>) -> Self {
+        self.shutdown_tx = Some(tx);
         self
     }
 
@@ -354,6 +386,8 @@ impl ApiServer {
             let self_ports_clone = Arc::clone(&self_ports);
             let config_store = self.config_store.clone();
             let runtime_context = self.runtime_context.clone();
+            let transparent_manager = self.transparent_manager.clone();
+            let shutdown_tx = self.shutdown_tx.clone();
             let ping_semaphore = Arc::clone(&self.ping_semaphore);
             let mutation_semaphore = Arc::clone(&self.mutation_semaphore);
             let mutation_lock = Arc::clone(&self.mutation_lock);
@@ -373,6 +407,8 @@ impl ApiServer {
                     proxy_nodes,
                     config_store,
                     runtime_context,
+                    transparent_manager,
+                    shutdown_tx,
                     ping_semaphore,
                     mutation_semaphore,
                     mutation_lock,
@@ -744,6 +780,8 @@ async fn handle_api_request(
     proxy_nodes: Arc<RwLock<HashMap<u32, ProxyNodeEntry>>>,
     config_store: Option<Arc<ConfigStore>>,
     runtime_context: Option<Arc<SystemRuntimeContext>>,
+    transparent_manager: Option<Arc<TransparentManager>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
     ping_semaphore: Arc<Semaphore>,
     mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
@@ -892,11 +930,14 @@ async fn handle_api_request(
                     | "/api/rules/simulate"
                     | "/api/rules/toggle"
                     | "/api/rules/move"
+                    | "/api/transparent/toggle"
             )
+            | ("PUT" | "POST", "/api/transparent/config")
     ) || (matches!(
         (method, path),
         ("POST", "/api/connections/kill" | "/api/nodes/ping") | ("DELETE", "/api/nodes" | "/api/rules")
-    ) && (!body_bytes.is_empty() || parse_query_param(query, "id").is_none()));
+    ) && (!body_bytes.is_empty() || parse_query_param(query, "id").is_none()))
+        || (method == "POST" && path == "/api/transparent/elevate" && !body_bytes.is_empty());
     if requires_json_ct && !has_json_content_type(&headers) {
         send_http_response(
             &mut stream,
@@ -914,8 +955,12 @@ async fn handle_api_request(
             | ("POST" | "PUT" | "PATCH" | "DELETE", "/api/rules")
             | (
                 "POST",
-                "/api/rules/default" | "/api/rules/toggle" | "/api/rules/move"
+                "/api/rules/default"
+                    | "/api/rules/toggle"
+                    | "/api/rules/move"
+                    | "/api/transparent/toggle"
             )
+            | ("PUT" | "POST", "/api/transparent/config")
     );
     let (mut mutation_guard, mut mutation_sem_permit) = if is_mutation {
         let Ok(sem_permit) = mutation_semaphore.try_acquire() else {
@@ -962,6 +1007,8 @@ async fn handle_api_request(
 
     let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
     let mut should_persist = false;
+    let mut rollback_transparent: Option<TransparentSettings> = None;
+    let mut trigger_elevated_shutdown = false;
 
     let (mut status, mut content_type, mut body) = match (method, path) {
         ("OPTIONS", _) => ("204 No Content", "text/plain", String::new()),
@@ -979,6 +1026,7 @@ async fn handle_api_request(
                 actual_port,
                 runtime_context.as_deref(),
                 config_store.as_deref(),
+                transparent_manager.as_deref(),
                 &proxy_nodes,
                 &rule_engine,
                 started_at,
@@ -1330,6 +1378,37 @@ async fn handle_api_request(
                 )
             }
         }
+        ("GET", "/api/transparent/status") => {
+            let status_view = transparent_status_or_fallback(transparent_manager.as_deref());
+            (
+                "200 OK",
+                "application/json; charset=utf-8",
+                serde_json_to_string(&status_view),
+            )
+        }
+        ("POST", "/api/transparent/toggle") => {
+            handle_transparent_toggle(
+                transparent_manager.as_ref(),
+                req_body,
+                locale,
+                &mut should_persist,
+                &mut rollback_transparent,
+            )
+            .await
+        }
+        ("PUT" | "POST", "/api/transparent/config") => {
+            handle_transparent_config(
+                transparent_manager.as_ref(),
+                req_body,
+                locale,
+                &mut should_persist,
+                &mut rollback_transparent,
+            )
+            .await
+        }
+        ("POST", "/api/transparent/elevate") => {
+            handle_transparent_elevate(req_body, locale, &mut trigger_elevated_shutdown).await
+        }
         _ => (
             "404 Not Found",
             "application/json; charset=utf-8",
@@ -1339,11 +1418,13 @@ async fn handle_api_request(
 
     if should_persist {
         let mut persisted_ok = true;
+        let persist_transparent = transparent_manager.as_ref().map(|m| m.settings());
         if let Some(store) = config_store.as_ref()
             && let Err(e) = persist_config_async_with_timeout(
                 Arc::clone(store),
                 &proxy_nodes,
                 &rule_engine,
+                persist_transparent,
                 persist_timeout,
             )
             .await
@@ -1352,6 +1433,23 @@ async fn handle_api_request(
                 "[API] Failed to write updated config to disk, aborting commit: {:#}",
                 e
             );
+            if let (Some(mgr), Some(prev_settings)) =
+                (transparent_manager.as_ref(), rollback_transparent.take())
+            {
+                let mgr_clone = Arc::clone(mgr);
+                let rt_handle = tokio::runtime::Handle::current();
+                if let Err(rb_err) = tokio::task::spawn_blocking(move || {
+                    mgr_clone.apply_settings(prev_settings, &rt_handle)
+                })
+                .await
+                .unwrap_or_else(|join_err| Err(format!("rollback task failed: {join_err}")))
+                {
+                    error!(
+                        "[API] Failed to roll back transparent proxy settings: {}",
+                        rb_err
+                    );
+                }
+            }
             status = "500 Internal Server Error";
             content_type = "application/json; charset=utf-8";
             body = json_error(
@@ -1378,6 +1476,9 @@ async fn handle_api_request(
     drop(mutation_sem_permit.take());
 
     send_http_response(&mut stream, status, content_type, &body).await?;
+    if trigger_elevated_shutdown && let Some(tx) = shutdown_tx.as_ref() {
+        let _ = tx.send(true);
+    }
     Ok(())
 }
 
@@ -2300,10 +2401,277 @@ pub(crate) fn handle_simulate_route_with_pool(
     ("200 OK", ct, serde_json_to_string(&resp))
 }
 
+fn transparent_status_or_fallback(mgr: Option<&TransparentManager>) -> TransparentRuntimeStatus {
+    mgr.map_or_else(
+        || probe_status(&TransparentSettings::default()),
+        |m| m.status(),
+    )
+}
+
+fn map_transparent_apply_error(
+    locale: Locale,
+    raw_err: &str,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let (status, code, key) = if raw_err.starts_with("ERR_TRANSPARENT_REQUIRES_ADMIN:") {
+        (
+            "409 Conflict",
+            "ERR_TRANSPARENT_REQUIRES_ADMIN",
+            "error.transparent_requires_admin",
+        )
+    } else if raw_err.starts_with("ERR_TRANSPARENT_MISSING_DRIVER:") {
+        (
+            "409 Conflict",
+            "ERR_TRANSPARENT_MISSING_DRIVER",
+            "error.transparent_missing_driver",
+        )
+    } else if raw_err.starts_with("ERR_TRANSPARENT_UNSUPPORTED_OS:") {
+        (
+            "400 Bad Request",
+            "ERR_TRANSPARENT_UNSUPPORTED_OS",
+            "error.transparent_unsupported_os",
+        )
+    } else {
+        (
+            "500 Internal Server Error",
+            "ERR_TRANSPARENT_START_FAILED",
+            "error.transparent_start_failed",
+        )
+    };
+    let payload = serde_json::json!({
+        "error": t(locale, key),
+        "code": code,
+        "detail": raw_err,
+    })
+    .to_string();
+    (status, ct, payload)
+}
+
+async fn apply_transparent_and_stage(
+    mgr: &Arc<TransparentManager>,
+    next: TransparentSettings,
+    locale: Locale,
+    should_persist: &mut bool,
+    rollback_transparent: &mut Option<TransparentSettings>,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let prev = mgr.settings();
+    let mgr_clone = Arc::clone(mgr);
+    let rt_handle = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || mgr_clone.apply_settings(next, &rt_handle)).await {
+        Ok(Ok(())) => {
+            *rollback_transparent = Some(prev);
+            *should_persist = true;
+            ("200 OK", ct, serde_json_to_string(&mgr.status()))
+        }
+        Ok(Err(raw_err)) => map_transparent_apply_error(locale, &raw_err),
+        Err(join_err) => map_transparent_apply_error(
+            locale,
+            &format!("Transparent manager background task failed: {join_err}"),
+        ),
+    }
+}
+
+async fn handle_transparent_toggle(
+    mgr: Option<&Arc<TransparentManager>>,
+    req_body: &str,
+    locale: Locale,
+    should_persist: &mut bool,
+    rollback_transparent: &mut Option<TransparentSettings>,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let Some(mgr) = mgr else {
+        return (
+            "503 Service Unavailable",
+            ct,
+            json_error(
+                locale,
+                "ERR_TRANSPARENT_UNAVAILABLE",
+                "error.transparent_unavailable",
+            ),
+        );
+    };
+    let Ok(req) = serde_json::from_str::<TransparentToggleRequest>(req_body) else {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_INVALID_TRANSPARENT_BODY",
+                "error.invalid_transparent_body",
+            ),
+        );
+    };
+
+    let mut next = mgr.settings();
+    next.enabled = req.enabled;
+    apply_transparent_and_stage(mgr, next, locale, should_persist, rollback_transparent).await
+}
+
+async fn handle_transparent_config(
+    mgr: Option<&Arc<TransparentManager>>,
+    req_body: &str,
+    locale: Locale,
+    should_persist: &mut bool,
+    rollback_transparent: &mut Option<TransparentSettings>,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    let Some(mgr) = mgr else {
+        return (
+            "503 Service Unavailable",
+            ct,
+            json_error(
+                locale,
+                "ERR_TRANSPARENT_UNAVAILABLE",
+                "error.transparent_unavailable",
+            ),
+        );
+    };
+    let Ok(req) = serde_json::from_str::<TransparentConfigRequest>(req_body) else {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_INVALID_TRANSPARENT_BODY",
+                "error.invalid_transparent_body",
+            ),
+        );
+    };
+
+    if req.clear_dll_path == Some(true)
+        && req
+            .dll_path
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_TRANSPARENT_INVALID_DLL_PATH",
+                "error.transparent_invalid_dll_path",
+            ),
+        );
+    }
+
+    if let Some(ref raw_path) = req.dll_path
+        && (raw_path.chars().any(|c| c.is_control()) || raw_path.len() > 4096)
+    {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_TRANSPARENT_INVALID_DLL_PATH",
+                "error.transparent_invalid_dll_path",
+            ),
+        );
+    }
+
+    let mut next = mgr.settings();
+    if let Some(v) = req.hijack_dns {
+        next.hijack_dns = v;
+    }
+    if let Some(v) = req.block_quic_for_proxied {
+        next.block_quic_for_proxied = v;
+    }
+    if req.clear_dll_path == Some(true) {
+        next.dll_path = None;
+    } else if let Some(raw_path) = req.dll_path {
+        let trimmed = raw_path.trim();
+        next.dll_path = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    apply_transparent_and_stage(mgr, next, locale, should_persist, rollback_transparent).await
+}
+
+async fn handle_transparent_elevate(
+    req_body: &str,
+    locale: Locale,
+    trigger_elevated_shutdown: &mut bool,
+) -> (&'static str, &'static str, String) {
+    let ct = "application/json; charset=utf-8";
+    if !req_body.trim().is_empty() && serde_json::from_str::<serde_json::Value>(req_body).is_err() {
+        return (
+            "400 Bad Request",
+            ct,
+            json_error(
+                locale,
+                "ERR_INVALID_TRANSPARENT_BODY",
+                "error.invalid_transparent_body",
+            ),
+        );
+    }
+
+    match tokio::task::spawn_blocking(|| relaunch_elevated_with_replace_pid(&[])).await {
+        Ok(Ok(())) => {
+            *trigger_elevated_shutdown = true;
+            ("200 OK", ct, r#"{"ok":true,"relaunching":true}"#.to_string())
+        }
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            let (status, code, key) = if msg.contains("ERR_TRANSPARENT_UNSUPPORTED_OS") {
+                (
+                    "400 Bad Request",
+                    "ERR_TRANSPARENT_UNSUPPORTED_OS",
+                    "error.transparent_unsupported_os",
+                )
+            } else if msg.contains("ERR_TRANSPARENT_UAC_CANCELLED") {
+                (
+                    "409 Conflict",
+                    "ERR_TRANSPARENT_UAC_CANCELLED",
+                    "error.transparent_uac_cancelled",
+                )
+            } else if e.kind() == std::io::ErrorKind::AlreadyExists {
+                (
+                    "409 Conflict",
+                    "ERR_TRANSPARENT_ALREADY_ELEVATED",
+                    "error.transparent_already_elevated",
+                )
+            } else {
+                (
+                    "500 Internal Server Error",
+                    "ERR_TRANSPARENT_ELEVATE_FAILED",
+                    "error.transparent_elevate_failed",
+                )
+            };
+            (
+                status,
+                ct,
+                serde_json::json!({
+                    "error": t(locale, key),
+                    "code": code,
+                    "detail": msg,
+                })
+                .to_string(),
+            )
+        }
+        Err(join_err) => (
+            "500 Internal Server Error",
+            ct,
+            serde_json::json!({
+                "error": t(locale, "error.transparent_elevate_failed"),
+                "code": "ERR_TRANSPARENT_ELEVATE_FAILED",
+                "detail": format!("Elevation background task failed: {join_err}"),
+            })
+            .to_string(),
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_system_info(
     actual_port: u16,
     runtime_ctx: Option<&SystemRuntimeContext>,
     config_store: Option<&ConfigStore>,
+    transparent_manager: Option<&TransparentManager>,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     rule_engine: &RuleEngine,
     started_at: Instant,
@@ -2360,6 +2728,7 @@ fn build_system_info(
         nodes_count,
         rules_count,
         enabled_rules_count,
+        transparent: transparent_status_or_fallback(transparent_manager),
     }
 }
 
@@ -2367,9 +2736,11 @@ async fn persist_config_async_with_timeout(
     store: Arc<ConfigStore>,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     rule_engine: &RuleEngine,
+    transparent: Option<TransparentSettings>,
     timeout: Duration,
 ) -> Result<()> {
-    let cfg = ConfigStore::snapshot_runtime(proxy_nodes, rule_engine);
+    let cfg =
+        ConfigStore::snapshot_runtime_with_transparent(proxy_nodes, rule_engine, transparent.as_ref());
     let handle = tokio::task::spawn_blocking(move || store.save_profile(&cfg));
     tokio::time::timeout(timeout, handle)
         .await
@@ -4468,6 +4839,209 @@ mod tests {
         let _ = release_tx.send(());
         let _ = blocker_thread.join();
         tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    #[tokio::test]
+    async fn test_api_transparent_status_config_toggle_and_persist_rollback() {
+        use crate::dns::server::DnsServer;
+        use crate::dns::FakeIpPool;
+        use crate::interceptor::dispatcher::DispatcherConfig;
+        use crate::interceptor::process::ProcessTracker;
+
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_api_transparent_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&cfg_path);
+
+        let store = Arc::new(ConfigStore::new(&cfg_path));
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let fake_ip_pool = Arc::new(FakeIpPool::new_default());
+        let tracker = Arc::new(ProcessTracker::new());
+        let upstream_dns: SocketAddr = "223.5.5.5:53".parse().unwrap();
+
+        let dispatcher_cfg = Arc::new(DispatcherConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            tracker,
+            fake_ip_pool: Arc::clone(&fake_ip_pool),
+            upstream_dns,
+            rule_engine: Arc::clone(&re),
+            monitor: Arc::clone(&mgr),
+            proxy_nodes: Arc::clone(&nodes),
+            proxy_chains: Arc::new(HashMap::new()),
+            self_ports: vec![40001, 1053],
+        });
+        let dns_server = Arc::new(DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            fake_ip_pool,
+            upstream_dns,
+            true,
+        ));
+        let t_mgr = Arc::new(TransparentManager::new(
+            dispatcher_cfg,
+            dns_server,
+            TransparentSettings::default(),
+        ));
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_self_ports(vec![40001, 40080, 1053])
+            .with_config_store(Arc::clone(&store))
+            .with_transparent_manager(Arc::clone(&t_mgr))
+            .with_persist_timeout(Duration::from_millis(200));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (shutdown_tx, rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { srv.run(listener, rx).await });
+
+        // 1. /api/system embeds transparent status and /api/transparent/status works
+        let sys_resp = raw_http(
+            addr,
+            &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        )
+        .await;
+        assert!(sys_resp.starts_with("HTTP/1.1 200 OK"), "sys: {sys_resp}");
+        assert!(sys_resp.contains(r#""transparent":{"#));
+
+        let status_resp = raw_http(
+            addr,
+            &format!("GET /api/transparent/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        )
+        .await;
+        assert!(status_resp.starts_with("HTTP/1.1 200 OK"), "status: {status_resp}");
+        assert!(status_resp.contains(r#""enabled":false"#));
+        assert!(status_resp.contains(r#""hijack_dns":true"#));
+
+        // 2. PUT /api/transparent/config rejects control chars & conflicting clear_dll_path
+        for bad_body in [
+            r#"{"dll_path":"C:\\bad\npath\\WinDivert.dll"}"#,
+            r#"{"dll_path":"C:\\ok\\WinDivert.dll","clear_dll_path":true}"#,
+        ] {
+            let bad_resp = raw_http(
+                addr,
+                &format!(
+                    "PUT /api/transparent/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    port,
+                    bad_body.len(),
+                    bad_body
+                ),
+            )
+            .await;
+            assert!(bad_resp.starts_with("HTTP/1.1 400 Bad Request"), "bad: {bad_resp}");
+            assert!(bad_resp.contains("ERR_TRANSPARENT_INVALID_DLL_PATH"));
+        }
+
+        // 3. Valid PUT /api/transparent/config persists <TransparentProxy> to XML
+        let cfg_body = r#"{"hijack_dns":false,"block_quic_for_proxied":false,"dll_path":"Z:\\__nonexistent_windivert_test__\\WinDivert.dll"}"#;
+        let cfg_resp = raw_http(
+            addr,
+            &format!(
+                "PUT /api/transparent/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                cfg_body.len(),
+                cfg_body
+            ),
+        )
+        .await;
+        assert!(cfg_resp.starts_with("HTTP/1.1 200 OK"), "cfg: {cfg_resp}");
+        assert!(cfg_resp.contains(r#""hijack_dns":false"#));
+        assert!(cfg_resp.contains(r#""block_quic_for_proxied":false"#));
+
+        let saved_rt = store.load_existing(&[]).unwrap();
+        assert!(!saved_rt.transparent_settings.hijack_dns);
+        assert!(!saved_rt.transparent_settings.block_quic_for_proxied);
+        assert_eq!(
+            saved_rt.transparent_settings.dll_path.as_deref(),
+            Some(r"Z:\__nonexistent_windivert_test__\WinDivert.dll")
+        );
+
+        // 4. Node mutations preserve <TransparentProxy> on disk
+        let node_body = r#"{"name":"n1","protocol":"SOCKS5","server_addr":"10.0.0.1:1080"}"#;
+        let node_resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                node_body.len(),
+                node_body
+            ),
+        )
+        .await;
+        assert!(node_resp.starts_with("HTTP/1.1 200 OK"), "node: {node_resp}");
+        let saved_after_node = store.load_existing(&[]).unwrap();
+        assert!(!saved_after_node.transparent_settings.hijack_dns);
+        assert_eq!(
+            saved_after_node.transparent_settings.dll_path.as_deref(),
+            Some(r"Z:\__nonexistent_windivert_test__\WinDivert.dll")
+        );
+
+        // 5. Enabling transparent proxy with missing driver/non-admin fails closed without mutating XML
+        let toggle_body = r#"{"enabled":true}"#;
+        let toggle_resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/transparent/toggle HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                toggle_body.len(),
+                toggle_body
+            ),
+        )
+        .await;
+        assert!(
+            toggle_resp.starts_with("HTTP/1.1 409 Conflict")
+                || toggle_resp.starts_with("HTTP/1.1 400 Bad Request"),
+            "toggle fail: {toggle_resp}"
+        );
+        assert!(!t_mgr.settings().enabled);
+        let saved_after_failed_toggle = store.load_existing(&[]).unwrap();
+        assert!(!saved_after_failed_toggle.transparent_settings.enabled);
+
+        // 6. Stalled ConfigStore persistence rolls back transparent settings in memory
+        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let blocker_store = Arc::clone(&store);
+        let blocker_nodes = Arc::clone(&nodes);
+        let blocker_re = Arc::clone(&re);
+        let blocker_thread = std::thread::spawn(move || {
+            let _lock = blocker_store.lock_save_for_test();
+            let _ = hold_tx.send(());
+            let _ = release_rx.recv();
+            drop(_lock);
+            let _ = blocker_store.save_runtime(&blocker_nodes, &blocker_re);
+        });
+        hold_rx.recv().unwrap();
+
+        let rollback_body = r#"{"hijack_dns":true,"clear_dll_path":true}"#;
+        let rb_resp = raw_http(
+            addr,
+            &format!(
+                "PUT /api/transparent/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                rollback_body.len(),
+                rollback_body
+            ),
+        )
+        .await;
+        assert!(rb_resp.starts_with("HTTP/1.1 500 Internal Server Error"), "rb: {rb_resp}");
+        assert!(rb_resp.contains("ERR_CONFIG_PERSIST_FAILED"));
+        assert!(!t_mgr.settings().hijack_dns, "hijack_dns should roll back on persist timeout");
+        assert_eq!(
+            t_mgr.settings().dll_path.as_deref(),
+            Some(r"Z:\__nonexistent_windivert_test__\WinDivert.dll")
+        );
+
+        let _ = release_tx.send(());
+        let _ = blocker_thread.join();
+        tokio::time::sleep(Duration::from_millis(30)).await;
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_file(&cfg_path);

@@ -46,6 +46,7 @@ impl ProxyNodeEntry {
 }
 
 /// 流量调度核心配置
+#[derive(Clone)]
 pub struct DispatcherConfig {
     pub bind_addr: SocketAddr,
     pub tracker: Arc<ProcessTracker>,

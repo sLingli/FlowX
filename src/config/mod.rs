@@ -15,8 +15,13 @@ use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
 use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
+use crate::transparent::TransparentSettings;
 
 static NEXT_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn default_true_bool() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename = "Profile", deny_unknown_fields)]
@@ -25,10 +30,53 @@ pub struct ProfileConfig {
     pub version: Option<String>,
     #[serde(rename = "DefaultAction", default, skip_serializing_if = "Option::is_none")]
     pub default_action: Option<RuleActionItem>,
+    #[serde(rename = "TransparentProxy", default, skip_serializing_if = "Option::is_none")]
+    pub transparent_proxy: Option<TransparentProxyItem>,
     #[serde(rename = "ProxyList", default, skip_serializing_if = "Option::is_none")]
     pub proxy_list: Option<ProxyList>,
     #[serde(rename = "RuleList", default, skip_serializing_if = "Option::is_none")]
     pub rule_list: Option<RuleList>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TransparentProxyItem {
+    #[serde(rename = "@enabled", default)]
+    pub enabled: bool,
+    #[serde(rename = "HijackDns", default = "default_true_bool")]
+    pub hijack_dns: bool,
+    #[serde(rename = "BlockQuicForProxied", default = "default_true_bool")]
+    pub block_quic_for_proxied: bool,
+    #[serde(rename = "DllPath", default, skip_serializing_if = "Option::is_none")]
+    pub dll_path: Option<String>,
+}
+
+impl TransparentProxyItem {
+    pub fn into_settings(self) -> TransparentSettings {
+        TransparentSettings {
+            enabled: self.enabled,
+            hijack_dns: self.hijack_dns,
+            block_quic_for_proxied: self.block_quic_for_proxied,
+            dll_path: self
+                .dll_path
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        }
+    }
+
+    pub fn from_settings(settings: &TransparentSettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            hijack_dns: settings.hijack_dns,
+            block_quic_for_proxied: settings.block_quic_for_proxied,
+            dll_path: settings
+                .dll_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -96,6 +144,7 @@ pub struct RuntimeProfile {
     pub proxy_nodes: HashMap<u32, ProxyNodeEntry>,
     pub rules: Vec<Rule>,
     pub default_action: Action,
+    pub transparent_settings: TransparentSettings,
 }
 
 impl ProfileConfig {
@@ -121,6 +170,7 @@ impl ProfileConfig {
                 action_type: "Direct".to_string(),
                 value: None,
             }),
+            transparent_proxy: None,
             proxy_list: Some(ProxyList {
                 proxies: vec![ProxyItem {
                     id: 101,
@@ -198,10 +248,16 @@ impl ProfileConfig {
             }
         }
 
+        let transparent_settings = self
+            .transparent_proxy
+            .map(TransparentProxyItem::into_settings)
+            .unwrap_or_default();
+
         Ok(RuntimeProfile {
             proxy_nodes,
             rules,
             default_action,
+            transparent_settings,
         })
     }
 
@@ -210,6 +266,16 @@ impl ProfileConfig {
         proxy_nodes: &HashMap<u32, ProxyNodeEntry>,
         rules: &[Rule],
         default_action: &Action,
+    ) -> Self {
+        Self::from_runtime_with_transparent(proxy_nodes, rules, default_action, None)
+    }
+
+    /// 从当前内存运行时状态（含透明代理设置）构造可持久化的配置对象
+    pub fn from_runtime_with_transparent(
+        proxy_nodes: &HashMap<u32, ProxyNodeEntry>,
+        rules: &[Rule],
+        default_action: &Action,
+        transparent: Option<&TransparentSettings>,
     ) -> Self {
         let mut proxies: Vec<ProxyItem> = proxy_nodes
             .values()
@@ -247,9 +313,14 @@ impl ProfileConfig {
             })
             .collect();
 
+        let transparent_proxy = transparent
+            .filter(|s| **s != TransparentSettings::default())
+            .map(TransparentProxyItem::from_settings);
+
         Self {
             version: Some("1".to_string()),
             default_action: Some(action_to_item(default_action)),
+            transparent_proxy,
             proxy_list: Some(ProxyList { proxies }),
             rule_list: Some(RuleList { rules: rule_items }),
         }
@@ -514,10 +585,24 @@ impl ConfigStore {
         proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
         rule_engine: &RuleEngine,
     ) -> ProfileConfig {
+        Self::snapshot_runtime_with_transparent(proxy_nodes, rule_engine, None)
+    }
+
+    /// 构造当前运行时状态（含透明代理设置）的配置快照
+    pub fn snapshot_runtime_with_transparent(
+        proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+        rule_engine: &RuleEngine,
+        transparent: Option<&TransparentSettings>,
+    ) -> ProfileConfig {
         let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
         let rules = rule_engine.current_rules();
         let default_action = rule_engine.default_action();
-        ProfileConfig::from_runtime(&nodes_guard, &rules, &default_action)
+        ProfileConfig::from_runtime_with_transparent(
+            &nodes_guard,
+            &rules,
+            &default_action,
+            transparent,
+        )
     }
 
     /// 串行加锁后将已构建的配置快照原子写入磁盘（适合在 `tokio::task::spawn_blocking` 中调用）
@@ -533,6 +618,17 @@ impl ConfigStore {
         rule_engine: &RuleEngine,
     ) -> Result<()> {
         let cfg = Self::snapshot_runtime(proxy_nodes, rule_engine);
+        self.save_profile(&cfg)
+    }
+
+    /// 串行化读取当前内存快照（含透明代理设置）并原子写回 XML 文件
+    pub fn save_runtime_with_transparent(
+        &self,
+        proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+        rule_engine: &RuleEngine,
+        transparent: Option<&TransparentSettings>,
+    ) -> Result<()> {
+        let cfg = Self::snapshot_runtime_with_transparent(proxy_nodes, rule_engine, transparent);
         self.save_profile(&cfg)
     }
 
@@ -1024,5 +1120,72 @@ mod tests {
         }
         assert_eq!(created_count, 1);
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn test_transparent_proxy_xml_roundtrip_and_unknown_field_rejection() {
+        // 1. Minimal attribute-only tag picks up safe defaults
+        let minimal_xml = r#"
+        <Profile version="1">
+          <TransparentProxy enabled="true" />
+        </Profile>
+        "#;
+        let minimal_rt = ProfileConfig::from_xml(minimal_xml).unwrap().into_runtime(&[]).unwrap();
+        assert_eq!(
+            minimal_rt.transparent_settings,
+            TransparentSettings {
+                enabled: true,
+                hijack_dns: true,
+                block_quic_for_proxied: true,
+                dll_path: None,
+            }
+        );
+
+        // 2. Full configuration with whitespace trimming round-trips cleanly
+        let full_xml = r#"
+        <Profile version="1">
+          <DefaultAction type="Direct" />
+          <TransparentProxy enabled="true">
+            <HijackDns>false</HijackDns>
+            <BlockQuicForProxied>false</BlockQuicForProxied>
+            <DllPath>  C:\tools\WinDivert.dll  </DllPath>
+          </TransparentProxy>
+          <ProxyList />
+          <RuleList />
+        </Profile>
+        "#;
+        let full_rt = ProfileConfig::from_xml(full_xml).unwrap().into_runtime(&[]).unwrap();
+        assert_eq!(
+            full_rt.transparent_settings,
+            TransparentSettings {
+                enabled: true,
+                hijack_dns: false,
+                block_quic_for_proxied: false,
+                dll_path: Some("C:\\tools\\WinDivert.dll".to_string()),
+            }
+        );
+
+        let serialized = ProfileConfig::from_runtime_with_transparent(
+            &full_rt.proxy_nodes,
+            &full_rt.rules,
+            &full_rt.default_action,
+            Some(&full_rt.transparent_settings),
+        )
+        .to_xml()
+        .unwrap();
+        let reparsed = ProfileConfig::from_xml(&serialized).unwrap().into_runtime(&[]).unwrap();
+        assert_eq!(reparsed.transparent_settings, full_rt.transparent_settings);
+
+        // 3. Unknown fields inside <TransparentProxy> are rejected fail-closed
+        let bad_xml = r#"
+        <Profile version="1">
+          <TransparentProxy enabled="true" bogus="1" />
+        </Profile>
+        "#;
+        assert!(ProfileConfig::from_xml(bad_xml).is_err());
+
+        // 4. Default profile yields disabled transparent defaults
+        let def_rt = ProfileConfig::default_profile().into_runtime(&[]).unwrap();
+        assert_eq!(def_rt.transparent_settings, TransparentSettings::default());
     }
 }

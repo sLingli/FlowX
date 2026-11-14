@@ -502,6 +502,154 @@
       margin-bottom: 20px;
     }
 
+    /* Transparent Proxy Control Card */
+    .tp-card {
+      margin-bottom: 20px;
+    }
+
+    .tp-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .tp-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    @media (max-width: 960px) {
+      .tp-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .tp-options {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .tp-option-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 12px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+      border-radius: 9px;
+    }
+
+    .tp-option-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+
+    .tp-option-desc {
+      font-size: 11.5px;
+      color: var(--text-muted);
+      margin-top: 2px;
+    }
+
+    .tp-dll-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .tp-dll-input {
+      flex: 1;
+      min-width: 180px;
+      background: var(--bg-input);
+      border: 1px solid var(--border-strong);
+      border-radius: 7px;
+      color: var(--text-primary);
+      padding: 6px 10px;
+      font-size: 12px;
+      font-family: inherit;
+    }
+
+    .tp-dll-input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .tp-stats-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    @media (max-width: 680px) {
+      .tp-stats-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    .tp-stat {
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: var(--bg-elevated);
+      border: 1px solid var(--border);
+    }
+
+    .tp-stat-label {
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .tp-stat-val {
+      font-size: 14px;
+      font-weight: 700;
+      margin-top: 2px;
+      color: var(--text-primary);
+    }
+
+    .tp-alert {
+      margin-bottom: 14px;
+      padding: 10px 14px;
+      border-radius: 9px;
+      border: 1px solid var(--amber-border);
+      background: var(--amber-soft);
+      color: var(--text-primary);
+      font-size: 12.5px;
+      line-height: 1.5;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .tp-alert.error {
+      border-color: var(--red-border);
+      background: var(--red-soft);
+    }
+
+    .tp-alert.info {
+      border-color: var(--accent-border);
+      background: var(--accent-soft);
+    }
+
+    .badge-ok {
+      background: var(--green-soft);
+      color: var(--green);
+      border: 1px solid var(--green-border);
+    }
+
+    .badge-warn {
+      background: var(--amber-soft);
+      color: var(--amber);
+      border: 1px solid var(--amber-border);
+    }
+
     .card {
       background: var(--bg-surface);
       border: 1px solid var(--border);
@@ -1402,6 +1550,100 @@
             </div>
           </div>
 
+          <div class="card tp-card" id="tp-card">
+            <div class="card-header">
+              <div>
+                <div class="card-title">
+                  <span data-i18n="tp_card_title">System Transparent Proxy (WinDivert)</span>
+                  <span class="badge badge-muted" id="tp-status-badge">Disabled</span>
+                  <span class="badge badge-muted" id="tp-admin-badge">Standard User</span>
+                </div>
+                <div class="card-sub" data-i18n="tp_card_sub">Automatically intercepts system outbound connections by process name &amp; routing rules without configuring each app</div>
+              </div>
+              <div class="tp-controls">
+                <button class="btn btn-primary btn-sm" id="btn-tp-elevate" style="display:none;" onclick="elevateTransparentProxy()" data-i18n="tp_btn_elevate">Restart as Administrator &amp; Enable</button>
+                <label class="switch" data-i18n-title="tp_master_switch_title" title="Enable/Disable System Transparent Proxy">
+                  <input type="checkbox" id="tp-toggle-switch" onchange="onTransparentToggleChange(this.checked)">
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+
+            <div class="tp-alert" id="tp-alert-box" style="display:none;">
+              <div id="tp-alert-text" style="flex:1; min-width:220px;"></div>
+            </div>
+
+            <div class="tp-grid">
+              <div class="tp-options">
+                <div class="tp-option-row">
+                  <div>
+                    <div class="tp-option-title" data-i18n="tp_opt_dns_title">Selective DNS Interception (UDP/53)</div>
+                    <div class="tp-option-desc" data-i18n="tp_opt_dns_desc">Captures DNS queries from Proxy/Domain-ruled apps into Fake-IP for accurate domain matching</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="tp-hijack-dns" checked onchange="updateTransparentOption('hijack_dns', this.checked)">
+                    <span class="slider"></span>
+                  </label>
+                </div>
+
+                <div class="tp-option-row">
+                  <div>
+                    <div class="tp-option-title" data-i18n="tp_opt_quic_title">Block QUIC / HTTP3 (UDP/443) for Proxied Apps</div>
+                    <div class="tp-option-desc" data-i18n="tp_opt_quic_desc">Forces Chromium/browsers to fall back to TCP/443 + TLS SNI instead of bypassing via UDP</div>
+                  </div>
+                  <label class="switch">
+                    <input type="checkbox" id="tp-block-quic" checked onchange="updateTransparentOption('block_quic_for_proxied', this.checked)">
+                    <span class="slider"></span>
+                  </label>
+                </div>
+
+                <div class="tp-option-row" style="flex-direction:column; align-items:stretch;">
+                  <div class="tp-option-title" data-i18n="tp_dll_label">Custom WinDivert.dll Path (Optional)</div>
+                  <div class="tp-dll-row">
+                    <input type="text" class="tp-dll-input mono" id="tp-dll-path" oninput="markTransparentDllDirty()" data-i18n-placeholder="tp_dll_placeholder" placeholder="Auto-detect next to flowx.exe (or enter C:\tools\WinDivert.dll)">
+                    <button class="btn btn-sm" id="btn-tp-save-dll" onclick="saveTransparentDllPath()" data-i18n="tp_btn_save_dll">Save</button>
+                    <button class="btn btn-sm" id="btn-tp-clear-dll" onclick="clearTransparentDllPath()" data-i18n="tp_btn_clear_dll">Reset</button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <div class="kv-list">
+                  <div class="kv-row">
+                    <span class="kv-key" data-i18n="tp_kv_driver">WinDivert Driver Status</span>
+                    <span class="kv-val mono" id="tp-driver-status">-</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key" data-i18n="tp_kv_paths">Resolved Paths</span>
+                    <span class="kv-val mono" id="tp-driver-paths" style="font-size:11px; max-width:340px; word-break:break-all; text-align:right;">-</span>
+                  </div>
+                </div>
+                <div class="tp-stats-grid">
+                  <div class="tp-stat">
+                    <div class="tp-stat-label" data-i18n="tp_stat_flows">Active Flows</div>
+                    <div class="tp-stat-val mono" id="tp-stat-flows">0</div>
+                  </div>
+                  <div class="tp-stat">
+                    <div class="tp-stat-label" data-i18n="tp_stat_tcp">Intercepted</div>
+                    <div class="tp-stat-val mono" id="tp-stat-tcp">0</div>
+                  </div>
+                  <div class="tp-stat">
+                    <div class="tp-stat-label" data-i18n="tp_stat_pass">Passthrough</div>
+                    <div class="tp-stat-val mono" id="tp-stat-pass">0</div>
+                  </div>
+                  <div class="tp-stat">
+                    <div class="tp-stat-label" data-i18n="tp_stat_dns">DNS Hijacked</div>
+                    <div class="tp-stat-val mono" id="tp-stat-dns">0</div>
+                  </div>
+                  <div class="tp-stat">
+                    <div class="tp-stat-label" data-i18n="tp_stat_blocked">RST / QUIC</div>
+                    <div class="tp-stat-val mono" id="tp-stat-blocked">0</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div class="card">
             <div class="card-header">
               <div>
@@ -1890,7 +2132,48 @@
         toast_rule_deleted: '规则已删除',
         toast_rule_del_fail: '删除规则失败',
         toast_default_updated: '已更新默认兜底策略: {action}',
-        toast_default_update_fail: '更新默认兜底策略失败'
+        toast_default_update_fail: '更新默认兜底策略失败',
+
+        tp_card_title: '系统级透明代理 (WinDivert)',
+        tp_card_sub: '类似 Proxifier 自动拦截系统出站连接并按进程/规则分发，无需单独为软件配置代理',
+        tp_master_switch_title: '开启或关闭系统级透明代理',
+        tp_btn_elevate: '以管理员权限重启并开启',
+        tp_status_running: '运行中 (已拦截)',
+        tp_status_disabled: '已关闭',
+        tp_status_pending: '待就绪 / 未激活',
+        tp_status_unsupported: '仅支持 Windows',
+        tp_admin_yes: '管理员权限',
+        tp_admin_no: '普通用户',
+        tp_opt_dns_title: '选择性 DNS 劫持 (UDP/53)',
+        tp_opt_dns_desc: '仅拦截需走代理或域名规则的进程 DNS 解析至本地 Fake-IP，直连软件放行原 DNS',
+        tp_opt_quic_title: '阻断代理进程的 QUIC / HTTP3 (UDP/443)',
+        tp_opt_quic_desc: '强制浏览器及客户端回退 TCP/443 + TLS SNI，避免 QUIC UDP 流量绕过代理',
+        tp_dll_label: '自定义 WinDivert.dll 路径（可选）',
+        tp_dll_placeholder: '自动探测同目录 WinDivert.dll，也可输入如 C:\\tools\\WinDivert.dll',
+        tp_btn_save_dll: '保存路径',
+        tp_btn_clear_dll: '重置',
+        tp_kv_driver: 'WinDivert 驱动状态',
+        tp_kv_paths: '驱动文件路径',
+        tp_driver_ready: '就绪 ({ver})',
+        tp_driver_missing: '缺失 (DLL: {dll}, SYS: {sys})',
+        tp_stat_flows: '透明活跃流',
+        tp_stat_tcp: '已接管 TCP',
+        tp_stat_pass: '直连放行包',
+        tp_stat_dns: '劫持 DNS 包',
+        tp_stat_blocked: '阻断 RST/QUIC',
+        tp_msg_unsupported: '当前宿主机非 Windows 系统，WinDivert 内核透明代理不可用（仍可使用本地 SOCKS5/HTTP 混合入站）。',
+        tp_msg_need_admin: '当前 FlowX 以标准用户权限运行。开启系统级透明代理需点击右上角「以管理员权限重启并开启」并通过 UAC 授权。',
+        tp_msg_missing_driver: '未检测到完整驱动文件：请将 WinDivert.dll 与 WinDivert64.sys 置于程序同级目录或配置自定义路径。已搜索目录：{dirs}',
+        tp_msg_elevating: '正在等待 Windows UAC 管理员授权并重启 FlowX 内核...',
+        tp_msg_elevated_timeout: '等待提权实例重新上线超时：若已取消 UAC，可点击按钮重新授权。',
+        toast_tp_enabled: '系统透明代理已开启',
+        toast_tp_disabled: '系统透明代理已关闭',
+        toast_tp_toggle_fail: '切换透明代理状态失败',
+        toast_tp_config_saved: '透明代理配置已保存并持久化',
+        toast_tp_config_fail: '更新透明代理配置失败',
+        toast_tp_elevating: '正在请求 Windows UAC 管理员权限重启 FlowX...',
+        toast_tp_elevated: 'FlowX 已以管理员身份重启并接管端口',
+        toast_tp_elevate_fail: '提权重启失败'
       },
       'en-US': {
         app_title: 'FlowX — Transparent Proxy & Process Routing Console',
@@ -2124,7 +2407,48 @@
         toast_rule_deleted: 'Rule deleted',
         toast_rule_del_fail: 'Failed to delete rule',
         toast_default_updated: 'Updated default fallback action: {action}',
-        toast_default_update_fail: 'Failed to update default fallback action'
+        toast_default_update_fail: 'Failed to update default fallback action',
+
+        tp_card_title: 'System Transparent Proxy (WinDivert)',
+        tp_card_sub: 'Proxifier-style automatic outbound interception by process & routing rules with zero per-app proxy setup',
+        tp_master_switch_title: 'Enable or disable system transparent proxy',
+        tp_btn_elevate: 'Restart as Administrator & Enable',
+        tp_status_running: 'Running (Active)',
+        tp_status_disabled: 'Disabled',
+        tp_status_pending: 'Standby / Not Active',
+        tp_status_unsupported: 'Windows Only',
+        tp_admin_yes: 'Administrator',
+        tp_admin_no: 'Standard User',
+        tp_opt_dns_title: 'Selective DNS Interception (UDP/53)',
+        tp_opt_dns_desc: 'Captures DNS lookups only for Proxy or domain-ruled processes into Fake-IP while passing direct apps through',
+        tp_opt_quic_title: 'Block QUIC / HTTP3 (UDP/443) for Proxied Apps',
+        tp_opt_quic_desc: 'Forces browsers to fall back to TCP/443 + TLS SNI instead of bypassing proxies over QUIC',
+        tp_dll_label: 'Custom WinDivert.dll Path (Optional)',
+        tp_dll_placeholder: 'Auto-detect WinDivert.dll next to flowx.exe, or enter C:\\tools\\WinDivert.dll',
+        tp_btn_save_dll: 'Save',
+        tp_btn_clear_dll: 'Reset',
+        tp_kv_driver: 'WinDivert Driver Status',
+        tp_kv_paths: 'Resolved Paths',
+        tp_driver_ready: 'Ready ({ver})',
+        tp_driver_missing: 'Missing (DLL: {dll}, SYS: {sys})',
+        tp_stat_flows: 'Active Flows',
+        tp_stat_tcp: 'Intercepted TCP',
+        tp_stat_pass: 'Passthrough',
+        tp_stat_dns: 'DNS Hijacked',
+        tp_stat_blocked: 'RST / QUIC',
+        tp_msg_unsupported: 'WinDivert transparent proxying is only supported on Windows (local SOCKS5/HTTP mixed inbound remains active).',
+        tp_msg_need_admin: 'FlowX is currently running without Administrator privileges. Click "Restart as Administrator & Enable" and approve UAC to capture system traffic.',
+        tp_msg_missing_driver: 'WinDivert binaries missing: place WinDivert.dll and WinDivert64.sys next to flowx.exe or set a custom DLL path. Searched: {dirs}',
+        tp_msg_elevating: 'Waiting for Windows UAC confirmation and elevated FlowX instance restart...',
+        tp_msg_elevated_timeout: 'Timed out waiting for elevated FlowX to reconnect. If UAC was cancelled, retry above.',
+        toast_tp_enabled: 'System transparent proxy enabled',
+        toast_tp_disabled: 'System transparent proxy disabled',
+        toast_tp_toggle_fail: 'Failed to toggle transparent proxy',
+        toast_tp_config_saved: 'Transparent proxy configuration saved',
+        toast_tp_config_fail: 'Failed to update transparent proxy configuration',
+        toast_tp_elevating: 'Requesting Windows UAC elevation to restart FlowX...',
+        toast_tp_elevated: 'FlowX restarted with Administrator privileges',
+        toast_tp_elevate_fail: 'Administrator elevation failed'
       }
     };
 
@@ -2159,6 +2483,9 @@
       editingRuleId: null,
       confirmContext: null,
       lastSimResult: null,
+      tpBusy: false,
+      tpElevating: false,
+      tpDllDirty: false,
       historyDown: new Array(MAX_HISTORY).fill(0),
       historyUp: new Array(MAX_HISTORY).fill(0)
     };
@@ -2569,6 +2896,262 @@
         document.getElementById('info-protocols').innerHTML = s.inbound_protocols
           .map(p => `<span class="badge badge-muted">${escapeHtml(p)}</span>`)
           .join('');
+      }
+      renderTransparentCard(s.transparent);
+    }
+
+    function renderTransparentCard(tp) {
+      const card = document.getElementById('tp-card');
+      if (!card) return;
+      const d = tp || {};
+      const supported = Boolean(d.supported);
+      const enabled = Boolean(d.enabled);
+      const running = Boolean(d.running);
+      const elevated = Boolean(d.elevated);
+      const dllFound = Boolean(d.dll_found);
+      const sysFound = Boolean(d.sys_found);
+
+      const statusBadge = document.getElementById('tp-status-badge');
+      if (!supported) {
+        statusBadge.textContent = t('tp_status_unsupported');
+        statusBadge.className = 'badge badge-muted';
+      } else if (running) {
+        statusBadge.textContent = t('tp_status_running');
+        statusBadge.className = 'badge badge-ok';
+      } else if (enabled) {
+        statusBadge.textContent = t('tp_status_pending');
+        statusBadge.className = 'badge badge-warn';
+      } else {
+        statusBadge.textContent = t('tp_status_disabled');
+        statusBadge.className = 'badge badge-muted';
+      }
+
+      const adminBadge = document.getElementById('tp-admin-badge');
+      if (elevated) {
+        adminBadge.textContent = t('tp_admin_yes');
+        adminBadge.className = 'badge badge-ok';
+      } else {
+        adminBadge.textContent = t('tp_admin_no');
+        adminBadge.className = 'badge badge-muted';
+      }
+
+      const elevateBtn = document.getElementById('btn-tp-elevate');
+      elevateBtn.style.display = supported && !elevated ? 'inline-flex' : 'none';
+      elevateBtn.disabled = state.tpBusy || state.tpElevating;
+
+      const masterEl = document.getElementById('tp-toggle-switch');
+      const dnsEl = document.getElementById('tp-hijack-dns');
+      const quicEl = document.getElementById('tp-block-quic');
+      const dllInput = document.getElementById('tp-dll-path');
+      const saveBtn = document.getElementById('btn-tp-save-dll');
+      const clearBtn = document.getElementById('btn-tp-clear-dll');
+
+      if (!state.tpBusy) {
+        masterEl.checked = enabled;
+        dnsEl.checked = d.hijack_dns !== false;
+        quicEl.checked = d.block_quic_for_proxied !== false;
+        if (!state.tpDllDirty && document.activeElement !== dllInput) {
+          dllInput.value = d.configured_dll_path || '';
+        }
+      }
+      const locked = state.tpBusy || state.tpElevating || !supported;
+      masterEl.disabled = locked;
+      dnsEl.disabled = state.tpBusy || state.tpElevating;
+      quicEl.disabled = state.tpBusy || state.tpElevating;
+      dllInput.disabled = state.tpBusy || state.tpElevating;
+      saveBtn.disabled = state.tpBusy || state.tpElevating;
+      clearBtn.disabled = state.tpBusy || state.tpElevating;
+
+      const driverEl = document.getElementById('tp-driver-status');
+      if (dllFound && sysFound) {
+        driverEl.textContent = t('tp_driver_ready', { ver: d.driver_version || 'WinDivert' });
+      } else {
+        driverEl.textContent = t('tp_driver_missing', {
+          dll: dllFound ? 'OK' : 'NO',
+          sys: sysFound ? 'OK' : 'NO'
+        });
+      }
+
+      const paths = [d.dll_path, d.sys_path].filter(Boolean).join(' · ');
+      document.getElementById('tp-driver-paths').textContent = paths || '-';
+
+      document.getElementById('tp-stat-flows').textContent = d.active_flows ?? 0;
+      document.getElementById('tp-stat-tcp').textContent = d.tcp_intercepted_total ?? 0;
+      document.getElementById('tp-stat-pass').textContent = d.tcp_passthrough_total ?? 0;
+      document.getElementById('tp-stat-dns').textContent = d.dns_hijacked_total ?? 0;
+      document.getElementById('tp-stat-blocked').textContent =
+        (Number(d.tcp_blocked_rst_total) || 0) + (Number(d.quic_blocked_total) || 0);
+
+      const alertBox = document.getElementById('tp-alert-box');
+      const alertText = document.getElementById('tp-alert-text');
+      alertBox.className = 'tp-alert';
+      if (state.tpElevating) {
+        alertBox.className = 'tp-alert info';
+        alertText.textContent = t('tp_msg_elevating');
+        alertBox.style.display = 'flex';
+      } else if (tp && !supported) {
+        alertText.textContent = t('tp_msg_unsupported');
+        alertBox.style.display = 'flex';
+      } else if (tp && (!dllFound || !sysFound)) {
+        alertBox.className = 'tp-alert error';
+        const dirs = Array.isArray(d.searched_dirs) ? d.searched_dirs.join(', ') : '-';
+        alertText.textContent = t('tp_msg_missing_driver', { dirs });
+        alertBox.style.display = 'flex';
+      } else if (tp && d.last_error && !( !elevated && String(d.last_error).startsWith('ERR_TRANSPARENT_REQUIRES_ADMIN:') )) {
+        alertBox.className = 'tp-alert error';
+        alertText.textContent = d.last_error;
+        alertBox.style.display = 'flex';
+      } else if (tp && !elevated) {
+        alertText.textContent = t('tp_msg_need_admin');
+        alertBox.style.display = 'flex';
+      } else {
+        alertBox.style.display = 'none';
+      }
+    }
+
+    function markTransparentDllDirty() {
+      state.tpDllDirty = true;
+    }
+
+    async function applyTransparentStatusPayload(data) {
+      if (!state.system) state.system = {};
+      state.system.transparent = data;
+      renderTransparentCard(data);
+    }
+
+    async function refreshTransparentStatus() {
+      try {
+        const res = await fetchWithTimeout('/api/transparent/status');
+        if (res.ok) {
+          const data = await res.json();
+          await applyTransparentStatusPayload(data);
+        }
+      } catch (_) {}
+    }
+
+    async function onTransparentToggleChange(enabled) {
+      if (state.tpBusy || state.tpElevating) return;
+      state.tpBusy = true;
+      renderTransparentCard(state.system.transparent);
+      try {
+        const res = await fetchWithTimeout('/api/transparent/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: Boolean(enabled) })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          await applyTransparentStatusPayload(data);
+          showToast(t(enabled ? 'toast_tp_enabled' : 'toast_tp_disabled'));
+        } else {
+          showToast(data.error || t('toast_tp_toggle_fail'), 'error');
+          await refreshTransparentStatus();
+        }
+      } catch (e) {
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
+        await refreshTransparentStatus();
+      } finally {
+        state.tpBusy = false;
+        renderTransparentCard(state.system.transparent);
+      }
+    }
+
+    async function sendTransparentConfig(payload) {
+      if (state.tpBusy || state.tpElevating) return false;
+      state.tpBusy = true;
+      renderTransparentCard(state.system.transparent);
+      try {
+        const res = await fetchWithTimeout('/api/transparent/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          state.tpDllDirty = false;
+          await applyTransparentStatusPayload(data);
+          showToast(t('toast_tp_config_saved'));
+          return true;
+        }
+        showToast(data.error || t('toast_tp_config_fail'), 'error');
+        await refreshTransparentStatus();
+        return false;
+      } catch (e) {
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
+        await refreshTransparentStatus();
+        return false;
+      } finally {
+        state.tpBusy = false;
+        renderTransparentCard(state.system.transparent);
+      }
+    }
+
+    async function updateTransparentOption(field, value) {
+      await sendTransparentConfig({ [field]: Boolean(value) });
+    }
+
+    async function saveTransparentDllPath() {
+      const dllInput = document.getElementById('tp-dll-path');
+      const val = dllInput.value.trim();
+      await sendTransparentConfig(val ? { dll_path: val } : { clear_dll_path: true });
+    }
+
+    async function clearTransparentDllPath() {
+      document.getElementById('tp-dll-path').value = '';
+      await sendTransparentConfig({ clear_dll_path: true });
+    }
+
+    async function elevateTransparentProxy() {
+      if (state.tpBusy || state.tpElevating) return;
+      state.tpElevating = true;
+      renderTransparentCard(state.system.transparent);
+      showToast(t('toast_tp_elevating'), 'info');
+      try {
+        const res = await fetchWithTimeout('/api/transparent/elevate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}'
+        }, 30000);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showToast(data.error || t('toast_tp_elevate_fail'), 'error');
+          return;
+        }
+
+        // 等待旧进程释放端口并由提权新实例上线
+        const deadline = Date.now() + 20000;
+        let reconnected = false;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 600));
+          try {
+            const hRes = await fetchWithTimeout('/api/health', {}, 1500);
+            if (hRes.ok) {
+              const sRes = await fetchWithTimeout('/api/transparent/status', {}, 1500);
+              if (sRes.ok) {
+                const st = await sRes.json().catch(() => null);
+                if (st && st.elevated) {
+                  reconnected = true;
+                  await applyTransparentStatusPayload(st);
+                  break;
+                }
+              }
+            }
+          } catch (_) {}
+        }
+
+        state.tpElevating = false;
+        if (reconnected) {
+          showToast(t('toast_tp_elevated'));
+          await refreshAll();
+        } else {
+          showToast(t('tp_msg_elevated_timeout'), 'error');
+          await refreshAll();
+        }
+      } catch (e) {
+        showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
+      } finally {
+        state.tpElevating = false;
+        renderTransparentCard(state.system.transparent);
       }
     }
 

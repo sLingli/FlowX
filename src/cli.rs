@@ -17,6 +17,7 @@ use crate::config::ConfigStore;
 use crate::i18n::Locale;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::router::{format_action_desc, Action, RuleEngine, RuleView};
+use crate::transparent::{probe_status, TransparentSettings};
 
 const DEFAULT_API_ADDR: &str = "127.0.0.1:40080";
 const DEFAULT_SELF_PORTS: [u16; 3] = [40001, 40080, 1053];
@@ -40,7 +41,11 @@ impl std::error::Error for SilentExitError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchMode {
-    Serve { config_path: String },
+    Serve {
+        config_path: String,
+        transparent_override: Option<bool>,
+        replace_pid: Option<u32>,
+    },
     Cli,
 }
 
@@ -63,7 +68,17 @@ struct ParsedCliInvocation {
 }
 
 fn is_subcommand_bool_flag(name: &str) -> bool {
-    matches!(name, "enable" | "disable" | "clear-password")
+    matches!(
+        name,
+        "enable"
+            | "disable"
+            | "clear-password"
+            | "hijack-dns"
+            | "no-hijack-dns"
+            | "block-quic"
+            | "no-block-quic"
+            | "clear-dll-path"
+    )
 }
 
 fn is_known_subcommand_value_flag(name: &str) -> bool {
@@ -92,6 +107,7 @@ fn is_known_subcommand_value_flag(name: &str) -> bool {
             | "direction"
             | "process"
             | "proc"
+            | "dll-path"
     )
 }
 
@@ -120,6 +136,8 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
     let mut offline = false;
     let mut json_output = false;
     let mut show_help = false;
+    let mut transparent_override: Option<bool> = None;
+    let mut replace_pid: Option<u32> = None;
     let mut rest: Vec<String> = Vec::new();
 
     let mut i = 1;
@@ -197,6 +215,48 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
             i += 1;
             continue;
         }
+        if !in_subcommand || rest.first().map(|s| s.as_str()) == Some("serve") {
+            if arg == "--transparent" {
+                if transparent_override == Some(false) {
+                    bail!("Conflicting flags --transparent and --no-transparent");
+                }
+                transparent_override = Some(true);
+                i += 1;
+                continue;
+            }
+            if arg == "--no-transparent" {
+                if transparent_override == Some(true) {
+                    bail!("Conflicting flags --transparent and --no-transparent");
+                }
+                transparent_override = Some(false);
+                i += 1;
+                continue;
+            }
+            if arg == "--replace-pid" {
+                i += 1;
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| anyhow!("Missing value for --replace-pid"))?;
+                let pid: u32 = val
+                    .parse()
+                    .ok()
+                    .filter(|&p| p > 0)
+                    .ok_or_else(|| anyhow!("Invalid PID '{}' for --replace-pid", val))?;
+                replace_pid = Some(pid);
+                i += 1;
+                continue;
+            }
+            if let Some(val) = arg.strip_prefix("--replace-pid=") {
+                let pid: u32 = val
+                    .parse()
+                    .ok()
+                    .filter(|&p| p > 0)
+                    .ok_or_else(|| anyhow!("Invalid PID '{}' for --replace-pid", val))?;
+                replace_pid = Some(pid);
+                i += 1;
+                continue;
+            }
+        }
 
         if let Some(stripped) = arg.strip_prefix("--") {
             if !in_subcommand || rest.first().map(|s| s.as_str()) == Some("serve") {
@@ -265,6 +325,8 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
         return Ok(ParsedCliInvocation {
             mode: LaunchMode::Serve {
                 config_path: config_path.clone(),
+                transparent_override,
+                replace_pid,
             },
             opts: GlobalCliOpts {
                 config_path,
@@ -292,6 +354,8 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
         return Ok(ParsedCliInvocation {
             mode: LaunchMode::Serve {
                 config_path: config_path.clone(),
+                transparent_override,
+                replace_pid,
             },
             opts: GlobalCliOpts {
                 config_path,
@@ -304,6 +368,15 @@ fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
                 rest,
             },
         });
+    }
+
+    if !show_help {
+        if transparent_override.is_some() {
+            bail!("Flag --transparent/--no-transparent can only be used with daemon mode (`flowx [serve]`)");
+        }
+        if replace_pid.is_some() {
+            bail!("Flag --replace-pid can only be used with daemon mode (`flowx [serve]`)");
+        }
     }
 
     Ok(ParsedCliInvocation {
@@ -451,6 +524,7 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
             Ok(())
         }
         "status" => cmd_status(&opts).await,
+        "transparent" => cmd_transparent(&opts).await,
         "node" => cmd_node(&opts).await,
         "rule" => cmd_rule(&opts).await,
         "default" => cmd_default(&opts).await,
@@ -469,12 +543,18 @@ pub fn print_help() {
 FlowX v{} — Transparent Proxy & Process Routing Engine CLI
 
 USAGE:
-  flowx [serve] [--config <flowx.xml>]
+  flowx [serve] [--config <flowx.xml>] [--transparent | --no-transparent]
   flowx <SUBCOMMAND> [OPTIONS] [--config <flowx.xml>] [--api <127.0.0.1:40080>] [--offline] [--json]
 
 SUBCOMMANDS:
   status
       Show daemon online/offline status, endpoints, node/rule counts, and default fallback action.
+
+  transparent status
+  transparent enable | disable
+  transparent config [--hijack-dns | --no-hijack-dns] [--block-quic | --no-block-quic] [--dll-path <PATH> | --clear-dll-path]
+  transparent doctor
+      Inspect WinDivert driver diagnostics, enable/disable system-level transparent proxying, or configure DNS/QUIC options.
 
   node list
   node add --name <NAME> --addr <HOST:PORT> [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U>] [--pass <P>]
@@ -1185,20 +1265,31 @@ fn ensure_offline_handler_ok(status_line: &str, body: &str) -> Result<Value> {
     }
 }
 
-type OfflineRuntime = (
-    ConfigStore,
-    RwLock<HashMap<u32, ProxyNodeEntry>>,
-    RuleEngine,
-);
+struct OfflineRuntime {
+    store: ConfigStore,
+    nodes: RwLock<HashMap<u32, ProxyNodeEntry>>,
+    engine: RuleEngine,
+    transparent: TransparentSettings,
+}
+
+impl OfflineRuntime {
+    fn save(&self) -> Result<()> {
+        self.store
+            .save_runtime_with_transparent(&self.nodes, &self.engine, Some(&self.transparent))
+    }
+}
 
 fn load_offline_runtime(config_path: &str) -> Result<OfflineRuntime> {
     let store = ConfigStore::new(config_path);
     let rt = store
         .load_existing_or_default(&DEFAULT_SELF_PORTS)
         .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
-    let nodes = RwLock::new(rt.proxy_nodes);
-    let engine = RuleEngine::new(rt.rules, rt.default_action);
-    Ok((store, nodes, engine))
+    Ok(OfflineRuntime {
+        store,
+        nodes: RwLock::new(rt.proxy_nodes),
+        engine: RuleEngine::new(rt.rules, rt.default_action),
+        transparent: rt.transparent_settings,
+    })
 }
 
 fn load_offline_runtime_readonly(config_path: &str) -> Result<OfflineRuntime> {
@@ -1206,9 +1297,12 @@ fn load_offline_runtime_readonly(config_path: &str) -> Result<OfflineRuntime> {
     let rt = store
         .load_existing(&DEFAULT_SELF_PORTS)
         .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
-    let nodes = RwLock::new(rt.proxy_nodes);
-    let engine = RuleEngine::new(rt.rules, rt.default_action);
-    Ok((store, nodes, engine))
+    Ok(OfflineRuntime {
+        store,
+        nodes: RwLock::new(rt.proxy_nodes),
+        engine: RuleEngine::new(rt.rules, rt.default_action),
+        transparent: rt.transparent_settings,
+    })
 }
 
 fn resolve_rule_id_from_views(rules: &[RuleView], id_or_index: u64) -> Option<u64> {
@@ -1253,6 +1347,9 @@ fn canonical_flag_group(flag: &str) -> &str {
         "target" | "targets" | "host" => "targets",
         "port" | "ports" => "ports",
         "dir" | "direction" => "dir",
+        "hijack-dns" | "no-hijack-dns" => "hijack-dns",
+        "block-quic" | "no-block-quic" => "block-quic",
+        "dll-path" | "clear-dll-path" => "dll-path",
         other => other,
     }
 }
@@ -1366,14 +1463,8 @@ fn resolve_id_arg(
 }
 
 enum RuleBackend {
-    Online {
-        rules: Vec<RuleView>,
-    },
-    Offline {
-        store: ConfigStore,
-        nodes: RwLock<HashMap<u32, ProxyNodeEntry>>,
-        engine: RuleEngine,
-    },
+    Online { rules: Vec<RuleView> },
+    Offline(OfflineRuntime),
 }
 
 async fn load_rule_backend(opts: &GlobalCliOpts) -> Result<RuleBackend> {
@@ -1381,12 +1472,7 @@ async fn load_rule_backend(opts: &GlobalCliOpts) -> Result<RuleBackend> {
         let rules: Vec<RuleView> = serde_json::from_value(ensure_api_ok(st, val)?)?;
         Ok(RuleBackend::Online { rules })
     } else {
-        let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-        Ok(RuleBackend::Offline {
-            store,
-            nodes,
-            engine,
-        })
+        Ok(RuleBackend::Offline(load_offline_runtime(&opts.config_path)?))
     }
 }
 
@@ -1454,32 +1540,43 @@ async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
                 "Active Conns:   {}",
                 stats_val["active_connections_count"].as_u64().unwrap_or(0)
             );
+            if let Some(tp) = sys_val.get("transparent") {
+                println!(
+                    "Transparent:    enabled={} running={} elevated={} hijack_dns={} block_quic={}",
+                    tp["enabled"].as_bool().unwrap_or(false),
+                    tp["running"].as_bool().unwrap_or(false),
+                    tp["elevated"].as_bool().unwrap_or(false),
+                    tp["hijack_dns"].as_bool().unwrap_or(true),
+                    tp["block_quic_for_proxied"].as_bool().unwrap_or(true),
+                );
+            }
         }
         return Ok(());
     }
 
-    let (store, nodes, engine) = load_offline_runtime_readonly(&opts.config_path)?;
-    let nodes_count = nodes.read().unwrap_or_else(|e| e.into_inner()).len();
-    let rules = engine.current_rules();
+    let rt = load_offline_runtime_readonly(&opts.config_path)?;
+    let nodes_count = rt.nodes.read().unwrap_or_else(|e| e.into_inner()).len();
+    let rules = rt.engine.current_rules();
     let enabled_count = rules.iter().filter(|r| r.enabled).count();
-    let def_act = engine.default_action();
+    let def_act = rt.engine.default_action();
     let def_desc = format_action_desc(&def_act, opts.locale);
 
     let out = json!({
         "mode": "offline",
-        "config_path": store.path().display().to_string(),
+        "config_path": rt.store.path().display().to_string(),
         "nodes_count": nodes_count,
         "rules_count": rules.len(),
         "enabled_rules_count": enabled_count,
         "default_action": def_desc,
         "default_action_type": def_act.type_str(),
         "default_node_id": def_act.target_id(),
+        "transparent": rt.transparent,
     });
     if opts.json_output {
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!("Mode:           OFFLINE (Direct XML Config)");
-        println!("Config File:    {}", store.path().display());
+        println!("Config File:    {}", rt.store.path().display());
         println!("Proxy Nodes:    {}", nodes_count);
         println!(
             "Routing Rules:  {} enabled / {} total",
@@ -1487,8 +1584,302 @@ async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
             rules.len()
         );
         println!("Default Action: {}", def_desc);
+        println!(
+            "Transparent:    enabled={} hijack_dns={} block_quic={}",
+            rt.transparent.enabled,
+            rt.transparent.hijack_dns,
+            rt.transparent.block_quic_for_proxied
+        );
     }
     Ok(())
+}
+
+fn print_transparent_status(st: &Value, mode_label: &str) {
+    println!(
+        "Transparent Proxy ({}): enabled={} running={} elevated={}",
+        mode_label,
+        st["enabled"].as_bool().unwrap_or(false),
+        st["running"].as_bool().unwrap_or(false),
+        st["elevated"].as_bool().unwrap_or(false),
+    );
+    println!(
+        "Options:        hijack_dns={} block_quic_for_proxied={} dll_path={}",
+        st["hijack_dns"].as_bool().unwrap_or(true),
+        st["block_quic_for_proxied"].as_bool().unwrap_or(true),
+        st["configured_dll_path"].as_str().unwrap_or("<auto>"),
+    );
+    println!(
+        "WinDivert:      supported={} dll_found={} sys_found={} driver_ver={}",
+        st["supported"].as_bool().unwrap_or(false),
+        st["dll_found"].as_bool().unwrap_or(false),
+        st["sys_found"].as_bool().unwrap_or(false),
+        st["driver_version"].as_str().unwrap_or("-"),
+    );
+    if let Some(p) = st["dll_path"].as_str() {
+        println!("DLL Resolved:   {}", p);
+    }
+    if let Some(p) = st["sys_path"].as_str() {
+        println!("SYS Resolved:   {}", p);
+    }
+    println!(
+        "Counters:       flows={} intercepted={} passthrough={} rst={} dns={} quic_drop={}",
+        st["active_flows"].as_u64().unwrap_or(0),
+        st["tcp_intercepted_total"].as_u64().unwrap_or(0),
+        st["tcp_passthrough_total"].as_u64().unwrap_or(0),
+        st["tcp_blocked_rst_total"].as_u64().unwrap_or(0),
+        st["dns_hijacked_total"].as_u64().unwrap_or(0),
+        st["quic_blocked_total"].as_u64().unwrap_or(0),
+    );
+    if let Some(err) = st["last_error"].as_str().filter(|s| !s.is_empty()) {
+        println!("Last Error:     {}", err);
+    }
+}
+
+async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
+    let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("status");
+    let tail = if opts.rest.len() > 2 {
+        &opts.rest[2..]
+    } else {
+        &[]
+    };
+
+    match sub {
+        "status" => {
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx transparent status",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            let (mode_label, res_val) = if let Some((st, val)) =
+                api_request_or_offline(opts, "GET", "/api/transparent/status", None).await?
+            {
+                ("ONLINE", ensure_api_ok(st, val)?)
+            } else {
+                let rt = load_offline_runtime_readonly(&opts.config_path)?;
+                ("OFFLINE", serde_json::to_value(probe_status(&rt.transparent))?)
+            };
+            if opts.json_output {
+                println!("{}", serde_json::to_string_pretty(&res_val)?);
+            } else {
+                print_transparent_status(&res_val, mode_label);
+            }
+            Ok(())
+        }
+        "enable" | "disable" => {
+            let cmd_label = if sub == "enable" {
+                "flowx transparent enable"
+            } else {
+                "flowx transparent disable"
+            };
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label,
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            let target_enabled = sub == "enable";
+            let payload = json!({ "enabled": target_enabled });
+            let (mode_label, res_val) = if let Some((st, val)) =
+                api_request_or_offline(opts, "POST", "/api/transparent/toggle", Some(&payload))
+                    .await?
+            {
+                ("ONLINE", ensure_api_ok(st, val)?)
+            } else {
+                let mut rt = load_offline_runtime(&opts.config_path)?;
+                rt.transparent.enabled = target_enabled;
+                rt.save()?;
+                ("OFFLINE", serde_json::to_value(probe_status(&rt.transparent))?)
+            };
+            if opts.json_output {
+                println!("{}", serde_json::to_string_pretty(&res_val)?);
+            } else {
+                print_transparent_status(&res_val, mode_label);
+            }
+            Ok(())
+        }
+        "config" => {
+            let (_, flags) = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx transparent config",
+                    value_flags: &["dll-path"],
+                    bool_flags: &[
+                        "hijack-dns",
+                        "no-hijack-dns",
+                        "block-quic",
+                        "no-block-quic",
+                        "clear-dll-path",
+                    ],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            if flags.is_empty() {
+                bail!(
+                    "Specify at least one option: --hijack-dns | --no-hijack-dns | --block-quic | --no-block-quic | --dll-path <PATH> | --clear-dll-path"
+                );
+            }
+
+            let hijack_dns = if flags.contains_key("hijack-dns") {
+                Some(true)
+            } else if flags.contains_key("no-hijack-dns") {
+                Some(false)
+            } else {
+                None
+            };
+            let block_quic = if flags.contains_key("block-quic") {
+                Some(true)
+            } else if flags.contains_key("no-block-quic") {
+                Some(false)
+            } else {
+                None
+            };
+            let clear_dll_path = flags.contains_key("clear-dll-path");
+            let dll_path = flags.get("dll-path").cloned();
+            if let Some(ref raw_path) = dll_path
+                && (raw_path.chars().any(|c| c.is_control()) || raw_path.len() > 4096)
+            {
+                bail!("Invalid --dll-path: contains control characters or exceeds 4096 bytes");
+            }
+
+            let mut payload = serde_json::Map::new();
+            if let Some(v) = hijack_dns {
+                payload.insert("hijack_dns".to_string(), json!(v));
+            }
+            if let Some(v) = block_quic {
+                payload.insert("block_quic_for_proxied".to_string(), json!(v));
+            }
+            if clear_dll_path {
+                payload.insert("clear_dll_path".to_string(), json!(true));
+            } else if let Some(ref p) = dll_path {
+                payload.insert("dll_path".to_string(), json!(p));
+            }
+            let payload_val = Value::Object(payload);
+
+            let (mode_label, res_val) = if let Some((st, val)) =
+                api_request_or_offline(opts, "PUT", "/api/transparent/config", Some(&payload_val))
+                    .await?
+            {
+                ("ONLINE", ensure_api_ok(st, val)?)
+            } else {
+                let mut rt = load_offline_runtime(&opts.config_path)?;
+                if let Some(v) = hijack_dns {
+                    rt.transparent.hijack_dns = v;
+                }
+                if let Some(v) = block_quic {
+                    rt.transparent.block_quic_for_proxied = v;
+                }
+                if clear_dll_path {
+                    rt.transparent.dll_path = None;
+                } else if let Some(raw_p) = dll_path {
+                    let trimmed = raw_p.trim();
+                    rt.transparent.dll_path = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                rt.save()?;
+                ("OFFLINE", serde_json::to_value(probe_status(&rt.transparent))?)
+            };
+            if opts.json_output {
+                println!("{}", serde_json::to_string_pretty(&res_val)?);
+            } else {
+                print_transparent_status(&res_val, mode_label);
+            }
+            Ok(())
+        }
+        "doctor" => {
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx transparent doctor",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            let settings = if std::path::Path::new(&opts.config_path).exists() {
+                load_offline_runtime_readonly(&opts.config_path)?.transparent
+            } else {
+                TransparentSettings::default()
+            };
+            let st = probe_status(&settings);
+            let mut issues: Vec<String> = Vec::new();
+            if !st.supported {
+                issues.push(
+                    "WinDivert transparent proxy is only supported on Windows hosts.".to_string(),
+                );
+            }
+            if !st.elevated {
+                issues.push(
+                    "Current process lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
+                );
+            }
+            if !st.dll_found || !st.sys_found {
+                issues.push(format!(
+                    "Missing WinDivert binaries (dll_found={}, sys_found={}); place WinDivert.dll and WinDivert64.sys next to flowx.exe or set --dll-path. Searched: {:?}",
+                    st.dll_found, st.sys_found, st.searched_dirs
+                ));
+            }
+            let ready = st.supported && st.elevated && st.dll_found && st.sys_found;
+            let report = json!({
+                "ready": ready,
+                "config_path": opts.config_path,
+                "supported": st.supported,
+                "elevated": st.elevated,
+                "dll_found": st.dll_found,
+                "sys_found": st.sys_found,
+                "dll_path": st.dll_path,
+                "sys_path": st.sys_path,
+                "configured_dll_path": st.configured_dll_path,
+                "searched_dirs": st.searched_dirs,
+                "config_enabled": st.enabled,
+                "hijack_dns": st.hijack_dns,
+                "block_quic_for_proxied": st.block_quic_for_proxied,
+                "issues": issues,
+            });
+            if opts.json_output {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Transparent Proxy Doctor:");
+                println!("  Ready:         {}", ready);
+                println!("  Windows Host:  {}", st.supported);
+                println!("  Elevated:      {}", st.elevated);
+                println!(
+                    "  WinDivert DLL: found={} ({})",
+                    st.dll_found,
+                    st.dll_path.as_deref().unwrap_or("-")
+                );
+                println!(
+                    "  WinDivert SYS: found={} ({})",
+                    st.sys_found,
+                    st.sys_path.as_deref().unwrap_or("-")
+                );
+                println!("  Search Dirs:   {:?}", st.searched_dirs);
+                if issues.is_empty() {
+                    println!("  Issues:        none");
+                } else {
+                    println!("  Issues:");
+                    for issue in &issues {
+                        println!("    - {}", issue);
+                    }
+                }
+            }
+            Ok(())
+        }
+        other => bail!("Unknown `flowx transparent` subcommand '{}'", other),
+    }
 }
 
 async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
@@ -1517,8 +1908,8 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     let v = ensure_api_ok(st, val)?;
                     serde_json::from_value(v)?
                 } else {
-                    let (_, nodes, _) = load_offline_runtime_readonly(&opts.config_path)?;
-                    let guard = nodes.read().unwrap_or_else(|e| e.into_inner());
+                    let rt = load_offline_runtime_readonly(&opts.config_path)?;
+                    let guard = rt.nodes.read().unwrap_or_else(|e| e.into_inner());
                     let mut v: Vec<ProxyNodeView> = guard.values().map(proxy_node_view).collect();
                     v.sort_by_key(|n| n.id);
                     v
@@ -1583,11 +1974,11 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
+                let rt = load_offline_runtime(&opts.config_path)?;
                 let req: AddNodeRequest = serde_json::from_value(payload)?;
-                let (st, _, body) = handle_add_node(req, &nodes, &DEFAULT_SELF_PORTS, opts.locale);
+                let (st, _, body) = handle_add_node(req, &rt.nodes, &DEFAULT_SELF_PORTS, opts.locale);
                 let val = ensure_offline_handler_ok(st, &body)?;
-                store.save_runtime(&nodes, &engine)?;
+                rt.save()?;
                 val
             };
 
@@ -1665,12 +2056,12 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
+                let rt = load_offline_runtime(&opts.config_path)?;
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
                 let (st, _, body) =
-                    handle_patch_node(req, &nodes, &DEFAULT_SELF_PORTS, opts.locale);
+                    handle_patch_node(req, &rt.nodes, &DEFAULT_SELF_PORTS, opts.locale);
                 let val = ensure_offline_handler_ok(st, &body)?;
-                store.save_runtime(&nodes, &engine)?;
+                rt.save()?;
                 val
             };
 
@@ -1711,9 +2102,9 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
-                let rules = engine.current_rules();
-                let current_default = engine.default_action();
+                let rt = load_offline_runtime(&opts.config_path)?;
+                let rules = rt.engine.current_rules();
+                let current_default = rt.engine.default_action();
                 let is_referenced = rules
                     .iter()
                     .any(|r| matches!(r.action, Action::Proxy(pid) if pid == id))
@@ -1724,7 +2115,8 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                         id
                     );
                 }
-                let removed = nodes
+                let removed = rt
+                    .nodes
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id)
@@ -1732,7 +2124,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 if !removed {
                     bail!("Proxy node #{} not found", id);
                 }
-                store.save_runtime(&nodes, &engine)?;
+                rt.save()?;
                 json!({ "ok": true, "id": id })
             };
 
@@ -1768,9 +2160,9 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let (_, nodes, _) = load_offline_runtime_readonly(&opts.config_path)?;
+                let rt = load_offline_runtime_readonly(&opts.config_path)?;
                 let addr = {
-                    let guard = nodes.read().unwrap_or_else(|e| e.into_inner());
+                    let guard = rt.nodes.read().unwrap_or_else(|e| e.into_inner());
                     guard
                         .get(&id)
                         .map(|n| n.server_addr.clone())
@@ -1836,8 +2228,8 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 {
                     serde_json::from_value(ensure_api_ok(st, val)?)?
                 } else {
-                    let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
-                    engine.list_rules_view_with_locale(opts.locale)
+                    let rt = load_offline_runtime_readonly(&opts.config_path)?;
+                    rt.engine.list_rules_view_with_locale(opts.locale)
                 };
 
             if opts.json_output {
@@ -1913,11 +2305,11 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
+                let rt = load_offline_runtime(&opts.config_path)?;
                 let req: AddRuleRequest = serde_json::from_value(payload)?;
-                let (st, _, body) = handle_add_rule(req, &engine, &nodes, opts.locale);
+                let (st, _, body) = handle_add_rule(req, &rt.engine, &rt.nodes, opts.locale);
                 let val = ensure_offline_handler_ok(st, &body)?;
-                store.save_runtime(&nodes, &engine)?;
+                rt.save()?;
                 val
             };
 
@@ -2008,12 +2400,8 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     .await?;
                     (resolved_id, ensure_api_ok(st, val)?)
                 }
-                RuleBackend::Offline {
-                    store,
-                    nodes,
-                    engine,
-                } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
+                RuleBackend::Offline(rt) => {
+                    let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
                     let payload = json!({
                         "id": resolved_id,
@@ -2026,9 +2414,9 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                         "enabled": enabled,
                     });
                     let req: PatchRuleRequest = serde_json::from_value(payload)?;
-                    let (st, _, body) = handle_patch_rule(req, &engine, &nodes, opts.locale);
+                    let (st, _, body) = handle_patch_rule(req, &rt.engine, &rt.nodes, opts.locale);
                     let val = ensure_offline_handler_ok(st, &body)?;
-                    store.save_runtime(&nodes, &engine)?;
+                    rt.save()?;
                     (resolved_id, val)
                 }
             };
@@ -2085,17 +2473,14 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     .await?;
                     (resolved_id, ensure_api_ok(st, val)?)
                 }
-                RuleBackend::Offline {
-                    store,
-                    nodes,
-                    engine,
-                } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
+                RuleBackend::Offline(rt) => {
+                    let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    let next_state = engine
+                    let next_state = rt
+                        .engine
                         .toggle_rule(resolved_id, enabled)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    store.save_runtime(&nodes, &engine)?;
+                    rt.save()?;
                     (
                         resolved_id,
                         json!({ "ok": true, "id": resolved_id, "enabled": next_state }),
@@ -2151,18 +2536,15 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     .await?;
                     (resolved_id, ensure_api_ok(st, val)?)
                 }
-                RuleBackend::Offline {
-                    store,
-                    nodes,
-                    engine,
-                } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
+                RuleBackend::Offline(rt) => {
+                    let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    let moved = engine
+                    let moved = rt
+                        .engine
                         .move_rule(resolved_id, &direction)
                         .ok_or_else(|| anyhow!("Invalid move target or direction '{}'", direction))?;
                     if moved {
-                        store.save_runtime(&nodes, &engine)?;
+                        rt.save()?;
                     }
                     (
                         resolved_id,
@@ -2214,17 +2596,13 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     .await?;
                     (resolved_id, ensure_api_ok(st, val)?)
                 }
-                RuleBackend::Offline {
-                    store,
-                    nodes,
-                    engine,
-                } => {
-                    let resolved_id = offline_resolve_rule_id(&engine, raw_id, opts.locale)
+                RuleBackend::Offline(rt) => {
+                    let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
                         .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    if !engine.delete_rule(resolved_id) {
+                    if !rt.engine.delete_rule(resolved_id) {
                         bail!("Routing rule #{} not found", raw_id);
                     }
-                    store.save_runtime(&nodes, &engine)?;
+                    rt.save()?;
                     (resolved_id, json!({ "ok": true, "id": resolved_id }))
                 }
             };
@@ -2279,11 +2657,11 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         {
             ensure_api_ok(st, val)?
         } else {
-            let (store, nodes, engine) = load_offline_runtime(&opts.config_path)?;
+            let rt = load_offline_runtime(&opts.config_path)?;
             let req: SetDefaultActionRequest = serde_json::from_value(payload)?;
-            let (st, _, body) = handle_set_default_action(req, &engine, &nodes, opts.locale);
+            let (st, _, body) = handle_set_default_action(req, &rt.engine, &rt.nodes, opts.locale);
             let val = ensure_offline_handler_ok(st, &body)?;
-            store.save_runtime(&nodes, &engine)?;
+            rt.save()?;
             val
         };
 
@@ -2321,8 +2699,8 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         return Ok(());
     }
 
-    let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
-    let act = engine.default_action();
+    let rt = load_offline_runtime_readonly(&opts.config_path)?;
+    let act = rt.engine.default_action();
     let desc = format_action_desc(&act, opts.locale);
     let out = json!({
         "default_action": desc,
@@ -2382,9 +2760,9 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
     {
         ensure_api_ok(st, val)?
     } else {
-        let (_, _, engine) = load_offline_runtime_readonly(&opts.config_path)?;
+        let rt = load_offline_runtime_readonly(&opts.config_path)?;
         let req: SimulateRouteRequest = serde_json::from_value(payload)?;
-        let (st, _, body) = handle_simulate_route(req, &engine, opts.locale);
+        let (st, _, body) = handle_simulate_route(req, &rt.engine, opts.locale);
         ensure_offline_handler_ok(st, &body)?
     };
 
@@ -2517,16 +2895,61 @@ mod tests {
         assert_eq!(
             resolve_launch_mode(&["flowx".into(), "--config".into(), "custom.xml".into()]).unwrap(),
             LaunchMode::Serve {
-                config_path: "custom.xml".into()
+                config_path: "custom.xml".into(),
+                transparent_override: None,
+                replace_pid: None,
             }
         );
         assert_eq!(
             resolve_launch_mode(&["flowx".into(), "serve".into(), "--config=custom.xml".into()])
                 .unwrap(),
             LaunchMode::Serve {
-                config_path: "custom.xml".into()
+                config_path: "custom.xml".into(),
+                transparent_override: None,
+                replace_pid: None,
             }
         );
+        assert_eq!(
+            resolve_launch_mode(&[
+                "flowx".into(),
+                "--transparent".into(),
+                "--replace-pid".into(),
+                "4321".into(),
+            ])
+            .unwrap(),
+            LaunchMode::Serve {
+                config_path: resolve_config_path_from_env(std::env::var("FLOWX_CONFIG").ok().as_deref()),
+                transparent_override: Some(true),
+                replace_pid: Some(4321),
+            }
+        );
+        assert_eq!(
+            resolve_launch_mode(&[
+                "flowx".into(),
+                "serve".into(),
+                "--no-transparent".into(),
+                "--replace-pid=777".into(),
+            ])
+            .unwrap(),
+            LaunchMode::Serve {
+                config_path: resolve_config_path_from_env(std::env::var("FLOWX_CONFIG").ok().as_deref()),
+                transparent_override: Some(false),
+                replace_pid: Some(777),
+            }
+        );
+        assert!(resolve_launch_mode(&[
+            "flowx".into(),
+            "--transparent".into(),
+            "--no-transparent".into(),
+        ])
+        .is_err());
+        assert!(resolve_launch_mode(&[
+            "flowx".into(),
+            "--replace-pid".into(),
+            "0".into(),
+        ])
+        .is_err());
+        assert!(parse_global_opts(&["flowx".into(), "--transparent".into(), "status".into()]).is_err());
         assert!(should_run_cli(&["flowx".into(), "status".into()]));
         assert!(should_run_cli(&["flowx".into(), "--help".into()]));
         assert!(should_run_cli(&[
@@ -3496,5 +3919,161 @@ mod tests {
         .await
         .unwrap_err();
         assert!(kill_err.downcast_ref::<SilentExitError>().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cli_transparent_commands_and_config_preservation() {
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_cli_transparent_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&cfg_path);
+        let cfg_str = cfg_path.to_string_lossy().to_string();
+
+        // 1. Readonly status must not create missing config file; doctor works cleanly without one
+        assert!(run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "status".into(),
+        ])
+        .await
+        .is_err());
+        assert!(!cfg_path.exists());
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--json".into(),
+            "transparent".into(),
+            "doctor".into(),
+        ])
+        .await
+        .unwrap();
+        assert!(!cfg_path.exists());
+
+        // 2. Conflicting options fail fast
+        assert!(run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+            "--hijack-dns".into(),
+            "--no-hijack-dns".into(),
+        ])
+        .await
+        .is_err());
+        assert!(run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+            "--dll-path".into(),
+            r"C:\ok\WinDivert.dll".into(),
+            "--clear-dll-path".into(),
+        ])
+        .await
+        .is_err());
+        assert!(run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+        ])
+        .await
+        .is_err());
+
+        // 3. Configure + enable persists to XML and survives node/rule mutations
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+            "--no-hijack-dns".into(),
+            "--no-block-quic".into(),
+            "--dll-path".into(),
+            r"C:\tools\WinDivert.dll".into(),
+        ])
+        .await
+        .unwrap();
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "enable".into(),
+        ])
+        .await
+        .unwrap();
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "PreserveNode".into(),
+            "--addr".into(),
+            "10.0.0.2:1080".into(),
+        ])
+        .await
+        .unwrap();
+
+        let loaded = ConfigStore::new(&cfg_path).load_existing(&[]).unwrap();
+        assert!(loaded.transparent_settings.enabled);
+        assert!(!loaded.transparent_settings.hijack_dns);
+        assert!(!loaded.transparent_settings.block_quic_for_proxied);
+        assert_eq!(
+            loaded.transparent_settings.dll_path.as_deref(),
+            Some(r"C:\tools\WinDivert.dll")
+        );
+
+        // 4. Clear DLL path + disable updates XML cleanly
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+            "--clear-dll-path".into(),
+        ])
+        .await
+        .unwrap();
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "disable".into(),
+        ])
+        .await
+        .unwrap();
+
+        let updated = ConfigStore::new(&cfg_path).load_existing(&[]).unwrap();
+        assert!(!updated.transparent_settings.enabled);
+        assert!(!updated.transparent_settings.hijack_dns);
+        assert!(!updated.transparent_settings.block_quic_for_proxied);
+        assert!(updated.transparent_settings.dll_path.is_none());
+
+        let _ = std::fs::remove_file(&cfg_path);
     }
 }

@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use anyhow::Context;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use crate::api::{ApiServer, SystemRuntimeContext};
@@ -26,13 +26,18 @@ use crate::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
 use crate::interceptor::process::ProcessTracker;
 use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::router::RuleEngine;
+use crate::transparent::TransparentManager;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let raw_args: Vec<String> = std::env::args().collect();
     let wants_json = cli::wants_json_output(&raw_args);
-    let config_path = match cli::resolve_launch_mode(&raw_args) {
-        Ok(cli::LaunchMode::Serve { config_path }) => config_path,
+    let (config_path, transparent_override, replace_pid) = match cli::resolve_launch_mode(&raw_args) {
+        Ok(cli::LaunchMode::Serve {
+            config_path,
+            transparent_override,
+            replace_pid,
+        }) => (config_path, transparent_override, replace_pid),
         Ok(cli::LaunchMode::Cli) => {
             if let Err(err) = cli::run_cli(&raw_args).await {
                 cli::emit_cli_error_and_exit(&err, wants_json);
@@ -51,6 +56,14 @@ async fn main() -> anyhow::Result<()> {
     info!("============================================================");
     info!("     FlowX - Modern Transparent Proxy & Process Routing Engine      ");
     info!("============================================================");
+
+    if let Some(old_pid) = replace_pid {
+        info!(
+            "[Startup] Waiting up to 12s for previous FlowX instance PID {} to release ports...",
+            old_pid
+        );
+        wait_for_pid_exit(old_pid, Duration::from_secs(12)).await;
+    }
 
     // 2. 初始化核心组件与端口规划
     let fake_ip_pool = Arc::new(FakeIpPool::new_default());
@@ -85,20 +98,26 @@ async fn main() -> anyhow::Result<()> {
         runtime_profile.rules,
         runtime_profile.default_action,
     ));
+    let mut effective_transparent = runtime_profile.transparent_settings;
+    if let Some(ov) = transparent_override {
+        effective_transparent.enabled = ov;
+    }
 
     // 4. Fail-Fast 端口绑定阶段（确保核心服务端口可用，若被占用立即明确报错）
     let in_flight = Arc::new(InFlightTracker::new());
 
-    let dns_server = DnsServer::new(
-        dns_bind,
-        Arc::clone(&fake_ip_pool),
-        upstream_dns,
-        true, // 阻断 AAAA IPv6 泄漏
-    )
-    .with_in_flight(Arc::clone(&in_flight));
+    let dns_server = Arc::new(
+        DnsServer::new(
+            dns_bind,
+            Arc::clone(&fake_ip_pool),
+            upstream_dns,
+            true, // 阻断 AAAA IPv6 泄漏
+        )
+        .with_in_flight(Arc::clone(&in_flight)),
+    );
     let dns_socket = dns_server.bind().await?;
 
-    let dispatcher = StreamDispatcher::new(DispatcherConfig {
+    let dispatcher_config = DispatcherConfig {
         bind_addr: dispatcher_bind,
         tracker: Arc::clone(&process_tracker),
         fake_ip_pool: Arc::clone(&fake_ip_pool),
@@ -108,9 +127,19 @@ async fn main() -> anyhow::Result<()> {
         proxy_nodes: Arc::clone(&proxy_nodes),
         proxy_chains: Arc::clone(&proxy_chains),
         self_ports: self_ports.clone(),
-    })
-    .with_in_flight(Arc::clone(&in_flight));
+    };
+    let dispatcher = StreamDispatcher::new(dispatcher_config.clone())
+        .with_in_flight(Arc::clone(&in_flight));
     let dispatcher_listener = dispatcher.bind().await?;
+
+    let transparent_mgr = TransparentManager::new(
+        Arc::new(dispatcher_config),
+        Arc::clone(&dns_server),
+        effective_transparent,
+    );
+
+    // 5. 初始化全局优雅停机广播通知通道
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let runtime_context = Arc::new(SystemRuntimeContext {
         inbound_addr: dispatcher_bind,
@@ -131,18 +160,54 @@ async fn main() -> anyhow::Result<()> {
     .with_self_ports(self_ports)
     .with_config_store(Arc::clone(&config_store))
     .with_runtime_context(runtime_context)
-    .with_in_flight(Arc::clone(&in_flight));
+    .with_in_flight(Arc::clone(&in_flight))
+    .with_transparent_manager(Arc::clone(&transparent_mgr))
+    .with_shutdown_sender(shutdown_tx.clone());
     let api_listener = api_server.bind().await?;
 
-    // 5. 初始化全局优雅停机广播通知通道
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // 6. 若配置或启动参数开启了透明代理，则尝试加载 WinDivert 驱动；失败时保留守护进程并记录诊断供前端修复
+    if transparent_mgr.settings().enabled {
+        let t_mgr = Arc::clone(&transparent_mgr);
+        let rt_handle = tokio::runtime::Handle::current();
+        match tokio::task::spawn_blocking(move || t_mgr.start(&rt_handle)).await {
+            Ok(Ok(())) => {
+                if replace_pid.is_some() && transparent_override == Some(true) {
+                    let store = Arc::clone(&config_store);
+                    let nodes = Arc::clone(&proxy_nodes);
+                    let engine = Arc::clone(&rule_engine);
+                    let t_settings = transparent_mgr.settings();
+                    if let Err(e) = tokio::task::spawn_blocking(move || {
+                        store.save_runtime_with_transparent(&nodes, &engine, Some(&t_settings))
+                    })
+                    .await
+                    .unwrap_or_else(|je| Err(anyhow::anyhow!("save task join error: {je}")))
+                    {
+                        warn!("[Transparent] Started cleanly via UAC elevation, but failed to persist enabled=true: {:#}", e);
+                    }
+                }
+            }
+            Ok(Err(err_msg)) => {
+                warn!(
+                    "[Transparent] Failed to start automatically on boot (daemon stays active): {}",
+                    err_msg
+                );
+            }
+            Err(join_err) => {
+                warn!(
+                    "[Transparent] Background startup task panicked/cancelled: {}",
+                    join_err
+                );
+            }
+        }
+    }
 
-    // 6. 在托管 JoinSet 中启动异步核心服务任务，任一核心任务异常提前退出时触发停机并向上返回错误
+    // 7. 在托管 JoinSet 中启动异步核心服务任务，任一核心任务异常提前退出时触发停机并向上返回错误
     let mut core_tasks: tokio::task::JoinSet<(&'static str, anyhow::Result<()>)> = tokio::task::JoinSet::new();
 
     let rx1 = shutdown_rx.clone();
+    let dns_task_srv = Arc::clone(&dns_server);
     core_tasks.spawn(async move {
-        let res = dns_server.run(dns_socket, rx1).await;
+        let res = dns_task_srv.run(dns_socket, rx1).await;
         ("dns", res)
     });
 
@@ -231,6 +296,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let _ = shutdown_tx.send(true);
+    let t_stop = Arc::clone(&transparent_mgr);
+    let _ = tokio::task::spawn_blocking(move || t_stop.stop()).await;
 
     // 优雅排空：等待所有核心循环退出且活跃连接 + 在途请求完全排空（最多等待 10 秒）
     let drain_start = std::time::Instant::now();
@@ -265,6 +332,40 @@ async fn main() -> anyhow::Result<()> {
     info!("[Shutdown] FlowX core stopped cleanly");
 
     Ok(())
+}
+
+async fn wait_for_pid_exit(pid: u32, timeout: Duration) {
+    #[cfg(windows)]
+    {
+        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let _ = tokio::task::spawn_blocking(move || {
+            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+            use windows_sys::Win32::System::Threading::{
+                OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+            };
+
+            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if handle.is_null() {
+                return;
+            }
+            let wait_res = unsafe { WaitForSingleObject(handle, timeout_ms) };
+            unsafe {
+                CloseHandle(handle);
+            }
+            if wait_res == WAIT_TIMEOUT {
+                warn!(
+                    "[Startup] Timed out waiting for PID {} to exit; continuing port bind attempt",
+                    pid
+                );
+            }
+        })
+        .await;
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (pid, timeout);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {

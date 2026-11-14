@@ -232,6 +232,18 @@ fn translate_zh(key: &str) -> &'static str {
         "label.unknown_process" => "未知进程",
         "system.memory_mode" => "仅内存模式",
 
+        // 透明代理
+        "error.transparent_unavailable" => "透明代理管理器尚未初始化",
+        "error.invalid_transparent_body" => "透明代理请求体格式无效",
+        "error.transparent_invalid_dll_path" => "WinDivert DLL 路径格式无效或包含非法字符",
+        "error.transparent_requires_admin" => "开启系统级透明代理需要以管理员身份运行 FlowX",
+        "error.transparent_missing_driver" => "未找到 WinDivert.dll 或 WinDivert64.sys，请将驱动文件置于程序同级目录或指定路径",
+        "error.transparent_unsupported_os" => "当前操作系统不支持 WinDivert 透明代理（仅支持 Windows）",
+        "error.transparent_uac_cancelled" => "管理员提权授权已取消或被系统拒绝",
+        "error.transparent_already_elevated" => "当前进程已具备管理员权限",
+        "error.transparent_elevate_failed" => "触发管理员提权重启失败",
+        "error.transparent_start_failed" => "WinDivert 透明代理启动失败",
+
         _ => "未知错误",
     }
 }
@@ -313,6 +325,18 @@ fn translate_en(key: &str) -> &'static str {
         "label.unknown_process" => "Unknown process",
         "system.memory_mode" => "Memory-only mode",
 
+        // Transparent proxy
+        "error.transparent_unavailable" => "Transparent proxy manager is not initialized",
+        "error.invalid_transparent_body" => "Invalid transparent proxy request payload",
+        "error.transparent_invalid_dll_path" => "Invalid WinDivert DLL path format or illegal characters",
+        "error.transparent_requires_admin" => "Transparent proxy requires running FlowX as Administrator",
+        "error.transparent_missing_driver" => "WinDivert.dll or WinDivert64.sys not found; place both files next to flowx.exe or set DllPath",
+        "error.transparent_unsupported_os" => "WinDivert transparent proxy is only supported on Windows",
+        "error.transparent_uac_cancelled" => "Administrator UAC elevation prompt was cancelled or denied",
+        "error.transparent_already_elevated" => "FlowX is already running with Administrator privileges",
+        "error.transparent_elevate_failed" => "Failed to launch elevated FlowX instance",
+        "error.transparent_start_failed" => "Failed to start WinDivert transparent proxy",
+
         _ => "Unknown error",
     }
 }
@@ -358,6 +382,22 @@ mod tests {
         assert_eq!(t(Locale::En, "error.missing_conn_id"), "Connection ID is required");
         assert_eq!(t(Locale::Zh, "status.ok"), "运行正常");
         assert_eq!(t(Locale::En, "status.ok"), "Operational");
+
+        for key in [
+            "error.transparent_unavailable",
+            "error.invalid_transparent_body",
+            "error.transparent_invalid_dll_path",
+            "error.transparent_requires_admin",
+            "error.transparent_missing_driver",
+            "error.transparent_unsupported_os",
+            "error.transparent_uac_cancelled",
+            "error.transparent_already_elevated",
+            "error.transparent_elevate_failed",
+            "error.transparent_start_failed",
+        ] {
+            assert_ne!(t(Locale::Zh, key), "未知错误", "missing zh key: {key}");
+            assert_ne!(t(Locale::En, key), "Unknown error", "missing en key: {key}");
+        }
     }
 
     #[test]
