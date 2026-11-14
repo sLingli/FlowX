@@ -17,6 +17,76 @@ pub(crate) const DEFAULT_OUTBOUND_UPSTREAM_DNS: SocketAddr =
 
 pub struct DirectOutbound;
 
+#[derive(Debug)]
+pub(crate) enum CandidateConnectError {
+    TimedOut { budget: Duration, addr: SocketAddr },
+    Io(std::io::Error),
+    NoCandidates,
+}
+
+/// 按剩余候选地址数分段分配单次连接预算，避免首个黑洞地址耗尽全部超时窗口。
+pub(crate) async fn connect_candidates_with<T, F, Fut>(
+    ips: &[IpAddr],
+    port: u16,
+    deadline: tokio::time::Instant,
+    min_attempt: Duration,
+    max_attempt: Duration,
+    mut connector: F,
+) -> std::result::Result<T, CandidateConnectError>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let total_candidates = ips.len();
+    if total_candidates == 0 {
+        return Err(CandidateConnectError::NoCandidates);
+    }
+    let mut last_err: Option<CandidateConnectError> = None;
+    for (idx, ip) in ips.iter().copied().enumerate() {
+        let sock_addr = SocketAddr::new(ip, port);
+        let remaining_total = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining_total.is_zero() {
+            return Err(last_err.unwrap_or(CandidateConnectError::TimedOut {
+                budget: Duration::ZERO,
+                addr: sock_addr,
+            }));
+        }
+        let remaining_candidates = (total_candidates - idx) as u32;
+        let attempt_budget = if remaining_candidates <= 1 {
+            remaining_total
+        } else {
+            (remaining_total / remaining_candidates)
+                .max(min_attempt)
+                .min(max_attempt)
+                .min(remaining_total)
+        };
+        match tokio::time::timeout(attempt_budget, connector(sock_addr)).await {
+            Ok(Ok(conn)) => return Ok(conn),
+            Ok(Err(e)) => last_err = Some(CandidateConnectError::Io(e)),
+            Err(_) => {
+                last_err = Some(CandidateConnectError::TimedOut {
+                    budget: attempt_budget,
+                    addr: sock_addr,
+                });
+            }
+        }
+    }
+    Err(last_err.unwrap_or(CandidateConnectError::NoCandidates))
+}
+
+pub(crate) async fn connect_candidates_with_budget(
+    ips: &[IpAddr],
+    port: u16,
+    deadline: tokio::time::Instant,
+    min_attempt: Duration,
+    max_attempt: Duration,
+) -> std::result::Result<TcpStream, CandidateConnectError> {
+    connect_candidates_with(ips, port, deadline, min_attempt, max_attempt, |addr| {
+        TcpStream::connect(addr)
+    })
+    .await
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DirectIpViolation {
     FakeIp(IpAddr),
@@ -136,42 +206,30 @@ impl DirectOutbound {
 
                     validate_direct_ips(&resolved_ips, *port, self_ports, fake_ip_pool, domain)?;
 
-                    let total_candidates = resolved_ips.len();
-                    let mut last_err: Option<anyhow::Error> = None;
-                    for (idx, ip) in resolved_ips.into_iter().enumerate() {
-                        let remaining_total =
-                            deadline.saturating_duration_since(tokio::time::Instant::now());
-                        if remaining_total.is_zero() {
-                            break;
-                        }
-                        let remaining_candidates = (total_candidates - idx) as u32;
-                        let attempt_budget = if remaining_candidates <= 1 {
-                            remaining_total
-                        } else {
-                            (remaining_total / remaining_candidates)
-                                .max(Duration::from_millis(1500))
-                                .min(Duration::from_secs(4))
-                                .min(remaining_total)
-                        };
-                        let sock_addr = SocketAddr::new(ip, *port);
-                        match tokio::time::timeout(attempt_budget, TcpStream::connect(sock_addr)).await {
-                            Ok(Ok(stream)) => return Ok(stream),
-                            Ok(Err(e)) => last_err = Some(anyhow::Error::new(e)),
-                            Err(_) => {
-                                last_err = Some(anyhow!(
-                                    "Direct connection attempt timed out ({:?}) for {}",
-                                    attempt_budget,
-                                    sock_addr
-                                ))
-                            }
-                        }
-                    }
-
-                    match last_err {
-                        Some(e) => Err(e).with_context(|| {
+                    match connect_candidates_with_budget(
+                        &resolved_ips,
+                        *port,
+                        deadline,
+                        Duration::from_millis(1500),
+                        Duration::from_secs(4),
+                    )
+                    .await
+                    {
+                        Ok(stream) => Ok(stream),
+                        Err(CandidateConnectError::Io(e)) => Err(anyhow::Error::new(e)).with_context(|| {
                             format!("Direct connection to target domain failed: {}:{}", domain, port)
                         }),
-                        None => bail!("No resolved IP candidates available for {}:{}", domain, port),
+                        Err(CandidateConnectError::TimedOut { budget, addr }) => Err(anyhow!(
+                            "Direct connection attempt timed out ({:?}) for {}",
+                            budget,
+                            addr
+                        ))
+                        .with_context(|| {
+                            format!("Direct connection to target domain failed: {}:{}", domain, port)
+                        }),
+                        Err(CandidateConnectError::NoCandidates) => {
+                            bail!("No resolved IP candidates available for {}:{}", domain, port)
+                        }
                     }
                 }
             }
@@ -292,5 +350,71 @@ mod tests {
             .unwrap();
         drop(stream);
         accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_candidates_with_blackhole_failover() {
+        let ips = vec![
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ];
+        let mut attempted = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        let winner = connect_candidates_with(
+            &ips,
+            443,
+            deadline,
+            Duration::from_millis(50),
+            Duration::from_millis(600),
+            |addr| {
+                attempted.push(addr);
+                let is_blackhole = addr.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST);
+                async move {
+                    if is_blackhole {
+                        std::future::pending::<std::io::Result<SocketAddr>>().await
+                    } else {
+                        Ok(addr)
+                    }
+                }
+            },
+        )
+        .await
+        .expect("third reachable candidate should succeed within shared deadline");
+
+        assert_eq!(winner, "127.0.0.1:443".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            attempted,
+            vec![
+                "198.51.100.1:443".parse::<SocketAddr>().unwrap(),
+                "198.51.100.2:443".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:443".parse::<SocketAddr>().unwrap(),
+            ]
+        );
+
+        let timeout_deadline = tokio::time::Instant::now() + Duration::from_millis(120);
+        let err = connect_candidates_with(
+            &ips[..2],
+            443,
+            timeout_deadline,
+            Duration::from_millis(30),
+            Duration::from_millis(120),
+            |_| std::future::pending::<std::io::Result<SocketAddr>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, CandidateConnectError::TimedOut { .. }));
+
+        let empty_err = connect_candidates_with::<SocketAddr, _, _>(
+            &[],
+            443,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            |_| async { unreachable!() },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(empty_err, CandidateConnectError::NoCandidates));
     }
 }

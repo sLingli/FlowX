@@ -2524,30 +2524,42 @@ async fn ping_address_with_context(
         return (false, 0, t(locale, key).to_string(), Some(detail));
     }
 
-    let target_addrs: Vec<SocketAddr> = candidate_ips
-        .into_iter()
-        .map(|ip| SocketAddr::new(ip, port))
-        .collect();
-
     let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
     if remaining.is_zero() {
         return (false, 0, t(locale, "ping.timeout").to_string(), None);
     }
 
-    match tokio::time::timeout(remaining, TcpStream::connect(target_addrs.as_slice())).await {
-        Ok(Ok(stream)) => {
+    let deadline = tokio::time::Instant::now() + remaining;
+    match crate::outbound::direct::connect_candidates_with_budget(
+        &candidate_ips,
+        port,
+        deadline,
+        Duration::from_millis(250),
+        PING_TIMEOUT,
+    )
+    .await
+    {
+        Ok(stream) => {
             drop(stream);
             let ms = start.elapsed().as_millis() as u64;
             (true, ms, format!("{} ms", ms), None)
         }
         // 面向用户的文案本地化；底层 OS 错误串只放进 detail，供排障而不直接展示
-        Ok(Err(e)) => (
+        Err(crate::outbound::direct::CandidateConnectError::Io(e)) => (
             false,
             0,
             t(locale, "error.ping_failed").to_string(),
             Some(e.to_string()),
         ),
-        Err(_) => (false, 0, t(locale, "ping.timeout").to_string(), None),
+        Err(crate::outbound::direct::CandidateConnectError::TimedOut { .. }) => {
+            (false, 0, t(locale, "ping.timeout").to_string(), None)
+        }
+        Err(crate::outbound::direct::CandidateConnectError::NoCandidates) => (
+            false,
+            0,
+            t(locale, "error.ping_failed").to_string(),
+            Some("No resolved IP candidates available".to_string()),
+        ),
     }
 }
 
@@ -3865,6 +3877,55 @@ mod tests {
             ping_address("[::ffff:198.18.0.10]:1080", &[bound_port], Locale::En).await;
         assert!(!ok_mapped_fake);
         assert!(msg_mapped_fake.contains("Fake-IP"));
+
+        // 5. Dual-candidate ping falls back cleanly when first IP fails/blackholes before reachable second IP
+        let v4_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let v4_port = v4_listener.local_addr().unwrap().port();
+        let accept_v4 = tokio::spawn(async move {
+            let _ = v4_listener.accept().await;
+        });
+        let mock_dns_multi = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_dns_multi_addr = mock_dns_multi.local_addr().unwrap();
+        let dns_multi_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let mut buf = [0u8; 512];
+                let (n, src) = mock_dns_multi.recv_from(&mut buf).await.unwrap();
+                let (tx, q) = crate::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                let resp = if q.qtype == 1 {
+                    let mut r = Vec::new();
+                    r.extend_from_slice(&tx.to_be_bytes());
+                    r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
+                    r.extend_from_slice(&buf[12..q.raw_len]);
+                    // First candidate: TEST-NET-2 blackhole/unreachable, second candidate: reachable 127.0.0.1
+                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 198, 51, 100, 1]);
+                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1]);
+                    r
+                } else {
+                    crate::dns::server::DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)
+                };
+                mock_dns_multi.send_to(&resp, src).await.unwrap();
+            }
+        });
+        let ctx_multi = SystemRuntimeContext {
+            dns_addr: "127.0.0.1:1053".parse().unwrap(),
+            upstream_dns: mock_dns_multi_addr,
+            inbound_addr: "127.0.0.1:40001".parse().unwrap(),
+            api_addr: "127.0.0.1:40080".parse().unwrap(),
+            fake_ip_pool: Arc::new(FakeIpPool::new_default()),
+            block_ipv6: true,
+            started_at: Instant::now(),
+        };
+        let (ok_multi, _, msg_multi, _) = ping_address_with_context(
+            &format!("dual.example:{}", v4_port),
+            &[40080],
+            Some(&ctx_multi),
+            None,
+            Locale::En,
+        )
+        .await;
+        assert!(ok_multi, "multi-IP ping should failover within 2s budget: {}", msg_multi);
+        let _ = tokio::time::timeout(Duration::from_secs(1), dns_multi_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), accept_v4).await;
     }
 
     #[tokio::test]
