@@ -12,7 +12,7 @@
 
 - **Unix 权限**：默认端口（`1053` / `40001` / `40080`）均大于 1024，普通用户即可运行，且在 Unix 下写回 `flowx.xml` 时强制使用 `0600` 私有文件权限；普通用户仅能反查同用户下发起的进程连接，Linux 跨用户识别可通过 `sudo` 或授予 `CAP_SYS_PTRACE` + `CAP_DAC_READ_SEARCH` 能力（`sudo setcap cap_sys_ptrace,cap_dac_read_search+ep ./flowx`），macOS 跨用户进程反查需以 `sudo` 运行。
 - **规则跨平台互通与安全限制**：应用程序规则中的 `.exe` 后缀双向兼容，`git.exe` 可匹配 Linux / macOS 下的 `git`，`git` 也可匹配 Windows 下的 `git.exe`；`%ComputerName%` / `%HOSTNAME%` 在拆词之后解析并过滤 `;` / 通配符 / CIDR 等元字符，防止主机名注入。
-- **代理认证与节点安全**：`HTTP` 与 `SOCKS5` 节点强制要求用户名与密码成对配置（清空密码会同步清除用户名；`HTTP` 用户名禁止包含冒号 `:`），`SOCKS4` 仅支持可选 `UserID`（无密码）；节点地址禁止指向 Fake-IP（`198.18.0.0/15`）或本机/回环中的 FlowX 自身服务端口。
+- **代理认证与节点安全**：`HTTP` 与 `SOCKS5` 节点强制要求用户名与密码成对配置（清空密码会同步清除用户名；`HTTP` 用户名禁止包含冒号 `:`；历史 XML 若遗留孤立 `<Username>` 无 `<Password>`，启动时会自动告警并降级清空用户名以免阻断启动），`SOCKS4` 仅支持可选 `UserID`（禁止携带密码）。节点名称、用户名与密码均禁止控制字符与超长（>255 字节）输入；节点地址禁止指向 Fake-IP（`198.18.0.0/15` / `[::ffff:198.18.0.x]`）或本机/回环中的 FlowX 自身服务端口，并支持通过上游 DNS `A + AAAA` 对称解析纯 IPv6 域名节点进行连通性测速（Ping）与实际出站拨号。
 
 ## 默认监听端口
 
@@ -39,13 +39,17 @@ cargo test
 
 ### CLI 控制子命令（支持在线热调用与离线 XML 直改）
 
-`flowx` 内置双栖 CLI 子命令，当守护进程运行时自动通过本地 API 实时同步；当未显式指定 `--api` / `$FLOWX_API` 且默认回环端口返回连接拒绝（`ConnectionRefused`）时安全回退离线读写 `flowx.xml`（只读命令绝不新建缺失配置，离线变更在参数校验失败时也不会提前写入文件；所有子命令均支持 `--json` 结构化输出）：
+`flowx` 内置双栖 CLI 子命令，当守护进程运行时自动通过本地 API 实时同步；当未显式指定 `--api` / `$FLOWX_API` 且默认回环端口返回连接拒绝（`ConnectionRefused`）时安全回退离线读写 `flowx.xml`（只读命令绝不新建缺失配置，离线变更在参数校验失败时也不会提前写入文件）。所有子命令均支持 `--json` 结构化输出、`--` 选项终止符与环境变量语言自动协商（按 `FLOWX_LANG` → `LC_ALL` → `LC_MESSAGES` → `LANG` 优先级随 `Accept-Language` 同步至服务端）；HTTP JSON 写入接口校验 `Content-Type: application/json`（缺失/不匹配返回 `415 Unsupported Media Type`），删除正被规则或默认策略引用的节点时返回 `409 Conflict`（`ERR_NODE_IN_USE`）。其中 `flowx node ping <ID>` 探测不可达（`ok == false`）与 `flowx conn kill <ID>` 失败（`killed == false`）时均会在完整输出 stdout 结果后以非零退出码 (`1`) 退出：
 
 ```bash
 # 查看运行状态与统计概览
 flowx status
 
-# 代理节点增删改查与测速
+# 查看活跃连接或按 ID 断开指定连接（失败返回退出码 1）
+flowx conn list
+flowx conn kill 12
+
+# 代理节点增删改查与测速（不可达返回退出码 1）
 flowx node list
 flowx node add --name "HK-Socks" --addr "127.0.0.1:10808" --protocol SOCKS5
 flowx node update 101 --name "HK-Main" --addr "127.0.0.1:10809"
@@ -81,6 +85,6 @@ curl -x http://127.0.0.1:40001 https://example.com
 
 ## 配置文件 (`flowx.xml`)
 
-启动时优先加载 `--config` 参数或 `FLOWX_CONFIG` 环境变量指定的路径（默认 `./flowx.xml`）。通过 Web 控制台对代理节点或分流规则进行的增删、启停和排序更改，都会自动原子写回该 XML 文件。
+启动时优先加载 `--config` 参数或 `FLOWX_CONFIG` 环境变量指定的路径（`FLOWX_CONFIG` 为空白字符串时回退默认 `./flowx.xml`）。通过 Web 控制台对代理节点或分流规则进行的增删、启停和排序更改，都会自动原子写回该 XML 文件（含旧版孤立 `<Username>` 降级配置在下次变更回写后自动清理）。
 
 更多架构细节与模块设计请参见 [ARCHITECTURE.md](ARCHITECTURE.md)。
