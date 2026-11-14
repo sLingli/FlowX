@@ -181,6 +181,7 @@ fn translate_zh(key: &str) -> &'static str {
         // 节点管理
         "error.invalid_node_body" => "无效的节点请求体",
         "error.empty_node_name" => "节点名称不能为空",
+        "error.invalid_node_name" => "节点名称包含非法控制字符或超出 255 字节限制",
         "error.unsupported_protocol" => "不支持的代理协议，仅支持 SOCKS5 / SOCKS4 / HTTP",
         "error.invalid_node_addr" => "节点服务器地址格式无效，应为 IP:Port 或 Host:Port",
         "error.invalid_node_port" => "节点服务器地址或端口无效",
@@ -197,6 +198,7 @@ fn translate_zh(key: &str) -> &'static str {
         "error.password_required_on_user_change" => "修改代理用户名时必须提供新密码",
         "error.socks4_password_unsupported" => "SOCKS4 协议仅支持 UserID，不支持密码认证",
         "error.config_persist_failed" => "配置持久化写入磁盘失败，已回滚本次内存变更",
+        "error.mutation_overloaded" => "当前配置写入并发过高，请稍后重试",
         "error.missing_node_id" => "缺少节点 ID",
         "error.node_not_found" => "指定的代理节点不存在",
         "error.node_in_use" => "节点正被路由规则或默认兜底动作引用，禁止删除。请先修改或删除关联配置",
@@ -260,6 +262,7 @@ fn translate_en(key: &str) -> &'static str {
         // Node management
         "error.invalid_node_body" => "Invalid node request payload",
         "error.empty_node_name" => "Node name cannot be empty",
+        "error.invalid_node_name" => "Node name contains invalid control characters or exceeds 255 bytes",
         "error.unsupported_protocol" => "Unsupported proxy protocol, only SOCKS5 / SOCKS4 / HTTP supported",
         "error.invalid_node_addr" => "Invalid node server address format, expected IP:Port or Host:Port",
         "error.invalid_node_port" => "Invalid node server address or port",
@@ -276,6 +279,7 @@ fn translate_en(key: &str) -> &'static str {
         "error.password_required_on_user_change" => "A new password must be provided when changing the proxy username",
         "error.socks4_password_unsupported" => "SOCKS4 only supports UserID and does not support passwords",
         "error.config_persist_failed" => "Failed to persist configuration changes to disk; in-memory state rolled back",
+        "error.mutation_overloaded" => "Too many concurrent configuration mutations; please retry later",
         "error.missing_node_id" => "Node ID is required",
         "error.node_not_found" => "Specified proxy node not found",
         "error.node_in_use" => "Node is referenced by active rules or default fallback action and cannot be deleted. Please modify or remove related configurations first",

@@ -407,6 +407,11 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
     })
 }
 
+/// Reject control characters and strings exceeding `max_bytes` across node metadata fields.
+pub(crate) fn has_control_or_oversize(s: &str, max_bytes: usize) -> bool {
+    s.chars().any(char::is_control) || s.len() > max_bytes
+}
+
 /// 配置文件存储管理器：负责 XML 加载与原子回写持久化
 pub struct ConfigStore {
     pub path: PathBuf,
@@ -423,6 +428,11 @@ impl ConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_save_for_test(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.save_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn read_existing_opt(&self, self_ports: &[u16]) -> Result<Option<RuntimeProfile>> {

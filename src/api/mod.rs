@@ -22,8 +22,10 @@ use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
+const CONFIG_PERSIST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_SIZE: usize = 1024 * 1024; // 1MB 上限防 DoS
 const MAX_API_CONCURRENCY: usize = 128;
+const MAX_MUTATION_CONCURRENCY: usize = 16;
 const MAX_PING_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,7 +218,9 @@ pub struct ApiServer {
     pub in_flight: Option<Arc<InFlightTracker>>,
     conn_limit: Arc<Semaphore>,
     ping_semaphore: Arc<Semaphore>,
+    mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
+    persist_timeout: Duration,
     started_at: Instant,
 }
 
@@ -238,9 +242,17 @@ impl ApiServer {
             in_flight: None,
             conn_limit: Arc::new(Semaphore::new(MAX_API_CONCURRENCY)),
             ping_semaphore: Arc::new(Semaphore::new(MAX_PING_CONCURRENCY)),
+            mutation_semaphore: Arc::new(Semaphore::new(MAX_MUTATION_CONCURRENCY)),
             mutation_lock: Arc::new(Mutex::new(())),
+            persist_timeout: CONFIG_PERSIST_TIMEOUT,
             started_at: Instant::now(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_persist_timeout(mut self, timeout: Duration) -> Self {
+        self.persist_timeout = timeout;
+        self
     }
 
     pub fn with_self_ports(mut self, self_ports: Vec<u16>) -> Self {
@@ -343,7 +355,9 @@ impl ApiServer {
             let config_store = self.config_store.clone();
             let runtime_context = self.runtime_context.clone();
             let ping_semaphore = Arc::clone(&self.ping_semaphore);
+            let mutation_semaphore = Arc::clone(&self.mutation_semaphore);
             let mutation_lock = Arc::clone(&self.mutation_lock);
+            let persist_timeout = self.persist_timeout;
             let started_at = self.started_at;
             let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
 
@@ -360,7 +374,9 @@ impl ApiServer {
                     config_store,
                     runtime_context,
                     ping_semaphore,
+                    mutation_semaphore,
                     mutation_lock,
+                    persist_timeout,
                     started_at,
                 )
                 .await
@@ -729,7 +745,9 @@ async fn handle_api_request(
     config_store: Option<Arc<ConfigStore>>,
     runtime_context: Option<Arc<SystemRuntimeContext>>,
     ping_semaphore: Arc<Semaphore>,
+    mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
+    persist_timeout: Duration,
     started_at: Instant,
 ) -> Result<()> {
     let mut req_bytes = Vec::with_capacity(4096);
@@ -899,10 +917,31 @@ async fn handle_api_request(
                 "/api/rules/default" | "/api/rules/toggle" | "/api/rules/move"
             )
     );
-    let mut mutation_guard = if is_mutation {
-        Some(mutation_lock.lock().await)
+    let (mut mutation_guard, mut mutation_sem_permit) = if is_mutation {
+        let Ok(sem_permit) = mutation_semaphore.try_acquire() else {
+            send_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json_error(locale, "ERR_OVERLOADED", "error.mutation_overloaded"),
+            )
+            .await?;
+            return Ok(());
+        };
+        let Ok(lock_guard) = tokio::time::timeout(persist_timeout, mutation_lock.lock()).await else {
+            drop(sem_permit);
+            send_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json_error(locale, "ERR_OVERLOADED", "error.mutation_overloaded"),
+            )
+            .await?;
+            return Ok(());
+        };
+        (Some(lock_guard), Some(sem_permit))
     } else {
-        None
+        (None, None)
     };
 
     let live_proxy_nodes = Arc::clone(&proxy_nodes);
@@ -1301,7 +1340,13 @@ async fn handle_api_request(
     if should_persist {
         let mut persisted_ok = true;
         if let Some(store) = config_store.as_ref()
-            && let Err(e) = persist_config_async(Arc::clone(store), &proxy_nodes, &rule_engine).await
+            && let Err(e) = persist_config_async_with_timeout(
+                Arc::clone(store),
+                &proxy_nodes,
+                &rule_engine,
+                persist_timeout,
+            )
+            .await
         {
             error!(
                 "[API] Failed to write updated config to disk, aborting commit: {:#}",
@@ -1328,8 +1373,9 @@ async fn handle_api_request(
         }
     }
 
-    // 内存与磁盘均提交/回滚完毕后立即释放写锁，避免慢读客户端占用 mutation_lock
+    // 内存与磁盘均提交/回滚完毕后立即释放写锁与并发许可，避免慢读客户端占用写通路
     drop(mutation_guard.take());
+    drop(mutation_sem_permit.take());
 
     send_http_response(&mut stream, status, content_type, &body).await?;
     Ok(())
@@ -1352,6 +1398,13 @@ fn validate_node_base(
             "400 Bad Request",
             ct,
             json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
+        ));
+    }
+    if crate::config::has_control_or_oversize(&name, 255) {
+        return Err((
+            "400 Bad Request",
+            ct,
+            json_error(locale, "ERR_INVALID_NODE_NAME", "error.invalid_node_name"),
         ));
     }
 
@@ -1415,7 +1468,7 @@ fn validate_node_base(
         .filter(|u| !u.is_empty());
 
     if let Some(u) = &username {
-        if u.contains('\r') || u.contains('\n') || u.contains('\0') || u.len() > 255 {
+        if crate::config::has_control_or_oversize(u, 255) {
             return Err((
                 "400 Bad Request",
                 ct,
@@ -1432,7 +1485,7 @@ fn validate_node_base(
     }
 
     if let Some(p) = &explicit_password {
-        if p.contains('\r') || p.contains('\n') || p.contains('\0') || p.len() > 255 {
+        if crate::config::has_control_or_oversize(p, 255) {
             return Err((
                 "400 Bad Request",
                 ct,
@@ -1493,7 +1546,6 @@ fn resolve_updated_credentials(
     is_patch: bool,
     protocol: &str,
     username: Option<String>,
-    req_username_explicit: bool,
     existing_username: &Option<String>,
     existing_password: Option<String>,
     explicit_password: Option<String>,
@@ -1569,7 +1621,6 @@ fn resolve_updated_credentials(
             ));
         }
         if clear_password == Some(false)
-            && keep_password == Some(false)
             && !has_raw_password_field
             && existing_password.is_some()
         {
@@ -1589,12 +1640,7 @@ fn resolve_updated_credentials(
     let clearing_password = clear_password == Some(true) || explicit_empty;
 
     if clearing_password {
-        let setting_explicit_user = if is_patch {
-            req_username_explicit
-        } else {
-            username != *existing_username
-        };
-        if setting_explicit_user {
+        if username != *existing_username {
             return Err((
                 "400 Bad Request",
                 ct,
@@ -1750,7 +1796,6 @@ pub(crate) fn handle_update_node(
         false,
         &protocol,
         username,
-        true,
         &existing.username,
         existing_password,
         explicit_password,
@@ -1809,8 +1854,6 @@ pub(crate) fn handle_patch_node(
             ),
         );
     }
-    let req_username_explicit = req.clear_username != Some(true)
-        && req.username.as_deref().is_some_and(|u| !u.trim().is_empty());
     let username_raw = if req.clear_username == Some(true) {
         None
     } else if req.username.is_some() {
@@ -1837,7 +1880,6 @@ pub(crate) fn handle_patch_node(
         true,
         &protocol,
         username,
-        req_username_explicit,
         &existing.username,
         existing_password,
         explicit_password,
@@ -2321,14 +2363,17 @@ fn build_system_info(
     }
 }
 
-async fn persist_config_async(
+async fn persist_config_async_with_timeout(
     store: Arc<ConfigStore>,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     rule_engine: &RuleEngine,
+    timeout: Duration,
 ) -> Result<()> {
     let cfg = ConfigStore::snapshot_runtime(proxy_nodes, rule_engine);
-    tokio::task::spawn_blocking(move || store.save_profile(&cfg))
+    let handle = tokio::task::spawn_blocking(move || store.save_profile(&cfg));
+    tokio::time::timeout(timeout, handle)
         .await
+        .with_context(|| format!("Configuration persistence timed out after {:?}", timeout))?
         .context("Configuration persistence background task failed")??;
     Ok(())
 }
@@ -4150,5 +4195,281 @@ mod tests {
         .await;
         assert!(r_s4_empty_pw_put.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(r_s4_empty_pw_put.contains("ERR_SOCKS4_PASSWORD_UNSUPPORTED"));
+    }
+
+    #[tokio::test]
+    async fn test_api_patch_clear_password_parity_conflict_and_control_chars() {
+        let monitor = Arc::new(ConnectionManager::new());
+        let rule_engine = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let server = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            monitor,
+            rule_engine,
+            Arc::clone(&nodes),
+        );
+        let listener = server.bind().await.unwrap();
+        let api_addr = listener.local_addr().unwrap();
+        let api_port = api_addr.port();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { server.run(listener, shutdown_rx).await });
+
+        // 1. Add SOCKS5 node with credentials
+        let add_body = r#"{"name":"p2node","protocol":"SOCKS5","server_addr":"10.0.0.5:1080","username":"alice","password":"secret"}"#;
+        let r_add = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                add_body.len(),
+                add_body
+            ),
+        )
+        .await;
+        assert!(r_add.starts_with("HTTP/1.1 200 OK"), "add: {}", r_add);
+        let id = serde_json::from_str::<serde_json::Value>(r_add.split("\r\n\r\n").nth(1).unwrap())
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap() as u32;
+
+        // 2. PATCH clear_username + clear_password=false without keep_password must NOT silently clear password
+        let patch_conflict = format!(
+            r#"{{"id":{},"clear_username":true,"clear_password":false}}"#,
+            id
+        );
+        let r_patch_conflict = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                patch_conflict.len(),
+                patch_conflict
+            ),
+        )
+        .await;
+        assert!(r_patch_conflict.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_patch_conflict.contains("ERR_CONFLICTING_PASSWORD_OPTIONS"));
+        {
+            let guard = nodes.read().unwrap();
+            let entry = guard.get(&id).unwrap();
+            assert_eq!(entry.username.as_deref(), Some("alice"));
+            assert_eq!(entry.client.auth_credentials(), (Some("alice"), Some("secret")));
+        }
+
+        // PUT with null username + clear_password=false + omitted keep_password also rejects cleanly
+        let put_conflict = format!(
+            r#"{{"id":{},"name":"p2node","protocol":"SOCKS5","server_addr":"10.0.0.5:1080","username":null,"clear_password":false}}"#,
+            id
+        );
+        let r_put_conflict = raw_http(
+            api_addr,
+            &format!(
+                "PUT /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                put_conflict.len(),
+                put_conflict
+            ),
+        )
+        .await;
+        assert!(r_put_conflict.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_put_conflict.contains("ERR_CONFLICTING_PASSWORD_OPTIONS"));
+
+        // 3. PATCH echoing existing username alongside clear_password=true clears both (parity with PUT)
+        let patch_clear_same_user = format!(
+            r#"{{"id":{},"username":"alice","clear_password":true}}"#,
+            id
+        );
+        let r_patch_clear = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                patch_clear_same_user.len(),
+                patch_clear_same_user
+            ),
+        )
+        .await;
+        assert!(r_patch_clear.starts_with("HTTP/1.1 200 OK"), "patch_clear: {}", r_patch_clear);
+        {
+            let guard = nodes.read().unwrap();
+            let entry = guard.get(&id).unwrap();
+            assert_eq!(entry.username, None);
+            assert_eq!(entry.client.auth_credentials(), (None, None));
+        }
+
+        // PATCH changing username alongside clear_password=true still rejects
+        let patch_clear_diff_user = format!(
+            r#"{{"id":{},"username":"bob","clear_password":true}}"#,
+            id
+        );
+        let r_patch_diff = raw_http(
+            api_addr,
+            &format!(
+                "PATCH /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                patch_clear_diff_user.len(),
+                patch_clear_diff_user
+            ),
+        )
+        .await;
+        assert!(r_patch_diff.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(r_patch_diff.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
+
+        // 4. Control characters (\t, \x1b, \x7f) rejected on name, username, and password
+        for (bad_body, expected_code) in [
+            (
+                r#"{"name":"bad\tname","protocol":"SOCKS5","server_addr":"10.0.0.5:1080"}"#,
+                "ERR_INVALID_NODE_NAME",
+            ),
+            (
+                r#"{"name":"ok","protocol":"SOCKS5","server_addr":"10.0.0.5:1080","username":"bad\u001buser","password":"secret"}"#,
+                "ERR_INVALID_USERNAME",
+            ),
+            (
+                r#"{"name":"ok","protocol":"SOCKS5","server_addr":"10.0.0.5:1080","username":"alice","password":"bad\u007fpass"}"#,
+                "ERR_INVALID_PASSWORD",
+            ),
+        ] {
+            let r_bad = raw_http(
+                api_addr,
+                &format!(
+                    "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    api_port,
+                    bad_body.len(),
+                    bad_body
+                ),
+            )
+            .await;
+            assert!(r_bad.starts_with("HTTP/1.1 400 Bad Request"), "resp: {}", r_bad);
+            assert!(r_bad.contains(expected_code), "expected {} in {}", expected_code, r_bad);
+        }
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_api_persist_timeout_and_mutation_isolation_do_not_starve_health_or_kill() {
+        let cfg_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("test_persist_isolation_{}.xml", std::process::id()));
+        let _ = std::fs::remove_file(&cfg_path);
+        let store = Arc::new(ConfigStore::new(&cfg_path));
+        store
+            .save_profile(&crate::config::ProfileConfig::default_profile())
+            .unwrap();
+
+        let monitor = Arc::new(ConnectionManager::new());
+        let tracked = monitor.register(
+            "curl.exe".into(),
+            "C:\\curl.exe".into(),
+            4321,
+            "example.com:443".into(),
+            "Default".into(),
+            "Direct".into(),
+            None,
+        );
+        let rule_engine = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+
+        let server = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Arc::clone(&monitor),
+            rule_engine,
+            Arc::clone(&nodes),
+        )
+        .with_config_store(Arc::clone(&store))
+        .with_persist_timeout(Duration::from_millis(80));
+        let listener = server.bind().await.unwrap();
+        let api_addr = listener.local_addr().unwrap();
+        let api_port = api_addr.port();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { server.run(listener, shutdown_rx).await });
+
+        // Hold save_lock on a background OS thread to simulate stalled disk I/O across awaits
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let store_blocker = Arc::clone(&store);
+        let blocker_thread = std::thread::spawn(move || {
+            let _guard = store_blocker.lock_save_for_test();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let mut handles = Vec::new();
+        for idx in 0..24 {
+            handles.push(tokio::spawn(async move {
+                let body = format!(
+                    r#"{{"name":"flood-{}","protocol":"SOCKS5","server_addr":"10.0.0.9:1080"}}"#,
+                    idx
+                );
+                let req = format!(
+                    "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    api_port,
+                    body.len(),
+                    body
+                );
+                raw_http(api_addr, &req).await
+            }));
+        }
+
+        // Let initial mutation enter stalled disk write while queue fills
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // Health & connection kill must remain unstarved and responsive
+        let r_health = tokio::time::timeout(
+            Duration::from_millis(400),
+            raw_http(
+                api_addr,
+                &format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", api_port),
+            ),
+        )
+        .await
+        .expect("/api/health starved by stalled mutations");
+        assert!(r_health.starts_with("HTTP/1.1 200 OK"), "health: {}", r_health);
+
+        let kill_body = format!(r#"{{"id":{}}}"#, tracked.id);
+        let r_kill = tokio::time::timeout(
+            Duration::from_millis(400),
+            raw_http(
+                api_addr,
+                &format!(
+                    "POST /api/connections/kill HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    api_port,
+                    kill_body.len(),
+                    kill_body
+                ),
+            ),
+        )
+        .await
+        .expect("/api/connections/kill starved by stalled mutations");
+        assert!(r_kill.starts_with("HTTP/1.1 200 OK"), "kill: {}", r_kill);
+        assert!(tracked.is_cancelled());
+
+        let mut saw_persist_timeout_500 = 0usize;
+        let mut saw_overloaded_503 = 0usize;
+        for h in handles {
+            let resp = h.await.unwrap();
+            assert!(!resp.starts_with("HTTP/1.1 200"), "unexpected commit: {}", resp);
+            if resp.contains("ERR_CONFIG_PERSIST_FAILED") {
+                saw_persist_timeout_500 += 1;
+            } else if resp.contains("ERR_OVERLOADED") {
+                saw_overloaded_503 += 1;
+            } else {
+                panic!("unexpected error response during stalled mutation flood: {}", resp);
+            }
+        }
+        assert!(saw_persist_timeout_500 >= 1);
+        assert!(saw_overloaded_503 >= 1);
+        assert!(nodes.read().unwrap().is_empty(), "stalled writes must roll back memory");
+
+        let _ = release_tx.send(());
+        let _ = blocker_thread.join();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&cfg_path);
     }
 }
