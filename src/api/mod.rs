@@ -2573,7 +2573,7 @@ async fn ping_address_with_context(
     }
 
     let deadline = tokio::time::Instant::now() + remaining;
-    match crate::outbound::direct::connect_candidates_with_budget(
+    match crate::outbound::direct::connect_candidates_guarded_with_budget(
         &candidate_ips,
         port,
         deadline,

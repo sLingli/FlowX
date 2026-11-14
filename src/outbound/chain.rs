@@ -1,8 +1,10 @@
 use std::net::SocketAddr;
 use anyhow::{bail, Context, Result};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use crate::dns::FakeIpPool;
-use super::direct::{connect_proxy_tcp, validate_direct_ips, DEFAULT_OUTBOUND_UPSTREAM_DNS};
+use super::bypass::OutboundTcpStream;
+use super::direct::{connect_proxy_tcp_guarded, validate_direct_ips, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::http::HttpConnectClient;
 use super::socks4::Socks4Client;
 use super::socks5::Socks5Client;
@@ -63,10 +65,17 @@ impl ProxyNode {
 
     /// 在一个既有 TCP 流上执行该节点的隧道握手
     pub async fn handshake(&self, stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
+        self.handshake_stream(stream, target).await
+    }
+
+    pub async fn handshake_stream<S>(&self, stream: S, target: &TargetAddr) -> Result<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         match self {
-            ProxyNode::Socks5(c) => c.handshake(stream, target).await,
-            ProxyNode::Http(c) => c.handshake(stream, target).await,
-            ProxyNode::Socks4(c) => c.handshake(stream, target).await,
+            ProxyNode::Socks5(c) => c.handshake_stream(stream, target).await,
+            ProxyNode::Http(c) => c.handshake_stream(stream, target).await,
+            ProxyNode::Socks4(c) => c.handshake_stream(stream, target).await,
         }
     }
 }
@@ -119,6 +128,18 @@ impl ProxyChain {
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<TcpStream> {
+        self.connect_with_policy_guarded(target, upstream_dns, fake_ip_pool, self_ports)
+            .await
+            .map(OutboundTcpStream::into_inner)
+    }
+
+    pub async fn connect_with_policy_guarded(
+        &self,
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<OutboundTcpStream> {
         if self.nodes.is_empty() {
             bail!("Proxy chain '{}' does not contain any proxy nodes", self.name);
         }
@@ -129,7 +150,7 @@ impl ProxyChain {
             // 1. Establish basic TCP connection with first hop via upstream DNS + Fake-IP/self-loop validation
             let first_node = &self.nodes[0];
             let role = format!("Proxy chain [{}] first node", self.name);
-            let mut stream = connect_proxy_tcp(
+            let mut stream = connect_proxy_tcp_guarded(
                 first_node.server_addr(),
                 upstream_dns,
                 fake_ip_pool,
@@ -146,7 +167,7 @@ impl ProxyChain {
                 if is_last {
                     // Last hop: connect to final target
                     stream = current_node
-                        .handshake(stream, target)
+                        .handshake_stream(stream, target)
                         .await
                         .with_context(|| {
                             format!(
@@ -170,7 +191,7 @@ impl ProxyChain {
                     )?;
 
                     stream = current_node
-                        .handshake(stream, &next_target)
+                        .handshake_stream(stream, &next_target)
                         .await
                         .with_context(|| {
                             format!(

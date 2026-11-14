@@ -5,6 +5,7 @@ use tokio::net::TcpStream;
 
 use crate::dns::server::resolve_via_upstream_dns;
 use crate::dns::FakeIpPool;
+use super::bypass::{connect_tcp_guarded, OutboundTcpStream};
 use super::{is_local_or_loopback_ip, is_loopback_domain, local_interface_ips, TargetAddr};
 
 /// Maximum timeout for direct TCP connection (including upstream DNS resolution)
@@ -74,15 +75,15 @@ where
     Err(last_err.unwrap_or(CandidateConnectError::NoCandidates))
 }
 
-pub(crate) async fn connect_candidates_with_budget(
+pub(crate) async fn connect_candidates_guarded_with_budget(
     ips: &[IpAddr],
     port: u16,
     deadline: tokio::time::Instant,
     min_attempt: Duration,
     max_attempt: Duration,
-) -> std::result::Result<TcpStream, CandidateConnectError> {
+) -> std::result::Result<OutboundTcpStream, CandidateConnectError> {
     connect_candidates_with(ips, port, deadline, min_attempt, max_attempt, |addr| {
-        TcpStream::connect(addr)
+        connect_tcp_guarded(addr)
     })
     .await
 }
@@ -147,6 +148,21 @@ pub(crate) fn validate_direct_ips(
 }
 
 /// 通过显式上游 DNS + Fake-IP 防死锁与回环自检连接上级代理节点，避免阻塞 `getaddrinfo` 命中系统 Fake-IP
+pub(crate) async fn connect_proxy_tcp_guarded(
+    proxy_addr: &str,
+    upstream_dns: SocketAddr,
+    fake_ip_pool: Option<&FakeIpPool>,
+    self_ports: &[u16],
+    role: &str,
+) -> Result<OutboundTcpStream> {
+    let proxy_target = TargetAddr::parse_authority(proxy_addr, None, false)
+        .with_context(|| format!("Invalid {} server address: {}", role, proxy_addr))?;
+    DirectOutbound::connect_guarded(&proxy_target, upstream_dns, fake_ip_pool, self_ports)
+        .await
+        .with_context(|| format!("Failed to connect to {}: {}", role, proxy_addr))
+}
+
+#[allow(dead_code)]
 pub(crate) async fn connect_proxy_tcp(
     proxy_addr: &str,
     upstream_dns: SocketAddr,
@@ -154,11 +170,9 @@ pub(crate) async fn connect_proxy_tcp(
     self_ports: &[u16],
     role: &str,
 ) -> Result<TcpStream> {
-    let proxy_target = TargetAddr::parse_authority(proxy_addr, None, false)
-        .with_context(|| format!("Invalid {} server address: {}", role, proxy_addr))?;
-    DirectOutbound::connect(&proxy_target, upstream_dns, fake_ip_pool, self_ports)
+    connect_proxy_tcp_guarded(proxy_addr, upstream_dns, fake_ip_pool, self_ports, role)
         .await
-        .with_context(|| format!("Failed to connect to {}: {}", role, proxy_addr))
+        .map(OutboundTcpStream::into_inner)
 }
 
 impl DirectOutbound {
@@ -168,6 +182,17 @@ impl DirectOutbound {
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<TcpStream> {
+        Self::connect_guarded(target, upstream_dns, fake_ip_pool, self_ports)
+            .await
+            .map(OutboundTcpStream::into_inner)
+    }
+
+    pub async fn connect_guarded(
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<OutboundTcpStream> {
         let deadline = tokio::time::Instant::now() + DIRECT_CONNECT_TIMEOUT;
         let fut = async {
             match target {
@@ -179,7 +204,7 @@ impl DirectOutbound {
                         fake_ip_pool,
                         &addr.ip().to_string(),
                     )?;
-                    TcpStream::connect(addr)
+                    connect_tcp_guarded(*addr)
                         .await
                         .with_context(|| format!("Direct connection to target IP failed: {}", addr))
                 }
@@ -206,7 +231,7 @@ impl DirectOutbound {
 
                     validate_direct_ips(&resolved_ips, *port, self_ports, fake_ip_pool, domain)?;
 
-                    match connect_candidates_with_budget(
+                    match connect_candidates_guarded_with_budget(
                         &resolved_ips,
                         *port,
                         deadline,

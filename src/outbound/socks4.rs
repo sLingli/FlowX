@@ -1,10 +1,11 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 use anyhow::{bail, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use crate::dns::FakeIpPool;
-use super::direct::{connect_proxy_tcp, DEFAULT_OUTBOUND_UPSTREAM_DNS};
+use super::bypass::OutboundTcpStream;
+use super::direct::{connect_proxy_tcp_guarded, DEFAULT_OUTBOUND_UPSTREAM_DNS};
 use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,8 +41,20 @@ impl Socks4Client {
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<TcpStream> {
+        self.connect_with_policy_guarded(target, upstream_dns, fake_ip_pool, self_ports)
+            .await
+            .map(OutboundTcpStream::into_inner)
+    }
+
+    pub async fn connect_with_policy_guarded(
+        &self,
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<OutboundTcpStream> {
         tokio::time::timeout(DEFAULT_TIMEOUT, async {
-            let mut stream = connect_proxy_tcp(
+            let mut stream = connect_proxy_tcp_guarded(
                 &self.proxy_addr,
                 upstream_dns,
                 fake_ip_pool,
@@ -57,14 +70,24 @@ impl Socks4Client {
         .map_err(|_| anyhow::anyhow!("SOCKS4 connection timed out ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
     }
 
-    pub async fn handshake(&self, mut stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
+    pub async fn handshake(&self, stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
+        self.handshake_stream(stream, target).await
+    }
+
+    pub async fn handshake_stream<S>(&self, mut stream: S, target: &TargetAddr) -> Result<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         tokio::time::timeout(DEFAULT_TIMEOUT, self.handshake_internal(&mut stream, target))
             .await
             .map_err(|_| anyhow::anyhow!("SOCKS4 handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
         Ok(stream)
     }
 
-    async fn handshake_internal(&self, stream: &mut TcpStream, target: &TargetAddr) -> Result<()> {
+    async fn handshake_internal<S>(&self, stream: &mut S, target: &TargetAddr) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
         if self.user_id.contains('\0') {
             bail!("SOCKS4 user_id contains invalid null byte (\\0)");
         }

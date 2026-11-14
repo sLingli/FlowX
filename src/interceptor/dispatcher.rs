@@ -330,11 +330,15 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &TargetAddr) -> Result<TcpStream> {
+async fn connect_outbound(
+    config: &DispatcherConfig,
+    action: &Action,
+    target: &TargetAddr,
+) -> Result<crate::outbound::OutboundTcpStream> {
     match action {
         Action::Block => bail!("Connection blocked by rule"),
         Action::Direct => {
-            DirectOutbound::connect(
+            DirectOutbound::connect_guarded(
                 target,
                 config.upstream_dns,
                 Some(config.fake_ip_pool.as_ref()),
@@ -353,15 +357,15 @@ async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &T
             let pool = Some(config.fake_ip_pool.as_ref());
             match &client {
                 ProxyNode::Socks5(s) => {
-                    s.connect_with_policy(target, config.upstream_dns, pool, &config.self_ports)
+                    s.connect_with_policy_guarded(target, config.upstream_dns, pool, &config.self_ports)
                         .await
                 }
                 ProxyNode::Http(h) => {
-                    h.connect_with_policy(target, config.upstream_dns, pool, &config.self_ports)
+                    h.connect_with_policy_guarded(target, config.upstream_dns, pool, &config.self_ports)
                         .await
                 }
                 ProxyNode::Socks4(s) => {
-                    s.connect_with_policy(target, config.upstream_dns, pool, &config.self_ports)
+                    s.connect_with_policy_guarded(target, config.upstream_dns, pool, &config.self_ports)
                         .await
                 }
             }
@@ -372,7 +376,7 @@ async fn connect_outbound(config: &DispatcherConfig, action: &Action, target: &T
                 None => bail!("Rule specifies non-existent proxy chain ID: {}", chain_id),
             };
             chain
-                .connect_with_policy(
+                .connect_with_policy_guarded(
                     target,
                     config.upstream_dns,
                     Some(config.fake_ip_pool.as_ref()),

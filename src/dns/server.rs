@@ -472,7 +472,7 @@ async fn forward_upstream_udp(
     } else {
         "0.0.0.0:0"
     };
-    let sock = UdpSocket::bind(local_bind)
+    let sock = crate::outbound::bypass::bind_udp_guarded(local_bind)
         .await
         .context("Failed to bind ephemeral upstream DNS socket")?;
     sock.send_to(query_bytes, upstream_dns)

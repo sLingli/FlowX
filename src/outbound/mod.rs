@@ -5,11 +5,42 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use crate::monitor::ActiveConnection;
 
+pub mod bypass;
 pub mod chain;
 pub mod direct;
 pub mod http;
 pub mod socks4;
 pub mod socks5;
+
+pub use bypass::OutboundTcpStream;
+
+use tokio::io::{AsyncRead, AsyncWrite};
+
+/// 可拆分全双工中继流抽象（统一支持原生 `TcpStream`、带端口绕过守卫的 `OutboundTcpStream` 及未来 `smoltcp` 透明流）
+pub trait RelayStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    type ReadHalf: AsyncRead + Unpin + Send + 'static;
+    type WriteHalf: AsyncWrite + Unpin + Send + 'static;
+
+    fn split_stream(self) -> (Self::ReadHalf, Self::WriteHalf);
+}
+
+impl RelayStream for TcpStream {
+    type ReadHalf = tokio::net::tcp::OwnedReadHalf;
+    type WriteHalf = tokio::net::tcp::OwnedWriteHalf;
+
+    fn split_stream(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        self.into_split()
+    }
+}
+
+impl RelayStream for OutboundTcpStream {
+    type ReadHalf = bypass::GuardedReadHalf;
+    type WriteHalf = bypass::GuardedWriteHalf;
+
+    fn split_stream(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        self.into_split()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TargetAddr {
@@ -365,13 +396,17 @@ fn record_activity_us(start: &tokio::time::Instant, tracker: &std::sync::atomic:
     tracker.store(elapsed_us, std::sync::atomic::Ordering::Relaxed);
 }
 
-async fn relay_downlink(
-    mut rr: tokio::net::tcp::OwnedReadHalf,
-    mut lw: tokio::net::tcp::OwnedWriteHalf,
+async fn relay_downlink<R, W>(
+    mut rr: R,
+    mut lw: W,
     conn: Option<Arc<ActiveConnection>>,
     start: tokio::time::Instant,
     last_activity_us: Arc<std::sync::atomic::AtomicU64>,
-) -> std::io::Result<u64> {
+) -> std::io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut buf = vec![0u8; 16384];
     let mut total_down = 0u64;
     loop {
@@ -464,11 +499,15 @@ where
 }
 
 /// 全双工透明流中继对拷（带实时流量监视与主动熔断切断支持）
-pub async fn relay_stream_monitored(
-    local: TcpStream,
-    remote: TcpStream,
+pub async fn relay_stream_monitored<L, R>(
+    local: L,
+    remote: R,
     conn: Option<&Arc<ActiveConnection>>,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64)>
+where
+    L: RelayStream,
+    R: RelayStream,
+{
     const RELAY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
     relay_stream_monitored_with_timeout(local, remote, conn, RELAY_IDLE_TIMEOUT).await
 }
@@ -476,20 +515,24 @@ pub async fn relay_stream_monitored(
 /// 可配置双向静默空闲超时的全双工对拷实现：
 /// 仅当上行与下行在 `idle_timeout` 内均无任何数据流动时才判定超时；
 /// 任一方向收到 EOF (n == 0) 半关闭后，仅关闭对端写方向并允许另一方向继续传输。
-pub async fn relay_stream_monitored_with_timeout(
-    local: TcpStream,
-    remote: TcpStream,
+pub async fn relay_stream_monitored_with_timeout<L, R>(
+    local: L,
+    remote: R,
     conn: Option<&Arc<ActiveConnection>>,
     idle_timeout: std::time::Duration,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64)>
+where
+    L: RelayStream,
+    R: RelayStream,
+{
     use std::sync::atomic::AtomicU64;
 
     if conn.is_some_and(|c| c.is_cancelled()) {
         anyhow::bail!("Connection aborted by administrator");
     }
 
-    let (mut lr, lw) = local.into_split();
-    let (rr, mut rw) = remote.into_split();
+    let (mut lr, lw) = local.split_stream();
+    let (rr, mut rw) = remote.split_stream();
 
     let conn_up = conn.cloned();
     let conn_down = conn.cloned();
@@ -539,14 +582,14 @@ pub(crate) fn find_http_header_end(buf: &[u8], scanned_len: usize) -> Option<usi
 }
 
 /// 预读前缀 + 底层的顺序流读取器，用于精确消费 HTTP 请求/响应体边界而绝不溢出到后续流水线报文
-struct PrefixedTcpReader {
+struct PrefixedTcpReader<R> {
     buf: Vec<u8>,
     pos: usize,
-    inner: tokio::net::tcp::OwnedReadHalf,
+    inner: R,
 }
 
-impl PrefixedTcpReader {
-    fn new(prefix: Vec<u8>, inner: tokio::net::tcp::OwnedReadHalf) -> Self {
+impl<R: AsyncRead + Unpin> PrefixedTcpReader<R> {
+    fn new(prefix: Vec<u8>, inner: R) -> Self {
         Self {
             buf: prefix,
             pos: 0,
@@ -700,8 +743,8 @@ impl From<std::io::Error> for BodyRelayError {
 }
 
 /// 统一带活跃计时与全局/单连接字节计数的有界 HTTP 体写入端，同时复用在上行请求体与下行响应体路径
-struct TrackedBodySink<'a> {
-    writer: tokio::net::tcp::OwnedWriteHalf,
+struct TrackedBodySink<'a, W> {
+    writer: W,
     total_bytes: &'a std::sync::atomic::AtomicU64,
     conn: &'a Option<Arc<ActiveConnection>>,
     start: &'a tokio::time::Instant,
@@ -709,7 +752,7 @@ struct TrackedBodySink<'a> {
     direction: RelayDirection,
 }
 
-impl<'a> TrackedBodySink<'a> {
+impl<'a, W: AsyncWrite + Unpin> TrackedBodySink<'a, W> {
     async fn write_all(&mut self, bytes: &[u8]) -> std::result::Result<(), BodyRelayError> {
         if bytes.is_empty() {
             return Ok(());
@@ -740,9 +783,9 @@ impl<'a> TrackedBodySink<'a> {
     }
 }
 
-async fn copy_exact_body(
-    reader: &mut PrefixedTcpReader,
-    sink: &mut TrackedBodySink<'_>,
+async fn copy_exact_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut PrefixedTcpReader<R>,
+    sink: &mut TrackedBodySink<'_, W>,
     mut remaining: u64,
 ) -> std::result::Result<(), BodyRelayError> {
     while remaining > 0 {
@@ -762,9 +805,9 @@ async fn copy_exact_body(
     Ok(())
 }
 
-async fn copy_until_eof(
-    reader: &mut PrefixedTcpReader,
-    sink: &mut TrackedBodySink<'_>,
+async fn copy_until_eof<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut PrefixedTcpReader<R>,
+    sink: &mut TrackedBodySink<'_, W>,
 ) -> std::result::Result<(), BodyRelayError> {
     loop {
         let avail = reader.fill().await?;
@@ -855,9 +898,9 @@ fn validate_chunk_trailer_line(line: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn forward_chunked_body(
-    reader: &mut PrefixedTcpReader,
-    sink: &mut TrackedBodySink<'_>,
+async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    reader: &mut PrefixedTcpReader<R>,
+    sink: &mut TrackedBodySink<'_, W>,
 ) -> std::result::Result<(), BodyRelayError> {
     const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
     const MAX_TRAILER_BYTES: usize = 16 * 1024;
@@ -1059,9 +1102,9 @@ fn parse_and_rewrite_http_response_head(
     })
 }
 
-async fn relay_http_response_downlink(
-    rr: tokio::net::tcp::OwnedReadHalf,
-    sink: &mut TrackedBodySink<'_>,
+async fn relay_http_response_downlink<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    rr: R,
+    sink: &mut TrackedBodySink<'_, W>,
     is_head_request: bool,
 ) -> std::io::Result<u64> {
     const MAX_HTTP_RESPONSE_HEADER: usize = 64 * 1024;
@@ -1131,9 +1174,9 @@ async fn relay_http_response_downlink(
 /// 明文 HTTP 代理有界双向报文转发：请求侧严格按 `Content-Length` / `chunked` 截断并隔离流水线走私；
 /// 响应侧解析 HTTP/1.x 响应头与有界响应体（重写 `Connection: close`），响应体完毕即主动优雅关闭双方连接，
 /// 防止忽略 `Connection: close` 的 HTTP/1.1 Keep-Alive 源站拖挂至 120s 空闲超时，同时兼容延迟响应与早期 4xx 拒绝。
-pub async fn relay_http_forward_monitored(
-    local: TcpStream,
-    remote: TcpStream,
+pub async fn relay_http_forward_monitored<L: RelayStream, R: RelayStream>(
+    local: L,
+    remote: R,
     conn: Option<&Arc<ActiveConnection>>,
     framing: crate::inbound::HttpBodyFraming,
     body_prefix: Vec<u8>,
@@ -1152,9 +1195,9 @@ pub async fn relay_http_forward_monitored(
     .await
 }
 
-pub async fn relay_http_forward_monitored_with_timeout(
-    local: TcpStream,
-    remote: TcpStream,
+pub async fn relay_http_forward_monitored_with_timeout<L: RelayStream, R: RelayStream>(
+    local: L,
+    remote: R,
     conn: Option<&Arc<ActiveConnection>>,
     framing: crate::inbound::HttpBodyFraming,
     body_prefix: Vec<u8>,
@@ -1167,8 +1210,8 @@ pub async fn relay_http_forward_monitored_with_timeout(
         anyhow::bail!("Connection aborted by administrator");
     }
 
-    let (lr, lw) = local.into_split();
-    let (rr, rw) = remote.into_split();
+    let (lr, lw) = local.split_stream();
+    let (rr, rw) = remote.split_stream();
 
     let conn_up = conn.cloned();
     let conn_down = conn.cloned();
@@ -1202,7 +1245,7 @@ pub async fn relay_http_forward_monitored_with_timeout(
         }
         // 丢弃 client 读端（阻断后续流水线请求字节），同时保留写端至响应完成，不发送提前 FIN
         drop(reader);
-        Ok::<tokio::net::tcp::OwnedWriteHalf, BodyRelayError>(up_sink.writer)
+        Ok::<R::WriteHalf, BodyRelayError>(up_sink.writer)
     };
 
     let down_task = async move {
@@ -1221,7 +1264,7 @@ pub async fn relay_http_forward_monitored_with_timeout(
         tokio::pin!(up_task);
         tokio::pin!(down_task);
         let mut up_done = false;
-        let mut rw_keepalive: Option<tokio::net::tcp::OwnedWriteHalf> = None;
+        let mut rw_keepalive: Option<R::WriteHalf> = None;
         let mut pending_up_write_err: Option<std::io::Error> = None;
 
         loop {
@@ -1259,7 +1302,7 @@ pub async fn relay_http_forward_monitored_with_timeout(
     await_relay_with_watchdog(relay_fut, start, last_activity_us, conn, idle_timeout).await
 }
 
-pub async fn relay_stream(local: TcpStream, remote: TcpStream) -> Result<(u64, u64)> {
+pub async fn relay_stream<L: RelayStream, R: RelayStream>(local: L, remote: R) -> Result<(u64, u64)> {
     relay_stream_monitored(local, remote, None).await
 }
 
