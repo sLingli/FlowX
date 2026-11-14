@@ -7,7 +7,7 @@
 //! (Wintun / WinDivert) 的情况下，`local_addr()` 永远是 FlowX 自身的监听地址，
 //! 会导致每条连接都被识别为发往 `127.0.0.1:<入站端口>` 并直连回自身，形成无限自连循环。
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr};
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -144,13 +144,13 @@ where
         bail!("SOCKS5 unsupported command: 0x{:02x}", header[1]);
     }
 
-    let target = match header[3] {
+    let target_res: Result<TargetAddr> = match header[3] {
         0x01 => {
             let mut buf = [0u8; 6];
             stream.read_exact(&mut buf).await?;
             let ip = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
             let port = u16::from_be_bytes([buf[4], buf[5]]);
-            TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port))
+            TargetAddr::from_ip_port(IpAddr::V4(ip), port)
         }
         0x04 => {
             let mut buf = [0u8; 18];
@@ -158,7 +158,7 @@ where
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&buf[..16]);
             let port = u16::from_be_bytes([buf[16], buf[17]]);
-            TargetAddr::Ip(SocketAddr::new(IpAddr::from(octets), port))
+            TargetAddr::from_ip_port(IpAddr::from(octets), port)
         }
         0x03 => {
             let mut len = [0u8; 1];
@@ -167,12 +167,22 @@ where
             stream.read_exact(&mut domain).await?;
             let mut port = [0u8; 2];
             stream.read_exact(&mut port).await?;
-            let host = String::from_utf8(domain).context("SOCKS5 target domain is not valid UTF-8")?;
-            make_target(&host, u16::from_be_bytes(port))?
+            let port = u16::from_be_bytes(port);
+            String::from_utf8(domain)
+                .context("SOCKS5 target domain is not valid UTF-8")
+                .and_then(|host| make_target(&host, port))
         }
         other => {
             stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
             bail!("SOCKS5 unsupported address type: 0x{:02x}", other);
+        }
+    };
+    let target = match target_res {
+        Ok(t) => t,
+        Err(e) => {
+            // 0x01: general SOCKS server failure (e.g., port 0 or invalid domain)
+            stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
+            return Err(e);
         }
     };
 
@@ -208,12 +218,20 @@ where
 
     // SOCKS4a：DSTIP 为 0.0.0.x (x != 0) 时，USERID 之后紧跟以 NUL 结尾的域名
     let o = ip.octets();
-    let target = if o[0] == 0 && o[1] == 0 && o[2] == 0 && o[3] != 0 {
+    let target_res: Result<TargetAddr> = if o[0] == 0 && o[1] == 0 && o[2] == 0 && o[3] != 0 {
         let domain = read_nul_terminated(stream, 255).await.context("Failed to read SOCKS4a domain")?;
-        let host = String::from_utf8(domain).context("SOCKS4a target domain is not valid UTF-8")?;
-        make_target(&host, port)?
+        String::from_utf8(domain)
+            .context("SOCKS4a target domain is not valid UTF-8")
+            .and_then(|host| make_target(&host, port))
     } else {
-        TargetAddr::Ip(SocketAddr::new(IpAddr::V4(ip), port))
+        TargetAddr::from_ip_port(IpAddr::V4(ip), port)
+    };
+    let target = match target_res {
+        Ok(t) => t,
+        Err(e) => {
+            stream.write_all(&[0x00, 0x5B, 0, 0, 0, 0, 0, 0]).await.ok();
+            return Err(e);
+        }
     };
 
     Ok(InboundRequest {
@@ -883,5 +901,66 @@ mod tests {
         });
         let ok = parse_http_from_start(&mut server3).await.unwrap();
         assert_eq!(ok.target, TargetAddr::Domain("example.com".to_string(), 443));
+    }
+
+    #[tokio::test]
+    async fn test_socks_rejects_port_zero_and_sends_error_replies() {
+        // SOCKS5 IPv4 port 0, IPv6 port 0, domain port 0, invalid domain, and invalid UTF-8 domain
+        let s5_cases: Vec<Vec<u8>> = vec![
+            vec![0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x00],
+            vec![
+                0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00,
+                0x00,
+            ],
+            [vec![0x05, 0x01, 0x00, 0x03, 11], b"example.com".to_vec(), vec![0x00, 0x00]]
+                .concat(),
+            [vec![0x05, 0x01, 0x00, 0x03, 8], b"bad host".to_vec(), vec![0x01, 0xbb]].concat(),
+            vec![0x05, 0x01, 0x00, 0x03, 2, 0xff, 0xfe, 0x01, 0xbb],
+        ];
+
+        for req in s5_cases {
+            let (mut client, mut server) = duplex(1024);
+            let task = tokio::spawn(async move { read_request(&mut server).await });
+
+            client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+            let mut auth_reply = [0u8; 2];
+            client.read_exact(&mut auth_reply).await.unwrap();
+            assert_eq!(auth_reply, [0x05, 0x00]);
+
+            client.write_all(&req).await.unwrap();
+            let mut err_reply = [0u8; 10];
+            client.read_exact(&mut err_reply).await.unwrap();
+            assert_eq!(
+                err_reply,
+                [0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0],
+                "expected SOCKS5 0x01 failure reply for {:?}",
+                req
+            );
+            assert!(task.await.unwrap().is_err());
+        }
+
+        // SOCKS4 IPv4 port 0, SOCKS4a port 0, SOCKS4a invalid domain, SOCKS4a non-UTF-8 domain
+        let s4_cases: Vec<Vec<u8>> = vec![
+            vec![0x04, 0x01, 0x00, 0x00, 1, 2, 3, 4, 0x00],
+            b"\x04\x01\x00\x00\x00\x00\x00\x01u\x00example.com\x00".to_vec(),
+            b"\x04\x01\x00\x50\x00\x00\x00\x01u\x00bad host\x00".to_vec(),
+            vec![0x04, 0x01, 0x00, 0x50, 0, 0, 0, 1, b'u', 0, 0xff, 0],
+        ];
+
+        for req in s4_cases {
+            let (mut client, mut server) = duplex(1024);
+            let task = tokio::spawn(async move { read_request(&mut server).await });
+            client.write_all(&req).await.unwrap();
+
+            let mut err_reply = [0u8; 8];
+            client.read_exact(&mut err_reply).await.unwrap();
+            assert_eq!(
+                err_reply,
+                [0x00, 0x5B, 0, 0, 0, 0, 0, 0],
+                "expected SOCKS4 0x5B failure reply for {:?}",
+                req
+            );
+            assert!(task.await.unwrap().is_err());
+        }
     }
 }

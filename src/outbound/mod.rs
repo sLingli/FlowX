@@ -246,16 +246,24 @@ pub(crate) fn is_local_or_loopback_ip(ip: IpAddr, local_ips: &[IpAddr]) -> bool 
 }
 
 impl TargetAddr {
+    /// Construct validated `TargetAddr::Ip` from IP address and non-zero port
+    pub fn from_ip_port(ip: IpAddr, port: u16) -> Result<Self> {
+        if port == 0 {
+            anyhow::bail!("Target port cannot be 0");
+        }
+        Ok(TargetAddr::Ip(SocketAddr::new(ip, port)))
+    }
+
     /// Construct validated `TargetAddr` from hostname/IP literal and non-zero port
     pub fn from_host_port(host: &str, port: u16) -> Result<Self> {
         if port == 0 {
             anyhow::bail!("Target port cannot be 0");
         }
         if let Ok(ip) = host.parse::<IpAddr>() {
-            return Ok(TargetAddr::Ip(SocketAddr::new(ip, port)));
+            return Self::from_ip_port(ip, port);
         }
         if let Some(v4) = parse_noncanonical_ipv4(host) {
-            return Ok(TargetAddr::Ip(SocketAddr::new(IpAddr::V4(v4), port)));
+            return Self::from_ip_port(IpAddr::V4(v4), port);
         }
         let valid = !host.is_empty()
             && host.len() <= 253
