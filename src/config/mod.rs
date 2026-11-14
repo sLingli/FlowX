@@ -345,13 +345,34 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
         }
     }
 
+    if proto == "SOCKS4" && item.password.is_some() {
+        bail!(
+            "Node #{} (SOCKS4) only supports UserID and cannot contain <Password>",
+            item.id
+        );
+    }
+
     let mut username = item
         .username
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty());
-    let password = item.password.filter(|p| !p.is_empty());
-    if proto == "HTTP" && username.as_deref().is_some_and(|u| u.contains(':')) {
-        bail!("Node #{} HTTP proxy username cannot contain ':' (RFC 7617)", item.id);
+    let raw_password = item.password;
+    if let Some(ref raw_pw) = raw_password
+        && has_control_or_oversize(raw_pw, 255)
+    {
+        bail!(
+            "Node #{} password contains invalid control characters or exceeds 255 bytes",
+            item.id
+        );
+    }
+    let password = raw_password.filter(|p| !p.is_empty());
+    if let Some(ref u) = username
+        && has_control_or_oversize(u, 255)
+    {
+        bail!(
+            "Node #{} username contains invalid control characters or exceeds 255 bytes",
+            item.id
+        );
     }
     if proto != "SOCKS4" {
         if username.is_none() && password.is_some() {
@@ -367,11 +388,20 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
             username = None;
         }
     }
+    if proto == "HTTP" && username.as_deref().is_some_and(|u| u.contains(':')) {
+        bail!("Node #{} HTTP proxy username cannot contain ':' (RFC 7617)", item.id);
+    }
     let name = item
         .name
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
         .unwrap_or_else(|| format!("Node-{} ({})", item.id, proto));
+    if has_control_or_oversize(&name, 255) {
+        bail!(
+            "Node #{} name contains invalid control characters or exceeds 255 bytes",
+            item.id
+        );
+    }
 
     let client = match proto.as_str() {
         "HTTP" => {
@@ -601,37 +631,82 @@ impl ConfigStore {
 }
 
 fn validate_xml_root_profile(xml_content: &str) -> Result<()> {
+    use quick_xml::events::Event;
+
     let trimmed_bom = xml_content.strip_prefix('\u{feff}').unwrap_or(xml_content);
     let mut reader = quick_xml::Reader::from_str(trimmed_bom);
+    let mut depth: usize = 0;
+    let mut saw_root = false;
+
     loop {
         match reader.read_event() {
-            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
-                let local = e.local_name();
-                if local.as_ref() != b"Profile" {
-                    let found = String::from_utf8_lossy(local.as_ref());
-                    bail!("Invalid XML root element <{}>: expected <Profile>", found);
+            Ok(Event::Start(e)) => {
+                let raw_name = e.name();
+                if !saw_root {
+                    if raw_name.as_ref() != b"Profile" {
+                        let found = String::from_utf8_lossy(raw_name.as_ref());
+                        bail!("Invalid XML root element <{}>: expected <Profile>", found);
+                    }
+                    saw_root = true;
+                    depth = 1;
+                } else if depth == 0 {
+                    let found = String::from_utf8_lossy(raw_name.as_ref());
+                    bail!("Unexpected trailing XML element <{}> after </Profile>", found);
+                } else {
+                    depth += 1;
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let raw_name = e.name();
+                if !saw_root {
+                    if raw_name.as_ref() != b"Profile" {
+                        let found = String::from_utf8_lossy(raw_name.as_ref());
+                        bail!("Invalid XML root element <{}>: expected <Profile>", found);
+                    }
+                    saw_root = true;
+                } else if depth == 0 {
+                    let found = String::from_utf8_lossy(raw_name.as_ref());
+                    bail!("Unexpected trailing XML element <{}/> after </Profile>", found);
+                }
+            }
+            Ok(Event::End(e)) => {
+                if !saw_root || depth == 0 {
+                    let raw_name = e.name();
+                    let found = String::from_utf8_lossy(raw_name.as_ref());
+                    bail!("Unexpected closing XML tag </{}>", found);
+                }
+                depth -= 1;
+            }
+            Ok(Event::Decl(_)) | Ok(Event::DocType(_)) => {
+                if saw_root {
+                    bail!("Unexpected XML declaration or DOCTYPE after <Profile> root");
+                }
+            }
+            Ok(Event::Comment(_)) | Ok(Event::PI(_)) => continue,
+            Ok(Event::Text(t)) => {
+                if depth == 0 && !t.as_ref().iter().all(|b| b.is_ascii_whitespace()) {
+                    if saw_root {
+                        bail!("Unexpected trailing text content after </Profile>");
+                    }
+                    bail!("Unexpected text content before <Profile> root element");
+                }
+            }
+            Ok(Event::CData(_)) => {
+                if depth == 0 {
+                    if saw_root {
+                        bail!("Unexpected trailing CDATA content after </Profile>");
+                    }
+                    bail!("Unexpected text content before <Profile> root element");
+                }
+            }
+            Ok(Event::Eof) => {
+                if !saw_root {
+                    bail!("Empty XML configuration: missing <Profile> root element");
+                }
+                if depth != 0 {
+                    bail!("Unclosed XML <Profile> element before end of file");
                 }
                 return Ok(());
-            }
-            Ok(quick_xml::events::Event::Decl(_))
-            | Ok(quick_xml::events::Event::Comment(_))
-            | Ok(quick_xml::events::Event::PI(_))
-            | Ok(quick_xml::events::Event::DocType(_)) => continue,
-            Ok(quick_xml::events::Event::Text(t))
-                if t.as_ref().iter().all(|b| b.is_ascii_whitespace()) =>
-            {
-                continue;
-            }
-            Ok(quick_xml::events::Event::Text(_)) | Ok(quick_xml::events::Event::CData(_)) => {
-                bail!("Unexpected text content before <Profile> root element");
-            }
-            Ok(quick_xml::events::Event::Eof) => {
-                bail!("Empty XML configuration: missing <Profile> root element");
-            }
-            Ok(quick_xml::events::Event::End(e)) => {
-                let local = e.local_name();
-                let found = String::from_utf8_lossy(local.as_ref());
-                bail!("Unexpected closing tag </{}> before <Profile> root element", found);
             }
             Err(e) => bail!("Malformed XML syntax: {}", e),
         }
@@ -834,7 +909,7 @@ mod tests {
               <Name>LegacyHttpEmptyPass</Name>
               <Address>10.0.0.3</Address>
               <Port>8080</Port>
-              <Username>orphan-http</Username>
+              <Username>orphan:http</Username>
               <Password></Password>
             </Proxy>
           </ProxyList>
@@ -843,11 +918,38 @@ mod tests {
         let rt = ProfileConfig::from_xml(legacy_xml)
             .unwrap()
             .into_runtime(&[40001, 40080])
-            .expect("Legacy orphan username without password should downgrade cleanly on startup");
+            .expect("Legacy orphan username without password (even containing ':') should downgrade cleanly on startup");
         assert_eq!(rt.proxy_nodes[&101].username, None);
         assert_eq!(rt.proxy_nodes[&101].client.auth_credentials(), (None, None));
         assert_eq!(rt.proxy_nodes[&102].username, None);
         assert_eq!(rt.proxy_nodes[&102].client.auth_credentials(), (None, None));
+
+        // Paired HTTP username containing ':' still fails
+        let bad_http_colon = r#"
+        <Profile version="1">
+          <ProxyList>
+            <Proxy id="104" type="HTTP">
+              <Name>HttpColonPaired</Name>
+              <Address>10.0.0.5</Address>
+              <Port>8080</Port>
+              <Username>bad:user</Username>
+              <Password>secret</Password>
+            </Proxy>
+          </ProxyList>
+        </Profile>
+        "#;
+        assert!(ProfileConfig::from_xml(bad_http_colon).unwrap().into_runtime(&[]).is_err());
+
+        // SOCKS4 with <Password> (even empty) and control characters on metadata fields must fail
+        for bad_node_xml in [
+            r#"<Profile version="1"><ProxyList><Proxy id="1" type="SOCKS4"><Address>10.0.0.2</Address><Port>1080</Port><Password></Password></Proxy></ProxyList></Profile>"#,
+            r#"<Profile version="1"><ProxyList><Proxy id="1" type="SOCKS4"><Address>10.0.0.2</Address><Port>1080</Port><Password>pw</Password></Proxy></ProxyList></Profile>"#,
+            "<Profile version=\"1\"><ProxyList><Proxy id=\"1\" type=\"SOCKS5\"><Name>bad\tname</Name><Address>10.0.0.2</Address><Port>1080</Port></Proxy></ProxyList></Profile>",
+            "<Profile version=\"1\"><ProxyList><Proxy id=\"1\" type=\"SOCKS5\"><Address>10.0.0.2</Address><Port>1080</Port><Username>alice</Username><Password>pw&#x1b;x</Password></Proxy></ProxyList></Profile>",
+        ] {
+            let parsed = ProfileConfig::from_xml(bad_node_xml).unwrap();
+            assert!(parsed.into_runtime(&[]).is_err(), "expected validation failure for {}", bad_node_xml);
+        }
 
         // Password without username still fails fast
         let bad_pw_only = r#"
@@ -883,6 +985,19 @@ mod tests {
         // Valid self-closing <Profile /> succeeds
         let empty_profile = r#"<?xml version="1.0" encoding="utf-8"?><Profile version="1"/>"#;
         assert!(ProfileConfig::from_xml(empty_profile).is_ok());
+
+        // Prefixed <ns:Profile>, multiple root elements, and trailing non-whitespace content are rejected
+        for bad_xml in [
+            r#"<ns:Profile version="1" xmlns:ns="http://example.com"><ProxyList/></ns:Profile>"#,
+            r#"<Profile version="1"/><OtherRoot/>"#,
+            r#"<Profile version="1"><ProxyList/></Profile>trailing-junk"#,
+        ] {
+            assert!(
+                ProfileConfig::from_xml(bad_xml).is_err(),
+                "expected XML validation failure for {}",
+                bad_xml
+            );
+        }
 
         // Concurrent load_or_init inside workspace target dir produces a valid config file cleanly
         let tmp = std::env::current_dir().unwrap().join("target").join(format!(
