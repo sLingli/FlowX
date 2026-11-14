@@ -990,7 +990,7 @@ fn sanitize_proc_comm_fallback(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .filter(|c| !c.is_control())
-        .map(|c| if c == '/' { '_' } else { c })
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
         .collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() {
@@ -1723,6 +1723,10 @@ mod tests {
         assert_eq!(parse_proc_cmdline_argv0(b"\0--flag"), None);
         assert_eq!(
             sanitize_proc_comm_fallback("../../ev\x1bil/app\n"),
+            Some(".._.._evil_app".to_string())
+        );
+        assert_eq!(
+            sanitize_proc_comm_fallback("..\\..\\ev\x1bil\\app\r\n"),
             Some(".._.._evil_app".to_string())
         );
         assert_eq!(sanitize_proc_comm_fallback("\x00\n\t "), None);
