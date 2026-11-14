@@ -523,6 +523,11 @@ pub async fn relay_stream_monitored_with_timeout(
     run_relay_with_watchdog(up_task, down_task, start, last_activity_us, conn, idle_timeout).await
 }
 
+/// Trim HTTP optional whitespace (`SP` and `HTAB`, per RFC 9110) without stripping Unicode whitespace.
+pub(crate) fn trim_http_ows(s: &str) -> &str {
+    s.trim_matches(|c| c == ' ' || c == '\t')
+}
+
 /// Incrementally locate the end offset (right after `\r\n\r\n`) of an HTTP header block.
 /// Scans from `scanned_len.saturating_sub(3)` so repeated calls across chunked reads stay O(N).
 pub(crate) fn find_http_header_end(buf: &[u8], scanned_len: usize) -> Option<usize> {
@@ -966,9 +971,9 @@ fn parse_and_rewrite_http_response_head(
             return Err(invalid("HTTP response header value contains control characters"));
         }
         if name.eq_ignore_ascii_case(b"content-length") {
-            let v = std::str::from_utf8(val)
-                .map_err(|_| invalid("Non-UTF-8 response Content-Length header"))?
-                .trim();
+            let raw_v = std::str::from_utf8(val)
+                .map_err(|_| invalid("Non-UTF-8 response Content-Length header"))?;
+            let v = trim_http_ows(raw_v);
             if v.is_empty() || !v.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(invalid("Invalid response Content-Length header"));
             }
@@ -986,9 +991,9 @@ fn parse_and_rewrite_http_response_head(
             let v = std::str::from_utf8(val)
                 .map_err(|_| invalid("Non-UTF-8 response Transfer-Encoding header"))?;
             for part in v.split(',') {
-                let coding = part.trim().to_ascii_lowercase();
-                if coding.is_empty() {
-                    return Err(invalid("Empty Transfer-Encoding coding in HTTP response"));
+                let coding = trim_http_ows(part).to_ascii_lowercase();
+                if coding.is_empty() || !coding.bytes().all(crate::inbound::is_http_token_byte) {
+                    return Err(invalid("Invalid Transfer-Encoding coding in HTTP response"));
                 }
                 te_codings.push(coding);
             }
@@ -1779,5 +1784,40 @@ mod tests {
         assert_eq!(find_http_header_end(b"\r\n\r\n", 3), Some(4));
         assert_eq!(find_http_header_end(b"Host: x\r\n\r\n", 999), None);
         assert_eq!(find_http_header_end(b"abc", 999), None);
+    }
+
+    #[test]
+    fn test_parse_http_response_head_strict_ows_rejects_unicode_whitespace() {
+        // ASCII OWS (SP / HTAB) around Content-Length and Transfer-Encoding is valid per RFC 9110
+        let ok_cl = b"HTTP/1.1 200 OK\r\nContent-Length:\t 12 \t";
+        assert!(matches!(
+            parse_and_rewrite_http_response_head(ok_cl, false).unwrap(),
+            ParsedHttpResponseHead::Final {
+                framing: HttpResponseFraming::ContentLength(12),
+                ..
+            }
+        ));
+        let ok_te = b"HTTP/1.1 200 OK\r\nTransfer-Encoding:\t chunked \t";
+        assert!(matches!(
+            parse_and_rewrite_http_response_head(ok_te, false).unwrap(),
+            ParsedHttpResponseHead::Final {
+                framing: HttpResponseFraming::Chunked,
+                ..
+            }
+        ));
+
+        // Non-OWS Unicode whitespace (NBSP U+00A0, EM SPACE U+2003) must be rejected
+        for bad in [
+            "HTTP/1.1 200 OK\r\nContent-Length:\u{00a0}5",
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\u{2003}",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding:\u{00a0}chunked",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\u{2003}",
+        ] {
+            assert!(
+                parse_and_rewrite_http_response_head(bad.as_bytes(), false).is_err(),
+                "expected error for non-OWS whitespace in {:?}",
+                bad
+            );
+        }
     }
 }

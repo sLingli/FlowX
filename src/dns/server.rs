@@ -86,7 +86,7 @@ fn decode_dns_name(packet: &[u8], start: usize) -> Result<(String, usize)> {
             bail!("DNS domain label exceeds packet boundary");
         }
         total_len += len + 1;
-        if total_len > 255 {
+        if total_len + 1 > 255 {
             bail!("DNS total domain length exceeds RFC 1035 limit");
         }
 
@@ -145,7 +145,7 @@ impl DnsPacketParser {
                 bail!("DNS domain label length exceeds packet boundary");
             }
             total_domain_len += len + 1;
-            if total_domain_len > 255 {
+            if total_domain_len + 1 > 255 {
                 bail!("DNS total domain length exceeds RFC 1035 limit of 253 bytes");
             }
             let raw_label = &buf[offset..offset + len];
@@ -843,6 +843,38 @@ mod tests {
         query_utf8.extend_from_slice(utf8_label);
         query_utf8.extend_from_slice(&[0, 0, 1, 0, 1]);
         assert!(DnsPacketParser::parse_question(&query_utf8).is_err());
+
+        // P2-3: RFC 1035 total wire limit includes terminating 0x00 root byte (253 chars == 254 pre-root wire bytes == 255 total)
+        let max_valid = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(max_valid.len(), 253);
+        let (pkt_valid, q_valid) = build_dns_query_packet(0x4242, &max_valid, 1).unwrap();
+        assert_eq!(q_valid.name, max_valid);
+        assert!(DnsPacketParser::parse_question(&pkt_valid).is_ok());
+        assert_eq!(decode_dns_name(&pkt_valid, 12).unwrap().0, max_valid);
+
+        let over_domain = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(62)
+        );
+        assert_eq!(over_domain.len(), 254);
+        assert!(build_dns_query_packet(0x4243, &over_domain, 1).is_err());
+        let mut wire_over = vec![0x42, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        for label in over_domain.split('.') {
+            wire_over.push(label.len() as u8);
+            wire_over.extend_from_slice(label.as_bytes());
+        }
+        wire_over.extend_from_slice(&[0, 0, 1, 0, 1]);
+        assert!(DnsPacketParser::parse_question(&wire_over).is_err());
+        assert!(decode_dns_name(&wire_over, 12).is_err());
     }
 
     /// P0-3 回归测试：开启防泄露模式下，AAAA (28)、SVCB (64) 与 HTTPS (65) 均返回空应答且不泄露给上游 DNS

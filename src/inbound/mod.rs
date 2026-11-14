@@ -407,7 +407,7 @@ where
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Non-UTF-8 Host header");
             };
-            host_header = Some(v.trim_matches(|c| c == ' ' || c == '\t'));
+            host_header = Some(crate::outbound::trim_http_ows(v));
         } else if name.eq_ignore_ascii_case(b"content-length") {
             if is_connect || content_length.is_some() {
                 reply_http_error(stream, "400 Bad Request").await;
@@ -417,7 +417,7 @@ where
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Invalid Content-Length header");
             };
-            let trimmed = v.trim_matches(|c| c == ' ' || c == '\t');
+            let trimmed = crate::outbound::trim_http_ows(v);
             let parsed_cl = trimmed.parse::<u64>().ok();
             if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) || parsed_cl.is_none() {
                 reply_http_error(stream, "400 Bad Request").await;
@@ -433,7 +433,7 @@ where
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Invalid Transfer-Encoding header");
             };
-            let trimmed = v.trim_matches(|c| c == ' ' || c == '\t');
+            let trimmed = crate::outbound::trim_http_ows(v);
             if !trimmed.eq_ignore_ascii_case("chunked") {
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Unsupported Transfer-Encoding: {:?}", trimmed);
@@ -451,7 +451,7 @@ where
                 bail!("Invalid Connection header");
             };
             for item in v.split(',') {
-                let token = item.trim_matches(|c| c == ' ' || c == '\t');
+                let token = crate::outbound::trim_http_ows(item);
                 if token.is_empty() {
                     continue;
                 }
