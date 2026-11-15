@@ -197,6 +197,7 @@ pub struct NetstackSignal {
 #[derive(Default)]
 struct SignalState {
     outbound_tcp: VecDeque<(Vec<u8>, PacketInterfaceMeta, Option<u32>)>,
+    closed_tcp_endpoints: VecDeque<(IpAddr, u16)>,
     pump_needed: bool,
     closed: bool,
 }
@@ -229,6 +230,21 @@ impl NetstackSignal {
         self.cv.notify_one();
     }
 
+    /// 通知协议栈线程某个本地 TCP 端点已关闭，用于立即清理可能因端口复用失效的旁路缓存
+    pub fn push_closed_tcp_endpoint(&self, local_ip: IpAddr, local_port: u16) {
+        if local_port == 0 {
+            return;
+        }
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.closed {
+            return;
+        }
+        guard
+            .closed_tcp_endpoints
+            .push_back((local_ip.to_canonical(), local_port));
+        self.cv.notify_one();
+    }
+
     #[inline]
     pub fn wake_pump(&self) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -242,14 +258,19 @@ impl NetstackSignal {
         self.cv.notify_all();
     }
 
-    /// 供工作线程等待下一批报文或异步写事件（最多阻塞 `max_wait` 以便推进 smoltcp 定时器）
+    /// 供工作线程等待下一批报文、端点关闭通知或异步写事件（最多阻塞 `max_wait` 以便推进 smoltcp 定时器）
     pub fn wait_drain_or_timeout(
         &self,
         max_wait: Duration,
         out_packets: &mut Vec<(Vec<u8>, PacketInterfaceMeta, Option<u32>)>,
+        out_closed_endpoints: &mut Vec<(IpAddr, u16)>,
     ) -> bool {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.outbound_tcp.is_empty() && !guard.pump_needed && !guard.closed {
+        if guard.outbound_tcp.is_empty()
+            && guard.closed_tcp_endpoints.is_empty()
+            && !guard.pump_needed
+            && !guard.closed
+        {
             let (new_guard, _) = self
                 .cv
                 .wait_timeout(guard, max_wait)
@@ -259,6 +280,9 @@ impl NetstackSignal {
         guard.pump_needed = false;
         while let Some(item) = guard.outbound_tcp.pop_front() {
             out_packets.push(item);
+        }
+        while let Some(ep) = guard.closed_tcp_endpoints.pop_front() {
+            out_closed_endpoints.push(ep);
         }
         !guard.closed
     }
@@ -313,6 +337,22 @@ fn take_all_wakers(
     if wake_flush.is_none() {
         *wake_flush = inner.flush_waker.take();
     }
+}
+
+fn close_bridge_and_collect_wakers(
+    inner: &mut BridgeInner,
+    errored: bool,
+    wake_read: &mut Option<Waker>,
+    wake_write: &mut Option<Waker>,
+    wake_flush: &mut Option<Waker>,
+) {
+    if errored {
+        inner.to_socket.clear();
+        inner.socket_errored = true;
+    }
+    inner.socket_closed = true;
+    inner.socket_eof_to_app = true;
+    take_all_wakers(inner, wake_read, wake_write, wake_flush);
 }
 
 struct SmoltcpBridge {
@@ -637,11 +677,18 @@ pub enum TcpIngestOutcome {
     InjectRst(EmittedIpPacket),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PassthroughEntry {
+    last_seen: Instant,
+    syn_seq: Option<u32>,
+}
+
 struct InterceptedSession {
     handle: SocketHandle,
     bridge: Arc<SmoltcpBridge>,
     meta: PacketInterfaceMeta,
     created_at: Instant,
+    syn_seq: u32,
     ever_established: bool,
     last_state: tcp::State,
     teardown_since: Option<Instant>,
@@ -654,7 +701,7 @@ pub struct NetstackEngine {
     device: VirtualIpDevice,
     sockets: SocketSet<'static>,
     intercepted: HashMap<TcpFlowKey, InterceptedSession>,
-    passthrough: HashMap<TcpFlowKey, Instant>,
+    passthrough: HashMap<TcpFlowKey, PassthroughEntry>,
     signal: Arc<NetstackSignal>,
     start_instant: Instant,
     last_prune: Instant,
@@ -712,14 +759,71 @@ impl NetstackEngine {
         }
         self.last_prune = now;
         self.passthrough
-            .retain(|_, ts| now.saturating_duration_since(*ts) <= PASSTHROUGH_TTL);
+            .retain(|_, entry| now.saturating_duration_since(entry.last_seen) <= PASSTHROUGH_TTL);
         if self.passthrough.len() > MAX_PASSTHROUGH_FLOWS {
-            let mut items: Vec<_> = self.passthrough.iter().map(|(k, v)| (*k, *v)).collect();
+            let mut items: Vec<_> = self.passthrough.iter().map(|(k, v)| (*k, v.last_seen)).collect();
             items.sort_unstable_by_key(|(_, ts)| *ts);
             let remove_cnt = self.passthrough.len().saturating_sub(MAX_PASSTHROUGH_FLOWS * 3 / 4);
             for (k, _) in items.into_iter().take(remove_cnt) {
                 self.passthrough.remove(&k);
             }
+        }
+    }
+
+    /// 当 SOCKET 层上报本地 TCP 端点关闭时，立即失效关联的直连旁路缓存以防止同端口复用穿透规则
+    pub fn invalidate_passthrough_for_local_endpoint(&mut self, local_ip: IpAddr, local_port: u16) {
+        if local_port == 0 {
+            return;
+        }
+        let canonical = local_ip.to_canonical();
+        let wildcard = canonical.is_unspecified();
+        self.passthrough.retain(|key, _| {
+            if key.src_port != local_port {
+                return true;
+            }
+            if wildcard {
+                return false;
+            }
+            match (key.src_ip, canonical) {
+                (IpAddr::V4(_), IpAddr::V4(_)) | (IpAddr::V6(_), IpAddr::V6(_)) => {
+                    key.src_ip != canonical
+                }
+                _ => true,
+            }
+        });
+    }
+
+    /// 四元组复用时静默移除退场中的旧劫持会话，不向宿主注入额外 RST 以免误伤刚刚发起的新连接
+    fn retire_session_silently(&mut self, key: TcpFlowKey) {
+        let Some(old_sess) = self.intercepted.remove(&key) else {
+            return;
+        };
+        let mut wake_read = None;
+        let mut wake_write = None;
+        let mut wake_flush = None;
+        {
+            let mut inner = old_sess
+                .bridge
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            close_bridge_and_collect_wakers(
+                &mut inner,
+                false,
+                &mut wake_read,
+                &mut wake_write,
+                &mut wake_flush,
+            );
+        }
+        self.sockets.remove(old_sess.handle);
+        if let Some(w) = wake_read {
+            w.wake();
+        }
+        if let Some(w) = wake_write {
+            w.wake();
+        }
+        if let Some(w) = wake_flush {
+            w.wake();
         }
     }
 
@@ -747,27 +851,86 @@ impl NetstackEngine {
         // 1. 最先检查 FlowX 自身绕过端口或当前进程 PID，避免代理出口自回环
         if is_tcp_port_bypassed(pkt.src_port) || pid.is_some_and(|p| p != 0 && p == std::process::id())
         {
-            self.passthrough.insert(key, now);
+            if pkt.rst {
+                self.passthrough.remove(&key);
+            } else {
+                self.passthrough.insert(
+                    key,
+                    PassthroughEntry {
+                        last_seen: now,
+                        syn_seq: (pkt.syn && !pkt.ack).then_some(pkt.seq),
+                    },
+                );
+            }
             return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
         }
 
-        // 2. 属于已登记劫持会话的后续报文（ACK / PSH / FIN / RST）：直接送入 smoltcp
+        // 2. 属于已登记劫持会话的后续报文（ACK / PSH / FIN / RST）：直接送入 smoltcp；
+        //    若旧会话已在挥手退场且迎来不同 ISN 的全新 SYN，则静默退休旧会话让位给新连接
+        let mut retire_old_session = false;
         if let Some(session) = self.intercepted.get_mut(&key) {
-            session.meta = meta;
-            self.device.rx_queue.push_back(raw_ip);
-            self.pump_internal(now, tx_out);
-            return TcpIngestOutcome::Intercepted;
+            let state = self.sockets.get::<tcp::Socket>(session.handle).state();
+            if pkt.syn
+                && !pkt.ack
+                && pkt.seq != session.syn_seq
+                && matches!(
+                    state,
+                    tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                        | tcp::State::TimeWait
+                        | tcp::State::Closed
+                )
+            {
+                retire_old_session = true;
+            } else {
+                session.meta = meta;
+                self.device.rx_queue.push_back(raw_ip);
+                self.pump_internal(now, tx_out);
+                return TcpIngestOutcome::Intercepted;
+            }
+        }
+        if retire_old_session {
+            self.retire_session_silently(key);
         }
 
-        // 3. 属于已缓存直连流或开启前已建立的存量连接（非 SYN 首包）：绝不强行劫持，平滑放行
-        if self.passthrough.contains_key(&key) || !pkt.syn || pkt.ack {
+        // 3. 属于已缓存直连流或开启前已建立的存量连接（非 SYN 首包）：绝不强行劫持，平滑放行；
+        //    若遭遇 RST 或不同 seq 的全新 SYN（四元组快速复用），立即失效旧旁路缓存并重走规则判断
+        if let Some(entry) = self.passthrough.get_mut(&key) {
+            if pkt.rst {
+                self.passthrough.remove(&key);
+                return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
+            }
+            if pkt.syn && !pkt.ack {
+                if entry.syn_seq == Some(pkt.seq) {
+                    entry.last_seen = now;
+                    return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
+                }
+                self.passthrough.remove(&key);
+            } else {
+                entry.last_seen = now;
+                return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
+            }
+        }
+        if !pkt.syn || pkt.ack {
             return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
         }
+
+        let insert_syn_passthrough = |passthrough: &mut HashMap<TcpFlowKey, PassthroughEntry>| {
+            passthrough.insert(
+                key,
+                PassthroughEntry {
+                    last_seen: now,
+                    syn_seq: Some(pkt.seq),
+                },
+            );
+        };
 
         // 4. 忽略未指定/多播/广播目标
         let is_broadcast = matches!(pkt.dst_ip, IpAddr::V4(v4) if v4.is_broadcast());
         if pkt.dst_ip.is_multicast() || pkt.dst_ip.is_unspecified() || is_broadcast {
-            self.passthrough.insert(key, now);
+            insert_syn_passthrough(&mut self.passthrough);
             return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
         }
 
@@ -789,7 +952,7 @@ impl NetstackEngine {
                         // 首包阶段 PID 未知但前方存在应用级非 Direct 规则（如 DevProxy）：接入协议栈交由 Dispatcher 异步复核进程归属，绝不盲目永久旁路
                         false
                     } else {
-                        self.passthrough.insert(key, now);
+                        insert_syn_passthrough(&mut self.passthrough);
                         return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
                     }
                 }
@@ -811,7 +974,7 @@ impl NetstackEngine {
             if let Some(rst) = build_synthetic_tcp_rst(&raw_ip) {
                 return TcpIngestOutcome::InjectRst(EmittedIpPacket { data: rst, meta });
             }
-            self.passthrough.insert(key, now);
+            insert_syn_passthrough(&mut self.passthrough);
             return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
         }
 
@@ -825,10 +988,11 @@ impl NetstackEngine {
             port: pkt.dst_port,
         };
         if sock.listen(listen_ep).is_err() {
-            self.passthrough.insert(key, now);
+            insert_syn_passthrough(&mut self.passthrough);
             return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
         }
         let handle = self.sockets.add(sock);
+        let syn_backup = raw_ip.clone();
         self.device.rx_queue.push_back(raw_ip);
 
         let smol_now = self.smol_now();
@@ -837,11 +1001,14 @@ impl NetstackEngine {
 
         let post_state = self.sockets.get::<tcp::Socket>(handle).state();
         if post_state == tcp::State::Listen {
-            // SYN 未能被 smoltcp 接受：立即清理并退回 Passthrough
+            // SYN 未能被 smoltcp 接受：立即清理并用原 SYN 退回 Passthrough（同时按四元组冲刷并发 TX），严禁静默吞包
             self.sockets.remove(handle);
-            self.drain_tx_packets(&meta, tx_out);
-            self.passthrough.insert(key, now);
-            return TcpIngestOutcome::Intercepted;
+            self.drain_tx_with_lookup(meta, tx_out);
+            insert_syn_passthrough(&mut self.passthrough);
+            return TcpIngestOutcome::Passthrough(EmittedIpPacket {
+                data: syn_backup,
+                meta,
+            });
         }
 
         let bridge = Arc::new(SmoltcpBridge::new(Arc::clone(&self.signal)));
@@ -853,6 +1020,7 @@ impl NetstackEngine {
                 bridge,
                 meta,
                 created_at: now,
+                syn_seq: pkt.seq,
                 ever_established: matches!(post_state, tcp::State::Established),
                 last_state: post_state,
                 teardown_since: None,
@@ -938,12 +1106,13 @@ impl NetstackEngine {
                             | tcp::State::Closing
                             | tcp::State::Closed
                     );
-                    if non_graceful_closed {
-                        inner.socket_errored = true;
-                    }
-                    inner.socket_closed = true;
-                    inner.socket_eof_to_app = true;
-                    take_all_wakers(&mut inner, &mut wake_read, &mut wake_write, &mut wake_flush);
+                    close_bridge_and_collect_wakers(
+                        &mut inner,
+                        non_graceful_closed,
+                        &mut wake_read,
+                        &mut wake_write,
+                        &mut wake_flush,
+                    );
                     remove_session = true;
                 } else {
                     // B. 检测远端（本地应用）是否已发送正常 FIN
@@ -984,13 +1153,10 @@ impl NetstackEngine {
                             >= SYN_RECEIVED_TIMEOUT;
 
                     if ungraceful_drop || syn_timed_out {
-                        inner.to_socket.clear();
                         sock.abort();
-                        inner.socket_errored = true;
-                        inner.socket_closed = true;
-                        inner.socket_eof_to_app = true;
-                        take_all_wakers(
+                        close_bridge_and_collect_wakers(
                             &mut inner,
+                            true,
                             &mut wake_read,
                             &mut wake_write,
                             &mut wake_flush,
@@ -1015,10 +1181,9 @@ impl NetstackEngine {
                             session.teardown_since = None;
                             let tw_since = *session.time_wait_since.get_or_insert(now);
                             if now.saturating_duration_since(tw_since) >= TIME_WAIT_REAP_TIMEOUT {
-                                inner.socket_closed = true;
-                                inner.socket_eof_to_app = true;
-                                take_all_wakers(
+                                close_bridge_and_collect_wakers(
                                     &mut inner,
+                                    false,
                                     &mut wake_read,
                                     &mut wake_write,
                                     &mut wake_flush,
@@ -1033,13 +1198,10 @@ impl NetstackEngine {
                             session.time_wait_since = None;
                             let td_since = *session.teardown_since.get_or_insert(now);
                             if now.saturating_duration_since(td_since) >= TEARDOWN_TIMEOUT {
-                                inner.to_socket.clear();
                                 sock.abort();
-                                inner.socket_errored = true;
-                                inner.socket_closed = true;
-                                inner.socket_eof_to_app = true;
-                                take_all_wakers(
+                                close_bridge_and_collect_wakers(
                                     &mut inner,
+                                    true,
                                     &mut wake_read,
                                     &mut wake_write,
                                     &mut wake_flush,
@@ -1081,15 +1243,6 @@ impl NetstackEngine {
         }
         for session in self.intercepted.values_mut() {
             session.last_state = self.sockets.get::<tcp::Socket>(session.handle).state();
-        }
-    }
-
-    fn drain_tx_packets(&mut self, meta: &PacketInterfaceMeta, tx_out: &mut Vec<EmittedIpPacket>) {
-        while let Some(pkt) = self.device.tx_queue.pop_front() {
-            tx_out.push(EmittedIpPacket {
-                data: pkt,
-                meta: *meta,
-            });
         }
     }
 
@@ -1733,5 +1886,337 @@ mod tests {
             TcpIngestOutcome::Intercepted
         ));
         assert_eq!(engine.active_flow_count(), 1);
+    }
+
+    #[test]
+    fn test_netstack_listen_fallback_returns_original_syn_and_preserves_tx_meta() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+
+        // 先建立一条来自接口 7 的活跃流并写入下行响应，使 device.tx_queue 或 pump 期间有不同接口元数据
+        let meta_existing = PacketInterfaceMeta {
+            if_idx: 7,
+            sub_if_idx: 1,
+            loopback: false,
+            is_ipv6: false,
+            bitfield: 1,
+        };
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+        let syn_ok = build_syn([10, 0, 0, 2], 52001, [1, 1, 1, 1], 443, 100);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn_ok,
+                meta_existing,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        let ack_ok = build_ack(
+            [10, 0, 0, 2],
+            52001,
+            [1, 1, 1, 1],
+            443,
+            101,
+            syn_ack.seq + 1,
+            false,
+            b"PING",
+        );
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                ack_ok,
+                meta_existing,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+        let flow = accepted.pop().unwrap();
+        {
+            let mut inner = flow.stream.write.bridge.inner.lock().unwrap();
+            inner.to_socket.extend(b"PONG");
+        }
+        // 在 smoltcp 下一次 poll 前故意触发 tx_queue 仅待 pump 时由另一流退回 Listen
+        let flow_tx_before_listen = {
+            // 将待发数据注入 smoltcp socket 缓冲区（不立即 poll 以便在 Listen fallback poll 中一并吐出）
+            let key_existing = TcpFlowKey::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                52001,
+                IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+                443,
+            );
+            let sess = engine.intercepted.get(&key_existing).unwrap();
+            let sock = engine.sockets.get_mut::<tcp::Socket>(sess.handle);
+            let sent = sock.send_slice(b"RESP").unwrap();
+            assert_eq!(sent, 4);
+            true
+        };
+        assert!(flow_tx_before_listen);
+
+        // 构造一条 etherparse 可解析、但包含非法 TCP MSS 选项长度（kind=2, len=1）导致 smoltcp 拒收留在 Listen 的 SYN
+        let mut hdr = TcpHeader::new(52002, 80, 777, 65535);
+        hdr.syn = true;
+        hdr.set_options_raw(&[2, 1, 0, 0]).unwrap();
+        let builder = PacketBuilder::ipv4([10, 0, 0, 9], [93, 184, 216, 34], 64).tcp_header(hdr);
+        let mut malformed_syn = Vec::with_capacity(builder.size(0));
+        builder.write(&mut malformed_syn, &[]).unwrap();
+        let expected_syn_bytes = malformed_syn.clone();
+
+        let meta_bad_syn = PacketInterfaceMeta {
+            if_idx: 19,
+            sub_if_idx: 2,
+            loopback: false,
+            is_ipv6: false,
+            bitfield: 9,
+        };
+        tx.clear();
+        let outcome = engine.ingest_outbound_tcp(
+            malformed_syn,
+            meta_bad_syn,
+            Some(9002),
+            None,
+            None,
+            None,
+            &mut accepted,
+            &mut tx,
+        );
+        // P1-5 修复断言 1：不得静默丢弃 SYN，必须原样以 Passthrough(syn_backup) 返回
+        let TcpIngestOutcome::Passthrough(emitted) = outcome else {
+            panic!("expected Passthrough fallback when smoltcp rejects malformed SYN");
+        };
+        assert_eq!(emitted.data, expected_syn_bytes);
+        assert_eq!(emitted.meta.if_idx, 19);
+        assert!(accepted.is_empty());
+        // 仅应保留第一条已建连会话，失败 Listen 句柄必须已销毁
+        assert_eq!(engine.active_flow_count(), 1);
+        // P1-5 修复断言 2：并发期间经由 drain_tx_with_lookup 冲刷的第一条流报文必须保留其接口 7 元数据而非混用接口 19
+        let resp_pkt = tx
+            .iter()
+            .find(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.dst_port == 52001))
+            .expect("expected existing flow TX packet flushed during fallback poll");
+        assert_eq!(resp_pkt.meta.if_idx, 7);
+    }
+
+    #[test]
+    fn test_netstack_passthrough_invalidated_on_rst_new_syn_seq_and_socket_close() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let direct_rules = RuleEngine::new(vec![], Action::Direct);
+        let proxy_rules = RuleEngine::new(vec![], Action::Proxy(101));
+
+        let meta = PacketInterfaceMeta::default();
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+
+        let src = [10, 0, 0, 2];
+        let sport = 53100;
+        let dst = [93, 184, 216, 34];
+        let dport = 443;
+
+        // 1. 首次 Direct 命中，记录 passthrough (syn_seq = 1000)
+        let syn1 = build_syn(src, sport, dst, dport, 1000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn1.clone(),
+                meta,
+                Some(1234),
+                Some(&direct_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Passthrough(_)
+        ));
+        // 同 seq 重传 SYN 即使切了 Proxy 规则仍保持同一连接快路径放行
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn1,
+                meta,
+                Some(1234),
+                Some(&proxy_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Passthrough(_)
+        ));
+
+        // 2. 端口快速复用发起不同 ISN (seq = 2000) 的全新 SYN：必须失效旧 passthrough 并按新规则接入劫持
+        let syn2 = build_syn(src, sport, dst, dport, 2000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn2,
+                meta,
+                Some(1234),
+                Some(&proxy_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+        assert_eq!(engine.active_flow_count(), 1);
+        accepted.clear();
+        tx.clear();
+
+        // 3. 测试 RST 立即清除 passthrough（改用端口 53101）
+        let syn3 = build_syn(src, 53101, dst, dport, 3000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn3.clone(),
+                meta,
+                Some(1234),
+                Some(&direct_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Passthrough(_)
+        ));
+        let rst = build_rst(src, 53101, dst, dport, 3001, 0);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                rst,
+                meta,
+                Some(1234),
+                Some(&proxy_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Passthrough(_)
+        ));
+        // Even same seq after RST must re-evaluate rules and intercept under proxy_rules
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn3,
+                meta,
+                Some(1234),
+                Some(&proxy_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+
+        // 4. 测试 SOCKET 层 SocketClose 通知按本地端点精确清缓存（端口 53102）
+        let syn4 = build_syn(src, 53102, dst, dport, 4000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn4.clone(),
+                meta,
+                Some(1234),
+                Some(&direct_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Passthrough(_)
+        ));
+        engine.invalidate_passthrough_for_local_endpoint(IpAddr::V4(Ipv4Addr::from(src)), 53102);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn4,
+                meta,
+                Some(1234),
+                Some(&proxy_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_netstack_intercepted_teardown_flow_retired_on_fresh_syn() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(Arc::clone(&signal));
+        let src = [10, 0, 0, 2];
+        let sport = 54000;
+        let dst = [93, 184, 216, 34];
+        let dport = 443;
+
+        let (flow1, syn_ack1) = establish_ipv4_flow(&mut engine, src, sport, dst, dport);
+        let (mut rd1, mut wr1) = flow1.stream.split_stream();
+        // 客户端先发 FIN，应用端发 FIN（进入 TimeWait/FinWait2/LastAck 退场期）
+        let meta = PacketInterfaceMeta::default();
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+        let mut fin_hdr = TcpHeader::new(sport, dport, 1001, 65535);
+        fin_hdr.ack = true;
+        fin_hdr.fin = true;
+        fin_hdr.acknowledgment_number = syn_ack1.seq + 1;
+        let builder = PacketBuilder::ipv4(src, dst, 64).tcp_header(fin_hdr);
+        let mut fin_pkt = Vec::with_capacity(builder.size(0));
+        builder.write(&mut fin_pkt, &[]).unwrap();
+        assert!(matches!(
+            engine.ingest_outbound_tcp(fin_pkt, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+
+        let sh = tokio::spawn(async move {
+            wr1.shutdown().await.unwrap();
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !sh.is_finished() {
+            tx.clear();
+            engine.pump(&mut tx);
+            assert!(tokio::time::Instant::now() < deadline, "Timed out waiting for shutdown pump");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sh.await.unwrap();
+        let mut buf = [0u8; 32];
+        assert_eq!(rd1.read(&mut buf).await.unwrap(), 0);
+
+        // 在 TIME_WAIT_REAP_TIMEOUT (2s) 到期前，立即以同一四元组和全新 ISN (seq = 9000) 建连
+        tx.clear();
+        accepted.clear();
+        let syn2 = build_syn(src, sport, dst, dport, 9000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn2, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        // 不得生成延迟 RST 误伤新生 SYN，应直接返回新 SYN/ACK 且接受新连接
+        assert!(!tx.iter().any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst)));
+        let syn_ack2 = tx
+            .iter()
+            .filter_map(|p| parse_tcp_packet(&p.data))
+            .find(|t| t.syn && t.ack)
+            .expect("expected fresh SYN/ACK on reused 4-tuple");
+        assert_eq!(syn_ack2.ack_num, 9001);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(engine.active_flow_count(), 1);
+    }
+
+    #[test]
+    fn test_netstack_signal_wakes_and_drains_closed_tcp_endpoints() {
+        let signal = Arc::new(NetstackSignal::new());
+        let local_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        signal.push_closed_tcp_endpoint(local_ip, 55123);
+        let mut pkts = Vec::new();
+        let mut closed = Vec::new();
+        assert!(signal.wait_drain_or_timeout(Duration::from_millis(50), &mut pkts, &mut closed));
+        assert!(pkts.is_empty());
+        assert_eq!(closed, vec![(local_ip, 55123)]);
     }
 }

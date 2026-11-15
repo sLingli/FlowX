@@ -1,4 +1,5 @@
 pub mod dns_hijack;
+pub mod fragment;
 pub mod netstack;
 pub mod sniffer;
 
@@ -518,9 +519,158 @@ struct ActiveRuntime {
     driver_version: Option<String>,
 }
 
-/// WinDivert NETWORK 层过滤表达式：捕获全部出站非自环 TCP、UDP/53 DNS、UDP/443 QUIC 以及发往 Fake-IP (`198.18.0.0/15`) 的任意 UDP
+/// WinDivert NETWORK 层收包初始缓冲区（128 KiB > WINDIVERT_MTU_MAX 65575）与 LSO/巨包动态扩容上限（4 MiB）
+pub(crate) const INITIAL_NET_RX_BUF_LEN: usize = 131_072;
+pub(crate) const MAX_NET_RX_BUF_LEN: usize = 4 * 1024 * 1024;
+#[cfg(windows)]
+const WINDOWS_ERROR_INSUFFICIENT_BUFFER: i32 = 122;
+
+#[inline]
+pub(crate) fn next_net_rx_buf_len(current: usize) -> Option<usize> {
+    if current >= MAX_NET_RX_BUF_LEN {
+        return None;
+    }
+    Some(current.saturating_mul(2).clamp(INITIAL_NET_RX_BUF_LEN, MAX_NET_RX_BUF_LEN))
+}
+
+/// WinDivert NETWORK 层过滤表达式：捕获全部出站非自环 TCP、UDP/53 DNS、UDP/443 QUIC、发往 Fake-IP (`198.18.0.0/15`) 的任意 UDP 以及全部 IPv4/IPv6 分片
 pub(crate) fn windivert_network_filter() -> &'static str {
-    "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255))"
+    "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255) or fragment)"
+}
+
+#[cfg(windows)]
+struct NetRxContext {
+    net_h: Arc<windivert_ffi::WinDivertHandle>,
+    table: Arc<pid_table::SocketPidTable>,
+    sig: Arc<netstack::NetstackSignal>,
+    dispatcher_cfg: Arc<DispatcherConfig>,
+    dns_srv: Arc<DnsServer>,
+    stats: Arc<TransparentStatsCounters>,
+    live_dns: Arc<AtomicBool>,
+    live_quic: Arc<AtomicBool>,
+    rt: tokio::runtime::Handle,
+}
+
+#[cfg(windows)]
+impl NetRxContext {
+    fn emit_passthrough(&self, raw: &[u8], addr: &windivert_ffi::WinDivertAddress, fallback_fragments: Option<&[netstack::EmittedIpPacket]>) {
+        if let Some(frags) = fallback_fragments {
+            for f in frags {
+                let passthru_addr = windivert_ffi::WinDivertAddress::outbound_passthrough(
+                    f.meta.if_idx,
+                    f.meta.sub_if_idx,
+                    f.meta.bitfield,
+                );
+                let _ = self.net_h.send(&f.data, &passthru_addr);
+            }
+        } else {
+            let _ = self.net_h.send(raw, addr);
+        }
+    }
+
+    /// 处理一条完整（未分片或已完成重组）的出站 IPv4/IPv6 UDP/TCP 报文；已认领返回 true
+    fn handle_complete_ip_packet(
+        &self,
+        raw: &[u8],
+        addr: &windivert_ffi::WinDivertAddress,
+        fallback_fragments: Option<&[netstack::EmittedIpPacket]>,
+    ) -> bool {
+        let net_data = addr.network();
+
+        if let Some(udp) = dns_hijack::parse_udp_packet(raw) {
+            let local_ep = std::net::SocketAddr::new(udp.src_ip, udp.src_port);
+            let remote_ep = std::net::SocketAddr::new(udp.dst_ip, udp.dst_port);
+            let pid = resolve_outbound_pid(&self.table, 17, local_ep, remote_ep, true);
+            let decision = dns_hijack::decide_udp_packet(
+                &udp,
+                pid,
+                self.live_dns.load(Ordering::Acquire),
+                self.live_quic.load(Ordering::Acquire),
+                Some(&self.dispatcher_cfg.rule_engine),
+                Some(&self.dispatcher_cfg.tracker),
+                Some(&self.dispatcher_cfg.fake_ip_pool),
+            );
+            match decision {
+                dns_hijack::UdpDecision::Passthrough => {
+                    self.emit_passthrough(raw, addr, fallback_fragments);
+                }
+                dns_hijack::UdpDecision::DropQuic => {
+                    self.stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
+                }
+                dns_hijack::UdpDecision::DropFakeIp => {}
+                dns_hijack::UdpDecision::HandleDns => {
+                    self.stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
+                    let owned_payload = udp.payload.to_vec();
+                    let req_meta = (
+                        udp.src_ip,
+                        udp.dst_ip,
+                        udp.src_port,
+                        udp.dst_port,
+                        udp.is_ipv6,
+                    );
+                    let net_inj = Arc::clone(&self.net_h);
+                    let dns = Arc::clone(&self.dns_srv);
+                    let loopback = addr.loopback();
+                    self.rt.spawn(async move {
+                        let orig_dns_dst = std::net::SocketAddr::new(req_meta.1, req_meta.3);
+                        if let Some(resp_payload) = dns
+                            .process_transparent_query_bytes(&owned_payload, orig_dns_dst)
+                            .await
+                        {
+                            let pseudo_req = dns_hijack::ParsedUdpPacket {
+                                src_ip: req_meta.0,
+                                dst_ip: req_meta.1,
+                                src_port: req_meta.2,
+                                dst_port: req_meta.3,
+                                payload: &[],
+                                is_ipv6: req_meta.4,
+                            };
+                            if let Ok(mut reply_ip) =
+                                dns_hijack::build_udp_reply_ip_packet(&pseudo_req, &resp_payload)
+                            {
+                                let mut inj_addr = windivert_ffi::WinDivertAddress::inbound_injection(
+                                    net_data.if_idx,
+                                    net_data.sub_if_idx,
+                                    loopback,
+                                    req_meta.4,
+                                );
+                                net_inj.calc_checksums(&mut reply_ip, &mut inj_addr);
+                                let _ = net_inj.send(&reply_ip, &inj_addr);
+                            }
+                        }
+                    });
+                }
+            }
+            return true;
+        }
+
+        if let Some(tcp) = netstack::parse_tcp_packet(raw) {
+            let local_ep = std::net::SocketAddr::new(tcp.src_ip, tcp.src_port);
+            let remote_ep = std::net::SocketAddr::new(tcp.dst_ip, tcp.dst_port);
+            let pid = resolve_outbound_pid(&self.table, 6, local_ep, remote_ep, tcp.syn && !tcp.ack);
+            if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port)
+                || pid.is_some_and(pid_table::SocketPidTable::is_self_pid)
+            {
+                self.stats
+                    .tcp_passthrough_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.emit_passthrough(raw, addr, fallback_fragments);
+                return true;
+            }
+
+            let meta = netstack::PacketInterfaceMeta {
+                if_idx: net_data.if_idx,
+                sub_if_idx: net_data.sub_if_idx,
+                loopback: addr.loopback(),
+                is_ipv6: tcp.is_ipv6,
+                bitfield: addr.raw_bitfield(),
+            };
+            self.sig.push_outbound_tcp(raw.to_vec(), meta, pid);
+            return true;
+        }
+
+        false
+    }
 }
 
 /// 透明代理全生命周期管理器：负责 WinDivert 驱动加载、双层截获线程调度、错误诊断与 Drop 安全回收
@@ -804,11 +954,12 @@ impl TransparentManager {
         };
         crate::outbound::bypass::set_transparent_active(true);
 
-        // 1. SOCKET 层监听线程：高速维护 (proto, local_ip, local_port) -> PID
+        // 1. SOCKET 层监听线程：高速维护 (proto, local_ip, local_port) -> PID，并推送 TCP 关闭事件失效旁路缓存
         {
             let stop = Arc::clone(&stop_flag);
             let sock_h = Arc::clone(&socket_handle);
             let table = Arc::clone(&pid_table);
+            let sig_sock = Arc::clone(&signal);
             let handle = std::thread::Builder::new()
                 .name("flowx-windivert-socket".to_string())
                 .spawn(move || {
@@ -833,6 +984,11 @@ impl TransparentManager {
                                     s.local_port,
                                     s.process_id,
                                 );
+                                if matches!(event, windivert_ffi::WinDivertEvent::SocketClose)
+                                    && s.protocol == 6
+                                {
+                                    sig_sock.push_closed_tcp_endpoint(local_ip, s.local_port);
+                                }
                             }
                             Err(e) => {
                                 if stop.load(Ordering::Acquire)
@@ -850,31 +1006,44 @@ impl TransparentManager {
             startup_guard.threads.push(handle);
         }
 
-        // 2. NETWORK 层抓包线程：快速分流自环放行 / UDP(DNS & QUIC) / TCP 入协议栈
+        // 2. NETWORK 层抓包线程：快速分流自环放行 / UDP(DNS & QUIC) / TCP 入协议栈，并对分片包实行有界重组防渗透
         {
             let stop = Arc::clone(&stop_flag);
-            let net_h = Arc::clone(&network_handle);
-            let table = Arc::clone(&pid_table);
-            let sig = Arc::clone(&signal);
-            let dispatcher_cfg = Arc::clone(&self.dispatcher_config);
-            let dns_srv = Arc::clone(&self.dns_server);
-            let stats = Arc::clone(&self.stats);
-            let live_dns = Arc::clone(&self.live_hijack_dns);
-            let live_quic = Arc::clone(&self.live_block_quic);
-            let rt = rt_handle.clone();
+            let ctx = NetRxContext {
+                net_h: Arc::clone(&network_handle),
+                table: Arc::clone(&pid_table),
+                sig: Arc::clone(&signal),
+                dispatcher_cfg: Arc::clone(&self.dispatcher_config),
+                dns_srv: Arc::clone(&self.dns_server),
+                stats: Arc::clone(&self.stats),
+                live_dns: Arc::clone(&self.live_hijack_dns),
+                live_quic: Arc::clone(&self.live_block_quic),
+                rt: rt_handle.clone(),
+            };
 
             let handle = std::thread::Builder::new()
                 .name("flowx-windivert-net-rx".to_string())
                 .spawn(move || {
-                    let mut buf = vec![0u8; 65_536];
+                    let mut buf = vec![0u8; INITIAL_NET_RX_BUF_LEN];
+                    let mut frag_tracker = fragment::FragmentTracker::new();
                     while !stop.load(Ordering::Acquire) {
-                        let (len, addr) = match net_h.recv(&mut buf) {
+                        let (len, addr) = match ctx.net_h.recv(&mut buf) {
                             Ok(res) => res,
                             Err(e) => {
                                 if stop.load(Ordering::Acquire)
                                     || matches!(e.raw_os_error(), Some(6 | 232 | 995))
                                 {
                                     break;
+                                }
+                                if e.raw_os_error() == Some(WINDOWS_ERROR_INSUFFICIENT_BUFFER)
+                                    && let Some(next_len) = next_net_rx_buf_len(buf.len())
+                                {
+                                    buf.resize(next_len, 0);
+                                    debug!(
+                                        new_buf_len = next_len,
+                                        "Expanded WinDivert NETWORK recv buffer after ERROR_INSUFFICIENT_BUFFER"
+                                    );
+                                    continue;
                                 }
                                 debug!(error = %e, "WinDivert NETWORK recv transient error");
                                 std::thread::yield_now();
@@ -885,113 +1054,49 @@ impl TransparentManager {
                             continue;
                         }
                         let raw = &buf[..len];
+                        if ctx.handle_complete_ip_packet(raw, &addr, None) {
+                            continue;
+                        }
+
                         let net_data = addr.network();
-
-                        if let Some(udp) = dns_hijack::parse_udp_packet(raw) {
-                            let local_ep = std::net::SocketAddr::new(udp.src_ip, udp.src_port);
-                            let remote_ep = std::net::SocketAddr::new(udp.dst_ip, udp.dst_port);
-                            let pid = resolve_outbound_pid(&table, 17, local_ep, remote_ep, true);
-                            let decision = dns_hijack::decide_udp_packet(
-                                &udp,
-                                pid,
-                                live_dns.load(Ordering::Acquire),
-                                live_quic.load(Ordering::Acquire),
-                                Some(&dispatcher_cfg.rule_engine),
-                                Some(&dispatcher_cfg.tracker),
-                                Some(&dispatcher_cfg.fake_ip_pool),
-                            );
-                            match decision {
-                                dns_hijack::UdpDecision::Passthrough => {
-                                    let _ = net_h.send(raw, &addr);
-                                }
-                                dns_hijack::UdpDecision::DropQuic => {
-                                    stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
-                                }
-                                dns_hijack::UdpDecision::DropFakeIp => {}
-                                dns_hijack::UdpDecision::HandleDns => {
-                                    stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
-                                    let owned_payload = udp.payload.to_vec();
-                                    let req_meta = (
-                                        udp.src_ip,
-                                        udp.dst_ip,
-                                        udp.src_port,
-                                        udp.dst_port,
-                                        udp.is_ipv6,
+                        let frag_meta = netstack::PacketInterfaceMeta {
+                            if_idx: net_data.if_idx,
+                            sub_if_idx: net_data.sub_if_idx,
+                            loopback: addr.loopback(),
+                            is_ipv6: addr.ipv6(),
+                            bitfield: addr.raw_bitfield(),
+                        };
+                        match frag_tracker.ingest(
+                            raw,
+                            frag_meta,
+                            Some(&ctx.dispatcher_cfg.fake_ip_pool),
+                        ) {
+                            fragment::FragmentOutcome::PassthroughSingle => {
+                                let _ = ctx.net_h.send(raw, &addr);
+                            }
+                            fragment::FragmentOutcome::Drop
+                            | fragment::FragmentOutcome::Pending => {}
+                            fragment::FragmentOutcome::Reassembled {
+                                full_packet,
+                                orig_fragments,
+                            } => {
+                                let rep_meta = orig_fragments
+                                    .first()
+                                    .map(|f| f.meta)
+                                    .unwrap_or(frag_meta);
+                                let reasm_addr =
+                                    windivert_ffi::WinDivertAddress::outbound_passthrough(
+                                        rep_meta.if_idx,
+                                        rep_meta.sub_if_idx,
+                                        rep_meta.bitfield,
                                     );
-                                    let net_inj = Arc::clone(&net_h);
-                                    let dns = Arc::clone(&dns_srv);
-                                    let loopback = addr.loopback();
-                                    rt.spawn(async move {
-                                        let orig_dns_dst =
-                                            std::net::SocketAddr::new(req_meta.1, req_meta.3);
-                                        if let Some(resp_payload) = dns
-                                            .process_transparent_query_bytes(
-                                                &owned_payload,
-                                                orig_dns_dst,
-                                            )
-                                            .await
-                                        {
-                                            let pseudo_req = dns_hijack::ParsedUdpPacket {
-                                                src_ip: req_meta.0,
-                                                dst_ip: req_meta.1,
-                                                src_port: req_meta.2,
-                                                dst_port: req_meta.3,
-                                                payload: &[],
-                                                is_ipv6: req_meta.4,
-                                            };
-                                            if let Ok(mut reply_ip) =
-                                                dns_hijack::build_udp_reply_ip_packet(
-                                                    &pseudo_req,
-                                                    &resp_payload,
-                                                )
-                                            {
-                                                let mut inj_addr = windivert_ffi::WinDivertAddress::inbound_injection(
-                                                    net_data.if_idx,
-                                                    net_data.sub_if_idx,
-                                                    loopback,
-                                                    req_meta.4,
-                                                );
-                                                net_inj.calc_checksums(&mut reply_ip, &mut inj_addr);
-                                                let _ = net_inj.send(&reply_ip, &inj_addr);
-                                            }
-                                        }
-                                    });
-                                }
+                                let _ = ctx.handle_complete_ip_packet(
+                                    &full_packet,
+                                    &reasm_addr,
+                                    Some(&orig_fragments),
+                                );
                             }
-                            continue;
                         }
-
-                        if let Some(tcp) = netstack::parse_tcp_packet(raw) {
-                            let local_ep = std::net::SocketAddr::new(tcp.src_ip, tcp.src_port);
-                            let remote_ep = std::net::SocketAddr::new(tcp.dst_ip, tcp.dst_port);
-                            let pid = resolve_outbound_pid(
-                                &table,
-                                6,
-                                local_ep,
-                                remote_ep,
-                                tcp.syn && !tcp.ack,
-                            );
-                            if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port)
-                                || pid.is_some_and(pid_table::SocketPidTable::is_self_pid)
-                            {
-                                stats.tcp_passthrough_total.fetch_add(1, Ordering::Relaxed);
-                                let _ = net_h.send(raw, &addr);
-                                continue;
-                            }
-
-                            let meta = netstack::PacketInterfaceMeta {
-                                if_idx: net_data.if_idx,
-                                sub_if_idx: net_data.sub_if_idx,
-                                loopback: addr.loopback(),
-                                is_ipv6: tcp.is_ipv6,
-                                bitfield: addr.raw_bitfield(),
-                            };
-                            sig.push_outbound_tcp(raw.to_vec(), meta, pid);
-                            continue;
-                        }
-
-                        // 其余异常/分片报文安全放行
-                        let _ = net_h.send(raw, &addr);
                     }
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn network recv thread: {e}")))?;
@@ -1012,14 +1117,23 @@ impl TransparentManager {
                 .spawn(move || {
                     let mut engine = netstack::NetstackEngine::new(Arc::clone(&sig));
                     let mut batch = Vec::with_capacity(64);
+                    let mut closed_endpoints = Vec::with_capacity(16);
                     let mut accepted = Vec::with_capacity(16);
                     let mut tx_packets = Vec::with_capacity(64);
                     let mut wait_budget = std::time::Duration::from_millis(20);
 
                     while !stop.load(Ordering::Acquire) {
-                        let alive = sig.wait_drain_or_timeout(wait_budget, &mut batch);
+                        let alive = sig.wait_drain_or_timeout(
+                            wait_budget,
+                            &mut batch,
+                            &mut closed_endpoints,
+                        );
                         if !alive || stop.load(Ordering::Acquire) {
                             break;
+                        }
+
+                        for (local_ip, local_port) in closed_endpoints.drain(..) {
+                            engine.invalidate_passthrough_for_local_endpoint(local_ip, local_port);
                         }
 
                         for (raw_ip, meta, pid) in batch.drain(..) {
@@ -1307,5 +1421,17 @@ mod tests {
         assert!(f.contains("udp.DstPort == 443"));
         assert!(f.contains("198.18.0.0"));
         assert!(f.contains("198.19.255.255"));
+        assert!(f.contains("or fragment"));
+    }
+
+    #[test]
+    fn test_net_rx_buf_growth_bounds() {
+        const { assert!(INITIAL_NET_RX_BUF_LEN > 65_575) };
+        assert_eq!(next_net_rx_buf_len(INITIAL_NET_RX_BUF_LEN), Some(262_144));
+        assert_eq!(
+            next_net_rx_buf_len(MAX_NET_RX_BUF_LEN / 2),
+            Some(MAX_NET_RX_BUF_LEN)
+        );
+        assert_eq!(next_net_rx_buf_len(MAX_NET_RX_BUF_LEN), None);
     }
 }
