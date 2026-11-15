@@ -442,6 +442,27 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
 }
 
 #[cfg(windows)]
+fn resolve_outbound_pid(
+    table: &pid_table::SocketPidTable,
+    protocol: u8,
+    local: std::net::SocketAddr,
+    remote: std::net::SocketAddr,
+    allow_os_fallback: bool,
+) -> Option<u32> {
+    if let Some(pid) = table.lookup(protocol, local.ip(), local.port()) {
+        return Some(pid);
+    }
+    if !allow_os_fallback {
+        return None;
+    }
+    let pid = crate::interceptor::process::lookup_outbound_socket_pid(protocol, local, remote)?;
+    if pid != 0 {
+        table.record_resolved_pid(protocol, local.ip(), local.port(), pid);
+    }
+    Some(pid)
+}
+
+#[cfg(windows)]
 fn shutdown_and_join_runtime(
     stop_flag: &AtomicBool,
     signal: &netstack::NetstackSignal,
@@ -449,6 +470,7 @@ fn shutdown_and_join_runtime(
     network_handle: &windivert_ffi::WinDivertHandle,
     threads: Vec<JoinHandle<()>>,
 ) {
+    crate::outbound::bypass::set_transparent_active(false);
     stop_flag.store(true, Ordering::Release);
     signal.close();
     let _ = socket_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
@@ -780,6 +802,7 @@ impl TransparentManager {
             network_handle: Arc::clone(&network_handle),
             threads: Vec::with_capacity(3),
         };
+        crate::outbound::bypass::set_transparent_active(true);
 
         // 1. SOCKET 层监听线程：高速维护 (proto, local_ip, local_port) -> PID
         {
@@ -865,7 +888,9 @@ impl TransparentManager {
                         let net_data = addr.network();
 
                         if let Some(udp) = dns_hijack::parse_udp_packet(raw) {
-                            let pid = table.lookup(17, udp.src_ip, udp.src_port);
+                            let local_ep = std::net::SocketAddr::new(udp.src_ip, udp.src_port);
+                            let remote_ep = std::net::SocketAddr::new(udp.dst_ip, udp.dst_port);
+                            let pid = resolve_outbound_pid(&table, 17, local_ep, remote_ep, true);
                             let decision = dns_hijack::decide_udp_packet(
                                 &udp,
                                 pid,
@@ -937,7 +962,15 @@ impl TransparentManager {
                         }
 
                         if let Some(tcp) = netstack::parse_tcp_packet(raw) {
-                            let pid = table.lookup(6, tcp.src_ip, tcp.src_port);
+                            let local_ep = std::net::SocketAddr::new(tcp.src_ip, tcp.src_port);
+                            let remote_ep = std::net::SocketAddr::new(tcp.dst_ip, tcp.dst_port);
+                            let pid = resolve_outbound_pid(
+                                &table,
+                                6,
+                                local_ep,
+                                remote_ep,
+                                tcp.syn && !tcp.ack,
+                            );
                             if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port)
                                 || pid.is_some_and(pid_table::SocketPidTable::is_self_pid)
                             {

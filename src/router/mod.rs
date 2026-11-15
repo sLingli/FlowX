@@ -209,26 +209,27 @@ impl Rule {
             .is_some_and(|domains| domains.iter().any(|d| d.matches(qname)))
     }
 
-    /// 仅评估启用状态、应用进程与端口约束，不校验目标域名或 IP/CIDR（供透明代理预判是否需嗅探域名）
-    ///
-    /// 命中返回 `Ok(())`，未命中返回 `"disabled"` | `"app_mismatch"` | `"port_mismatch"`。
-    pub fn matches_app_and_port(&self, ctx: &RouteContext) -> Result<(), &'static str> {
-        self.matches_app_only(ctx)?;
-
-        // 2. 匹配端口
+    fn matches_port_only(&self, target_port: u16) -> Result<(), &'static str> {
         if let Some(ports) = &self.ports {
             if ports.is_empty() {
                 return Err("port_mismatch");
             }
             let port_matched = ports
                 .iter()
-                .any(|r| ctx.target_port >= r.start && ctx.target_port <= r.end);
+                .any(|r| target_port >= r.start && target_port <= r.end);
             if !port_matched {
                 return Err("port_mismatch");
             }
         }
-
         Ok(())
+    }
+
+    /// 仅评估启用状态、应用进程与端口约束，不校验目标域名或 IP/CIDR（供透明代理预判是否需嗅探域名）
+    ///
+    /// 命中返回 `Ok(())`，未命中返回 `"disabled"` | `"app_mismatch"` | `"port_mismatch"`。
+    pub fn matches_app_and_port(&self, ctx: &RouteContext) -> Result<(), &'static str> {
+        self.matches_app_only(ctx)?;
+        self.matches_port_only(ctx.target_port)
     }
 
     /// 评估当前规则是否命中给定流量上下文；命中返回 `Ok(())`，未命中返回原因码：
@@ -687,6 +688,52 @@ impl RuleEngine {
         } else {
             DnsHijackDecision::Passthrough
         }
+    }
+
+    /// 当首包阶段 PID 未知时，判断给定 `(target_ip, target_port)` 前方是否存在可达的非 `Direct` 应用级规则（如 `DevProxy`）。
+    ///
+    /// 若在无条件全局匹配终止之前存在任何可能命中的 `application_patterns` 非 `Direct` 规则，则返回 `true`，
+    /// 防止 `NetstackEngine` 在驱动层 PID 竞态缺失时误将代理流量永久写入直连 `passthrough` 缓存。
+    pub fn has_reachable_app_scoped_override(
+        &self,
+        target_ip: Option<IpAddr>,
+        target_port: u16,
+    ) -> bool {
+        let local_hostname = parser::resolve_local_hostname();
+        let rules = self.current_rules();
+
+        for rule in rules.iter() {
+            if !rule.enabled || rule.matches_port_only(target_port).is_err() {
+                continue;
+            }
+            let wildcard_target = rule.target_domains.is_none() && rule.target_subnets.is_none();
+            let subnet_matched = rule
+                .target_subnets
+                .as_ref()
+                .is_some_and(|subs| target_ip.is_some_and(|ip| subs.iter().any(|s| s.contains(&ip))));
+            let domain_applicable = rule
+                .target_domains
+                .as_ref()
+                .is_some_and(|domains| rule_has_applicable_domain(domains, target_ip, &local_hostname));
+
+            if !(wildcard_target || subnet_matched || domain_applicable) {
+                continue;
+            }
+
+            if rule.application_patterns.is_none() {
+                // 任意应用都会命中的明确规则（无目标约束或 IP 已命中）：后续应用级规则不可能再被执行
+                if (wildcard_target || subnet_matched) && rule.action == Action::Direct {
+                    return false;
+                }
+                if rule.action != Action::Direct {
+                    return true;
+                }
+            } else if rule.action != Action::Direct {
+                return true;
+            }
+        }
+
+        self.default_action() != Action::Direct
     }
 
     /// 模拟流量路由并返回完整的逐条规则匹配与跳过原因诊断轨迹

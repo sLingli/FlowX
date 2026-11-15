@@ -783,8 +783,15 @@ impl NetstackEngine {
             match re.needs_domain_for_routing(proc_path, proc_name, Some(pkt.dst_ip), pkt.dst_port)
             {
                 DomainNeedDecision::Immediate(Action::Direct) => {
-                    self.passthrough.insert(key, now);
-                    return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
+                    if pid.is_none()
+                        && re.has_reachable_app_scoped_override(Some(pkt.dst_ip), pkt.dst_port)
+                    {
+                        // 首包阶段 PID 未知但前方存在应用级非 Direct 规则（如 DevProxy）：接入协议栈交由 Dispatcher 异步复核进程归属，绝不盲目永久旁路
+                        false
+                    } else {
+                        self.passthrough.insert(key, now);
+                        return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
+                    }
                 }
                 DomainNeedDecision::Immediate(Action::Block) => {
                     if let Some(rst) = build_synthetic_tcp_rst(&raw_ip) {
@@ -1662,5 +1669,69 @@ mod tests {
         // 数据应完整进入 bridge.to_app
         let inner = flow.stream.read.bridge.inner.lock().unwrap();
         assert_eq!(inner.to_app.len(), 2400);
+    }
+
+    #[test]
+    fn test_netstack_unknown_pid_does_not_bypass_app_scoped_proxy_rule() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let engine_rules = RuleEngine::new(
+            vec![
+                Rule::from_raw(
+                    "LocalBypass",
+                    true,
+                    None,
+                    Some("192.168.0.0/16"),
+                    None,
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "DevProxy",
+                    true,
+                    Some("chrome.exe"),
+                    None,
+                    None,
+                    Action::Proxy(101),
+                ),
+            ],
+            Action::Direct,
+        );
+
+        let meta = PacketInterfaceMeta::default();
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+
+        // 1. pid = None 访问 192.168/16：无条件全局 Direct 已命中，允许直接 Passthrough
+        let syn_lan = build_syn([10, 0, 0, 2], 51200, [192, 168, 1, 5], 80, 100);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn_lan,
+                meta,
+                None,
+                Some(&engine_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx,
+            ),
+            TcpIngestOutcome::Passthrough(_)
+        ));
+
+        // 2. pid = None 访问公网 8.8.8.8:443：因前方存在 DevProxy (chrome.exe -> Proxy)，绝不盲目放行写入 passthrough
+        let syn_pub = build_syn([10, 0, 0, 2], 51201, [8, 8, 8, 8], 443, 200);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn_pub,
+                meta,
+                None,
+                Some(&engine_rules),
+                None,
+                None,
+                &mut accepted,
+                &mut tx,
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+        assert_eq!(engine.active_flow_count(), 1);
     }
 }

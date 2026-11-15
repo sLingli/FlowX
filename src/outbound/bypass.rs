@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -46,9 +46,20 @@ impl BypassPortRegistry {
 }
 
 static BYPASS_REGISTRY: OnceLock<BypassPortRegistry> = OnceLock::new();
+static TRANSPARENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn registry() -> &'static BypassPortRegistry {
     BYPASS_REGISTRY.get_or_init(BypassPortRegistry::new)
+}
+
+/// 切换透明代理激活状态：仅在 WinDivert 拦截激活期间预绑定并登记绕过端口；显式代理模式下保持 OS 原始 `TcpStream::connect` 选源行为
+pub fn set_transparent_active(active: bool) {
+    TRANSPARENT_ACTIVE.store(active, Ordering::Release);
+}
+
+#[inline]
+pub fn is_transparent_active() -> bool {
+    TRANSPARENT_ACTIVE.load(Ordering::Acquire)
 }
 
 /// RAII 端口绕过守卫：创建时以 SeqCst 屏障登记源端口，析构时自动递减引用计数。
@@ -254,9 +265,16 @@ impl AsyncWrite for GuardedWriteHalf {
     }
 }
 
-/// 先绑定本地未指定端口并登记到 `BypassPortRegistry`，再发起出站 TCP 连接，保障从首包 SYN 起即豁免透明劫持。
+/// 仅在透明代理激活期间先绑定未指定端口并登记到 `BypassPortRegistry` 再发起连接；显式模式下直接走 `TcpStream::connect` 保留 OS 原生行为
 pub async fn connect_tcp_guarded(addr: SocketAddr) -> std::io::Result<OutboundTcpStream> {
     let target = normalize_connect_addr(addr);
+    if !is_transparent_active() {
+        let stream = TcpStream::connect(target).await?;
+        return Ok(OutboundTcpStream {
+            inner: stream,
+            _bypass_guard: None,
+        });
+    }
     let sock = match target {
         SocketAddr::V4(_) => {
             let s = TcpSocket::new_v4()?;
@@ -281,7 +299,7 @@ pub async fn connect_tcp_guarded(addr: SocketAddr) -> std::io::Result<OutboundTc
 /// 持有源端口绕过守卫的出站 UDP 套接字；`socket` 先于 `_bypass_guard` 析构以保护关闭时序。
 pub struct GuardedUdpSocket {
     socket: UdpSocket,
-    _bypass_guard: BypassPortGuard,
+    _bypass_guard: Option<BypassPortGuard>,
 }
 
 impl Deref for GuardedUdpSocket {
@@ -292,11 +310,15 @@ impl Deref for GuardedUdpSocket {
     }
 }
 
-/// 绑定临时 UDP 套接字并登记本地源端口至 UDP 绕过表（供上游 DNS 查询使用）。
+/// 绑定临时 UDP 套接字；透明代理激活时自动登记本地源端口至 UDP 绕过表（供上游 DNS 查询使用）。
 pub async fn bind_udp_guarded(local_bind: &str) -> std::io::Result<GuardedUdpSocket> {
     let socket = UdpSocket::bind(local_bind).await?;
-    let local_port = socket.local_addr()?.port();
-    let guard = register_bypass_port(BypassProtocol::Udp, local_port);
+    let guard = if is_transparent_active() {
+        let local_port = socket.local_addr()?.port();
+        Some(register_bypass_port(BypassProtocol::Udp, local_port))
+    } else {
+        None
+    };
     Ok(GuardedUdpSocket {
         socket,
         _bypass_guard: guard,
@@ -307,6 +329,15 @@ pub async fn bind_udp_guarded(local_bind: &str) -> std::io::Result<GuardedUdpSoc
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    static TEST_ACTIVE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct TransparentActiveReset;
+    impl Drop for TransparentActiveReset {
+        fn drop(&mut self) {
+            set_transparent_active(false);
+        }
+    }
 
     #[test]
     fn test_bypass_port_refcount_overlapping_guards() {
@@ -330,6 +361,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_guarded_and_split_lifetime() {
+        let _lock = TEST_ACTIVE_MUTEX.lock().await;
+        let _reset = TransparentActiveReset;
+        set_transparent_active(true);
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -355,7 +390,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_connect_tcp_and_bind_udp_skip_bypass_when_transparent_inactive() {
+        let _lock = TEST_ACTIVE_MUTEX.lock().await;
+        let _reset = TransparentActiveReset;
+        set_transparent_active(false);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client_res, accept_res) = tokio::join!(connect_tcp_guarded(addr), listener.accept());
+        let client = client_res.unwrap();
+        let _server = accept_res.unwrap().0;
+
+        let local_port = client.local_addr().unwrap().port();
+        assert!(
+            !is_tcp_port_bypassed(local_port),
+            "Explicit mode must not register TCP ports in BypassPortRegistry"
+        );
+
+        let udp = bind_udp_guarded("127.0.0.1:0").await.unwrap();
+        let udp_port = udp.local_addr().unwrap().port();
+        assert!(
+            !is_udp_port_bypassed(udp_port),
+            "Explicit mode must not register UDP ports in BypassPortRegistry"
+        );
+    }
+
+    #[tokio::test]
     async fn test_bind_udp_guarded_registers_and_releases() {
+        let _lock = TEST_ACTIVE_MUTEX.lock().await;
+        let _reset = TransparentActiveReset;
+        set_transparent_active(true);
+
         let guarded = bind_udp_guarded("127.0.0.1:0").await.unwrap();
         let port = guarded.local_addr().unwrap().port();
         assert!(is_udp_port_bypassed(port));

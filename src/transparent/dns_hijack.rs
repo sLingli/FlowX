@@ -201,7 +201,15 @@ pub fn decide_udp_packet(
 
             match re.needs_domain_for_routing(proc_path, proc_name, Some(pkt.dst_ip), pkt.dst_port)
             {
-                DomainNeedDecision::Immediate(Action::Direct) => UdpDecision::Passthrough,
+                DomainNeedDecision::Immediate(Action::Direct) => {
+                    if pid.is_none()
+                        && re.has_reachable_app_scoped_override(Some(pkt.dst_ip), pkt.dst_port)
+                    {
+                        UdpDecision::DropQuic
+                    } else {
+                        UdpDecision::Passthrough
+                    }
+                }
                 DomainNeedDecision::Immediate(_) | DomainNeedDecision::NeedsDomainSniff => {
                     UdpDecision::DropQuic
                 }

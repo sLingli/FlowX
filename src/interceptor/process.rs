@@ -401,30 +401,21 @@ where
 }
 
 #[cfg(windows)]
-fn query_extended_tcp_table<Row: Copy, F>(
-    af: u32,
+fn query_ip_helper_owner_pid_table<Row: Copy, Fetch, Match>(
     table_offset: usize,
-    mut matcher: F,
+    mut fetch_fn: Fetch,
+    mut matcher: Match,
 ) -> Option<u32>
 where
-    F: FnMut(&Row) -> Option<u32>,
+    Fetch: FnMut(*mut std::ffi::c_void, *mut u32) -> u32,
+    Match: FnMut(&Row) -> Option<u32>,
 {
     use windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
-    };
 
     unsafe {
         for _ in 0..4 {
             let mut size = 0u32;
-            let _ = GetExtendedTcpTable(
-                std::ptr::null_mut(),
-                &mut size,
-                0,
-                af,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            );
+            let _ = fetch_fn(std::ptr::null_mut(), &mut size);
             if size == 0 {
                 return None;
             }
@@ -437,15 +428,7 @@ where
             };
             let mut buffer: Vec<u32> = vec![0u32; u32_elements];
 
-            let ret = GetExtendedTcpTable(
-                buffer.as_mut_ptr().cast(),
-                &mut actual_size,
-                0,
-                af,
-                TCP_TABLE_OWNER_PID_ALL,
-                0,
-            );
-
+            let ret = fetch_fn(buffer.as_mut_ptr().cast(), &mut actual_size);
             if ret == ERROR_INSUFFICIENT_BUFFER {
                 continue;
             }
@@ -464,6 +447,50 @@ where
     }
 
     None
+}
+
+#[cfg(windows)]
+fn query_extended_tcp_table<Row: Copy, F>(
+    af: u32,
+    table_offset: usize,
+    matcher: F,
+) -> Option<u32>
+where
+    F: FnMut(&Row) -> Option<u32>,
+{
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
+    };
+
+    query_ip_helper_owner_pid_table::<Row, _, _>(
+        table_offset,
+        |ptr, size_ptr| unsafe {
+            GetExtendedTcpTable(ptr, size_ptr, 0, af, TCP_TABLE_OWNER_PID_ALL, 0)
+        },
+        matcher,
+    )
+}
+
+#[cfg(windows)]
+fn query_extended_udp_table<Row: Copy, F>(
+    af: u32,
+    table_offset: usize,
+    matcher: F,
+) -> Option<u32>
+where
+    F: FnMut(&Row) -> Option<u32>,
+{
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedUdpTable, UDP_TABLE_OWNER_PID,
+    };
+
+    query_ip_helper_owner_pid_table::<Row, _, _>(
+        table_offset,
+        |ptr, size_ptr| unsafe {
+            GetExtendedUdpTable(ptr, size_ptr, 0, af, UDP_TABLE_OWNER_PID, 0)
+        },
+        matcher,
+    )
 }
 
 #[cfg(windows)]
@@ -546,6 +573,88 @@ fn get_pid_by_connection(client: SocketAddr, server: SocketAddr) -> Option<u32> 
             }
             None
         }
+    }
+}
+
+#[cfg(windows)]
+fn query_windows_udp_v4(target_ip: Option<Ipv4Addr>, target_port: u16) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    let table_offset = std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table);
+    let mut wild_pid: Option<u32> = None;
+    let exact = query_extended_udp_table::<MIB_UDPROW_OWNER_PID, _>(AF_INET as u32, table_offset, |row| {
+        let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+        if local_port != target_port || row.dwOwningPid == 0 {
+            return None;
+        }
+        let local_ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+        if target_ip.is_some_and(|req_ip| local_ip == req_ip) {
+            return Some(row.dwOwningPid);
+        }
+        if local_ip.is_unspecified() && wild_pid.is_none() {
+            wild_pid = Some(row.dwOwningPid);
+        }
+        None
+    });
+    exact.or(wild_pid)
+}
+
+#[cfg(windows)]
+fn query_windows_udp_v6(target_ip: Option<Ipv6Addr>, target_port: u16) -> Option<u32> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET6;
+
+    let table_offset = std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table);
+    let mut wild_pid: Option<u32> = None;
+    let exact = query_extended_udp_table::<MIB_UDP6ROW_OWNER_PID, _>(AF_INET6 as u32, table_offset, |row| {
+        let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+        if local_port != target_port || row.dwOwningPid == 0 {
+            return None;
+        }
+        let local_ip = Ipv6Addr::from(row.ucLocalAddr);
+        if target_ip.is_some_and(|req_ip| local_ip == req_ip) {
+            return Some(row.dwOwningPid);
+        }
+        if local_ip.is_unspecified() && wild_pid.is_none() {
+            wild_pid = Some(row.dwOwningPid);
+        }
+        None
+    });
+    exact.or(wild_pid)
+}
+
+#[cfg(windows)]
+fn get_pid_by_udp_endpoint(local: SocketAddr) -> Option<u32> {
+    match local.ip().to_canonical() {
+        std::net::IpAddr::V4(v4) => query_windows_udp_v4(Some(v4), local.port())
+            .or_else(|| query_windows_udp_v6(None, local.port())),
+        std::net::IpAddr::V6(v6) => query_windows_udp_v6(Some(v6), local.port()),
+    }
+}
+
+/// 透明代理在 `SocketPidTable` 未命中时的 OS 套接字表同步回退查询（Windows `GetExtendedTcpTable` / `GetExtendedUdpTable`）
+pub fn lookup_outbound_socket_pid(
+    protocol: u8,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        match protocol {
+            6 => get_pid_by_connection(local, remote).filter(|&p| p != 0),
+            17 => get_pid_by_udp_endpoint(local).filter(|&p| p != 0),
+            _ => None,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (protocol, local, remote);
+        None
     }
 }
 
@@ -1938,5 +2047,22 @@ mod tests {
             .expect("current pid should resolve asynchronously");
         assert_eq!(async_info.pid, pid);
         assert_eq!(async_info.path, sync_info.path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_lookup_outbound_socket_pid_udp_and_tcp_fallback() {
+        let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_local = udp_sock.local_addr().unwrap();
+        let udp_pid = lookup_outbound_socket_pid(17, udp_local, "1.1.1.1:53".parse().unwrap());
+        assert_eq!(udp_pid, Some(std::process::id()));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(server_addr).unwrap();
+        let _accepted = listener.accept().unwrap();
+        let client_local = client.local_addr().unwrap();
+        let tcp_pid = lookup_outbound_socket_pid(6, client_local, server_addr);
+        assert_eq!(tcp_pid, Some(std::process::id()));
     }
 }
