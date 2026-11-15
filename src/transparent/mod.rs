@@ -159,18 +159,66 @@ pub fn is_process_elevated() -> bool {
     }
 }
 
+/// 仅从 Windows `System32` 目录加载系统 DLL（避免高权限下被 CWD / 应用目录 / `PATH` 劫持）
+#[cfg(windows)]
+unsafe fn load_system32_library(dll_name: &str) -> io::Result<windows_sys::Win32::Foundation::HMODULE> {
+    use windows_sys::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+
+    let wide: Vec<u16> = dll_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let module = unsafe {
+        LoadLibraryExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if module.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(module)
+}
+
+/// 解析 `%SystemRoot%\System32\<exe_name>` 完整可信路径，禁止裸名走 `PATH` / CWD
+#[cfg(windows)]
+fn resolve_system32_executable(exe_name: &str) -> io::Result<std::path::PathBuf> {
+    let sys_root = std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Neither SystemRoot nor windir environment variable is set",
+            )
+        })?;
+    let root_path = std::path::PathBuf::from(sys_root);
+    if !root_path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("SystemRoot path is not absolute: {}", root_path.display()),
+        ));
+    }
+    let exe_path = root_path.join("System32").join(exe_name);
+    if !exe_path.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("System32 executable not found: {}", exe_path.display()),
+        ));
+    }
+    Ok(exe_path)
+}
+
 /// 刷新 Windows 系统 DNS 缓存，确保切入/退出透明模式时清理陈旧解析记录及 Fake-IP 残留
 pub fn flush_dns_cache() -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::ffi::CString;
         use windows_sys::Win32::Foundation::FreeLibrary;
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
         type FnDnsFlushResolverCache = unsafe extern "system" fn() -> i32;
-        let dll_wide: Vec<u16> = "dnsapi.dll\0".encode_utf16().collect();
-        let module = unsafe { LoadLibraryW(dll_wide.as_ptr()) };
-        if !module.is_null() {
+        if let Ok(module) = unsafe { load_system32_library("dnsapi.dll") } {
             let sym = CString::new("DnsFlushResolverCache").unwrap();
             let proc = unsafe { GetProcAddress(module, sym.as_ptr() as *const u8) };
             let flushed = if let Some(ptr) = proc {
@@ -188,10 +236,11 @@ pub fn flush_dns_cache() -> io::Result<()> {
             }
         }
 
-        // 后备方案：静默执行 ipconfig /flushdns（隐藏控制台窗口）
+        // 后备方案：仅从 %SystemRoot%\System32\ipconfig.exe 静默执行（禁止裸名走 PATH / CWD）
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let status = std::process::Command::new("ipconfig")
+        let ipconfig_path = resolve_system32_executable("ipconfig.exe")?;
+        let status = std::process::Command::new(ipconfig_path)
             .arg("/flushdns")
             .creation_flags(CREATE_NO_WINDOW)
             .status()?;
@@ -294,7 +343,7 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{FreeLibrary, HINSTANCE, HWND};
-        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
         if is_process_elevated() {
@@ -313,16 +362,13 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
             n_show_cmd: i32,
         ) -> HINSTANCE;
 
-        // 按需延迟加载 shell32.dll，避免无头服务/CLI 或受限桌面环境在进程启动阶段触发 GUI DLL 初始化失败
-        let shell32_w: Vec<u16> = "shell32.dll\0".encode_utf16().collect();
-        let shell32_mod = unsafe { LoadLibraryW(shell32_w.as_ptr()) };
-        if shell32_mod.is_null() {
-            let os_err = io::Error::last_os_error();
-            return Err(io::Error::new(
+        // 按需仅从 System32 延迟加载 shell32.dll，避免无头环境启动失败或 CWD/PATH DLL 劫持
+        let shell32_mod = unsafe { load_system32_library("shell32.dll") }.map_err(|os_err| {
+            io::Error::new(
                 os_err.kind(),
-                format!("Failed to load shell32.dll for UAC elevation: {os_err}"),
-            ));
-        }
+                format!("Failed to load shell32.dll from System32 for UAC elevation: {os_err}"),
+            )
+        })?;
 
         let proc_ptr = unsafe { GetProcAddress(shell32_mod, c"ShellExecuteW".as_ptr().cast()) };
         let Some(proc_fn) = proc_ptr else {
@@ -392,6 +438,51 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
             io::ErrorKind::Unsupported,
             "ERR_TRANSPARENT_UNSUPPORTED_OS: Elevated WinDivert relaunch is only supported on Windows.",
         ))
+    }
+}
+
+#[cfg(windows)]
+fn shutdown_and_join_runtime(
+    stop_flag: &AtomicBool,
+    signal: &netstack::NetstackSignal,
+    socket_handle: &windivert_ffi::WinDivertHandle,
+    network_handle: &windivert_ffi::WinDivertHandle,
+    threads: Vec<JoinHandle<()>>,
+) {
+    stop_flag.store(true, Ordering::Release);
+    signal.close();
+    let _ = socket_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
+    let _ = network_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
+    for th in threads {
+        let _ = th.join();
+    }
+}
+
+/// 启动期原子回滚守卫：若任意子线程创建失败或发生 panic，确保已启动线程与 WinDivert 句柄全部回收
+#[cfg(windows)]
+struct PartialRuntimeGuard {
+    armed: bool,
+    stop_flag: Arc<AtomicBool>,
+    signal: Arc<netstack::NetstackSignal>,
+    socket_handle: Arc<windivert_ffi::WinDivertHandle>,
+    network_handle: Arc<windivert_ffi::WinDivertHandle>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl Drop for PartialRuntimeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let threads = std::mem::take(&mut self.threads);
+        shutdown_and_join_runtime(
+            &self.stop_flag,
+            &self.signal,
+            &self.socket_handle,
+            &self.network_handle,
+            threads,
+        );
     }
 }
 
@@ -604,7 +695,7 @@ impl TransparentManager {
         let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
         if !avail.dll_found || !avail.sys_found {
             let searched = if avail.searched_dirs.is_empty() {
-                "current directory".to_string()
+                "executable directory".to_string()
             } else {
                 avail.searched_dirs.join(", ")
             };
@@ -628,7 +719,7 @@ impl TransparentManager {
                 socket_filter,
                 windivert_ffi::WinDivertLayer::Socket,
                 0,
-                windivert_ffi::WINDIVERT_FLAG_RECV_ONLY,
+                windivert_ffi::SOCKET_LAYER_FLAGS,
             )
             .map_err(|e| {
                 self.set_error(format!(
@@ -677,7 +768,14 @@ impl TransparentManager {
         let pid_table = Arc::new(pid_table::SocketPidTable::new());
         let signal = Arc::new(netstack::NetstackSignal::new());
 
-        let mut threads = Vec::with_capacity(3);
+        let mut startup_guard = PartialRuntimeGuard {
+            armed: true,
+            stop_flag: Arc::clone(&stop_flag),
+            signal: Arc::clone(&signal),
+            socket_handle: Arc::clone(&socket_handle),
+            network_handle: Arc::clone(&network_handle),
+            threads: Vec::with_capacity(3),
+        };
 
         // 1. SOCKET 层监听线程：高速维护 (proto, local_ip, local_port) -> PID
         {
@@ -722,7 +820,7 @@ impl TransparentManager {
                     }
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn socket monitor thread: {e}")))?;
-            threads.push(handle);
+            startup_guard.threads.push(handle);
         }
 
         // 2. NETWORK 层抓包线程：快速分流自环放行 / UDP(DNS & QUIC) / TCP 入协议栈
@@ -853,7 +951,7 @@ impl TransparentManager {
                     }
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn network recv thread: {e}")))?;
-            threads.push(handle);
+            startup_guard.threads.push(handle);
         }
 
         // 3. 用户态协议栈 Actor 线程：单所有权运行 smoltcp 并协调 AsyncRead/AsyncWrite 与入站注入
@@ -958,9 +1056,11 @@ impl TransparentManager {
                     }
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn netstack actor thread: {e}")))?;
-            threads.push(handle);
+            startup_guard.threads.push(handle);
         }
 
+        startup_guard.armed = false;
+        let threads = std::mem::take(&mut startup_guard.threads);
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.runtime.lock().unwrap_or_else(|e| e.into_inner()) = Some(ActiveRuntime {
             stop_flag,
@@ -986,18 +1086,13 @@ impl TransparentManager {
             return;
         };
 
-        rt.stop_flag.store(true, Ordering::Release);
-        rt.signal.close();
-        let _ = rt
-            .socket_handle
-            .shutdown(windivert_ffi::WinDivertShutdownMode::Both);
-        let _ = rt
-            .network_handle
-            .shutdown(windivert_ffi::WinDivertShutdownMode::Both);
-
-        for th in rt.threads {
-            let _ = th.join();
-        }
+        shutdown_and_join_runtime(
+            &rt.stop_flag,
+            &rt.signal,
+            &rt.socket_handle,
+            &rt.network_handle,
+            rt.threads,
+        );
         drop(rt.socket_handle);
         drop(rt.network_handle);
         self.stats.active_flows.store(0, Ordering::Relaxed);
@@ -1133,5 +1228,31 @@ mod tests {
         mgr.apply_settings(TransparentSettings::default(), rt.handle())
             .unwrap();
         assert!(mgr.status().last_error.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_system32_dll_and_exe_loaders_resolve_system32() {
+        use windows_sys::Win32::Foundation::FreeLibrary;
+
+        let dnsapi = unsafe { load_system32_library("dnsapi.dll") }
+            .expect("dnsapi.dll should load cleanly from System32");
+        assert!(!dnsapi.is_null());
+        unsafe {
+            FreeLibrary(dnsapi);
+        }
+
+        let ipconfig = resolve_system32_executable("ipconfig.exe")
+            .expect("ipconfig.exe should resolve inside SystemRoot\\System32");
+        assert!(ipconfig.is_absolute());
+        assert!(ipconfig.is_file());
+        assert!(
+            ipconfig
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n.eq_ignore_ascii_case("System32")),
+            "unexpected ipconfig dir: {}",
+            ipconfig.display()
+        );
     }
 }

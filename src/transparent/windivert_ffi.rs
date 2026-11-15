@@ -7,7 +7,10 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
     FreeLibrary, GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 pub const WINDIVERT_FLAG_SNIFF: u64 = 0x0001;
 pub const WINDIVERT_FLAG_DROP: u64 = 0x0002;
@@ -15,6 +18,9 @@ pub const WINDIVERT_FLAG_RECV_ONLY: u64 = 0x0004;
 pub const WINDIVERT_FLAG_SEND_ONLY: u64 = 0x0008;
 pub const WINDIVERT_FLAG_NO_INSTALL: u64 = 0x0010;
 pub const WINDIVERT_FLAG_FRAGMENTS: u64 = 0x0020;
+
+/// WinDivert `SOCKET` 层必须同时开启 `SNIFF | RECV_ONLY` 旁路嗅探；仅传 `RECV_ONLY` 会按阻断分流模式挂起或失败宿主机所有 socket 操作
+pub const SOCKET_LAYER_FLAGS: u64 = WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY;
 
 pub const WINDIVERT_PARAM_QUEUE_LENGTH_DEFAULT: u64 = 4096;
 pub const WINDIVERT_PARAM_QUEUE_LENGTH_MAX: u64 = 16384;
@@ -359,7 +365,73 @@ pub struct WinDivertAvailability {
     pub searched_dirs: Vec<String>,
 }
 
-/// 探测 `WinDivert.dll` 与对应架构内核驱动 `.sys` 是否就位（仅检查常见可信位置，不修改系统目录）
+fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let pb = PathBuf::from(trimmed);
+    let cand = if pb.is_dir()
+        || (pb.extension().is_none()
+            && !pb
+                .file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case("WinDivert.dll")))
+    {
+        pb.join("WinDivert.dll")
+    } else {
+        pb
+    };
+    Some(std::path::absolute(&cand).unwrap_or(cand))
+}
+
+fn locate_windivert_in_candidates(candidates: Vec<PathBuf>, sys_name: &str) -> WinDivertAvailability {
+    let mut searched_dirs = Vec::new();
+    let mut partial: Option<(Option<PathBuf>, Option<PathBuf>)> = None;
+
+    for dll_cand in candidates {
+        let abs_dll = std::path::absolute(&dll_cand).unwrap_or(dll_cand);
+        let Some(parent) = abs_dll.parent() else {
+            continue;
+        };
+        let dir_str = parent.display().to_string();
+        if !searched_dirs.contains(&dir_str) {
+            searched_dirs.push(dir_str);
+        }
+
+        let dll_ok = abs_dll.is_file();
+        let sys_cand = parent.join(sys_name);
+        let sys_ok = sys_cand.is_file();
+
+        // DLL 与对应架构 .sys 驱动必须位于同一目录，防止跨目录混配或残缺加载
+        if dll_ok && sys_ok {
+            return WinDivertAvailability {
+                dll_found: true,
+                sys_found: true,
+                dll_path: Some(abs_dll.display().to_string()),
+                sys_path: Some(sys_cand.display().to_string()),
+                searched_dirs,
+            };
+        }
+
+        if partial.is_none() && (dll_ok || sys_ok) {
+            partial = Some((
+                dll_ok.then_some(abs_dll),
+                sys_ok.then_some(sys_cand),
+            ));
+        }
+    }
+
+    let (partial_dll, partial_sys) = partial.unwrap_or((None, None));
+    WinDivertAvailability {
+        dll_found: partial_dll.is_some(),
+        sys_found: partial_sys.is_some(),
+        dll_path: partial_dll.map(|p| p.display().to_string()),
+        sys_path: partial_sys.map(|p| p.display().to_string()),
+        searched_dirs,
+    }
+}
+
+/// 探测 `WinDivert.dll` 与对应架构内核驱动 `.sys` 是否同目录配对就位（仅检查显式配置、环境变量与程序目录，禁止回退当前工作目录）
 pub fn locate_windivert_files(custom_dll_path: Option<&str>) -> WinDivertAvailability {
     let sys_name = if cfg!(target_pointer_width = "64") {
         "WinDivert64.sys"
@@ -368,77 +440,23 @@ pub fn locate_windivert_files(custom_dll_path: Option<&str>) -> WinDivertAvailab
     };
 
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(p) = custom_dll_path.map(str::trim).filter(|s| !s.is_empty()) {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            candidates.push(pb);
-        } else if pb.is_dir() {
-            candidates.push(pb.join("WinDivert.dll"));
+    if let Some(custom) = custom_dll_path.and_then(resolve_candidate_dll_path) {
+        candidates.push(custom);
+    } else {
+        if let Ok(env_p) = std::env::var("FLOWX_WINDIVERT_DLL")
+            && let Some(cand) = resolve_candidate_dll_path(&env_p)
+        {
+            candidates.push(cand);
         }
-    }
-    if let Ok(env_p) = std::env::var("FLOWX_WINDIVERT_DLL") {
-        let trimmed = env_p.trim();
-        if !trimmed.is_empty() {
-            let pb = PathBuf::from(trimmed);
-            candidates.push(if pb.is_dir() {
-                pb.join("WinDivert.dll")
-            } else {
-                pb
-            });
-        }
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        candidates.push(dir.join("WinDivert.dll"));
-        candidates.push(dir.join("driver").join("WinDivert.dll"));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("WinDivert.dll"));
-        candidates.push(cwd.join("driver").join("WinDivert.dll"));
-    }
-
-    let mut searched_dirs = Vec::new();
-    let mut found_dll: Option<PathBuf> = None;
-    let mut found_sys: Option<PathBuf> = None;
-
-    for dll_cand in candidates {
-        if let Some(parent) = dll_cand.parent() {
-            let dir_str = parent.display().to_string();
-            if !searched_dirs.contains(&dir_str) {
-                searched_dirs.push(dir_str);
-            }
-            if found_sys.is_none() {
-                let sys_cand = parent.join(sys_name);
-                if sys_cand.is_file() {
-                    found_sys = Some(sys_cand);
-                }
-            }
-        }
-        if found_dll.is_none() && dll_cand.is_file() {
-            found_dll = Some(dll_cand);
-        }
-        if found_dll.is_some() && found_sys.is_some() {
-            break;
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join("WinDivert.dll"));
+            candidates.push(dir.join("driver").join("WinDivert.dll"));
         }
     }
 
-    if let (Some(dll), None) = (&found_dll, &found_sys)
-        && let Some(parent) = dll.parent()
-    {
-        let sys_cand = parent.join(sys_name);
-        if sys_cand.is_file() {
-            found_sys = Some(sys_cand);
-        }
-    }
-
-    WinDivertAvailability {
-        dll_found: found_dll.is_some(),
-        sys_found: found_sys.is_some(),
-        dll_path: found_dll.map(|p| p.display().to_string()),
-        sys_path: found_sys.map(|p| p.display().to_string()),
-        searched_dirs,
-    }
+    locate_windivert_in_candidates(candidates, sys_name)
 }
 
 /// 动态加载并托管的 `WinDivert.dll` 函数表；销毁时自动 `FreeLibrary`
@@ -487,25 +505,51 @@ unsafe fn load_proc<T>(module: HMODULE, name: &str) -> io::Result<T> {
 }
 
 impl WinDivertApi {
-    /// 动态加载 `WinDivert.dll` 并解析所有所需导出口（零构建期 C 库或 SDK 依赖）
+    /// 动态加载已与对应 `.sys` 同目录配对的 `WinDivert.dll`（使用限定安全搜索路径，不回退 CWD/PATH 裸名）
     pub fn load(custom_dll_path: Option<&str>) -> io::Result<Arc<Self>> {
         let avail = locate_windivert_files(custom_dll_path);
-        let load_target = avail
-            .dll_path
-            .clone()
-            .unwrap_or_else(|| "WinDivert.dll".to_string());
-        let wide = to_wide_null(&load_target);
-        let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+        if !avail.dll_found || !avail.sys_found {
+            let searched = if avail.searched_dirs.is_empty() {
+                "executable directory".to_string()
+            } else {
+                avail.searched_dirs.join(", ")
+            };
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "Paired WinDivert.dll (found={}) and matching .sys driver (found={}) not found in the same trusted directory. Searched dirs: {}",
+                    avail.dll_found, avail.sys_found, searched
+                ),
+            ));
+        }
+        let load_target = avail.dll_path.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Paired WinDivert.dll path missing after availability check",
+            )
+        })?;
+        let abs_target = std::path::absolute(Path::new(&load_target))
+            .unwrap_or_else(|_| PathBuf::from(&load_target));
+        let abs_target_str = abs_target.display().to_string();
+        let wide = to_wide_null(&abs_target_str);
+        let module = unsafe {
+            LoadLibraryExW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
         if module.is_null() {
             let err = io::Error::last_os_error();
             let detail = if avail.searched_dirs.is_empty() {
                 format!(
-                    "Failed to load WinDivert.dll ({err}). Place WinDivert.dll and WinDivert64.sys next to flowx.exe."
+                    "Failed to load WinDivert.dll from '{}' ({err}).",
+                    abs_target_str
                 )
             } else {
                 format!(
                     "Failed to load WinDivert.dll from '{}' ({err}). Searched dirs: {}",
-                    load_target,
+                    abs_target_str,
                     avail.searched_dirs.join(", ")
                 )
             };
@@ -516,7 +560,7 @@ impl WinDivertApi {
         let load_res: io::Result<Self> = unsafe {
             Ok(Self {
                 module,
-                loaded_from: Path::new(&load_target).display().to_string(),
+                loaded_from: abs_target_str,
                 fn_open: load_proc(module, "WinDivertOpen")?,
                 fn_recv: load_proc(module, "WinDivertRecv")?,
                 fn_send: load_proc(module, "WinDivertSend")?,
@@ -751,5 +795,109 @@ mod tests {
             ((n >> 96) & 0xffff_ffff) as u32,
         ];
         assert_eq!(decode_windivert_addr(&v6_raw, true), IpAddr::V6(v6));
+    }
+
+    #[test]
+    fn test_socket_layer_flags_include_sniff_and_recv_only() {
+        assert_ne!(SOCKET_LAYER_FLAGS & WINDIVERT_FLAG_SNIFF, 0);
+        assert_ne!(SOCKET_LAYER_FLAGS & WINDIVERT_FLAG_RECV_ONLY, 0);
+        assert_eq!(
+            SOCKET_LAYER_FLAGS,
+            WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY
+        );
+    }
+
+    #[test]
+    fn test_locate_windivert_enforces_same_dir_pairing_and_no_cwd() {
+        struct CleanDir(PathBuf);
+        impl Drop for CleanDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("flowx_windivert_pair_{}_{}", std::process::id(), nonce));
+        let _clean = CleanDir(root.clone());
+        let dir_dll_only = root.join("dll_only");
+        let dir_sys_only = root.join("sys_only");
+        let dir_paired = root.join("paired");
+        std::fs::create_dir_all(&dir_dll_only).unwrap();
+        std::fs::create_dir_all(&dir_sys_only).unwrap();
+        std::fs::create_dir_all(&dir_paired).unwrap();
+
+        let sys_name = if cfg!(target_pointer_width = "64") {
+            "WinDivert64.sys"
+        } else {
+            "WinDivert32.sys"
+        };
+
+        std::fs::write(dir_dll_only.join("WinDivert.dll"), b"dll").unwrap();
+        std::fs::write(dir_sys_only.join(sys_name), b"sys").unwrap();
+
+        // 目录 A 仅有 DLL、目录 B 仅有 SYS：绝不能跨目录混配出 dll_found && sys_found
+        let split = locate_windivert_in_candidates(
+            vec![
+                dir_dll_only.join("WinDivert.dll"),
+                dir_sys_only.join("WinDivert.dll"),
+            ],
+            sys_name,
+        );
+        assert!(split.dll_found);
+        assert!(!split.sys_found);
+        assert!(split.sys_path.is_none());
+
+        // 通过 WinDivertApi::load 加载缺少同目录 .sys 的路径时必须失败，不得裸名回退
+        let err = match WinDivertApi::load(Some(&dir_dll_only.display().to_string())) {
+            Err(e) => e,
+            Ok(_) => panic!("WinDivertApi::load must refuse loading DLL without paired .sys"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+
+        // 目录 C 同时包含 DLL + SYS 时必须优先配对返回同目录路径
+        std::fs::write(dir_paired.join("WinDivert.dll"), b"dll").unwrap();
+        std::fs::write(dir_paired.join(sys_name), b"sys").unwrap();
+        let paired = locate_windivert_in_candidates(
+            vec![
+                dir_dll_only.join("WinDivert.dll"),
+                dir_sys_only.join("WinDivert.dll"),
+                dir_paired.join("WinDivert.dll"),
+            ],
+            sys_name,
+        );
+        assert!(paired.dll_found);
+        assert!(paired.sys_found);
+        assert_eq!(
+            paired.dll_path.as_deref(),
+            Some(dir_paired.join("WinDivert.dll").display().to_string().as_str())
+        );
+        assert_eq!(
+            paired.sys_path.as_deref(),
+            Some(dir_paired.join(sys_name).display().to_string().as_str())
+        );
+
+        // 默认探测不得搜索 current_dir（除非 exe 目录恰好等于 cwd）
+        if std::env::var_os("FLOWX_WINDIVERT_DLL").is_none()
+            && let (Ok(cwd), Ok(exe)) = (std::env::current_dir(), std::env::current_exe())
+            && exe.parent() != Some(cwd.as_path())
+        {
+            let auto_avail = locate_windivert_files(None);
+            assert!(
+                !auto_avail
+                    .searched_dirs
+                    .iter()
+                    .any(|d| Path::new(d) == cwd.as_path()),
+                "searched_dirs must never include current_dir: {:?}",
+                auto_avail.searched_dirs
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
