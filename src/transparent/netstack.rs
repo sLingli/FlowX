@@ -27,6 +27,8 @@ const MAX_INTERCEPTED_FLOWS: usize = 4096;
 const MAX_PASSTHROUGH_FLOWS: usize = 16_384;
 const PASSTHROUGH_TTL: Duration = Duration::from_secs(120);
 const SYN_RECEIVED_TIMEOUT: Duration = Duration::from_secs(15);
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const TIME_WAIT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 网络接口路由元数据，确保通过 WinDivert 注回本机时使用与原出站包一致的接口索引及卸载标志
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -267,8 +269,10 @@ struct BridgeInner {
     to_socket: VecDeque<u8>,
     socket_eof_to_app: bool,
     socket_errored: bool,
+    socket_closed: bool,
     app_read_closed: bool,
     app_write_closed: bool,
+    graceful_shutdown: bool,
     fin_sent_to_socket: bool,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
@@ -282,13 +286,32 @@ impl Default for BridgeInner {
             to_socket: VecDeque::with_capacity(4096),
             socket_eof_to_app: false,
             socket_errored: false,
+            socket_closed: false,
             app_read_closed: false,
             app_write_closed: false,
+            graceful_shutdown: false,
             fin_sent_to_socket: false,
             read_waker: None,
             write_waker: None,
             flush_waker: None,
         }
+    }
+}
+
+fn take_all_wakers(
+    inner: &mut BridgeInner,
+    wake_read: &mut Option<Waker>,
+    wake_write: &mut Option<Waker>,
+    wake_flush: &mut Option<Waker>,
+) {
+    if wake_read.is_none() {
+        *wake_read = inner.read_waker.take();
+    }
+    if wake_write.is_none() {
+        *wake_write = inner.write_waker.take();
+    }
+    if wake_flush.is_none() {
+        *wake_flush = inner.flush_waker.take();
     }
 }
 
@@ -388,7 +411,7 @@ impl AsyncRead for SmoltcpReadHalf {
                     io::ErrorKind::ConnectionReset,
                     "Transparent TCP connection reset by local peer",
                 )))
-            } else if inner.socket_eof_to_app {
+            } else if inner.socket_eof_to_app || inner.socket_closed {
                 Poll::Ready(Ok(()))
             } else {
                 inner.read_waker = Some(cx.waker().clone());
@@ -421,10 +444,10 @@ impl AsyncWrite for SmoltcpWriteHalf {
                     "Transparent TCP connection reset during write",
                 )));
             }
-            if inner.app_write_closed {
+            if inner.socket_closed || inner.app_write_closed {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "Transparent TCP write half already shut down",
+                    "Transparent TCP write half already closed",
                 )));
             }
             let avail = BRIDGE_BUFFER_LIMIT.saturating_sub(inner.to_socket.len());
@@ -453,6 +476,12 @@ impl AsyncWrite for SmoltcpWriteHalf {
         if inner.to_socket.is_empty() {
             return Poll::Ready(Ok(()));
         }
+        if inner.socket_closed {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Transparent TCP connection closed before flush completed",
+            )));
+        }
         inner.flush_waker = Some(cx.waker().clone());
         drop(inner);
         self.bridge.signal.wake_pump();
@@ -463,8 +492,21 @@ impl AsyncWrite for SmoltcpWriteHalf {
         let wake_now = {
             let mut inner = self.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.app_write_closed = true;
-            if inner.socket_errored || (inner.to_socket.is_empty() && inner.fin_sent_to_socket) {
+            inner.graceful_shutdown = true;
+            if inner.socket_errored {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "Transparent TCP connection reset during shutdown",
+                )));
+            }
+            if inner.to_socket.is_empty() && (inner.fin_sent_to_socket || inner.socket_closed) {
                 return Poll::Ready(Ok(()));
+            }
+            if inner.socket_closed {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Transparent TCP connection closed before shutdown completed",
+                )));
             }
             inner.flush_waker = Some(cx.waker().clone());
             true
@@ -601,6 +643,9 @@ struct InterceptedSession {
     meta: PacketInterfaceMeta,
     created_at: Instant,
     ever_established: bool,
+    last_state: tcp::State,
+    teardown_since: Option<Instant>,
+    time_wait_since: Option<Instant>,
 }
 
 /// 单所有权用户态 TCP/IP 协议栈引擎：负责四元组流分拣、孤立 Listen 握手防碰撞、双向缓冲泵送及异常连接清理
@@ -802,6 +847,9 @@ impl NetstackEngine {
                 meta,
                 created_at: now,
                 ever_established: matches!(post_state, tcp::State::Established),
+                last_state: post_state,
+                teardown_since: None,
+                time_wait_since: None,
             },
         );
         self.drain_tx_with_lookup(meta, tx_out);
@@ -857,7 +905,7 @@ impl NetstackEngine {
             {
                 let mut inner = session.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
 
-                // A. socket -> to_app
+                // A. socket -> to_app（先消费缓冲区残余数据）
                 if !inner.app_read_closed {
                     while sock.can_recv() && inner.to_app.len() < BRIDGE_BUFFER_LIMIT {
                         let room = BRIDGE_BUFFER_LIMIT - inner.to_app.len();
@@ -874,89 +922,128 @@ impl NetstackEngine {
                     }
                 }
 
-                // B. 检测远端（本地应用）是否已发送 FIN 或异常重置
-                if !sock.may_recv() && !sock.can_recv() && !inner.socket_eof_to_app {
+                // F0. Closed 检查必须先于 Step B：否则 RST 会被 !sock.may_recv() 误标为优雅 EOF
+                if state == tcp::State::Closed {
+                    let non_graceful_closed = !matches!(
+                        session.last_state,
+                        tcp::State::TimeWait
+                            | tcp::State::LastAck
+                            | tcp::State::Closing
+                            | tcp::State::Closed
+                    );
+                    if non_graceful_closed {
+                        inner.socket_errored = true;
+                    }
+                    inner.socket_closed = true;
                     inner.socket_eof_to_app = true;
-                    if wake_read.is_none() {
-                        wake_read = inner.read_waker.take();
-                    }
-                }
-
-                // C. to_socket -> socket
-                while !inner.to_socket.is_empty() && sock.can_send() {
-                    let (head, _) = inner.to_socket.as_slices();
-                    if head.is_empty() {
-                        break;
-                    }
-                    match sock.send_slice(head) {
-                        Ok(n) if n > 0 => {
-                            inner.to_socket.drain(..n);
-                            if inner.to_socket.len() < BRIDGE_BUFFER_LIMIT && wake_write.is_none() {
-                                wake_write = inner.write_waker.take();
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-
-                // D. 优雅半关闭写端：待 `to_socket` 完全冲刷入 smoltcp 后触发 TCP FIN
-                if inner.app_write_closed && inner.to_socket.is_empty() && !inner.fin_sent_to_socket
-                {
-                    sock.close();
-                    inner.fin_sent_to_socket = true;
-                }
-
-                if inner.to_socket.is_empty() && inner.flush_waker.is_some() {
-                    wake_flush = inner.flush_waker.take();
-                }
-
-                // E. 若双向均已关闭且未经正常 FIN 发送，直接中止清理
-                if inner.app_read_closed
-                    && inner.app_write_closed
-                    && inner.to_socket.is_empty()
-                    && !inner.fin_sent_to_socket
-                    && state != tcp::State::Closed
-                {
-                    sock.abort();
+                    take_all_wakers(&mut inner, &mut wake_read, &mut wake_write, &mut wake_flush);
                     remove_session = true;
-                }
-
-                // F. 检测异常关闭或长时间停滞在 SynReceived 的半开扫描连接
-                let syn_timed_out = !session.ever_established
-                    && state == tcp::State::SynReceived
-                    && now.saturating_duration_since(session.created_at) >= SYN_RECEIVED_TIMEOUT;
-                if syn_timed_out {
-                    sock.abort();
-                    inner.socket_errored = true;
-                    inner.socket_eof_to_app = true;
-                    if wake_read.is_none() {
-                        wake_read = inner.read_waker.take();
-                    }
-                    if wake_write.is_none() {
-                        wake_write = inner.write_waker.take();
-                    }
-                    if wake_flush.is_none() {
-                        wake_flush = inner.flush_waker.take();
-                    }
-                    remove_session = true;
-                } else if state == tcp::State::Closed {
-                    if !inner.socket_eof_to_app {
-                        // 对端直接 RST 而未经 FIN 时标注 socket_errored
-                        if !session.ever_established {
-                            inner.socket_errored = true;
-                        }
+                } else {
+                    // B. 检测远端（本地应用）是否已发送正常 FIN
+                    if !sock.may_recv() && !sock.can_recv() && !inner.socket_eof_to_app {
                         inner.socket_eof_to_app = true;
+                        if wake_read.is_none() {
+                            wake_read = inner.read_waker.take();
+                        }
                     }
-                    if wake_read.is_none() {
-                        wake_read = inner.read_waker.take();
+
+                    // C. to_socket -> socket
+                    while !inner.to_socket.is_empty() && sock.can_send() {
+                        let (head, _) = inner.to_socket.as_slices();
+                        if head.is_empty() {
+                            break;
+                        }
+                        match sock.send_slice(head) {
+                            Ok(n) if n > 0 => {
+                                inner.to_socket.drain(..n);
+                                if inner.to_socket.len() < BRIDGE_BUFFER_LIMIT
+                                    && wake_write.is_none()
+                                {
+                                    wake_write = inner.write_waker.take();
+                                }
+                            }
+                            _ => break,
+                        }
                     }
-                    if wake_write.is_none() {
-                        wake_write = inner.write_waker.take();
+
+                    // E. 非优雅关闭中止检查（先于 Step D！）：双端已弃用且未触发 shutdown() 时立刻 abort 发 RST 并释放槽位
+                    let ungraceful_drop = inner.app_read_closed
+                        && inner.app_write_closed
+                        && !inner.graceful_shutdown
+                        && !inner.fin_sent_to_socket;
+                    let syn_timed_out = !session.ever_established
+                        && state == tcp::State::SynReceived
+                        && now.saturating_duration_since(session.created_at)
+                            >= SYN_RECEIVED_TIMEOUT;
+
+                    if ungraceful_drop || syn_timed_out {
+                        inner.to_socket.clear();
+                        sock.abort();
+                        inner.socket_errored = true;
+                        inner.socket_closed = true;
+                        inner.socket_eof_to_app = true;
+                        take_all_wakers(
+                            &mut inner,
+                            &mut wake_read,
+                            &mut wake_write,
+                            &mut wake_flush,
+                        );
+                        remove_session = true;
+                    } else {
+                        // D. 优雅半关闭写端：待 `to_socket` 完全冲刷入 smoltcp 后触发 TCP FIN
+                        if inner.app_write_closed
+                            && inner.to_socket.is_empty()
+                            && !inner.fin_sent_to_socket
+                        {
+                            sock.close();
+                            inner.fin_sent_to_socket = true;
+                        }
+
+                        if inner.to_socket.is_empty() && inner.flush_waker.is_some() {
+                            wake_flush = inner.flush_waker.take();
+                        }
+
+                        // F1. 收割长期滞留的 FinWait1/FinWait2/Closing/LastAck/TimeWait 半关连接，防止 4096 槽位耗尽
+                        if state == tcp::State::TimeWait {
+                            session.teardown_since = None;
+                            let tw_since = *session.time_wait_since.get_or_insert(now);
+                            if now.saturating_duration_since(tw_since) >= TIME_WAIT_REAP_TIMEOUT {
+                                inner.socket_closed = true;
+                                inner.socket_eof_to_app = true;
+                                take_all_wakers(
+                                    &mut inner,
+                                    &mut wake_read,
+                                    &mut wake_write,
+                                    &mut wake_flush,
+                                );
+                                remove_session = true;
+                            }
+                        } else if (matches!(state, tcp::State::FinWait1 | tcp::State::FinWait2)
+                            && inner.app_read_closed
+                            && inner.app_write_closed)
+                            || matches!(state, tcp::State::Closing | tcp::State::LastAck)
+                        {
+                            session.time_wait_since = None;
+                            let td_since = *session.teardown_since.get_or_insert(now);
+                            if now.saturating_duration_since(td_since) >= TEARDOWN_TIMEOUT {
+                                inner.to_socket.clear();
+                                sock.abort();
+                                inner.socket_errored = true;
+                                inner.socket_closed = true;
+                                inner.socket_eof_to_app = true;
+                                take_all_wakers(
+                                    &mut inner,
+                                    &mut wake_read,
+                                    &mut wake_write,
+                                    &mut wake_flush,
+                                );
+                                remove_session = true;
+                            }
+                        } else {
+                            session.teardown_since = None;
+                            session.time_wait_since = None;
+                        }
                     }
-                    if wake_flush.is_none() {
-                        wake_flush = inner.flush_waker.take();
-                    }
-                    remove_session = true;
                 }
             }
 
@@ -974,7 +1061,7 @@ impl NetstackEngine {
             }
         }
 
-        // 第二轮 poll：立即将刚写入 smoltcp 发送队列或 close() FIN/RST 发成 IP 包吐出
+        // 第二轮 poll：立即将刚写入 smoltcp 发送队列或 close()/abort() FIN/RST 发成 IP 包吐出
         let smol_now = self.smol_now();
         self.iface
             .poll(smol_now, &mut self.device, &mut self.sockets);
@@ -984,6 +1071,9 @@ impl NetstackEngine {
             if let Some(sess) = self.intercepted.remove(&key) {
                 self.sockets.remove(sess.handle);
             }
+        }
+        for session in self.intercepted.values_mut() {
+            session.last_state = self.sockets.get::<tcp::Socket>(session.handle).state();
         }
     }
 
@@ -1309,6 +1399,225 @@ mod tests {
         writer_handle.await.unwrap();
         assert_eq!(received_from_smoltcp, resp_payload);
         assert!(saw_server_fin);
+    }
+
+    fn build_rst(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, seq: u32, ack: u32) -> Vec<u8> {
+        let mut hdr = TcpHeader::new(sport, dport, seq, 65535);
+        hdr.rst = true;
+        hdr.ack = true;
+        hdr.acknowledgment_number = ack;
+        let builder = PacketBuilder::ipv4(src, dst, 64).tcp_header(hdr);
+        let mut out = Vec::with_capacity(builder.size(0));
+        builder.write(&mut out, &[]).unwrap();
+        out
+    }
+
+    fn establish_ipv4_flow(
+        engine: &mut NetstackEngine,
+        src: [u8; 4],
+        sport: u16,
+        dst: [u8; 4],
+        dport: u16,
+    ) -> (AcceptedTcpFlow, ParsedTcpPacket) {
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+        let meta = PacketInterfaceMeta {
+            if_idx: 3,
+            sub_if_idx: 0,
+            loopback: false,
+            is_ipv6: false,
+            bitfield: 0,
+        };
+        let syn = build_syn(src, sport, dst, dport, 1000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        assert!(syn_ack.syn && syn_ack.ack);
+
+        let ack = build_ack(src, sport, dst, dport, 1001, syn_ack.seq + 1, false, &[]);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let flow = accepted.pop().unwrap();
+        (flow, syn_ack)
+    }
+
+    #[test]
+    fn test_netstack_ungraceful_drop_aborts_with_rst_and_frees_slot() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let (flow, _syn_ack) = establish_ipv4_flow(
+            &mut engine,
+            [192, 168, 1, 20],
+            55100,
+            [93, 184, 216, 34],
+            443,
+        );
+        assert_eq!(engine.active_flow_count(), 1);
+
+        // 模拟 Dispatcher 因 Action::Block / 拨号失败直接丢弃双端流（未调用 shutdown）
+        drop(flow);
+
+        let mut tx = Vec::new();
+        engine.pump(&mut tx);
+
+        assert!(
+            tx.iter()
+                .filter_map(|p| parse_tcp_packet(&p.data))
+                .any(|p| p.rst),
+            "ungraceful stream drop must emit TCP RST instead of silently sticking in FinWait2"
+        );
+        assert_eq!(engine.active_flow_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_netstack_reaps_stalled_fin_wait_2_slot_after_teardown_timeout() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let src = [192, 168, 1, 21];
+        let dst = [93, 184, 216, 34];
+        let sport = 55101;
+        let dport = 80;
+        let (flow, syn_ack) = establish_ipv4_flow(&mut engine, src, sport, dst, dport);
+
+        let (rd, mut wr) = flow.stream.split_stream();
+        drop(rd);
+
+        let writer = tokio::spawn(async move {
+            wr.shutdown().await.unwrap();
+        });
+
+        // 推进 pump 直到 smoltcp 发送 FIN 并让 writer.shutdown() 完成（进入 FinWait1）
+        let mut tx = Vec::new();
+        let mut fin_pkt = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            engine.pump(&mut tx);
+            for p in tx.drain(..) {
+                if let Some(parsed) = parse_tcp_packet(&p.data)
+                    && parsed.fin
+                {
+                    fin_pkt = Some(parsed);
+                }
+            }
+            if writer.is_finished() && fin_pkt.is_some() {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "Timed out waiting for graceful FIN");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        writer.await.unwrap();
+
+        // 客户端仅 ACK 我方 FIN 而不回 FIN -> smoltcp 进入 FinWait2
+        let fin_parsed = fin_pkt.unwrap();
+        let ack_only = build_ack(
+            src,
+            sport,
+            dst,
+            dport,
+            1001,
+            fin_parsed.seq.wrapping_add(1),
+            false,
+            &[],
+        );
+        let mut accepted = Vec::new();
+        let _ = engine.ingest_outbound_tcp(
+            ack_only,
+            PacketInterfaceMeta::default(),
+            Some(9001),
+            None,
+            None,
+            None,
+            &mut accepted,
+            &mut tx,
+        );
+        tx.clear();
+
+        let t0 = Instant::now();
+        engine.pump_internal(t0, &mut tx);
+        assert_eq!(engine.active_flow_count(), 1);
+        let key = TcpFlowKey::new(IpAddr::from(src), sport, IpAddr::from(dst), dport);
+        assert_eq!(
+            engine
+                .sockets
+                .get::<tcp::Socket>(engine.intercepted.get(&key).unwrap().handle)
+                .state(),
+            tcp::State::FinWait2
+        );
+
+        // 超过 TEARDOWN_TIMEOUT 后应自动 abort 并回收 FinWait2 槽位
+        engine.pump_internal(t0 + TEARDOWN_TIMEOUT + Duration::from_millis(50), &mut tx);
+        assert_eq!(engine.active_flow_count(), 0);
+        assert!(
+            tx.iter()
+                .filter_map(|p| parse_tcp_packet(&p.data))
+                .any(|p| p.rst)
+        );
+        let _ = syn_ack;
+    }
+
+    #[tokio::test]
+    async fn test_netstack_established_rst_wakes_and_fails_write_flush_shutdown_and_read() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let src = [192, 168, 1, 22];
+        let dst = [93, 184, 216, 34];
+        let sport = 55102;
+        let dport = 443;
+        let (flow, syn_ack) = establish_ipv4_flow(&mut engine, src, sport, dst, dport);
+        let (mut rd, mut wr) = flow.stream.split_stream();
+
+        // 先写入超过桥梁+窗口容量的数据并等待 write_all 因背压进入 Poll::Pending
+        let fill = vec![b'Z'; BRIDGE_BUFFER_LIMIT];
+        wr.write_all(&fill).await.unwrap();
+
+        let (tx_wr_done, rx_wr_done) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let w_res = wr.write_all(&[b'Q'; 32]).await;
+            let s_res = wr.shutdown().await;
+            let _ = tx_wr_done.send((w_res, s_res));
+        });
+        tokio::task::yield_now().await;
+
+        let (tx_rd_done, rx_rd_done) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let r_res = rd.read(&mut buf).await;
+            let _ = tx_rd_done.send(r_res);
+        });
+        tokio::task::yield_now().await;
+
+        // 已建连会话收到客户端 RST：必须立即唤醒并报错，绝不能挂起到 120s 空闲超时
+        let rst = build_rst(src, sport, dst, dport, 1001, syn_ack.seq + 1);
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+        let _ = engine.ingest_outbound_tcp(
+            rst,
+            PacketInterfaceMeta::default(),
+            Some(9001),
+            None,
+            None,
+            None,
+            &mut accepted,
+            &mut tx,
+        );
+
+        let (w_res, s_res) = tokio::time::timeout(Duration::from_secs(1), rx_wr_done)
+            .await
+            .expect("poll_write / poll_shutdown must wake immediately on RST")
+            .unwrap();
+        assert_eq!(w_res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(s_res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+
+        let r_res = tokio::time::timeout(Duration::from_secs(1), rx_rd_done)
+            .await
+            .expect("poll_read must wake immediately on RST")
+            .unwrap();
+        assert_eq!(r_res.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+        assert_eq!(engine.active_flow_count(), 0);
     }
 
     #[test]
