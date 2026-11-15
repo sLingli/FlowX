@@ -153,10 +153,8 @@ impl Rule {
         }
     }
 
-    /// 仅评估启用状态、应用进程与端口约束，不校验目标域名或 IP/CIDR（供透明代理预判是否需嗅探域名）
-    ///
-    /// 命中返回 `Ok(())`，未命中返回 `"disabled"` | `"app_mismatch"` | `"port_mismatch"`。
-    pub fn matches_app_and_port(&self, ctx: &RouteContext) -> Result<(), &'static str> {
+    /// 仅评估启用状态与应用进程约束（供端口无关的 DNS 预判与通用匹配复用）
+    pub fn matches_app_only(&self, ctx: &RouteContext) -> Result<(), &'static str> {
         if !self.enabled {
             return Err("disabled");
         }
@@ -201,6 +199,21 @@ impl Rule {
                 return Err("app_mismatch");
             }
         }
+
+        Ok(())
+    }
+
+    fn matches_domain(&self, qname: &str) -> bool {
+        self.target_domains
+            .as_ref()
+            .is_some_and(|domains| domains.iter().any(|d| d.matches(qname)))
+    }
+
+    /// 仅评估启用状态、应用进程与端口约束，不校验目标域名或 IP/CIDR（供透明代理预判是否需嗅探域名）
+    ///
+    /// 命中返回 `Ok(())`，未命中返回 `"disabled"` | `"app_mismatch"` | `"port_mismatch"`。
+    pub fn matches_app_and_port(&self, ctx: &RouteContext) -> Result<(), &'static str> {
+        self.matches_app_only(ctx)?;
 
         // 2. 匹配端口
         if let Some(ports) = &self.ports {
@@ -296,6 +309,72 @@ pub enum DomainNeedDecision {
     Immediate(Action),
     /// 存在靠前的按域名匹配规则可能命中当前进程/端口，需等待客户端首包并嗅探 SNI / Host
     NeedsDomainSniff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DnsHijackDecision {
+    /// 放行至真实上游 DNS（保留 AAAA / HTTPS / SVCB / QUIC / 内网记录，不注入 Fake-IP）
+    Passthrough,
+    /// 该 (进程, 查询域名) 可能命中非直连规则，由透明 Fake-IP DNS 接管
+    Hijack,
+}
+
+/// 判定是否为公网可路由单播 IP（排除环回、RFC1918 私网、链路本地、CGNAT、ULA 及 Fake-IP `198.18.0.0/15`）
+fn is_public_unicast_ip(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !v4.is_loopback()
+                && !v4.is_private()
+                && !v4.is_link_local()
+                && !v4.is_unspecified()
+                && !v4.is_broadcast()
+                && !v4.is_multicast()
+                && !(a == 100 && (b & 0xC0) == 64)
+                && !(a == 198 && (b & 0xFE) == 18)
+        }
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (seg0 & 0xfe00) != 0xfc00
+                && (seg0 & 0xffc0) != 0xfe80
+        }
+    }
+}
+
+fn rule_has_applicable_domain(
+    domains: &[DomainMatcher],
+    target_ip: Option<IpAddr>,
+    local_hostname: &str,
+) -> bool {
+    if domains.is_empty() {
+        return false;
+    }
+    if target_ip.is_some_and(is_public_unicast_ip) {
+        domains.iter().any(|d| !d.is_host_local(local_hostname))
+    } else {
+        true
+    }
+}
+
+/// 绝不分配 Fake-IP 的本机 / mDNS / 反向解析 / 单标签主机名集合
+fn is_non_hijackable_local_qname(qname: &str, local_hostname: &str) -> bool {
+    let norm = qname.trim().trim_end_matches('.');
+    if norm.is_empty() || !norm.contains('.') {
+        return true;
+    }
+    let lower = norm.to_ascii_lowercase();
+    let local_norm = local_hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".lan")
+        || lower.ends_with(".home.arpa")
+        || lower == "arpa"
+        || lower.ends_with(".arpa")
+        || (!local_norm.is_empty() && lower == local_norm)
 }
 
 impl RuleEngine {
@@ -473,7 +552,7 @@ impl RuleEngine {
     /// 判断仅依据进程、端口与目标 IP 是否已可安全决定动作，或前方是否存在可能匹配当前流的域名规则
     ///
     /// 仅当返回 `DomainNeedDecision::Immediate(Action::Direct)` 且目标非 Fake-IP 时，
-    /// 透明代理旁路才可直接在驱动层零拷贝放行真实 IP 连接；一旦存在靠前且适用当前进程/端口的域名规则，
+    /// 透明代理旁路才可直接在驱动层零拷贝放行真实 IP 连接；一旦存在靠前且与兜底动作不同的域名规则，
     /// 必须返回 `DomainNeedDecision::NeedsDomainSniff` 以便先接入用户态嗅探 SNI / Host。
     pub fn needs_domain_for_routing(
         &self,
@@ -489,28 +568,125 @@ impl RuleEngine {
             target_ip,
             target_port,
         };
+        let local_hostname = parser::resolve_local_hostname();
         let rules = self.current_rules();
+        let mut speculative_actions: Vec<Action> = Vec::new();
+
         for rule in rules.iter() {
             if rule.matches_app_and_port(&ctx).is_err() {
                 continue;
             }
             if rule.target_domains.is_none() && rule.target_subnets.is_none() {
-                return DomainNeedDecision::Immediate(rule.action.clone());
+                let fallback = rule.action.clone();
+                if speculative_actions.iter().all(|a| a == &fallback) {
+                    return DomainNeedDecision::Immediate(fallback);
+                }
+                return DomainNeedDecision::NeedsDomainSniff;
             }
             if let Some(subnets) = &rule.target_subnets
                 && let Some(ip) = target_ip
                 && subnets.iter().any(|subnet| subnet.contains(&ip))
             {
-                return DomainNeedDecision::Immediate(rule.action.clone());
+                let fallback = rule.action.clone();
+                if speculative_actions.iter().all(|a| a == &fallback) {
+                    return DomainNeedDecision::Immediate(fallback);
+                }
+                return DomainNeedDecision::NeedsDomainSniff;
             }
             if let Some(domains) = &rule.target_domains
-                && !domains.is_empty()
+                && rule_has_applicable_domain(domains, target_ip, &local_hostname)
             {
-                return DomainNeedDecision::NeedsDomainSniff;
+                speculative_actions.push(rule.action.clone());
             }
         }
 
-        DomainNeedDecision::Immediate(self.default_action())
+        let fallback = self.default_action();
+        if speculative_actions.iter().all(|a| a == &fallback) {
+            DomainNeedDecision::Immediate(fallback)
+        } else {
+            DomainNeedDecision::NeedsDomainSniff
+        }
+    }
+
+    /// 结合进程与实际 DNS QNAME 判断 UDP/53 查询是否需要注入 Fake-IP（覆盖全部端口而非仅 80/443），
+    /// 并对共享系统 DNS 解析器（如 Windows `svchost.exe` `Dnscache`）免疫仅限进程且无域名约束规则的全局污染。
+    pub fn classify_dns_query(
+        &self,
+        process_path: Option<&str>,
+        process_name: Option<&str>,
+        qname: &str,
+        is_shared_system_dns: bool,
+    ) -> DnsHijackDecision {
+        let local_hostname = parser::resolve_local_hostname();
+        if is_non_hijackable_local_qname(qname, &local_hostname) {
+            return DnsHijackDecision::Passthrough;
+        }
+
+        let ctx = RouteContext {
+            process_path,
+            process_name,
+            target_host: Some(qname),
+            target_ip: None,
+            target_port: 0,
+        };
+        let rules = self.current_rules();
+
+        for rule in rules.iter() {
+            if !rule.enabled {
+                continue;
+            }
+
+            if !is_shared_system_dns {
+                if rule.matches_app_only(&ctx).is_err() {
+                    continue;
+                }
+                let matched_qname = (rule.target_domains.is_none()
+                    && rule.target_subnets.is_none())
+                    || rule.matches_domain(qname);
+                if !matched_qname {
+                    continue;
+                }
+                if rule.action != Action::Direct {
+                    return DnsHijackDecision::Hijack;
+                }
+                if rule.ports.is_none() {
+                    return DnsHijackDecision::Passthrough;
+                }
+                continue;
+            }
+
+            // 共享系统 DNS（如 svchost.exe）：
+            // 1) 显式针对 svchost.exe 本身的规则，或全局（无应用限定）规则按正常优先级生效；
+            // 2) 仅限其他应用的无域名规则（如 DevProxy）绝不污染系统公共 DNS 缓存；
+            // 3) 若存在明确匹配外部域名的非 Direct 规则（含针对特定应用的域名规则），则对该域名按需 Fake-IP 劫持。
+            let explicitly_scoped_to_other_app = rule.application_patterns.is_some()
+                && rule.matches_app_only(&ctx).is_err();
+
+            if explicitly_scoped_to_other_app {
+                if rule.matches_domain(qname) && rule.action != Action::Direct {
+                    return DnsHijackDecision::Hijack;
+                }
+            } else {
+                let matched_qname = (rule.target_domains.is_none()
+                    && rule.target_subnets.is_none())
+                    || rule.matches_domain(qname);
+                if !matched_qname {
+                    continue;
+                }
+                if rule.action != Action::Direct {
+                    return DnsHijackDecision::Hijack;
+                }
+                if rule.ports.is_none() {
+                    return DnsHijackDecision::Passthrough;
+                }
+            }
+        }
+
+        if self.default_action() != Action::Direct {
+            DnsHijackDecision::Hijack
+        } else {
+            DnsHijackDecision::Passthrough
+        }
     }
 
     /// 模拟流量路由并返回完整的逐条规则匹配与跳过原因诊断轨迹
@@ -931,6 +1107,203 @@ mod tests {
         assert_eq!(
             engine.needs_domain_for_routing(Some("/usr/bin/ssh"), Some("ssh"), Some(public_ip), 443),
             DomainNeedDecision::Immediate(Action::Direct)
+        );
+    }
+
+    #[test]
+    fn test_local_bypass_pruning_and_selective_dns_classification() {
+        let local_host = parser::resolve_local_hostname();
+        let profile_engine = RuleEngine::new(
+            vec![
+                Rule::from_raw(
+                    "LocalBypass",
+                    true,
+                    None,
+                    Some("127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16"),
+                    None,
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "DevProxy",
+                    true,
+                    Some("node.exe; *chrome*.exe; *git*.exe; *antigravity*.exe"),
+                    None,
+                    None,
+                    Action::Proxy(101),
+                ),
+            ],
+            Action::Direct,
+        );
+
+        let public_ip: IpAddr = "142.250.1.1".parse().unwrap();
+        let private_192: IpAddr = "192.168.1.50".parse().unwrap();
+        let private_10: IpAddr = "10.0.0.5".parse().unwrap();
+
+        // Direct 应用访问公网 IP：LocalBypass 仅含本机域名且与兜底 Direct 同效，绝不触发 SNI 嗅探
+        assert_eq!(
+            profile_engine.needs_domain_for_routing(
+                Some(r"C:\Windows\System32\curl.exe"),
+                Some("curl.exe"),
+                Some(public_ip),
+                443,
+            ),
+            DomainNeedDecision::Immediate(Action::Direct)
+        );
+
+        // DevProxy 应用访问公网 IP：LocalBypass 忽略本机域名 -> 直接 Immediate(Proxy(101))，免去 120ms SNI 等待
+        assert_eq!(
+            profile_engine.needs_domain_for_routing(
+                Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                Some("chrome.exe"),
+                Some(public_ip),
+                443,
+            ),
+            DomainNeedDecision::Immediate(Action::Proxy(101))
+        );
+
+        // DevProxy 应用访问 192.168/16 -> 命中 LocalBypass Subnet -> Immediate(Direct)
+        assert_eq!(
+            profile_engine.needs_domain_for_routing(
+                Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                Some("chrome.exe"),
+                Some(private_192),
+                8080,
+            ),
+            DomainNeedDecision::Immediate(Action::Direct)
+        );
+
+        // DevProxy 应用访问非 192.168 私网 IP 10.0.0.5 -> 仍保留 Host 嗅探以识别内网 %ComputerName%
+        assert_eq!(
+            profile_engine.needs_domain_for_routing(
+                Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                Some("chrome.exe"),
+                Some(private_10),
+                8080,
+            ),
+            DomainNeedDecision::NeedsDomainSniff
+        );
+
+        // Windows 共享 DNS 客户端 (svchost.exe) 在仅有进程无域名规则 (DevProxy) 时必须全部 Passthrough，绝不污染系统 DNS
+        assert_eq!(
+            profile_engine.classify_dns_query(
+                Some(r"C:\Windows\System32\svchost.exe"),
+                Some("svchost.exe"),
+                "www.baidu.com",
+                true,
+            ),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            profile_engine.classify_dns_query(
+                Some(r"C:\Windows\System32\svchost.exe"),
+                Some("svchost.exe"),
+                "github.com",
+                true,
+            ),
+            DnsHijackDecision::Passthrough
+        );
+
+        // 若应用自身进程直接发出 UDP/53 查询，则按其自身规则精准判定
+        assert_eq!(
+            profile_engine.classify_dns_query(
+                Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                Some("chrome.exe"),
+                "github.com",
+                false,
+            ),
+            DnsHijackDecision::Hijack
+        );
+        assert_eq!(
+            profile_engine.classify_dns_query(
+                Some(r"C:\Windows\System32\curl.exe"),
+                Some("curl.exe"),
+                "www.baidu.com",
+                false,
+            ),
+            DnsHijackDecision::Passthrough
+        );
+
+        // 非 80/443 端口限定域名规则、本机名、mDNS (.local)、rDNS (.arpa)、单标签主机名测试
+        let mixed_engine = RuleEngine::new(
+            vec![
+                Rule::from_raw(
+                    "BypassDirect",
+                    true,
+                    None,
+                    Some("direct.example"),
+                    None,
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "BypassHttpsOnly",
+                    true,
+                    None,
+                    Some("halfdirect.example"),
+                    Some("443"),
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "GameUdpProxy",
+                    true,
+                    Some("game.exe"),
+                    Some("*.game.example"),
+                    Some("7777"),
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
+                    "FallbackGlobalProxy",
+                    true,
+                    None,
+                    Some("*.proxy.example"),
+                    None,
+                    Action::Proxy(101),
+                ),
+            ],
+            Action::Direct,
+        );
+
+        // 7777 端口限定的应用域名规则也能在 DNS 阶段正确捕获，不会再因硬编码 80/443 漏放
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "login.game.example", true),
+            DnsHijackDecision::Hijack
+        );
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "unrelated.org", true),
+            DnsHijackDecision::Passthrough
+        );
+
+        // 即使全局默认代理，mDNS / .arpa / localhost / 单标签名 / 本机主机名也绝不被 Fake-IP 劫持
+        let global_proxy = RuleEngine::new(
+            vec![Rule::from_raw("DirectApex", true, None, Some("direct.example"), None, Action::Direct)],
+            Action::Proxy(101),
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), "localhost", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), "printer.local", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), "1.0.0.127.in-addr.arpa", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), "intranetbox", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), &local_host, true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), "direct.example", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            global_proxy.classify_dns_query(None, Some("svchost.exe"), "public.example", true),
+            DnsHijackDecision::Hijack
         );
     }
 }

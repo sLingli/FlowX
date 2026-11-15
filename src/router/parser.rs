@@ -90,6 +90,21 @@ impl DomainMatcher {
             }
         }
     }
+
+    /// 判断域名匹配器是否仅针对本机自身标识（如 `localhost`、`*.localhost` 或当前主机名），
+    /// 用于在访问公网单播 IP 时跳过不必要的 SNI/Host 嗅探，避免 `LocalBypass` 拖慢或污染透明代理。
+    pub fn is_host_local(&self, local_hostname: &str) -> bool {
+        let host_norm = local_hostname.trim().trim_end_matches('.');
+        match self {
+            DomainMatcher::Exact(exact) => {
+                exact.eq_ignore_ascii_case("localhost")
+                    || exact.ends_with(".localhost")
+                    || (!host_norm.is_empty() && exact.eq_ignore_ascii_case(host_norm))
+            }
+            DomainMatcher::Suffix(suffix) => suffix.eq_ignore_ascii_case("localhost"),
+            DomainMatcher::Pattern(_) => false,
+        }
+    }
 }
 
 /// 规则主干至少包含一个具体（非纯通配符）文件名字符时，才在规则编译期补充无 `.exe` 变体，

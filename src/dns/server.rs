@@ -727,8 +727,11 @@ impl DnsServer {
         Ok(Arc::new(socket))
     }
 
-    /// 直接处理原始 DNS 查询报文（与 UDP 监听端共用 Fake-IP 分配、IPv6/HTTPS 防泄漏屏蔽及上游受控转发逻辑）
-    pub async fn process_query_bytes(&self, query_bytes: &[u8]) -> Option<Vec<u8>> {
+    async fn process_query_with_upstream(
+        &self,
+        query_bytes: &[u8],
+        upstream_dns: SocketAddr,
+    ) -> Option<Vec<u8>> {
         let Ok(_permit) = self.concurrency_limit.clone().try_acquire_owned() else {
             warn!("[DNS Engine] Dropped transparent DNS query exceeding concurrency limit (5000)");
             return None;
@@ -736,13 +739,43 @@ impl DnsServer {
         let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
         handle_dns_query_bytes(
             &self.pool,
-            self.upstream_dns,
+            upstream_dns,
             self.block_ipv6,
             &self.upstream_limit,
             query_bytes,
             None,
         )
         .await
+    }
+
+    /// 直接处理原始 DNS 查询报文（与 UDP 监听端共用 Fake-IP 分配、IPv6/HTTPS 防泄漏屏蔽及上游受控转发逻辑）
+    pub async fn process_query_bytes(&self, query_bytes: &[u8]) -> Option<Vec<u8>> {
+        self.process_query_with_upstream(query_bytes, self.upstream_dns)
+            .await
+    }
+
+    /// 透明代理专用 DNS 查询处理：保留原始报文目的 DNS 服务器 `orig_dst` 供非 `A/AAAA/HTTPS` 记录（如 `TXT`/`SRV`/`CNAME`）直达企业/VPN 原配 DNS，仅当目标无效或指向自身监听器时回退默认上游
+    pub async fn process_transparent_query_bytes(
+        &self,
+        query_bytes: &[u8],
+        orig_dst: SocketAddr,
+    ) -> Option<Vec<u8>> {
+        let dst_ip = orig_dst.ip().to_canonical();
+        let bind_ip = self.bind_addr.ip().to_canonical();
+        let points_to_self = orig_dst.port() == self.bind_addr.port()
+            && self.bind_addr.port() != 0
+            && (dst_ip == bind_ip || (bind_ip.is_unspecified() && dst_ip.is_loopback()));
+        let effective_upstream = if orig_dst.port() == 0
+            || dst_ip.is_unspecified()
+            || self.pool.is_fake_ip_addr(dst_ip)
+            || points_to_self
+        {
+            self.upstream_dns
+        } else {
+            SocketAddr::new(dst_ip, orig_dst.port())
+        };
+        self.process_query_with_upstream(query_bytes, effective_upstream)
+            .await
     }
 
     /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and ephemeral upstream isolation)
@@ -1266,5 +1299,39 @@ mod tests {
             .expect("AAAA query with block_ipv6=true should yield empty answer response");
         assert_eq!(&aaaa_resp[0..2], &[0x66, 0xBB]);
         assert_eq!(&aaaa_resp[6..8], &[0x00, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_process_transparent_query_bytes_preserves_orig_dst_upstream() {
+        let mock_up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_up.local_addr().unwrap();
+        let up_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, peer) = mock_up.recv_from(&mut buf).await.unwrap();
+            let (_txid, q) = DnsPacketParser::parse_question(&buf[..n]).unwrap();
+            assert_eq!(q.qtype, 16);
+            // 回送标准 RCODE=0 响应，保持相同 TxID 与 Question 段
+            let mut resp = Vec::with_capacity(n);
+            resp.extend_from_slice(&buf[0..2]);
+            resp.extend_from_slice(&[0x81, 0x80]); // QR=1, RD=1, RA=1
+            resp.extend_from_slice(&buf[4..n]);
+            mock_up.send_to(&resp, peer).await.unwrap();
+        });
+
+        let pool = Arc::new(FakeIpPool::new_default());
+        // 默认 upstream 指向不可达 TEST-NET，若未保留 orig_dst 则 TXT 请求必然超时失败
+        let server = DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            pool,
+            "192.0.2.1:53".parse().unwrap(),
+            true,
+        );
+        let txt_query = build_sample_query(0x77CC, "corp.internal.example", 16);
+        let resp = server
+            .process_transparent_query_bytes(&txt_query, mock_addr)
+            .await
+            .expect("TXT query must forward to original packet dst_ip:dst_port");
+        up_task.await.unwrap();
+        assert_eq!(&resp[0..2], &[0x77, 0xCC]);
     }
 }

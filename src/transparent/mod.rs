@@ -496,6 +496,11 @@ struct ActiveRuntime {
     driver_version: Option<String>,
 }
 
+/// WinDivert NETWORK 层过滤表达式：捕获全部出站非自环 TCP、UDP/53 DNS、UDP/443 QUIC 以及发往 Fake-IP (`198.18.0.0/15`) 的任意 UDP
+pub(crate) fn windivert_network_filter() -> &'static str {
+    "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255))"
+}
+
 /// 透明代理全生命周期管理器：负责 WinDivert 驱动加载、双层截获线程调度、错误诊断与 Drop 安全回收
 pub struct TransparentManager {
     dispatcher_config: Arc<DispatcherConfig>,
@@ -728,8 +733,7 @@ impl TransparentManager {
             })?,
         );
 
-        let network_filter =
-            "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443)";
+        let network_filter = windivert_network_filter();
         let network_handle = Arc::new(
             windivert_ffi::WinDivertHandle::open(
                 Arc::clone(&api),
@@ -878,6 +882,7 @@ impl TransparentManager {
                                 dns_hijack::UdpDecision::DropQuic => {
                                     stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
                                 }
+                                dns_hijack::UdpDecision::DropFakeIp => {}
                                 dns_hijack::UdpDecision::HandleDns => {
                                     stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
                                     let owned_payload = udp.payload.to_vec();
@@ -892,8 +897,14 @@ impl TransparentManager {
                                     let dns = Arc::clone(&dns_srv);
                                     let loopback = addr.loopback();
                                     rt.spawn(async move {
-                                        if let Some(resp_payload) =
-                                            dns.process_query_bytes(&owned_payload).await
+                                        let orig_dns_dst =
+                                            std::net::SocketAddr::new(req_meta.1, req_meta.3);
+                                        if let Some(resp_payload) = dns
+                                            .process_transparent_query_bytes(
+                                                &owned_payload,
+                                                orig_dns_dst,
+                                            )
+                                            .await
                                         {
                                             let pseudo_req = dns_hijack::ParsedUdpPacket {
                                                 src_ip: req_meta.0,
@@ -1254,5 +1265,14 @@ mod tests {
             "unexpected ipconfig dir: {}",
             ipconfig.display()
         );
+    }
+
+    #[test]
+    fn test_windivert_network_filter_captures_fake_ip_udp() {
+        let f = windivert_network_filter();
+        assert!(f.contains("udp.DstPort == 53"));
+        assert!(f.contains("udp.DstPort == 443"));
+        assert!(f.contains("198.18.0.0"));
+        assert!(f.contains("198.19.255.255"));
     }
 }

@@ -3,16 +3,42 @@ use std::net::IpAddr;
 
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 
+use crate::dns::server::DnsPacketParser;
 use crate::dns::FakeIpPool;
 use crate::interceptor::process::ProcessTracker;
 use crate::outbound::bypass::is_udp_port_bypassed;
-use crate::router::{Action, DomainNeedDecision, RuleEngine};
+use crate::router::{Action, DnsHijackDecision, DomainNeedDecision, RuleEngine};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDecision {
     Passthrough,
     DropQuic,
+    DropFakeIp,
     HandleDns,
+}
+
+/// 识别代表系统共享 DNS 解析器（如 Windows `svchost.exe` DNS Client）发起 UDP/53 查询的进程
+pub fn is_shared_system_dns_process(
+    process_path: Option<&str>,
+    process_name: Option<&str>,
+) -> bool {
+    let base = process_name
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            process_path.and_then(|p| {
+                p.rsplit(['\\', '/'])
+                    .next()
+                    .filter(|s| !s.is_empty())
+            })
+        });
+    let Some(name) = base.map(str::trim) else {
+        return false;
+    };
+    name.eq_ignore_ascii_case("svchost.exe")
+        || name.eq_ignore_ascii_case("svchost")
+        || name.eq_ignore_ascii_case("dnscache")
+        || name.eq_ignore_ascii_case("systemd-resolved")
+        || name.eq_ignore_ascii_case("mdnsresponder")
 }
 
 /// 从原始 IP 数据包中解析出的轻量 UDP 视图（兼容 IPv4 与 IPv6，自动剔除分片报文）
@@ -129,11 +155,25 @@ pub fn decide_udp_packet(
         return UdpDecision::Passthrough;
     }
 
+    // 发往 Fake-IP 地址段的任意非 53 端口 UDP（443 QUIC、8443、游戏/STUN 等）均无法直接穿透公网，必须全部拦截丢弃
+    if pkt.dst_port != 53
+        && fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(pkt.dst_ip))
+    {
+        return if pkt.dst_port == 443 {
+            UdpDecision::DropQuic
+        } else {
+            UdpDecision::DropFakeIp
+        };
+    }
+
     match pkt.dst_port {
         53 => {
             if !hijack_dns || pkt.payload.len() < 12 {
                 return UdpDecision::Passthrough;
             }
+            let Ok((_, question)) = DnsPacketParser::parse_question(pkt.payload) else {
+                return UdpDecision::Passthrough;
+            };
             let Some(re) = rule_engine else {
                 return UdpDecision::HandleDns;
             };
@@ -141,27 +181,17 @@ pub fn decide_udp_packet(
             let proc_info = pid.and_then(|p| tracker.and_then(|t| t.resolve_pid(p)));
             let proc_path = proc_info.as_ref().map(|i| i.path.as_str());
             let proc_name = proc_info.as_ref().map(|i| i.name.as_str());
+            let is_shared = pid.is_none() || is_shared_system_dns_process(proc_path, proc_name);
 
-            // 仅当同时覆盖常见 HTTP/TLS 端口的判断皆明确为 Direct（无域名规则或被更高优 Direct 进程规则拦截）时直通系统 DNS
-            let d443 = re.needs_domain_for_routing(proc_path, proc_name, None, 443);
-            let d80 = re.needs_domain_for_routing(proc_path, proc_name, None, 80);
-            if matches!(d443, DomainNeedDecision::Immediate(Action::Direct))
-                && matches!(d80, DomainNeedDecision::Immediate(Action::Direct))
-            {
-                UdpDecision::Passthrough
-            } else {
-                UdpDecision::HandleDns
+            match re.classify_dns_query(proc_path, proc_name, &question.name, is_shared) {
+                DnsHijackDecision::Hijack => UdpDecision::HandleDns,
+                DnsHijackDecision::Passthrough => UdpDecision::Passthrough,
             }
         }
         443 => {
             if !block_quic_for_proxied {
                 return UdpDecision::Passthrough;
             }
-            // 目标为 Fake-IP 时，原始 UDP 无法脱离主机直达外网，必须丢弃 QUIC 促使浏览器回退到 TCP/443
-            if fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(pkt.dst_ip)) {
-                return UdpDecision::DropQuic;
-            }
-
             let Some(re) = rule_engine else {
                 return UdpDecision::DropQuic;
             };
@@ -320,7 +350,7 @@ mod tests {
             );
         }
 
-        // 有域名代理规则时：UDP/53 需劫持，UDP/443 QUIC 需阻断降级
+        // 有域名代理规则 (*.google.com) 时：无关域名 example.com 放行真实 DNS，命中域名 mail.google.com 才劫持
         let domain_engine = build_engine(
             vec![rule_with(
                 "proxy-google",
@@ -333,6 +363,25 @@ mod tests {
         assert_eq!(
             decide_udp_packet(
                 &parsed_dns,
+                Some(99999),
+                true,
+                true,
+                Some(&domain_engine),
+                None,
+                None
+            ),
+            UdpDecision::Passthrough
+        );
+        let google_dns_payload = build_sample_dns_query(0x1123, "mail.google.com", 1);
+        let mut google_dns_pkt = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .udp(40005, 53)
+            .write(&mut google_dns_pkt, &google_dns_payload)
+            .unwrap();
+        let parsed_google_dns = parse_udp_packet(&google_dns_pkt).unwrap();
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_google_dns,
                 Some(99999),
                 true,
                 true,
@@ -389,7 +438,7 @@ mod tests {
             UdpDecision::Passthrough
         );
 
-        // 即使规则引擎未匹配 Proxy，发往 Fake-IP 的 QUIC UDP/443 也必须阻断降级为 TCP
+        // 即使规则引擎未匹配 Proxy（且哪怕 block_quic_for_proxied=false），发往 Fake-IP 的任意非 53 UDP 也必须拦截丢弃
         let pool = FakeIpPool::new_default();
         let fake_ip = pool.allocate("custom.internal");
         let mut fake_quic = Vec::new();
@@ -403,12 +452,45 @@ mod tests {
                 &parsed_fake_quic,
                 Some(99999),
                 true,
-                true,
+                false,
                 Some(&direct_only_engine),
                 None,
                 Some(&pool),
             ),
             UdpDecision::DropQuic
         );
+
+        let mut fake_game_udp = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 2], fake_ip.octets(), 64)
+            .udp(40004, 7777)
+            .write(&mut fake_game_udp, &[0x01, 0x02, 0x03])
+            .unwrap();
+        let parsed_fake_game = parse_udp_packet(&fake_game_udp).unwrap();
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_fake_game,
+                Some(99999),
+                true,
+                false,
+                Some(&direct_only_engine),
+                None,
+                Some(&pool),
+            ),
+            UdpDecision::DropFakeIp
+        );
+
+        // 验证共享系统 DNS 进程识别辅助函数
+        assert!(is_shared_system_dns_process(
+            Some(r"C:\Windows\System32\svchost.exe"),
+            Some("svchost.exe")
+        ));
+        assert!(is_shared_system_dns_process(
+            Some(r"C:\Windows\System32\svchost.exe"),
+            None
+        ));
+        assert!(!is_shared_system_dns_process(
+            Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            Some("chrome.exe")
+        ));
     }
 }
