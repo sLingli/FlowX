@@ -678,6 +678,7 @@ pub struct TransparentManager {
     dispatcher_config: Arc<DispatcherConfig>,
     dns_server: Arc<DnsServer>,
     settings: Mutex<TransparentSettings>,
+    persisted_enabled: AtomicBool,
     live_hijack_dns: Arc<AtomicBool>,
     live_block_quic: Arc<AtomicBool>,
     stats: Arc<TransparentStatsCounters>,
@@ -693,12 +694,29 @@ impl TransparentManager {
         dns_server: Arc<DnsServer>,
         initial_settings: TransparentSettings,
     ) -> Arc<Self> {
+        let persisted_enabled = initial_settings.enabled;
+        Self::new_with_persisted(
+            dispatcher_config,
+            dns_server,
+            initial_settings,
+            persisted_enabled,
+        )
+    }
+
+    /// 构造透明代理管理器并显式区分磁盘持久化开关 `persisted_enabled` 与临时启动覆写开关 `initial_settings.enabled`
+    pub fn new_with_persisted(
+        dispatcher_config: Arc<DispatcherConfig>,
+        dns_server: Arc<DnsServer>,
+        initial_settings: TransparentSettings,
+        persisted_enabled: bool,
+    ) -> Arc<Self> {
         let hijack = initial_settings.hijack_dns;
         let block_quic = initial_settings.block_quic_for_proxied;
         Arc::new(Self {
             dispatcher_config,
             dns_server,
             settings: Mutex::new(initial_settings),
+            persisted_enabled: AtomicBool::new(persisted_enabled),
             live_hijack_dns: Arc::new(AtomicBool::new(hijack)),
             live_block_quic: Arc::new(AtomicBool::new(block_quic)),
             stats: Arc::new(TransparentStatsCounters::default()),
@@ -714,6 +732,17 @@ impl TransparentManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// 返回应持久化写入配置文件的透明代理设置（不被 `--transparent` / `--no-transparent` 临时启动参数污染）
+    pub fn persisted_settings(&self) -> TransparentSettings {
+        let mut cfg = self.settings();
+        cfg.enabled = self.persisted_enabled.load(Ordering::Acquire);
+        cfg
+    }
+
+    pub fn set_persisted_enabled(&self, enabled: bool) {
+        self.persisted_enabled.store(enabled, Ordering::Release);
     }
 
     pub fn is_running(&self) -> bool {
@@ -1433,5 +1462,55 @@ mod tests {
             Some(MAX_NET_RX_BUF_LEN)
         );
         assert_eq!(next_net_rx_buf_len(MAX_NET_RX_BUF_LEN), None);
+    }
+
+    #[test]
+    fn test_transparent_manager_persisted_enabled_isolated_from_cli_override() {
+        use crate::dns::FakeIpPool;
+        use crate::interceptor::process::ProcessTracker;
+        use crate::monitor::ConnectionManager;
+        use crate::router::{Action, RuleEngine};
+        use std::collections::HashMap;
+        use std::sync::RwLock;
+
+        let fake_ip_pool = Arc::new(FakeIpPool::new_default());
+        let dispatcher_cfg = Arc::new(DispatcherConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            tracker: Arc::new(ProcessTracker::new()),
+            fake_ip_pool: Arc::clone(&fake_ip_pool),
+            upstream_dns: "223.5.5.5:53".parse().unwrap(),
+            rule_engine: Arc::new(RuleEngine::new(vec![], Action::Direct)),
+            monitor: Arc::new(ConnectionManager::new()),
+            proxy_nodes: Arc::new(RwLock::new(HashMap::new())),
+            proxy_chains: Arc::new(HashMap::new()),
+            self_ports: Vec::new(),
+        });
+        let dns_server = Arc::new(DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            fake_ip_pool,
+            "223.5.5.5:53".parse().unwrap(),
+            true,
+        ));
+
+        // 模拟配置中 enabled=true 但 CLI 传入 --no-transparent 的场景
+        let mgr = TransparentManager::new_with_persisted(
+            dispatcher_cfg,
+            dns_server,
+            TransparentSettings {
+                enabled: false,
+                hijack_dns: false,
+                block_quic_for_proxied: true,
+                dll_path: Some(r"C:\test\WinDivert.dll".to_string()),
+            },
+            true,
+        );
+        assert!(!mgr.settings().enabled);
+        let persisted = mgr.persisted_settings();
+        assert!(persisted.enabled);
+        assert!(!persisted.hijack_dns);
+        assert_eq!(persisted.dll_path.as_deref(), Some(r"C:\test\WinDivert.dll"));
+
+        mgr.set_persisted_enabled(false);
+        assert!(!mgr.persisted_settings().enabled);
     }
 }

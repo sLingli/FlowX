@@ -59,10 +59,11 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(old_pid) = replace_pid {
         info!(
-            "[Startup] Waiting up to 12s for previous FlowX instance PID {} to release ports...",
+            "[Startup] Waiting up to {}s for previous FlowX instance PID {} to release ports...",
+            REPLACE_PID_WAIT_TIMEOUT.as_secs(),
             old_pid
         );
-        wait_for_pid_exit(old_pid, Duration::from_secs(12)).await;
+        wait_for_pid_exit(old_pid, REPLACE_PID_WAIT_TIMEOUT).await;
     }
 
     // 2. 初始化核心组件与端口规划
@@ -98,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         runtime_profile.rules,
         runtime_profile.default_action,
     ));
+    let persisted_transparent_enabled = runtime_profile.transparent_settings.enabled;
     let mut effective_transparent = runtime_profile.transparent_settings;
     if let Some(ov) = transparent_override {
         effective_transparent.enabled = ov;
@@ -132,10 +134,11 @@ async fn main() -> anyhow::Result<()> {
         .with_in_flight(Arc::clone(&in_flight));
     let dispatcher_listener = dispatcher.bind().await?;
 
-    let transparent_mgr = TransparentManager::new(
+    let transparent_mgr = TransparentManager::new_with_persisted(
         Arc::new(dispatcher_config),
         Arc::clone(&dns_server),
         effective_transparent,
+        persisted_transparent_enabled,
     );
 
     // 5. 初始化全局优雅停机广播通知通道
@@ -172,10 +175,11 @@ async fn main() -> anyhow::Result<()> {
         match tokio::task::spawn_blocking(move || t_mgr.start(&rt_handle)).await {
             Ok(Ok(())) => {
                 if replace_pid.is_some() && transparent_override == Some(true) {
+                    transparent_mgr.set_persisted_enabled(true);
                     let store = Arc::clone(&config_store);
                     let nodes = Arc::clone(&proxy_nodes);
                     let engine = Arc::clone(&rule_engine);
-                    let t_settings = transparent_mgr.settings();
+                    let t_settings = transparent_mgr.persisted_settings();
                     if let Err(e) = tokio::task::spawn_blocking(move || {
                         store.save_runtime_with_transparent(&nodes, &engine, Some(&t_settings))
                     })
@@ -267,34 +271,14 @@ async fn main() -> anyhow::Result<()> {
     info!("[Ready] Web console ready at: http://127.0.0.1:40080");
     info!("[Ready] Press Ctrl+C (or send SIGTERM) to stop FlowX core");
 
-    // 8. 同时等待 OS 停机信号与核心任务异常退出
-    let mut unexpected_exit: Option<anyhow::Error> = None;
-    tokio::select! {
-        sig_res = wait_for_shutdown_signal() => {
-            let sig_name = sig_res?;
-            info!("[Shutdown] Received {} signal, stopping inbound traffic...", sig_name);
-        }
-        joined = core_tasks.join_next() => {
-            match joined {
-                Some(Ok((name, Ok(())))) => {
-                    let err = anyhow::anyhow!("Core service task '{}' exited unexpectedly before shutdown signal", name);
-                    tracing::error!("[Shutdown] {:#}", err);
-                    unexpected_exit = Some(err);
-                }
-                Some(Ok((name, Err(e)))) => {
-                    let err = anyhow::anyhow!("Core service task '{}' failed: {:#}", name, e);
-                    tracing::error!("[Shutdown] {:#}", err);
-                    unexpected_exit = Some(err);
-                }
-                Some(Err(join_err)) => {
-                    let err = anyhow::anyhow!("Core service task panicked or was cancelled: {}", join_err);
-                    tracing::error!("[Shutdown] {:#}", err);
-                    unexpected_exit = Some(err);
-                }
-                None => {}
-            }
-        }
-    }
+    // 8. 同时等待 OS 停机信号、内部停机通知（如提权交接）与核心任务异常退出
+    let mut main_shutdown_rx = shutdown_rx.clone();
+    let unexpected_exit = wait_for_shutdown_or_core_exit(
+        &mut core_tasks,
+        &mut main_shutdown_rx,
+        wait_for_shutdown_signal(),
+    )
+    .await?;
     let _ = shutdown_tx.send(true);
     let t_stop = Arc::clone(&transparent_mgr);
     let _ = tokio::task::spawn_blocking(move || t_stop.stop()).await;
@@ -390,5 +374,118 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
             .await
             .context("Failed to listen for Ctrl+C shutdown signal")?;
         Ok("Ctrl+C")
+    }
+}
+
+const REPLACE_PID_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
+
+async fn wait_for_watch_shutdown(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+}
+
+async fn wait_for_shutdown_or_core_exit<F>(
+    core_tasks: &mut tokio::task::JoinSet<(&'static str, anyhow::Result<()>)>,
+    shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
+    os_signal_fut: F,
+) -> anyhow::Result<Option<anyhow::Error>>
+where
+    F: std::future::Future<Output = anyhow::Result<&'static str>>,
+{
+    tokio::pin!(os_signal_fut);
+    tokio::select! {
+        biased;
+        sig_res = &mut os_signal_fut => {
+            let sig_name = sig_res?;
+            info!("[Shutdown] Received {} signal, stopping inbound traffic...", sig_name);
+            Ok(None)
+        }
+        _ = wait_for_watch_shutdown(shutdown_rx) => {
+            info!("[Shutdown] Received internal shutdown signal, stopping inbound traffic...");
+            Ok(None)
+        }
+        joined = core_tasks.join_next() => {
+            if *shutdown_rx.borrow() {
+                return Ok(None);
+            }
+            match joined {
+                Some(Ok((name, Ok(())))) => {
+                    let err = anyhow::anyhow!(
+                        "Core service task '{}' exited unexpectedly before shutdown signal",
+                        name
+                    );
+                    tracing::error!("[Shutdown] {:#}", err);
+                    Ok(Some(err))
+                }
+                Some(Ok((name, Err(e)))) => {
+                    let err = anyhow::anyhow!("Core service task '{}' failed: {:#}", name, e);
+                    tracing::error!("[Shutdown] {:#}", err);
+                    Ok(Some(err))
+                }
+                Some(Err(join_err)) => {
+                    let err = anyhow::anyhow!(
+                        "Core service task panicked or was cancelled: {}",
+                        join_err
+                    );
+                    tracing::error!("[Shutdown] {:#}", err);
+                    Ok(Some(err))
+                }
+                None => Ok(None),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_internal_watch_shutdown_exits_cleanly_while_unexpected_task_exit_errors() {
+        const { assert!(REPLACE_PID_WAIT_TIMEOUT.as_secs() >= 20) };
+
+        // 1. 收到内部停机信号（如 /api/transparent/elevate 发送 shutdown_tx=true）时，
+        //    即使核心任务随之同步退出，也不得判定为 unexpected_exit
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        let mut tasks: tokio::task::JoinSet<(&'static str, anyhow::Result<()>)> =
+            tokio::task::JoinSet::new();
+        let mut rx_task = rx.clone();
+        tasks.spawn(async move {
+            wait_for_watch_shutdown(&mut rx_task).await;
+            ("api", Ok(()))
+        });
+
+        tx.send(true).unwrap();
+        let outcome = wait_for_shutdown_or_core_exit(
+            &mut tasks,
+            &mut rx,
+            std::future::pending::<anyhow::Result<&'static str>>(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            outcome.is_none(),
+            "internal shutdown_tx must yield clean exit: {outcome:?}"
+        );
+
+        // 2. 未触发 shutdown_tx 时若核心任务自行退出，必须返回 unexpected_exit 错误
+        let (_tx2, mut rx2) = tokio::sync::watch::channel(false);
+        let mut tasks2: tokio::task::JoinSet<(&'static str, anyhow::Result<()>)> =
+            tokio::task::JoinSet::new();
+        tasks2.spawn(async { ("dns", Ok(())) });
+        let outcome2 = wait_for_shutdown_or_core_exit(
+            &mut tasks2,
+            &mut rx2,
+            std::future::pending::<anyhow::Result<&'static str>>(),
+        )
+        .await
+        .unwrap();
+        assert!(outcome2.is_some());
     }
 }

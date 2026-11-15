@@ -949,19 +949,7 @@ async fn handle_api_request(
         return Ok(());
     }
 
-    let is_mutation = matches!(
-        (method, path),
-        ("POST" | "PUT" | "PATCH" | "DELETE", "/api/nodes")
-            | ("POST" | "PUT" | "PATCH" | "DELETE", "/api/rules")
-            | (
-                "POST",
-                "/api/rules/default"
-                    | "/api/rules/toggle"
-                    | "/api/rules/move"
-                    | "/api/transparent/toggle"
-            )
-            | ("PUT" | "POST", "/api/transparent/config")
-    );
+    let is_mutation = is_mutation_endpoint(method, path);
     let (mut mutation_guard, mut mutation_sem_permit) = if is_mutation {
         let Ok(sem_permit) = mutation_semaphore.try_acquire() else {
             send_http_response(
@@ -1007,7 +995,7 @@ async fn handle_api_request(
 
     let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
     let mut should_persist = false;
-    let mut rollback_transparent: Option<TransparentSettings> = None;
+    let mut rollback_transparent: Option<TransparentRollbackState> = None;
     let mut trigger_elevated_shutdown = false;
 
     let (mut status, mut content_type, mut body) = match (method, path) {
@@ -1418,7 +1406,7 @@ async fn handle_api_request(
 
     if should_persist {
         let mut persisted_ok = true;
-        let persist_transparent = transparent_manager.as_ref().map(|m| m.settings());
+        let persist_transparent = transparent_manager.as_ref().map(|m| m.persisted_settings());
         if let Some(store) = config_store.as_ref()
             && let Err(e) = persist_config_async_with_timeout(
                 Arc::clone(store),
@@ -1433,13 +1421,16 @@ async fn handle_api_request(
                 "[API] Failed to write updated config to disk, aborting commit: {:#}",
                 e
             );
-            if let (Some(mgr), Some(prev_settings)) =
+            if let (Some(mgr), Some(rb)) =
                 (transparent_manager.as_ref(), rollback_transparent.take())
             {
+                if let Some(prev_pe) = rb.prev_persisted_enabled {
+                    mgr.set_persisted_enabled(prev_pe);
+                }
                 let mgr_clone = Arc::clone(mgr);
                 let rt_handle = tokio::runtime::Handle::current();
                 if let Err(rb_err) = tokio::task::spawn_blocking(move || {
-                    mgr_clone.apply_settings(prev_settings, &rt_handle)
+                    mgr_clone.apply_settings(rb.prev_settings, &rt_handle)
                 })
                 .await
                 .unwrap_or_else(|join_err| Err(format!("rollback task failed: {join_err}")))
@@ -1475,11 +1466,57 @@ async fn handle_api_request(
     drop(mutation_guard.take());
     drop(mutation_sem_permit.take());
 
-    send_http_response(&mut stream, status, content_type, &body).await?;
-    if trigger_elevated_shutdown && let Some(tx) = shutdown_tx.as_ref() {
-        let _ = tx.send(true);
-    }
+    finish_api_response_and_maybe_shutdown(
+        &mut stream,
+        status,
+        content_type,
+        &body,
+        trigger_elevated_shutdown,
+        shutdown_tx.as_ref(),
+    )
+    .await?;
     Ok(())
+}
+
+#[inline]
+fn is_mutation_endpoint(method: &str, path: &str) -> bool {
+    matches!(
+        (method, path),
+        ("POST" | "PUT" | "PATCH" | "DELETE", "/api/nodes")
+            | ("POST" | "PUT" | "PATCH" | "DELETE", "/api/rules")
+            | (
+                "POST",
+                "/api/rules/default"
+                    | "/api/rules/toggle"
+                    | "/api/rules/move"
+                    | "/api/transparent/toggle"
+                    | "/api/transparent/elevate"
+            )
+            | ("PUT" | "POST", "/api/transparent/config")
+    )
+}
+
+struct TransparentRollbackState {
+    prev_settings: TransparentSettings,
+    prev_persisted_enabled: Option<bool>,
+}
+
+async fn finish_api_response_and_maybe_shutdown(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &str,
+    trigger_elevated_shutdown: bool,
+    shutdown_tx: Option<&watch::Sender<bool>>,
+) -> std::io::Result<()> {
+    let send_res = send_http_response(stream, status, content_type, body).await;
+    if trigger_elevated_shutdown {
+        let _ = stream.shutdown().await;
+        if let Some(tx) = shutdown_tx {
+            let _ = tx.send(true);
+        }
+    }
+    send_res
 }
 
 #[allow(clippy::type_complexity)]
@@ -2450,17 +2487,25 @@ fn map_transparent_apply_error(
 async fn apply_transparent_and_stage(
     mgr: &Arc<TransparentManager>,
     next: TransparentSettings,
+    update_persisted_enabled: Option<bool>,
     locale: Locale,
     should_persist: &mut bool,
-    rollback_transparent: &mut Option<TransparentSettings>,
+    rollback_transparent: &mut Option<TransparentRollbackState>,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
     let prev = mgr.settings();
+    let prev_persisted = update_persisted_enabled.map(|_| mgr.persisted_settings().enabled);
     let mgr_clone = Arc::clone(mgr);
     let rt_handle = tokio::runtime::Handle::current();
     match tokio::task::spawn_blocking(move || mgr_clone.apply_settings(next, &rt_handle)).await {
         Ok(Ok(())) => {
-            *rollback_transparent = Some(prev);
+            if let Some(new_pe) = update_persisted_enabled {
+                mgr.set_persisted_enabled(new_pe);
+            }
+            *rollback_transparent = Some(TransparentRollbackState {
+                prev_settings: prev,
+                prev_persisted_enabled: prev_persisted,
+            });
             *should_persist = true;
             ("200 OK", ct, serde_json_to_string(&mgr.status()))
         }
@@ -2477,7 +2522,7 @@ async fn handle_transparent_toggle(
     req_body: &str,
     locale: Locale,
     should_persist: &mut bool,
-    rollback_transparent: &mut Option<TransparentSettings>,
+    rollback_transparent: &mut Option<TransparentRollbackState>,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
     let Some(mgr) = mgr else {
@@ -2505,7 +2550,15 @@ async fn handle_transparent_toggle(
 
     let mut next = mgr.settings();
     next.enabled = req.enabled;
-    apply_transparent_and_stage(mgr, next, locale, should_persist, rollback_transparent).await
+    apply_transparent_and_stage(
+        mgr,
+        next,
+        Some(req.enabled),
+        locale,
+        should_persist,
+        rollback_transparent,
+    )
+    .await
 }
 
 async fn handle_transparent_config(
@@ -2513,7 +2566,7 @@ async fn handle_transparent_config(
     req_body: &str,
     locale: Locale,
     should_persist: &mut bool,
-    rollback_transparent: &mut Option<TransparentSettings>,
+    rollback_transparent: &mut Option<TransparentRollbackState>,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
     let Some(mgr) = mgr else {
@@ -2589,7 +2642,15 @@ async fn handle_transparent_config(
         };
     }
 
-    apply_transparent_and_stage(mgr, next, locale, should_persist, rollback_transparent).await
+    apply_transparent_and_stage(
+        mgr,
+        next,
+        None,
+        locale,
+        should_persist,
+        rollback_transparent,
+    )
+    .await
 }
 
 async fn handle_transparent_elevate(
@@ -2771,7 +2832,12 @@ Connection: close\r\n\
         body.len(),
         body
     );
-    match tokio::time::timeout(API_TIMEOUT, stream.write_all(response.as_bytes())).await {
+    match tokio::time::timeout(API_TIMEOUT, async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.flush().await
+    })
+    .await
+    {
         Ok(res) => res,
         Err(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
@@ -5042,6 +5108,145 @@ mod tests {
         let _ = release_tx.send(());
         let _ = blocker_thread.join();
         tokio::time::sleep(Duration::from_millis(30)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    #[tokio::test]
+    async fn test_api_elevate_is_mutation_and_always_signals_shutdown() {
+        assert!(is_mutation_endpoint("POST", "/api/transparent/elevate"));
+        assert!(!is_mutation_endpoint("GET", "/api/transparent/status"));
+
+        // 即使响应写入期间客户端提前断开连接，触发提权重启停机时仍必须广播 shutdown_tx
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (mut server_stream, _) = listener.accept().await.unwrap();
+        drop(client);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let large_body = "x".repeat(4 * 1024 * 1024);
+        // 先关闭/写探测确保写入最终失败或半关后仍唤醒 shutdown_tx
+        let _ = server_stream.shutdown().await;
+        let res = finish_api_response_and_maybe_shutdown(
+            &mut server_stream,
+            "200 OK",
+            "application/json; charset=utf-8",
+            &large_body,
+            true,
+            Some(&shutdown_tx),
+        )
+        .await;
+        assert!(res.is_err(), "writing after shutdown/disconnect should return error");
+        assert!(
+            *shutdown_rx.borrow(),
+            "shutdown_tx must still be triggered when elevated response write fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_override() {
+        use crate::dns::server::DnsServer;
+        use crate::dns::FakeIpPool;
+        use crate::interceptor::dispatcher::DispatcherConfig;
+        use crate::interceptor::process::ProcessTracker;
+
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_api_transparent_override_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&cfg_path);
+
+        let store = Arc::new(ConfigStore::new(&cfg_path));
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let fake_ip_pool = Arc::new(FakeIpPool::new_default());
+        let tracker = Arc::new(ProcessTracker::new());
+        let upstream_dns: SocketAddr = "223.5.5.5:53".parse().unwrap();
+
+        let dispatcher_cfg = Arc::new(DispatcherConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            tracker,
+            fake_ip_pool: Arc::clone(&fake_ip_pool),
+            upstream_dns,
+            rule_engine: Arc::clone(&re),
+            monitor: Arc::clone(&mgr),
+            proxy_nodes: Arc::clone(&nodes),
+            proxy_chains: Arc::new(HashMap::new()),
+            self_ports: vec![40001, 1053],
+        });
+        let dns_server = Arc::new(DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            fake_ip_pool,
+            upstream_dns,
+            true,
+        ));
+        // 模拟配置磁盘 enabled=true，但以 --no-transparent 临时启动（runtime enabled=false）
+        let t_mgr = TransparentManager::new_with_persisted(
+            dispatcher_cfg,
+            dns_server,
+            TransparentSettings {
+                enabled: false,
+                hijack_dns: true,
+                block_quic_for_proxied: true,
+                dll_path: None,
+            },
+            true,
+        );
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_self_ports(vec![40001, 40080, 1053])
+            .with_config_store(Arc::clone(&store))
+            .with_transparent_manager(Arc::clone(&t_mgr));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (shutdown_tx, rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { srv.run(listener, rx).await });
+
+        // 1. 新增代理节点触发持久化，不应把临时 --no-transparent 的 false 覆写到磁盘
+        let node_body = r#"{"name":"n1","protocol":"SOCKS5","server_addr":"8.8.8.8:1080"}"#;
+        let resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                node_body.len(),
+                node_body
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "resp: {resp}");
+        let saved1 = store.load_existing(&[]).unwrap();
+        assert!(
+            saved1.transparent_settings.enabled,
+            "node mutation must preserve persisted enabled=true across --no-transparent"
+        );
+        assert!(!t_mgr.settings().enabled);
+
+        // 2. 更新透明代理附加设置同样不得破坏 persisted enabled=true
+        let cfg_body = r#"{"hijack_dns":false}"#;
+        let resp2 = raw_http(
+            addr,
+            &format!(
+                "PUT /api/transparent/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                cfg_body.len(),
+                cfg_body
+            ),
+        )
+        .await;
+        assert!(resp2.starts_with("HTTP/1.1 200 OK"), "resp2: {resp2}");
+        let saved2 = store.load_existing(&[]).unwrap();
+        assert!(saved2.transparent_settings.enabled);
+        assert!(!saved2.transparent_settings.hijack_dns);
+
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_file(&cfg_path);
