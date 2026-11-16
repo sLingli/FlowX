@@ -11,11 +11,61 @@ const MAX_TOTAL_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 const FRAGMENT_TTL: Duration = Duration::from_secs(10);
 
 const IP_PROTO_HOPOPT: u8 = 0;
+const IP_PROTO_ICMPV4: u8 = 1;
 const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
 const IP_PROTO_ROUTING: u8 = 43;
 const IP_PROTO_FRAGMENT: u8 = 44;
+const IP_PROTO_AH: u8 = 51;
+const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_DESTOPT: u8 = 60;
+
+#[inline]
+fn is_ipv6_extension_header(nh: u8) -> bool {
+    matches!(
+        nh,
+        IP_PROTO_HOPOPT | IP_PROTO_ROUTING | IP_PROTO_AH | IP_PROTO_DESTOPT
+    )
+}
+
+#[inline]
+fn ipv6_ext_header_len(nh: u8, slice: &[u8]) -> Option<usize> {
+    if slice.len() < 2 {
+        return None;
+    }
+    match nh {
+        IP_PROTO_HOPOPT | IP_PROTO_ROUTING | IP_PROTO_DESTOPT => Some(((slice[1] as usize) + 1) * 8),
+        IP_PROTO_AH => Some(((slice[1] as usize) + 2) * 4),
+        _ => None,
+    }
+}
+
+enum ExtWalk {
+    Transport { proto: u8, offset: usize },
+    Incomplete { next_nh: u8 },
+    NestedFragOrMalformed,
+}
+
+fn walk_ipv6_ext_headers(mut nh: u8, data: &[u8]) -> ExtWalk {
+    let mut pos = 0usize;
+    for _ in 0..8 {
+        if nh == IP_PROTO_FRAGMENT {
+            return ExtWalk::NestedFragOrMalformed;
+        }
+        if !is_ipv6_extension_header(nh) {
+            return ExtWalk::Transport { proto: nh, offset: pos };
+        }
+        let Some(ext_len) = ipv6_ext_header_len(nh, &data[pos..]) else {
+            return ExtWalk::Incomplete { next_nh: nh };
+        };
+        if pos + ext_len > data.len() {
+            return ExtWalk::Incomplete { next_nh: nh };
+        }
+        nh = data[pos];
+        pos += ext_len;
+    }
+    ExtWalk::NestedFragOrMalformed
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FragmentKey {
@@ -50,13 +100,13 @@ enum FragmentParse {
     Fragment {
         key: FragmentKey,
         proto: u8,
+        v6_frag_next_hdr: u8,
         frag_offset: usize,
         more_fragments: bool,
         payload_start: usize,
         payload_end: usize,
         v4_ihl: usize,
         v6_frag_hdr_offset: usize,
-        v6_next_hdr_ptr_offset: usize,
         is_ipv6: bool,
     },
     Malformed,
@@ -79,9 +129,8 @@ enum ReassemblyPrefix {
         header: Vec<u8>,
     },
     Ipv6 {
-        prefix_headers: Vec<u8>,
-        next_hdr_ptr_offset: usize,
-        upper_proto: u8,
+        base_header: [u8; 40],
+        frag_next_hdr: u8,
     },
 }
 
@@ -169,19 +218,30 @@ impl FragmentTracker {
             FragmentParse::Fragment {
                 key,
                 proto,
+                v6_frag_next_hdr,
                 frag_offset,
                 more_fragments,
                 payload_start,
                 payload_end,
                 v4_ihl,
                 v6_frag_hdr_offset,
-                v6_next_hdr_ptr_offset,
                 is_ipv6,
             } => {
                 let is_fake_ip = fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(key.dst_ip));
 
-                // 非 TCP/UDP（例如 ping -l 2000 等大 ICMP 报文）且非发往 Fake-IP：立即平滑放行，不浪费重组预算
-                if proto != IP_PROTO_TCP && proto != IP_PROTO_UDP {
+                // 仅允许纯 ICMPv4 / ICMPv6 且尚未存在同 ID 组时单包放行；
+                // TCP / UDP 以及任何携带 IPv6 扩展头（可能隐藏后续 TCP/UDP 或嵌套分片）的分片均进入有界重组。
+                if !is_fake_ip
+                    && matches!(proto, IP_PROTO_ICMPV4 | IP_PROTO_ICMPV6)
+                    && !self.groups.contains_key(&key)
+                {
+                    return FragmentOutcome::PassthroughSingle;
+                }
+                let needs_reassembly = proto == IP_PROTO_TCP
+                    || proto == IP_PROTO_UDP
+                    || (is_ipv6 && is_ipv6_extension_header(proto));
+                if !needs_reassembly {
+                    self.remove_group(&key);
                     return if is_fake_ip {
                         FragmentOutcome::Drop
                     } else {
@@ -212,8 +272,13 @@ impl FragmentTracker {
                     return FragmentOutcome::Drop;
                 }
 
-                // Fake-IP 快速拦截：如果首片 UDP 目标端口并非 DNS 53，直接拒绝整组重组并丢弃
-                if is_fake_ip && proto == IP_PROTO_UDP && frag_offset == 0 && frag_payload.len() >= 4 {
+                // Fake-IP 快速拦截：如果无前置扩展头的 UDP 首片目标端口并非 DNS 53，直接拒绝整组重组并丢弃
+                if is_fake_ip
+                    && proto == IP_PROTO_UDP
+                    && (!is_ipv6 || v6_frag_next_hdr == IP_PROTO_UDP)
+                    && frag_offset == 0
+                    && frag_payload.len() >= 4
+                {
                     let dst_port = u16::from_be_bytes([frag_payload[2], frag_payload[3]]);
                     if dst_port != 53 {
                         self.remove_group(&key);
@@ -281,17 +346,20 @@ impl FragmentTracker {
                 }
 
                 if frag_offset == 0 && group.first_prefix.is_none() {
-                    group.first_prefix = Some(if is_ipv6 {
-                        ReassemblyPrefix::Ipv6 {
-                            prefix_headers: raw[..v6_frag_hdr_offset].to_vec(),
-                            next_hdr_ptr_offset: v6_next_hdr_ptr_offset,
-                            upper_proto: proto,
-                        }
+                    if is_ipv6 {
+                        let Ok(base_header) = <[u8; 40]>::try_from(&raw[..40]) else {
+                            self.remove_group(&key);
+                            return FragmentOutcome::Drop;
+                        };
+                        group.first_prefix = Some(ReassemblyPrefix::Ipv6 {
+                            base_header,
+                            frag_next_hdr: v6_frag_next_hdr,
+                        });
                     } else {
-                        ReassemblyPrefix::Ipv4 {
+                        group.first_prefix = Some(ReassemblyPrefix::Ipv4 {
                             header: raw[..v4_ihl].to_vec(),
-                        }
-                    });
+                        });
+                    }
                 }
 
                 let stored = StoredChunk {
@@ -409,22 +477,27 @@ fn build_reassembled_ip_packet(group: FragmentGroup) -> Option<(Vec<u8>, Vec<Emi
             Some((out, orig_fragments))
         }
         ReassemblyPrefix::Ipv6 {
-            mut prefix_headers,
-            next_hdr_ptr_offset,
-            upper_proto,
+            mut base_header,
+            frag_next_hdr,
         } => {
-            if prefix_headers.len() < 40 || next_hdr_ptr_offset >= prefix_headers.len() {
+            let ExtWalk::Transport {
+                proto: final_proto,
+                offset: ext_offset,
+            } = walk_ipv6_ext_headers(frag_next_hdr, &assembled_payload)
+            else {
+                return None;
+            };
+            if !matches!(final_proto, IP_PROTO_TCP | IP_PROTO_UDP) {
                 return None;
             }
-            let ext_len = prefix_headers.len() - 40;
-            let ipv6_payload_len = ext_len.checked_add(assembled_payload.len())?;
-            let payload_len_u16 = u16::try_from(ipv6_payload_len).ok()?;
-            prefix_headers[next_hdr_ptr_offset] = upper_proto;
-            prefix_headers[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
+            let transport_slice = &assembled_payload[ext_offset..];
+            let payload_len_u16 = u16::try_from(transport_slice.len()).ok()?;
+            base_header[6] = final_proto;
+            base_header[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
 
-            let mut out = Vec::with_capacity(prefix_headers.len() + assembled_payload.len());
-            out.extend_from_slice(&prefix_headers);
-            out.extend_from_slice(&assembled_payload);
+            let mut out = Vec::with_capacity(40 + transport_slice.len());
+            out.extend_from_slice(&base_header);
+            out.extend_from_slice(transport_slice);
             Some((out, orig_fragments))
         }
     }
@@ -494,13 +567,13 @@ fn parse_ipv4_fragment(raw: &[u8]) -> FragmentParse {
             ident,
         },
         proto,
+        v6_frag_next_hdr: proto,
         frag_offset,
         more_fragments,
         payload_start: ihl,
         payload_end: total_len,
         v4_ihl: ihl,
         v6_frag_hdr_offset: 0,
-        v6_next_hdr_ptr_offset: 0,
         is_ipv6: false,
     }
 }
@@ -534,7 +607,6 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
     let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_octets)).to_canonical();
 
     let mut next_hdr = raw[6];
-    let mut next_hdr_ptr_offset = 6usize;
     let mut pos = 40usize;
 
     for _ in 0..8 {
@@ -543,7 +615,10 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
                 if lso_or_oversized || pos + 8 > end {
                     return FragmentParse::Malformed;
                 }
-                let upper_proto = raw[pos];
+                let frag_next_hdr = raw[pos];
+                if frag_next_hdr == IP_PROTO_FRAGMENT {
+                    return FragmentParse::Malformed;
+                }
                 let off_m = u16::from_be_bytes([raw[pos + 2], raw[pos + 3]]);
                 let frag_offset = (off_m & 0xFFF8) as usize;
                 let more_fragments = (off_m & 0x0001) != 0;
@@ -552,34 +627,42 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
                 };
                 let ident = u32::from_be_bytes(ident_bytes);
 
+                let effective_proto = if frag_offset == 0 {
+                    match walk_ipv6_ext_headers(frag_next_hdr, &raw[pos + 8..end]) {
+                        ExtWalk::Transport { proto, .. } => proto,
+                        ExtWalk::Incomplete { next_nh } => next_nh,
+                        ExtWalk::NestedFragOrMalformed => return FragmentParse::Malformed,
+                    }
+                } else {
+                    frag_next_hdr
+                };
+
                 return FragmentParse::Fragment {
                     key: FragmentKey {
                         is_ipv6: true,
                         src_ip,
                         dst_ip,
-                        proto: upper_proto,
+                        proto: 0,
                         ident,
                     },
-                    proto: upper_proto,
+                    proto: effective_proto,
+                    v6_frag_next_hdr: frag_next_hdr,
                     frag_offset,
                     more_fragments,
                     payload_start: pos + 8,
                     payload_end: end,
                     v4_ihl: 0,
                     v6_frag_hdr_offset: pos,
-                    v6_next_hdr_ptr_offset: next_hdr_ptr_offset,
                     is_ipv6: true,
                 };
             }
-            IP_PROTO_HOPOPT | IP_PROTO_ROUTING | IP_PROTO_DESTOPT => {
-                if pos + 2 > end {
+            other if is_ipv6_extension_header(other) => {
+                let Some(ext_len) = ipv6_ext_header_len(other, &raw[pos..end]) else {
                     return FragmentParse::Malformed;
-                }
-                let ext_len = ((raw[pos + 1] as usize) + 1) * 8;
+                };
                 if pos + ext_len > end {
                     return FragmentParse::Malformed;
                 }
-                next_hdr_ptr_offset = pos;
                 next_hdr = raw[pos];
                 pos += ext_len;
             }
@@ -765,6 +848,81 @@ mod tests {
             tracker.ingest_at(t_later, &other_icmp, meta, Some(&fake_pool)),
             FragmentOutcome::PassthroughSingle
         ));
+        assert_eq!(tracker.active_group_count(), 0);
+    }
+
+    #[test]
+    fn test_ipv6_fragment_with_post_fragment_dest_opt_and_ah_reassembles_and_nested_frag_drops() {
+        let mut tracker = FragmentTracker::new();
+        let src6 = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 10);
+        let dst6 = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let meta = PacketInterfaceMeta {
+            if_idx: 4,
+            is_ipv6: true,
+            ..Default::default()
+        };
+
+        let mut hdr = etherparse::TcpHeader::new(57000, 443, 424242, 65535);
+        hdr.syn = true;
+        let payload = b"HELLO_POST_FRAG!";
+        let builder = PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64).tcp_header(hdr);
+        let mut full_v6 = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut full_v6, payload).unwrap();
+        let tcp_seg = &full_v6[40..];
+
+        // 1. 构建 [IPv6(nh=44)][Frag(nh=60)][DestOpt(8B, nh=6)][TCP SYN] 并按两片递交
+        let mut fragmentable = Vec::with_capacity(8 + tcp_seg.len());
+        fragmentable.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
+        fragmentable.extend_from_slice(tcp_seg);
+
+        let f0 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_DESTOPT,
+            0x0BAD_F00D,
+            0,
+            true,
+            &fragmentable[..24],
+        );
+        let f1 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_DESTOPT,
+            0x0BAD_F00D,
+            24,
+            false,
+            &fragmentable[24..],
+        );
+
+        // 先收到 Fragment 1 (next_hdr = DestOpt 60)：绝不可误当作非 TCP/UDP 放行，必须 Pending
+        assert!(matches!(tracker.ingest(&f1, meta, None), FragmentOutcome::Pending));
+        let FragmentOutcome::Reassembled { full_packet, .. } = tracker.ingest(&f0, meta, None)
+        else {
+            panic!("expected IPv6 packet with post-Fragment DestOpt to reassemble cleanly");
+        };
+        let parsed = parse_tcp_packet(&full_packet).expect("stripped IPv6 TCP packet must parse");
+        assert!(parsed.is_ipv6 && parsed.syn && parsed.dst_port == 443);
+        let sliced = SlicedPacket::from_ip(&full_packet).unwrap();
+        let Some(TransportSlice::Tcp(t)) = sliced.transport else {
+            panic!("expected TCP slice after stripping DestOpt");
+        };
+        assert_eq!(t.payload(), payload);
+
+        // 2. 嵌套分片攻击：[IPv6(nh=44)][Frag(nh=60)][DestOpt(nh=44)][Frag(nh=6)] 必须 Drop
+        let mut nested_payload = Vec::new();
+        nested_payload.extend_from_slice(&[IP_PROTO_FRAGMENT, 0, 0, 0, 0, 0, 0, 0]);
+        nested_payload.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0x11, 0x22, 0x33, 0x44]);
+        nested_payload.extend_from_slice(&tcp_seg[..8]);
+        let nested_pkt = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_DESTOPT,
+            0xDEAD_BEEF,
+            0,
+            false,
+            &nested_payload,
+        );
+        assert!(matches!(tracker.ingest(&nested_pkt, meta, None), FragmentOutcome::Drop));
         assert_eq!(tracker.active_group_count(), 0);
     }
 }
