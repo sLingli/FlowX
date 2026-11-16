@@ -468,10 +468,6 @@ fn parse_ipv4_fragment(raw: &[u8]) -> FragmentParse {
         return FragmentParse::Malformed;
     }
     let total_len = u16::from_be_bytes([raw[2], raw[3]]) as usize;
-    if total_len < ihl || raw.len() < total_len {
-        return FragmentParse::Malformed;
-    }
-
     let proto = raw[9];
     let src_ip = IpAddr::V4(Ipv4Addr::new(raw[12], raw[13], raw[14], raw[15])).to_canonical();
     let dst_ip = IpAddr::V4(Ipv4Addr::new(raw[16], raw[17], raw[18], raw[19])).to_canonical();
@@ -482,6 +478,10 @@ fn parse_ipv4_fragment(raw: &[u8]) -> FragmentParse {
 
     if !more_fragments && frag_offset == 0 {
         return FragmentParse::NotFragmented { dst_ip, proto };
+    }
+
+    if total_len < ihl || raw.len() < total_len {
+        return FragmentParse::Malformed;
     }
 
     let ident = u16::from_be_bytes([raw[4], raw[5]]) as u32;
@@ -510,12 +510,19 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
         return FragmentParse::Malformed;
     }
     let payload_len = u16::from_be_bytes([raw[4], raw[5]]) as usize;
-    let Some(end) = 40usize.checked_add(payload_len) else {
-        return FragmentParse::Malformed;
+    let lso_or_oversized =
+        (payload_len == 0 && raw.len() > 40) || raw.len() > 40 + u16::MAX as usize;
+    let end = if lso_or_oversized {
+        raw.len()
+    } else {
+        let Some(end) = 40usize.checked_add(payload_len) else {
+            return FragmentParse::Malformed;
+        };
+        if end > raw.len() || payload_len == 0 {
+            return FragmentParse::Malformed;
+        }
+        end
     };
-    if end > raw.len() || payload_len == 0 {
-        return FragmentParse::Malformed;
-    }
 
     let Ok(src_octets) = <[u8; 16]>::try_from(&raw[8..24]) else {
         return FragmentParse::Malformed;
@@ -533,7 +540,7 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
     for _ in 0..8 {
         match next_hdr {
             IP_PROTO_FRAGMENT => {
-                if pos + 8 > end {
+                if lso_or_oversized || pos + 8 > end {
                     return FragmentParse::Malformed;
                 }
                 let upper_proto = raw[pos];

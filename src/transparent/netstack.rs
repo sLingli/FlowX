@@ -1,12 +1,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TcpHeader, TransportSlice};
+use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TcpHeader, TcpHeaderSlice, TransportSlice};
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{self, SocketBuffer};
@@ -23,6 +23,7 @@ use crate::router::{Action, DomainNeedDecision, RuleEngine};
 const BRIDGE_BUFFER_LIMIT: usize = 512 * 1024;
 const SMOLTCP_RX_BUF: usize = 128 * 1024;
 const SMOLTCP_TX_BUF: usize = 128 * 1024;
+const MAX_SMOLTCP_TCP_SEG_PAYLOAD: usize = 32_768;
 const MAX_INTERCEPTED_FLOWS: usize = 4096;
 const MAX_PASSTHROUGH_FLOWS: usize = 16_384;
 const PASSTHROUGH_TTL: Duration = Duration::from_secs(120);
@@ -98,8 +99,209 @@ impl ParsedTcpPacket {
     }
 }
 
-/// 解析原始 IPv4/IPv6 TCP 报文；自动忽略分片报文与非 TCP 报文
+struct ParsedTcpRaw<'a> {
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    is_ipv6: bool,
+    fast_path_ok: bool,
+    tcp_hdr: TcpHeaderSlice<'a>,
+    payload: &'a [u8],
+}
+
+fn ipv6_ext_len(nh: u8, slice: &[u8]) -> Option<usize> {
+    if slice.len() < 2 {
+        return None;
+    }
+    match nh {
+        0 | 43 | 60 => Some(((slice[1] as usize) + 1) * 8),
+        51 => Some(((slice[1] as usize) + 2) * 4),
+        _ => None,
+    }
+}
+
+fn parse_lso_or_standard_tcp_packet(raw_ip: &[u8]) -> Option<ParsedTcpRaw<'_>> {
+    let ver = raw_ip.first()? >> 4;
+    match ver {
+        4 => {
+            if raw_ip.len() < 20 {
+                return None;
+            }
+            let ihl = ((raw_ip[0] & 0x0F) as usize) * 4;
+            if ihl < 20 || raw_ip.len() < ihl {
+                return None;
+            }
+            let flags_frag = u16::from_be_bytes([raw_ip[6], raw_ip[7]]);
+            if (flags_frag & 0x2000) != 0 || (flags_frag & 0x1FFF) != 0 {
+                return None;
+            }
+            if raw_ip[9] != 6 {
+                return None;
+            }
+            let hdr_total_len = u16::from_be_bytes([raw_ip[2], raw_ip[3]]) as usize;
+            let (ip_end, fast_path_ok) = if hdr_total_len == 0 || raw_ip.len() > u16::MAX as usize {
+                (raw_ip.len(), false)
+            } else if hdr_total_len >= ihl && hdr_total_len <= raw_ip.len() {
+                (hdr_total_len, hdr_total_len == raw_ip.len())
+            } else {
+                return None;
+            };
+
+            let tcp_slice = &raw_ip[ihl..ip_end];
+            let tcp_hdr = TcpHeaderSlice::from_slice(tcp_slice).ok()?;
+            let payload = &tcp_slice[tcp_hdr.slice().len()..];
+            let src_ip =
+                IpAddr::V4(Ipv4Addr::new(raw_ip[12], raw_ip[13], raw_ip[14], raw_ip[15]))
+                    .to_canonical();
+            let dst_ip =
+                IpAddr::V4(Ipv4Addr::new(raw_ip[16], raw_ip[17], raw_ip[18], raw_ip[19]))
+                    .to_canonical();
+
+            Some(ParsedTcpRaw {
+                src_ip,
+                dst_ip,
+                is_ipv6: false,
+                fast_path_ok,
+                tcp_hdr,
+                payload,
+            })
+        }
+        6 => {
+            if raw_ip.len() < 40 {
+                return None;
+            }
+            let hdr_payload_len = u16::from_be_bytes([raw_ip[4], raw_ip[5]]) as usize;
+            let lso_override =
+                (hdr_payload_len == 0 && raw_ip.len() > 40) || raw_ip.len() > 40 + u16::MAX as usize;
+            let ip_end = if lso_override {
+                raw_ip.len()
+            } else {
+                let end = 40usize.checked_add(hdr_payload_len)?;
+                if end > raw_ip.len() || hdr_payload_len == 0 {
+                    return None;
+                }
+                end
+            };
+
+            let mut next_hdr = raw_ip[6];
+            let mut pos = 40usize;
+            for _ in 0..8 {
+                if next_hdr == 6 {
+                    break;
+                }
+                if next_hdr == 44 {
+                    return None;
+                }
+                let ext_len = ipv6_ext_len(next_hdr, &raw_ip[pos..ip_end])?;
+                if pos + ext_len > ip_end {
+                    return None;
+                }
+                next_hdr = raw_ip[pos];
+                pos += ext_len;
+            }
+            if next_hdr != 6 || pos >= ip_end {
+                return None;
+            }
+
+            let tcp_slice = &raw_ip[pos..ip_end];
+            let tcp_hdr = TcpHeaderSlice::from_slice(tcp_slice).ok()?;
+            let payload = &tcp_slice[tcp_hdr.slice().len()..];
+            let src_octets: [u8; 16] = raw_ip[8..24].try_into().ok()?;
+            let dst_octets: [u8; 16] = raw_ip[24..40].try_into().ok()?;
+            let src_ip = IpAddr::V6(Ipv6Addr::from(src_octets)).to_canonical();
+            let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_octets)).to_canonical();
+            let fast_path_ok = !lso_override
+                && pos == 40
+                && ip_end == raw_ip.len()
+                && !matches!((src_ip, dst_ip), (IpAddr::V4(_), _) | (_, IpAddr::V4(_)));
+
+            Some(ParsedTcpRaw {
+                src_ip,
+                dst_ip,
+                is_ipv6: true,
+                fast_path_ok,
+                tcp_hdr,
+                payload,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// 将标准或 LSO >65KB / header length=0 的出站 TCP 报文规范切片并入队 `smoltcp`，
+/// 防止大于 65,535B 的 NDIS LSO 大包被忽略截断或 `total_len=0` 引发解析失败。
+fn enqueue_tcp_for_smoltcp(rx_queue: &mut VecDeque<Vec<u8>>, raw_ip: Vec<u8>) {
+    let Some(parsed) = parse_lso_or_standard_tcp_packet(&raw_ip) else {
+        rx_queue.push_back(raw_ip);
+        return;
+    };
+
+    if parsed.fast_path_ok && parsed.payload.len() <= MAX_SMOLTCP_TCP_SEG_PAYLOAD {
+        rx_queue.push_back(raw_ip);
+        return;
+    }
+
+    let base_hdr = parsed.tcp_hdr.to_header();
+    let emit_segment = |rx_queue: &mut VecDeque<Vec<u8>>, hdr: TcpHeader, data: &[u8]| match (
+        parsed.src_ip,
+        parsed.dst_ip,
+    ) {
+        (IpAddr::V4(s4), IpAddr::V4(d4)) => {
+            let builder = PacketBuilder::ipv4(s4.octets(), d4.octets(), 64).tcp_header(hdr);
+            let mut out = Vec::with_capacity(builder.size(data.len()));
+            if builder.write(&mut out, data).is_ok() {
+                rx_queue.push_back(out);
+            }
+        }
+        (IpAddr::V6(s6), IpAddr::V6(d6)) => {
+            let builder = PacketBuilder::ipv6(s6.octets(), d6.octets(), 64).tcp_header(hdr);
+            let mut out = Vec::with_capacity(builder.size(data.len()));
+            if builder.write(&mut out, data).is_ok() {
+                rx_queue.push_back(out);
+            }
+        }
+        _ => {}
+    };
+
+    if parsed.payload.is_empty() {
+        emit_segment(rx_queue, base_hdr, &[]);
+        return;
+    }
+
+    let total_chunks = parsed.payload.len().div_ceil(MAX_SMOLTCP_TCP_SEG_PAYLOAD);
+    let mut offset = 0usize;
+    for (idx, chunk) in parsed.payload.chunks(MAX_SMOLTCP_TCP_SEG_PAYLOAD).enumerate() {
+        let mut hdr = base_hdr.clone();
+        hdr.sequence_number = base_hdr.sequence_number.wrapping_add(offset as u32);
+        if idx > 0 {
+            hdr.syn = false;
+        }
+        if idx + 1 < total_chunks {
+            hdr.fin = false;
+            hdr.psh = false;
+        }
+        offset += chunk.len();
+        emit_segment(rx_queue, hdr, chunk);
+    }
+}
+
+/// 解析原始 IPv4/IPv6 TCP 报文（兼容 Windows NDIS LSO 大包及 length=0 卸载包）；自动忽略分片报文与非 TCP 报文
 pub fn parse_tcp_packet(raw_ip: &[u8]) -> Option<ParsedTcpPacket> {
+    if let Some(raw) = parse_lso_or_standard_tcp_packet(raw_ip) {
+        return Some(ParsedTcpPacket {
+            src_ip: raw.src_ip,
+            dst_ip: raw.dst_ip,
+            src_port: raw.tcp_hdr.source_port(),
+            dst_port: raw.tcp_hdr.destination_port(),
+            seq: raw.tcp_hdr.sequence_number(),
+            ack_num: raw.tcp_hdr.acknowledgment_number(),
+            syn: raw.tcp_hdr.syn(),
+            ack: raw.tcp_hdr.ack(),
+            fin: raw.tcp_hdr.fin(),
+            rst: raw.tcp_hdr.rst(),
+            payload_len: raw.payload.len(),
+            is_ipv6: raw.is_ipv6,
+        });
+    }
     let sliced = SlicedPacket::from_ip(raw_ip).ok()?;
     let (src_ip, dst_ip, is_ipv6) = match sliced.net? {
         NetSlice::Ipv4(ipv4) => {
@@ -875,7 +1077,8 @@ impl NetstackEngine {
                 && pkt.seq != session.syn_seq
                 && matches!(
                     state,
-                    tcp::State::FinWait1
+                    tcp::State::Listen
+                        | tcp::State::FinWait1
                         | tcp::State::FinWait2
                         | tcp::State::Closing
                         | tcp::State::LastAck
@@ -886,7 +1089,7 @@ impl NetstackEngine {
                 retire_old_session = true;
             } else {
                 session.meta = meta;
-                self.device.rx_queue.push_back(raw_ip);
+                enqueue_tcp_for_smoltcp(&mut self.device.rx_queue, raw_ip);
                 self.pump_internal(now, tx_out);
                 return TcpIngestOutcome::Intercepted;
             }
@@ -993,7 +1196,7 @@ impl NetstackEngine {
         }
         let handle = self.sockets.add(sock);
         let syn_backup = raw_ip.clone();
-        self.device.rx_queue.push_back(raw_ip);
+        enqueue_tcp_for_smoltcp(&mut self.device.rx_queue, raw_ip);
 
         let smol_now = self.smol_now();
         self.iface
@@ -1097,15 +1300,17 @@ impl NetstackEngine {
                     }
                 }
 
-                // F0. Closed 检查必须先于 Step B：否则 RST 会被 !sock.may_recv() 误标为优雅 EOF
-                if state == tcp::State::Closed {
-                    let non_graceful_closed = !matches!(
-                        session.last_state,
-                        tcp::State::TimeWait
-                            | tcp::State::LastAck
-                            | tcp::State::Closing
-                            | tcp::State::Closed
-                    );
+                // F0. Closed 或 SynReceived 遭 RST 退回的 Listen 均表示连接已终止，
+                //     必须先于 Step B 处理以免误标干净 EOF 并杜绝僵尸 Listen 槽位劫持后续连接
+                if matches!(state, tcp::State::Closed | tcp::State::Listen) {
+                    let non_graceful_closed = state == tcp::State::Listen
+                        || !matches!(
+                            session.last_state,
+                            tcp::State::TimeWait
+                                | tcp::State::LastAck
+                                | tcp::State::Closing
+                                | tcp::State::Closed
+                        );
                     close_bridge_and_collect_wakers(
                         &mut inner,
                         non_graceful_closed,
@@ -2218,5 +2423,189 @@ mod tests {
         assert!(signal.wait_drain_or_timeout(Duration::from_millis(50), &mut pkts, &mut closed));
         assert!(pkts.is_empty());
         assert_eq!(closed, vec![(local_ip, 55123)]);
+    }
+
+    #[tokio::test]
+    async fn test_netstack_syn_received_rst_reverts_to_listen_is_reaped_and_does_not_hijack_next_syn() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let meta = PacketInterfaceMeta::default();
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+
+        let src = [10, 0, 0, 2];
+        let sport = 54111;
+        let dst = [93, 184, 216, 34];
+        let dport = 443;
+
+        // 1. 仅完成 SYN -> SYN/ACK，使 socket 停留在 SynReceived（非零 listen_ep）
+        let syn1 = build_syn(src, sport, dst, dport, 1000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn1, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack1 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        let flow1 = accepted.pop().unwrap();
+        assert_eq!(engine.active_flow_count(), 1);
+
+        // 2. 客户端在 SynReceived 阶段发送 RST（如 Chrome 取消预连接）：smoltcp 会将该句柄重置回 State::Listen
+        let rst = build_rst(src, sport, dst, dport, 1001, syn_ack1.seq + 1);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(rst, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+
+        // 必须立即触发 Step F0 摘除该僵尸 Listen 槽位并向调度器唤醒报错，而非误标 EOF 或泄露槽位
+        assert_eq!(engine.active_flow_count(), 0);
+        assert!(engine.sockets.iter().count() == 0);
+
+        let (mut rd, mut wr) = flow1.stream.split_stream();
+        let mut buf = [0u8; 16];
+        let rerr = rd.read(&mut buf).await.unwrap_err();
+        assert_eq!(rerr.kind(), io::ErrorKind::ConnectionReset);
+        let werr = wr.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap_err();
+        assert_eq!(werr.kind(), io::ErrorKind::ConnectionReset);
+
+        // 3. 不同源端口再连同一个 (dst_ip, dst_port)：不得被僵尸 Listen 句柄抢占触发回退 Passthrough
+        tx.clear();
+        accepted.clear();
+        let syn2 = build_syn(src, 54112, dst, dport, 2000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn2, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(engine.active_flow_count(), 1);
+        let syn_ack2 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        assert!(syn_ack2.syn && syn_ack2.ack && syn_ack2.ack_num == 2001);
+    }
+
+    #[test]
+    fn test_netstack_lso_over_64kb_and_zero_header_len_ipv4_and_ipv6() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+
+        // 1. IPv4 70,000B LSO 包（Total Length = 0，总长 > 65,535，启用 WSCALE 窗口扩大以容纳 >64KB 单次突发）
+        let meta4 = PacketInterfaceMeta {
+            if_idx: 3,
+            sub_if_idx: 0,
+            loopback: false,
+            is_ipv6: false,
+            bitfield: 0,
+        };
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+        let mut syn4_hdr = TcpHeader::new(56001, 443, 1000, 65535);
+        syn4_hdr.syn = true;
+        syn4_hdr.set_options_raw(&[3, 3, 8, 1]).unwrap();
+        let syn4_b = PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).tcp_header(syn4_hdr);
+        let mut syn4 = Vec::with_capacity(syn4_b.size(0));
+        syn4_b.write(&mut syn4, &[]).unwrap();
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn4, meta4, Some(8888), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack4 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        let ack4 = build_ack([10, 0, 0, 2], 56001, [1, 1, 1, 1], 443, 1001, syn_ack4.seq + 1, false, &[]);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack4, meta4, Some(8888), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let flow4 = accepted.pop().unwrap();
+
+        let payload4 = vec![0x5Au8; 70_000];
+        let mut hdr4 = TcpHeader::new(56001, 443, 1001, 65535);
+        hdr4.ack = true;
+        hdr4.psh = true;
+        hdr4.acknowledgment_number = syn_ack4.seq + 1;
+        let lso4 = PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64).tcp_header(hdr4);
+        let mut pkt4 = Vec::with_capacity(20 + 20 + payload4.len());
+        lso4.write(&mut pkt4, &payload4[..1000]).unwrap();
+        // 手动拼接完整 70,000 字节并按 NDIS LSO 规范将 IPv4 Total Length 置 0
+        pkt4.extend_from_slice(&payload4[1000..]);
+        pkt4[2..4].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(pkt4.len(), 20 + 20 + 70_000);
+
+        let parsed4 = parse_tcp_packet(&pkt4).expect("IPv4 LSO >64KB with total_len=0 must parse");
+        assert_eq!(parsed4.payload_len, 70_000);
+
+        tx.clear();
+        accepted.clear();
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                pkt4,
+                meta4,
+                Some(8888),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx,
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+        {
+            let inner = flow4.stream.read.bridge.inner.lock().unwrap();
+            assert_eq!(inner.to_app.len(), 70_000);
+            assert!(inner.to_app.iter().all(|&b| b == 0x5A));
+        }
+
+        // 2. IPv6 70,000B LSO 包（Payload Length = 0，总长 > 65,575）
+        let src6 = Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 3, 4, 5, 6);
+        let dst6 = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+        let meta6 = PacketInterfaceMeta {
+            if_idx: 2,
+            is_ipv6: true,
+            ..Default::default()
+        };
+        let mut syn6_hdr = TcpHeader::new(61122, 443, 8000, 65535);
+        syn6_hdr.syn = true;
+        syn6_hdr.set_options_raw(&[3, 3, 8, 1]).unwrap();
+        let syn6_b = PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64).tcp_header(syn6_hdr);
+        let mut syn6 = Vec::with_capacity(syn6_b.size(0));
+        syn6_b.write(&mut syn6, &[]).unwrap();
+        tx.clear();
+        accepted.clear();
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn6, meta6, Some(8889), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack6 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        let mut ack6_hdr = TcpHeader::new(61122, 443, 8001, 65535);
+        ack6_hdr.ack = true;
+        ack6_hdr.acknowledgment_number = syn_ack6.seq + 1;
+        let ack6_builder =
+            PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64).tcp_header(ack6_hdr);
+        let mut ack6 = Vec::with_capacity(ack6_builder.size(0));
+        ack6_builder.write(&mut ack6, &[]).unwrap();
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack6, meta6, Some(8889), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let flow6 = accepted.pop().unwrap();
+
+        let payload6 = vec![0x3Cu8; 70_000];
+        let mut hdr6 = TcpHeader::new(61122, 443, 8001, 65535);
+        hdr6.ack = true;
+        hdr6.psh = true;
+        hdr6.acknowledgment_number = syn_ack6.seq + 1;
+        let lso6 = PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64).tcp_header(hdr6);
+        let mut pkt6 = Vec::with_capacity(40 + 20 + payload6.len());
+        lso6.write(&mut pkt6, &payload6[..1000]).unwrap();
+        pkt6.extend_from_slice(&payload6[1000..]);
+        pkt6[4..6].copy_from_slice(&0u16.to_be_bytes());
+        assert_eq!(pkt6.len(), 40 + 20 + 70_000);
+
+        let parsed6 = parse_tcp_packet(&pkt6).expect("IPv6 LSO >64KB with payload_len=0 must parse");
+        assert_eq!(parsed6.payload_len, 70_000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(pkt6, meta6, Some(8889), None, None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        {
+            let inner = flow6.stream.read.bridge.inner.lock().unwrap();
+            assert_eq!(inner.to_app.len(), 70_000);
+            assert!(inner.to_app.iter().all(|&b| b == 0x3C));
+        }
     }
 }
