@@ -2487,6 +2487,7 @@ fn map_transparent_apply_error(
 async fn apply_transparent_and_stage(
     mgr: &Arc<TransparentManager>,
     next: TransparentSettings,
+    is_config_only: bool,
     update_persisted_enabled: Option<bool>,
     locale: Locale,
     should_persist: &mut bool,
@@ -2497,7 +2498,15 @@ async fn apply_transparent_and_stage(
     let prev_persisted = update_persisted_enabled.map(|_| mgr.persisted_settings().enabled);
     let mgr_clone = Arc::clone(mgr);
     let rt_handle = tokio::runtime::Handle::current();
-    match tokio::task::spawn_blocking(move || mgr_clone.apply_settings(next, &rt_handle)).await {
+    match tokio::task::spawn_blocking(move || {
+        if is_config_only {
+            mgr_clone.apply_config_update(next, &rt_handle)
+        } else {
+            mgr_clone.apply_settings(next, &rt_handle)
+        }
+    })
+    .await
+    {
         Ok(Ok(())) => {
             if let Some(new_pe) = update_persisted_enabled {
                 mgr.set_persisted_enabled(new_pe);
@@ -2553,6 +2562,7 @@ async fn handle_transparent_toggle(
     apply_transparent_and_stage(
         mgr,
         next,
+        false,
         Some(req.enabled),
         locale,
         should_persist,
@@ -2645,6 +2655,7 @@ async fn handle_transparent_config(
     apply_transparent_and_stage(
         mgr,
         next,
+        true,
         None,
         locale,
         should_persist,
@@ -5246,6 +5257,103 @@ mod tests {
         let saved2 = store.load_existing(&[]).unwrap();
         assert!(saved2.transparent_settings.enabled);
         assert!(!saved2.transparent_settings.hijack_dns);
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    #[tokio::test]
+    async fn test_api_transparent_config_succeeds_after_boot_start_failure() {
+        use crate::dns::server::DnsServer;
+        use crate::dns::FakeIpPool;
+        use crate::interceptor::dispatcher::DispatcherConfig;
+        use crate::interceptor::process::ProcessTracker;
+
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_api_boot_fail_cfg_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&cfg_path);
+
+        let store = Arc::new(ConfigStore::new(&cfg_path));
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let fake_ip_pool = Arc::new(FakeIpPool::new_default());
+        let tracker = Arc::new(ProcessTracker::new());
+        let upstream_dns: SocketAddr = "223.5.5.5:53".parse().unwrap();
+
+        let dispatcher_cfg = Arc::new(DispatcherConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            tracker,
+            fake_ip_pool: Arc::clone(&fake_ip_pool),
+            upstream_dns,
+            rule_engine: Arc::clone(&re),
+            monitor: Arc::clone(&mgr),
+            proxy_nodes: Arc::clone(&nodes),
+            proxy_chains: Arc::new(HashMap::new()),
+            self_ports: vec![40001, 1053],
+        });
+        let dns_server = Arc::new(DnsServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            fake_ip_pool,
+            upstream_dns,
+            true,
+        ));
+        // 模拟配置 enabled=true，启动时驱动缺失导致 start 失败后调用 mark_boot_start_failed
+        let t_mgr = TransparentManager::new_with_persisted(
+            dispatcher_cfg,
+            dns_server,
+            TransparentSettings {
+                enabled: true,
+                hijack_dns: true,
+                block_quic_for_proxied: true,
+                dll_path: Some(r"C:\__missing__\WinDivert.dll".to_string()),
+            },
+            true,
+        );
+        let err = t_mgr
+            .start(&tokio::runtime::Handle::current())
+            .expect_err("missing driver or non-admin must fail on boot");
+        assert!(err.contains("ERR_TRANSPARENT_"));
+        t_mgr.mark_boot_start_failed();
+        assert!(!t_mgr.settings().enabled);
+        assert!(t_mgr.persisted_settings().enabled);
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
+            .with_self_ports(vec![40001, 40080, 1053])
+            .with_config_store(Arc::clone(&store))
+            .with_transparent_manager(Arc::clone(&t_mgr));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (shutdown_tx, rx) = watch::channel(false);
+        let server_task = tokio::spawn(async move { srv.run(listener, rx).await });
+
+        let cfg_body = r#"{"hijack_dns":false,"dll_path":"C:\\FlowX\\driver\\WinDivert.dll"}"#;
+        let resp = raw_http(
+            addr,
+            &format!(
+                "PUT /api/transparent/config HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                port,
+                cfg_body.len(),
+                cfg_body
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "config update must not lock out: {resp}");
+        let saved = store.load_existing(&[]).unwrap();
+        assert!(saved.transparent_settings.enabled);
+        assert!(!saved.transparent_settings.hijack_dns);
+        assert_eq!(
+            saved.transparent_settings.dll_path.as_deref(),
+            Some(r"C:\FlowX\driver\WinDivert.dll")
+        );
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;

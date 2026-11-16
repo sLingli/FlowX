@@ -365,12 +365,37 @@ pub struct WinDivertAvailability {
     pub searched_dirs: Vec<String>,
 }
 
-fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
+pub(crate) fn is_trusted_local_absolute_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut has_disk_prefix = !cfg!(windows);
+    for comp in path.components() {
+        match comp {
+            std::path::Component::ParentDir | std::path::Component::CurDir => return false,
+            #[cfg(windows)]
+            std::path::Component::Prefix(prefix) => {
+                use std::path::Prefix;
+                match prefix.kind() {
+                    Prefix::Disk(_) | Prefix::VerbatimDisk(_) => has_disk_prefix = true,
+                    _ => return false,
+                }
+            }
+            _ => {}
+        }
+    }
+    has_disk_prefix
+}
+
+pub(crate) fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
     }
     let pb = PathBuf::from(trimmed);
+    if !is_trusted_local_absolute_path(&pb) {
+        return None;
+    }
     let cand = if pb.is_dir()
         || (pb.extension().is_none()
             && !pb
@@ -381,7 +406,13 @@ fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
     } else {
         pb
     };
-    Some(std::path::absolute(&cand).unwrap_or(cand))
+    if !cand
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("WinDivert.dll"))
+    {
+        return None;
+    }
+    Some(cand)
 }
 
 fn locate_windivert_in_candidates(candidates: Vec<PathBuf>, sys_name: &str) -> WinDivertAvailability {
@@ -442,17 +473,17 @@ pub fn locate_windivert_files(custom_dll_path: Option<&str>) -> WinDivertAvailab
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(custom) = custom_dll_path.and_then(resolve_candidate_dll_path) {
         candidates.push(custom);
-    } else {
-        if let Ok(env_p) = std::env::var("FLOWX_WINDIVERT_DLL")
-            && let Some(cand) = resolve_candidate_dll_path(&env_p)
-        {
-            candidates.push(cand);
-        }
+    } else if custom_dll_path.is_none_or(|p| p.trim().is_empty()) {
         if let Ok(exe) = std::env::current_exe()
             && let Some(dir) = exe.parent()
         {
             candidates.push(dir.join("WinDivert.dll"));
             candidates.push(dir.join("driver").join("WinDivert.dll"));
+        }
+        if let Ok(env_p) = std::env::var("FLOWX_WINDIVERT_DLL")
+            && let Some(cand) = resolve_candidate_dll_path(&env_p)
+        {
+            candidates.push(cand);
         }
     }
 
@@ -899,5 +930,25 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_resolve_candidate_dll_path_enforces_trusted_absolute_windivert_dll() {
+        assert!(resolve_candidate_dll_path("").is_none());
+        assert!(resolve_candidate_dll_path("WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r".\driver\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"..\driver\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"C:\FlowX\..\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"\\fileserver\share\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"C:\FlowX\evil.dll").is_none());
+
+        assert_eq!(
+            resolve_candidate_dll_path(r"C:\FlowX\driver\WinDivert.dll"),
+            Some(PathBuf::from(r"C:\FlowX\driver\WinDivert.dll"))
+        );
+        assert_eq!(
+            resolve_candidate_dll_path(r"C:\FlowX\driver"),
+            Some(PathBuf::from(r"C:\FlowX\driver\WinDivert.dll"))
+        );
     }
 }

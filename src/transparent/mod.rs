@@ -11,13 +11,17 @@ pub mod windivert_ffi;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use tracing::{debug, info, warn};
 
 use crate::dns::server::DnsServer;
-use crate::interceptor::dispatcher::{dispatch_transparent_stream, DispatcherConfig};
+use crate::interceptor::dispatcher::DispatcherConfig;
+#[cfg(windows)]
+use crate::interceptor::dispatcher::dispatch_transparent_stream;
 
 /// 透明代理配置（持久化至 `<TransparentProxy>`）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -182,25 +186,44 @@ unsafe fn load_system32_library(dll_name: &str) -> io::Result<windows_sys::Win32
     Ok(module)
 }
 
-/// 解析 `%SystemRoot%\System32\<exe_name>` 完整可信路径，禁止裸名走 `PATH` / CWD
+/// 解析通过 Windows API `GetSystemDirectoryW` 确认的本地可信 `System32\<exe_name>` 路径，拒绝可变环境变量、CWD 与 UNC 回退
+#[cfg(windows)]
+fn get_trusted_system32_dir() -> io::Result<std::path::PathBuf> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetSystemDirectoryW(lpBuffer: *mut u16, uSize: u32) -> u32;
+    }
+
+    let mut buf = vec![0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if (len as usize) > buf.len() {
+        buf.resize(len as usize, 0);
+        let len2 = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+        if len2 == 0 || (len2 as usize) >= buf.len() {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(std::path::PathBuf::from(String::from_utf16_lossy(
+            &buf[..len2 as usize],
+        )));
+    }
+    Ok(std::path::PathBuf::from(String::from_utf16_lossy(
+        &buf[..len as usize],
+    )))
+}
+
 #[cfg(windows)]
 fn resolve_system32_executable(exe_name: &str) -> io::Result<std::path::PathBuf> {
-    let sys_root = std::env::var_os("SystemRoot")
-        .or_else(|| std::env::var_os("windir"))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Neither SystemRoot nor windir environment variable is set",
-            )
-        })?;
-    let root_path = std::path::PathBuf::from(sys_root);
-    if !root_path.is_absolute() {
+    let sys_dir = get_trusted_system32_dir()?;
+    if !windivert_ffi::is_trusted_local_absolute_path(&sys_dir) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("SystemRoot path is not absolute: {}", root_path.display()),
+            format!("GetSystemDirectoryW returned untrusted path: {}", sys_dir.display()),
         ));
     }
-    let exe_path = root_path.join("System32").join(exe_name);
+    let exe_path = sys_dir.join(exe_name);
     if !exe_path.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -478,6 +501,7 @@ fn shutdown_and_join_runtime(
     socket_handle: &windivert_ffi::WinDivertHandle,
     network_handle: &windivert_ffi::WinDivertHandle,
     threads: Vec<JoinHandle<()>>,
+    dns_abort_handles: &Mutex<Vec<tokio::task::AbortHandle>>,
 ) {
     crate::outbound::bypass::set_transparent_active(false);
     stop_flag.store(true, Ordering::Release);
@@ -486,6 +510,10 @@ fn shutdown_and_join_runtime(
     let _ = network_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
     for th in threads {
         let _ = th.join();
+    }
+    let mut handles = dns_abort_handles.lock().unwrap_or_else(|e| e.into_inner());
+    for h in handles.drain(..) {
+        h.abort();
     }
 }
 
@@ -498,6 +526,7 @@ struct PartialRuntimeGuard {
     socket_handle: Arc<windivert_ffi::WinDivertHandle>,
     network_handle: Arc<windivert_ffi::WinDivertHandle>,
     threads: Vec<JoinHandle<()>>,
+    dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 #[cfg(windows)]
@@ -513,6 +542,7 @@ impl Drop for PartialRuntimeGuard {
             &self.socket_handle,
             &self.network_handle,
             threads,
+            &self.dns_abort_handles,
         );
     }
 }
@@ -524,15 +554,19 @@ struct ActiveRuntime {
     socket_handle: Arc<windivert_ffi::WinDivertHandle>,
     network_handle: Arc<windivert_ffi::WinDivertHandle>,
     threads: Vec<JoinHandle<()>>,
+    dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     driver_version: Option<String>,
 }
 
 /// WinDivert NETWORK 层收包初始缓冲区（128 KiB > WINDIVERT_MTU_MAX 65575）与 LSO/巨包动态扩容上限（4 MiB）
+#[cfg(any(windows, test))]
 pub(crate) const INITIAL_NET_RX_BUF_LEN: usize = 131_072;
+#[cfg(any(windows, test))]
 pub(crate) const MAX_NET_RX_BUF_LEN: usize = 4 * 1024 * 1024;
 #[cfg(windows)]
 const WINDOWS_ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 
+#[cfg(any(windows, test))]
 #[inline]
 pub(crate) fn next_net_rx_buf_len(current: usize) -> Option<usize> {
     if current >= MAX_NET_RX_BUF_LEN {
@@ -542,12 +576,14 @@ pub(crate) fn next_net_rx_buf_len(current: usize) -> Option<usize> {
 }
 
 /// WinDivert NETWORK 层过滤表达式：捕获全部出站非自环 TCP、UDP/53 DNS、UDP/443 QUIC、发往 Fake-IP (`198.18.0.0/15`) 的任意 UDP 以及全部 IPv4/IPv6 分片
+#[cfg(any(windows, test))]
 pub(crate) fn windivert_network_filter() -> &'static str {
     "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255) or fragment)"
 }
 
 #[cfg(windows)]
 struct NetRxContext {
+    stop_flag: Arc<AtomicBool>,
     net_h: Arc<windivert_ffi::WinDivertHandle>,
     table: Arc<pid_table::SocketPidTable>,
     sig: Arc<netstack::NetstackSignal>,
@@ -557,6 +593,7 @@ struct NetRxContext {
     live_dns: Arc<AtomicBool>,
     live_quic: Arc<AtomicBool>,
     rt: tokio::runtime::Handle,
+    dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
 #[cfg(windows)]
@@ -621,15 +658,22 @@ impl NetRxContext {
                         udp.dst_port,
                         udp.is_ipv6,
                     );
-                    let net_inj = Arc::clone(&self.net_h);
+                    let net_inj = Arc::downgrade(&self.net_h);
+                    let stop = Arc::clone(&self.stop_flag);
                     let dns = Arc::clone(&self.dns_srv);
                     let loopback = addr.loopback();
-                    self.rt.spawn(async move {
+                    let join_handle = self.rt.spawn(async move {
                         let orig_dns_dst = std::net::SocketAddr::new(req_meta.1, req_meta.3);
                         if let Some(resp_payload) = dns
                             .process_transparent_query_bytes(&owned_payload, orig_dns_dst)
                             .await
                         {
+                            if stop.load(Ordering::Acquire) {
+                                return;
+                            }
+                            let Some(net_inj) = net_inj.upgrade() else {
+                                return;
+                            };
                             let pseudo_req = dns_hijack::ParsedUdpPacket {
                                 src_ip: req_meta.0,
                                 dst_ip: req_meta.1,
@@ -652,6 +696,12 @@ impl NetRxContext {
                             }
                         }
                     });
+                    let mut handles = self
+                        .dns_abort_handles
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    handles.retain(|h| !h.is_finished());
+                    handles.push(join_handle.abort_handle());
                 }
             }
             return true;
@@ -693,7 +743,9 @@ impl NetRxContext {
 
 /// 透明代理全生命周期管理器：负责 WinDivert 驱动加载、双层截获线程调度、错误诊断与 Drop 安全回收
 pub struct TransparentManager {
+    #[cfg_attr(not(windows), allow(dead_code))]
     dispatcher_config: Arc<DispatcherConfig>,
+    #[cfg_attr(not(windows), allow(dead_code))]
     dns_server: Arc<DnsServer>,
     settings: Mutex<TransparentSettings>,
     persisted_enabled: AtomicBool,
@@ -856,6 +908,51 @@ impl TransparentManager {
         Ok(())
     }
 
+    /// 启动期自动开启失败时将运行时 `enabled` 复位为 `false`，同时保留 `persisted_enabled` 与错误诊断，
+    /// 避免后续在线更新 `dll_path` 或附加配置时因沿用 `enabled = true` 而被回滚锁死。
+    pub fn mark_boot_start_failed(&self) {
+        let mut guard = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        guard.enabled = false;
+    }
+
+    /// 在线更新透明代理附加配置（`hijack_dns` / `block_quic_for_proxied` / `dll_path`）：
+    /// 若当前处于运行态，仍按热重启 semantics 执行并在失败时回滚；若当前未运行，则直接提交新配置供后续启用或提权生效。
+    pub fn apply_config_update(
+        &self,
+        mut next: TransparentSettings,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<(), String> {
+        if self.is_running() {
+            return self.apply_settings(next, rt_handle);
+        }
+
+        let _guard = self
+            .lifecycle_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        self.live_hijack_dns
+            .store(next.hijack_dns, Ordering::Release);
+        self.live_block_quic
+            .store(next.block_quic_for_proxied, Ordering::Release);
+
+        if next.enabled {
+            match self.start_locked(rt_handle, &next) {
+                Ok(()) => {
+                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = next;
+                    *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                Err(_) => {
+                    next.enabled = false;
+                    *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = next;
+                }
+            }
+        } else {
+            *self.settings.lock().unwrap_or_else(|e| e.into_inner()) = next;
+        }
+        Ok(())
+    }
+
     /// 尝试按照当前 `settings` 启动透明代理
     pub fn start(&self, rt_handle: &tokio::runtime::Handle) -> Result<(), String> {
         let _guard = self
@@ -990,6 +1087,7 @@ impl TransparentManager {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let pid_table = Arc::new(pid_table::SocketPidTable::new());
         let signal = Arc::new(netstack::NetstackSignal::new());
+        let dns_abort_handles = Arc::new(Mutex::new(Vec::new()));
 
         let mut startup_guard = PartialRuntimeGuard {
             armed: true,
@@ -998,6 +1096,7 @@ impl TransparentManager {
             socket_handle: Arc::clone(&socket_handle),
             network_handle: Arc::clone(&network_handle),
             threads: Vec::with_capacity(3),
+            dns_abort_handles: Arc::clone(&dns_abort_handles),
         };
         crate::outbound::bypass::set_transparent_active(true);
 
@@ -1057,6 +1156,7 @@ impl TransparentManager {
         {
             let stop = Arc::clone(&stop_flag);
             let ctx = NetRxContext {
+                stop_flag: Arc::clone(&stop_flag),
                 net_h: Arc::clone(&network_handle),
                 table: Arc::clone(&pid_table),
                 sig: Arc::clone(&signal),
@@ -1066,6 +1166,7 @@ impl TransparentManager {
                 live_dns: Arc::clone(&self.live_hijack_dns),
                 live_quic: Arc::clone(&self.live_block_quic),
                 rt: rt_handle.clone(),
+                dns_abort_handles: Arc::clone(&dns_abort_handles),
             };
 
             let handle = std::thread::Builder::new()
@@ -1273,6 +1374,7 @@ impl TransparentManager {
             socket_handle,
             network_handle,
             threads,
+            dns_abort_handles,
             driver_version: driver_version.clone(),
         });
 
@@ -1297,6 +1399,7 @@ impl TransparentManager {
             &rt.socket_handle,
             &rt.network_handle,
             rt.threads,
+            &rt.dns_abort_handles,
         );
         drop(rt.socket_handle);
         drop(rt.network_handle);

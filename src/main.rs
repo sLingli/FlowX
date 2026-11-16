@@ -191,12 +191,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             Ok(Err(err_msg)) => {
+                transparent_mgr.mark_boot_start_failed();
                 warn!(
                     "[Transparent] Failed to start automatically on boot (daemon stays active): {}",
                     err_msg
                 );
             }
             Err(join_err) => {
+                transparent_mgr.mark_boot_start_failed();
                 warn!(
                     "[Transparent] Background startup task panicked/cancelled: {}",
                     join_err

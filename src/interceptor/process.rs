@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 use std::hash::Hash;
+#[cfg(any(windows, target_os = "macos", test))]
 use std::mem::size_of;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(any(windows, target_os = "linux", test))]
+use std::net::{SocketAddrV4, SocketAddrV6};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
