@@ -179,9 +179,10 @@ pub fn decide_udp_packet(
             };
 
             let proc_info = pid.and_then(|p| tracker.and_then(|t| t.resolve_pid(p)));
+            let proc_unresolved = pid.is_none() || (tracker.is_some() && proc_info.is_none());
             let proc_path = proc_info.as_ref().map(|i| i.path.as_str());
             let proc_name = proc_info.as_ref().map(|i| i.name.as_str());
-            let is_shared = pid.is_none() || is_shared_system_dns_process(proc_path, proc_name);
+            let is_shared = proc_unresolved || is_shared_system_dns_process(proc_path, proc_name);
 
             match re.classify_dns_query(proc_path, proc_name, &question.name, is_shared) {
                 DnsHijackDecision::Hijack => UdpDecision::HandleDns,
@@ -196,13 +197,14 @@ pub fn decide_udp_packet(
                 return UdpDecision::DropQuic;
             };
             let proc_info = pid.and_then(|p| tracker.and_then(|t| t.resolve_pid(p)));
+            let proc_unresolved = pid.is_none() || (tracker.is_some() && proc_info.is_none());
             let proc_path = proc_info.as_ref().map(|i| i.path.as_str());
             let proc_name = proc_info.as_ref().map(|i| i.name.as_str());
 
             match re.needs_domain_for_routing(proc_path, proc_name, Some(pkt.dst_ip), pkt.dst_port)
             {
                 DomainNeedDecision::Immediate(Action::Direct) => {
-                    if pid.is_none()
+                    if proc_unresolved
                         && re.has_reachable_app_scoped_override(Some(pkt.dst_ip), pkt.dst_port)
                     {
                         UdpDecision::DropQuic
@@ -500,5 +502,28 @@ mod tests {
             Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
             Some("chrome.exe")
         ));
+
+        // 传入了一个已消逝或权限受限的 PID (Some(999999)) 且搭配真实 ProcessTracker 时，
+        // resolve_pid 返回 None => proc_unresolved 必须激活，拦截前导应用级规则 DevProxy 上的 QUIC 防止绕过
+        let real_tracker = ProcessTracker::new();
+        let app_proxy_engine = build_engine(
+            vec![
+                rule_with("LocalBypass", None, Some("192.168.0.0/16"), Action::Direct),
+                rule_with("DevProxy", Some("chrome.exe"), None, Action::Proxy(101)),
+            ],
+            Action::Direct,
+        );
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_quic,
+                Some(999_999),
+                true,
+                true,
+                Some(&app_proxy_engine),
+                Some(&real_tracker),
+                None,
+            ),
+            UdpDecision::DropQuic
+        );
     }
 }

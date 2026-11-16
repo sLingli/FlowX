@@ -8,6 +8,14 @@ use crate::transparent::windivert_ffi::WinDivertEvent;
 const SHARD_COUNT: usize = 16;
 const MAX_ENTRIES_PER_SHARD: usize = 4096;
 const ENTRY_TTL: Duration = Duration::from_secs(300);
+const NEG_LOOKUP_TTL: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidTableLookup {
+    Hit(u32),
+    NegativeCached,
+    Miss,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct PidEntry {
@@ -20,43 +28,44 @@ struct PidShard {
     exact: HashMap<(u8, IpAddr, u16), PidEntry>,
     /// 键为 `(protocol, is_ipv6_unspec, local_port)`；仅由 `0.0.0.0` / `[::]` 通配事件写入
     wild: HashMap<(u8, bool, u16), PidEntry>,
+    /// 短生命周期负缓存：抑制 `GetExtendedUdpTable` / `GetExtendedTcpTable` 在缓存未命中下的同步高频扫描
+    neg_exact: HashMap<(u8, IpAddr, u16), Instant>,
+}
+
+fn trim_map_if_over<K: Copy + Eq + std::hash::Hash, V>(
+    map: &mut HashMap<K, V>,
+    ts_of: impl Fn(&V) -> Instant,
+) {
+    if map.len() <= MAX_ENTRIES_PER_SHARD {
+        return;
+    }
+    let mut items: Vec<_> = map.iter().map(|(k, v)| (*k, ts_of(v))).collect();
+    items.sort_unstable_by_key(|(_, ts)| *ts);
+    let remove_cnt = map.len().saturating_sub(MAX_ENTRIES_PER_SHARD * 3 / 4);
+    for (k, _) in items.into_iter().take(remove_cnt) {
+        map.remove(&k);
+    }
 }
 
 impl PidShard {
     fn maybe_evict(&mut self, now: Instant) {
-        if self.exact.len() <= MAX_ENTRIES_PER_SHARD && self.wild.len() <= MAX_ENTRIES_PER_SHARD {
+        if self.exact.len() <= MAX_ENTRIES_PER_SHARD
+            && self.wild.len() <= MAX_ENTRIES_PER_SHARD
+            && self.neg_exact.len() <= MAX_ENTRIES_PER_SHARD
+        {
             return;
         }
         self.exact
             .retain(|_, v| now.saturating_duration_since(v.updated_at) <= ENTRY_TTL);
         self.wild
             .retain(|_, v| now.saturating_duration_since(v.updated_at) <= ENTRY_TTL);
+        self.neg_exact
+            .retain(|_, ts| now.saturating_duration_since(*ts) <= NEG_LOOKUP_TTL);
 
         // 若未过期项仍超限（高并发短连接冲击），按最近更新时间淘汰最老的四分之一
-        if self.exact.len() > MAX_ENTRIES_PER_SHARD {
-            let mut items: Vec<_> = self
-                .exact
-                .iter()
-                .map(|(k, v)| (*k, v.updated_at))
-                .collect();
-            items.sort_unstable_by_key(|(_, ts)| *ts);
-            let remove_cnt = self.exact.len().saturating_sub(MAX_ENTRIES_PER_SHARD * 3 / 4);
-            for (k, _) in items.into_iter().take(remove_cnt) {
-                self.exact.remove(&k);
-            }
-        }
-        if self.wild.len() > MAX_ENTRIES_PER_SHARD {
-            let mut items: Vec<_> = self
-                .wild
-                .iter()
-                .map(|(k, v)| (*k, v.updated_at))
-                .collect();
-            items.sort_unstable_by_key(|(_, ts)| *ts);
-            let remove_cnt = self.wild.len().saturating_sub(MAX_ENTRIES_PER_SHARD * 3 / 4);
-            for (k, _) in items.into_iter().take(remove_cnt) {
-                self.wild.remove(&k);
-            }
-        }
+        trim_map_if_over(&mut self.exact, |v| v.updated_at);
+        trim_map_if_over(&mut self.wild, |v| v.updated_at);
+        trim_map_if_over(&mut self.neg_exact, |ts| *ts);
     }
 }
 
@@ -116,6 +125,7 @@ impl SocketPidTable {
         let mut shard = self.shards[Self::shard_index(local_port)]
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        shard.neg_exact.remove(&(protocol, norm_ip, local_port));
         shard.exact.insert(
             (protocol, norm_ip, local_port),
             PidEntry {
@@ -123,6 +133,29 @@ impl SocketPidTable {
                 updated_at: now,
             },
         );
+        shard.maybe_evict(now);
+    }
+
+    /// 写入短时负查找缓存，避免热路径对已消失/系统级端点连续重复调用 OS API 全表扫描
+    pub fn record_negative_lookup(&self, protocol: u8, local_ip: IpAddr, local_port: u16) {
+        self.record_negative_lookup_at(protocol, local_ip, local_port, Instant::now());
+    }
+
+    fn record_negative_lookup_at(
+        &self,
+        protocol: u8,
+        local_ip: IpAddr,
+        local_port: u16,
+        now: Instant,
+    ) {
+        if local_port == 0 || !matches!(protocol, 6 | 17) {
+            return;
+        }
+        let norm_ip = local_ip.to_canonical();
+        let mut shard = self.shards[Self::shard_index(local_port)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        shard.neg_exact.insert((protocol, norm_ip, local_port), now);
         shard.maybe_evict(now);
     }
 
@@ -156,9 +189,13 @@ impl SocketPidTable {
                     updated_at: now,
                 };
                 if !norm_ip.is_unspecified() {
+                    shard.neg_exact.remove(&(protocol, norm_ip, local_port));
                     shard.exact.insert((protocol, norm_ip, local_port), entry);
                 } else {
                     // 仅当套接字明确处于通配绑定（0.0.0.0 / ::）时才写入 wild，绝不让具体地址覆写或污染他族通配表
+                    shard
+                        .neg_exact
+                        .retain(|(p, _, port), _| !(*p == protocol && *port == local_port));
                     shard
                         .wild
                         .insert((protocol, norm_ip.is_ipv6(), local_port), entry);
@@ -185,9 +222,17 @@ impl SocketPidTable {
 
     /// 根据五元组中的源协议、源 IP 与源端口高速查询归属 PID；优先精确匹配，未命中则查同族/双栈 `[::]` 通配绑定，并滑动续期 `updated_at`
     pub fn lookup(&self, protocol: u8, local_ip: IpAddr, local_port: u16) -> Option<u32> {
-        self.lookup_at(protocol, local_ip, local_port, Instant::now())
+        match self.lookup_status(protocol, local_ip, local_port) {
+            PidTableLookup::Hit(pid) => Some(pid),
+            PidTableLookup::NegativeCached | PidTableLookup::Miss => None,
+        }
     }
 
+    pub fn lookup_status(&self, protocol: u8, local_ip: IpAddr, local_port: u16) -> PidTableLookup {
+        self.lookup_status_at(protocol, local_ip, local_port, Instant::now())
+    }
+
+    #[cfg(test)]
     fn lookup_at(
         &self,
         protocol: u8,
@@ -195,8 +240,21 @@ impl SocketPidTable {
         local_port: u16,
         now: Instant,
     ) -> Option<u32> {
+        match self.lookup_status_at(protocol, local_ip, local_port, now) {
+            PidTableLookup::Hit(pid) => Some(pid),
+            PidTableLookup::NegativeCached | PidTableLookup::Miss => None,
+        }
+    }
+
+    fn lookup_status_at(
+        &self,
+        protocol: u8,
+        local_ip: IpAddr,
+        local_port: u16,
+        now: Instant,
+    ) -> PidTableLookup {
         if local_port == 0 {
-            return None;
+            return PidTableLookup::Miss;
         }
         let norm_ip = local_ip.to_canonical();
         let mut shard = self.shards[Self::shard_index(local_port)]
@@ -207,14 +265,14 @@ impl SocketPidTable {
             && now.saturating_duration_since(entry.updated_at) <= ENTRY_TTL
         {
             entry.updated_at = now;
-            return Some(entry.pid);
+            return PidTableLookup::Hit(entry.pid);
         }
         let is_v6 = norm_ip.is_ipv6();
         if let Some(entry) = shard.wild.get_mut(&(protocol, is_v6, local_port))
             && now.saturating_duration_since(entry.updated_at) <= ENTRY_TTL
         {
             entry.updated_at = now;
-            return Some(entry.pid);
+            return PidTableLookup::Hit(entry.pid);
         }
         // Windows 双栈 `[::]` UDP/TCP 套接字发出的 IPv4 包也可回退命中 `is_ipv6 = true` 的通配项
         if !is_v6
@@ -222,9 +280,14 @@ impl SocketPidTable {
             && now.saturating_duration_since(entry.updated_at) <= ENTRY_TTL
         {
             entry.updated_at = now;
-            return Some(entry.pid);
+            return PidTableLookup::Hit(entry.pid);
         }
-        None
+        if let Some(neg_ts) = shard.neg_exact.get(&(protocol, norm_ip, local_port))
+            && now.saturating_duration_since(*neg_ts) <= NEG_LOOKUP_TTL
+        {
+            return PidTableLookup::NegativeCached;
+        }
+        PidTableLookup::Miss
     }
 
     #[inline]
@@ -317,5 +380,36 @@ mod tests {
         table.record_event_at(WinDivertEvent::SocketBind, 17, unspec4, 61112, 9010, t0);
         assert_eq!(table.lookup_at(17, nic6, 61112, t0), None);
         assert_eq!(table.lookup_at(17, nic4, 61112, t0), Some(9010));
+    }
+
+    #[test]
+    fn test_socket_pid_table_negative_cache_and_positive_clear() {
+        let table = SocketPidTable::new();
+        let nic = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20));
+        let t0 = Instant::now();
+
+        assert_eq!(table.lookup_status_at(17, nic, 59999, t0), PidTableLookup::Miss);
+        table.record_negative_lookup_at(17, nic, 59999, t0);
+        assert_eq!(
+            table.lookup_status_at(17, nic, 59999, t0 + Duration::from_secs(1)),
+            PidTableLookup::NegativeCached
+        );
+        // 超过 2s 负缓存 TTL 后回到 Miss 允许再探
+        assert_eq!(
+            table.lookup_status_at(17, nic, 59999, t0 + Duration::from_secs(3)),
+            PidTableLookup::Miss
+        );
+
+        // 写入负缓存后若 SOCKET 层迎来 SocketConnect 正向事件，必须立刻清负缓存并命中 PID
+        table.record_negative_lookup_at(17, nic, 59998, t0);
+        assert_eq!(
+            table.lookup_status_at(17, nic, 59998, t0),
+            PidTableLookup::NegativeCached
+        );
+        table.record_event_at(WinDivertEvent::SocketConnect, 17, nic, 59998, 7777, t0);
+        assert_eq!(
+            table.lookup_status_at(17, nic, 59998, t0),
+            PidTableLookup::Hit(7777)
+        );
     }
 }

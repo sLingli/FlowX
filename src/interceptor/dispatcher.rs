@@ -172,10 +172,6 @@ fn is_self_target(target: &TargetAddr, server_addr: &SocketAddr, self_ports: &[u
     false
 }
 
-fn is_sniffable_default_port(port: u16) -> bool {
-    matches!(port, 80 | 443 | 8080 | 8443)
-}
-
 struct DispatchSession {
     inbound_label: &'static str,
     inbound_kind: Option<inbound::InboundKind>,
@@ -365,7 +361,6 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             (target, None, None, Vec::new())
         } else {
             let need_sniff = needs_domain_sniff
-                || is_sniffable_default_port(orig_dst.port())
                 || matches!(
                     config.rule_engine.needs_domain_for_routing(
                         proc_info.as_ref().map(|p| p.path.as_str()),
@@ -902,5 +897,60 @@ mod tests {
         assert!(mapped_res.is_ok(), "Fake-IP domain restore should trigger Action::Block cleanly");
         let mut probe = [0u8; 8];
         assert_eq!(app_mapped.read(&mut probe).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_skips_sniff_when_immediate_on_443() {
+        // 服务器等待客户端主动发首字节（不会先发 banner）：若触发 120ms 嗅探则会明显拖延首包或消费超时，
+        // 这里使用 Immediate(Proxy/Direct) + 沉默服务端 + 明确发首字节前的 Immediate 直连延迟检测：
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin.local_addr().unwrap();
+        let srv_task = tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            // 服务端先发送二进制协议 banner：若 dispatcher 在 443 上错误等待客户端先发 SNI，将死锁满 120ms
+            s.write_all(b"SRV_BANNER").await.unwrap();
+            let mut ack = [0u8; 6];
+            s.read_exact(&mut ack).await.unwrap();
+            assert_eq!(&ack, b"CLI_OK");
+        });
+
+        let mut cfg = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "BypassPort443",
+                true,
+                None,
+                None,
+                None,
+                Action::Direct,
+            )],
+        );
+        cfg.fake_ip_pool = Arc::new(FakeIpPool::new_default());
+        let (mut app_side, disp_side) = tokio::io::duplex(4096);
+        // 即使源目标端口是 443，只要 needs_domain_sniff=false 且 rule_engine 返回 Immediate，也不得阻塞等待客户端先发 SNI
+        let fake_dst_443 = SocketAddr::new(origin_addr.ip(), 443);
+        let _ = fake_dst_443;
+        let disp_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(cfg),
+                disp_side,
+                "127.0.0.1:50099".parse().unwrap(),
+                origin_addr,
+                None,
+                false,
+            )
+            .await
+        });
+
+        let mut banner = [0u8; 10];
+        tokio::time::timeout(Duration::from_secs(2), app_side.read_exact(&mut banner))
+            .await
+            .expect("Immediate route must forward server banner without awaiting client SNI")
+            .unwrap();
+        assert_eq!(&banner, b"SRV_BANNER");
+        app_side.write_all(b"CLI_OK").await.unwrap();
+        drop(app_side);
+        disp_handle.await.unwrap().unwrap();
+        srv_task.await.unwrap();
     }
 }

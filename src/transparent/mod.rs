@@ -450,17 +450,25 @@ fn resolve_outbound_pid(
     remote: std::net::SocketAddr,
     allow_os_fallback: bool,
 ) -> Option<u32> {
-    if let Some(pid) = table.lookup(protocol, local.ip(), local.port()) {
-        return Some(pid);
+    match table.lookup_status(protocol, local.ip(), local.port()) {
+        pid_table::PidTableLookup::Hit(pid) => Some(pid),
+        pid_table::PidTableLookup::NegativeCached => None,
+        pid_table::PidTableLookup::Miss => {
+            if !allow_os_fallback {
+                return None;
+            }
+            match crate::interceptor::process::lookup_outbound_socket_pid(protocol, local, remote) {
+                Some(pid) if pid != 0 => {
+                    table.record_resolved_pid(protocol, local.ip(), local.port(), pid);
+                    Some(pid)
+                }
+                _ => {
+                    table.record_negative_lookup(protocol, local.ip(), local.port());
+                    None
+                }
+            }
+        }
     }
-    if !allow_os_fallback {
-        return None;
-    }
-    let pid = crate::interceptor::process::lookup_outbound_socket_pid(protocol, local, remote)?;
-    if pid != 0 {
-        table.record_resolved_pid(protocol, local.ip(), local.port(), pid);
-    }
-    Some(pid)
 }
 
 #[cfg(windows)]
@@ -578,9 +586,14 @@ impl NetRxContext {
         let net_data = addr.network();
 
         if let Some(udp) = dns_hijack::parse_udp_packet(raw) {
+            if crate::outbound::bypass::is_udp_port_bypassed(udp.src_port) {
+                self.emit_passthrough(raw, addr, fallback_fragments);
+                return true;
+            }
             let local_ep = std::net::SocketAddr::new(udp.src_ip, udp.src_port);
             let remote_ep = std::net::SocketAddr::new(udp.dst_ip, udp.dst_port);
-            let pid = resolve_outbound_pid(&self.table, 17, local_ep, remote_ep, true);
+            let allow_os_fallback = matches!(udp.dst_port, 53 | 443);
+            let pid = resolve_outbound_pid(&self.table, 17, local_ep, remote_ep, allow_os_fallback);
             let decision = dns_hijack::decide_udp_packet(
                 &udp,
                 pid,
@@ -645,12 +658,17 @@ impl NetRxContext {
         }
 
         if let Some(tcp) = netstack::parse_tcp_packet(raw) {
+            if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port) {
+                self.stats
+                    .tcp_passthrough_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.emit_passthrough(raw, addr, fallback_fragments);
+                return true;
+            }
             let local_ep = std::net::SocketAddr::new(tcp.src_ip, tcp.src_port);
             let remote_ep = std::net::SocketAddr::new(tcp.dst_ip, tcp.dst_port);
             let pid = resolve_outbound_pid(&self.table, 6, local_ep, remote_ep, tcp.syn && !tcp.ack);
-            if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port)
-                || pid.is_some_and(pid_table::SocketPidTable::is_self_pid)
-            {
+            if pid.is_some_and(pid_table::SocketPidTable::is_self_pid) {
                 self.stats
                     .tcp_passthrough_total
                     .fetch_add(1, Ordering::Relaxed);

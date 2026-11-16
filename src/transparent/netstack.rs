@@ -1144,15 +1144,16 @@ impl NetstackEngine {
             false
         } else if let Some(re) = rule_engine {
             let proc_info = pid.and_then(|p| tracker.and_then(|t| t.resolve_pid(p)));
+            let proc_unresolved = pid.is_none() || (tracker.is_some() && proc_info.is_none());
             let proc_path = proc_info.as_ref().map(|i| i.path.as_str());
             let proc_name = proc_info.as_ref().map(|i| i.name.as_str());
             match re.needs_domain_for_routing(proc_path, proc_name, Some(pkt.dst_ip), pkt.dst_port)
             {
                 DomainNeedDecision::Immediate(Action::Direct) => {
-                    if pid.is_none()
+                    if proc_unresolved
                         && re.has_reachable_app_scoped_override(Some(pkt.dst_ip), pkt.dst_port)
                     {
-                        // 首包阶段 PID 未知但前方存在应用级非 Direct 规则（如 DevProxy）：接入协议栈交由 Dispatcher 异步复核进程归属，绝不盲目永久旁路
+                        // 首包阶段 PID 或进程名解析缺失但前方存在应用级非 Direct 规则（如 DevProxy）：接入协议栈交由 Dispatcher 异步复核进程归属，绝不盲目永久旁路
                         false
                     } else {
                         insert_syn_passthrough(&mut self.passthrough);
@@ -2091,6 +2092,25 @@ mod tests {
             TcpIngestOutcome::Intercepted
         ));
         assert_eq!(engine.active_flow_count(), 1);
+
+        // 3. 当提供真实 ProcessTracker 但 PID = Some(999999) 已退出无法解析进程路径/名称时，
+        //    proc_unresolved 必须生效并接入协议栈复核，不得误写 passthrough 绕过 DevProxy
+        let real_tracker = ProcessTracker::new();
+        let syn_dead_pid = build_syn([10, 0, 0, 2], 51202, [8, 8, 8, 8], 443, 300);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(
+                syn_dead_pid,
+                meta,
+                Some(999_999),
+                Some(&engine_rules),
+                Some(&real_tracker),
+                None,
+                &mut accepted,
+                &mut tx,
+            ),
+            TcpIngestOutcome::Intercepted
+        ));
+        assert_eq!(engine.active_flow_count(), 2);
     }
 
     #[test]

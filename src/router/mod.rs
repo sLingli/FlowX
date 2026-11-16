@@ -320,28 +320,18 @@ pub enum DnsHijackDecision {
     Hijack,
 }
 
-/// 判定是否为公网可路由单播 IP（排除环回、RFC1918 私网、链路本地、CGNAT、ULA 及 Fake-IP `198.18.0.0/15`）
-fn is_public_unicast_ip(ip: IpAddr) -> bool {
+/// 判定是否为非环回、非未指定、非广播多播且非 Fake-IP (`198.18.0.0/15`) 的有效单播 IP（覆盖公网及 RFC1918/CGNAT/ULA 私网）
+fn is_non_loopback_unicast_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
             !v4.is_loopback()
-                && !v4.is_private()
-                && !v4.is_link_local()
                 && !v4.is_unspecified()
                 && !v4.is_broadcast()
                 && !v4.is_multicast()
-                && !(a == 100 && (b & 0xC0) == 64)
                 && !(a == 198 && (b & 0xFE) == 18)
         }
-        IpAddr::V6(v6) => {
-            let seg0 = v6.segments()[0];
-            !v6.is_loopback()
-                && !v6.is_unspecified()
-                && !v6.is_multicast()
-                && (seg0 & 0xfe00) != 0xfc00
-                && (seg0 & 0xffc0) != 0xfe80
-        }
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
     }
 }
 
@@ -353,7 +343,7 @@ fn rule_has_applicable_domain(
     if domains.is_empty() {
         return false;
     }
-    if target_ip.is_some_and(is_public_unicast_ip) {
+    if target_ip.is_some_and(is_non_loopback_unicast_ip) {
         domains.iter().any(|d| !d.is_host_local(local_hostname))
     } else {
         true
@@ -657,14 +647,17 @@ impl RuleEngine {
             }
 
             // 共享系统 DNS（如 svchost.exe）：
-            // 1) 显式针对 svchost.exe 本身的规则，或全局（无应用限定）规则按正常优先级生效；
-            // 2) 仅限其他应用的无域名规则（如 DevProxy）绝不污染系统公共 DNS 缓存；
-            // 3) 若存在明确匹配外部域名的非 Direct 规则（含针对特定应用的域名规则），则对该域名按需 Fake-IP 劫持。
+            // 1) 显式针对 svchost.exe 本身的规则，或全局（无应用限定）规则按正常优先级生效（如先导全局 Direct/LocalBypass 直通）；
+            // 2) 若启用了针对特定应用的代理/阻断规则（如 DevProxy，含无目标通配或匹配外部域名），
+            //    则允许对外部查询域名前置分配 Fake-IP，使 node/git/antigravity 经由 Dnscache 解析后同样享受到无 DNS 泄漏的域名级代理。
             let explicitly_scoped_to_other_app = rule.application_patterns.is_some()
                 && rule.matches_app_only(&ctx).is_err();
 
             if explicitly_scoped_to_other_app {
-                if rule.matches_domain(qname) && rule.action != Action::Direct {
+                let matched_qname = (rule.target_domains.is_none()
+                    && rule.target_subnets.is_none())
+                    || rule.matches_domain(qname);
+                if matched_qname && rule.action != Action::Direct {
                     return DnsHijackDecision::Hijack;
                 }
             } else {
@@ -1219,7 +1212,7 @@ mod tests {
             DomainNeedDecision::Immediate(Action::Direct)
         );
 
-        // DevProxy 应用访问非 192.168 私网 IP 10.0.0.5 -> 仍保留 Host 嗅探以识别内网 %ComputerName%
+        // DevProxy 应用访问非 192.168 非环回私网 IP 10.0.0.5 -> 同样剪枝 LocalBypass 本机域名，直接 Immediate(Proxy(101))
         assert_eq!(
             profile_engine.needs_domain_for_routing(
                 Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
@@ -1227,10 +1220,11 @@ mod tests {
                 Some(private_10),
                 8080,
             ),
-            DomainNeedDecision::NeedsDomainSniff
+            DomainNeedDecision::Immediate(Action::Proxy(101))
         );
 
-        // Windows 共享 DNS 客户端 (svchost.exe) 在仅有进程无域名规则 (DevProxy) 时必须全部 Passthrough，绝不污染系统 DNS
+        // 启用 DevProxy 时，经 svchost.exe 发起的外部域名查询同样接入 Fake-IP，防止 node/git/antigravity 经系统 DNSclient 绕过远程解析；
+        // 但本地 / mDNS / 环回名仍强制直连，纯 Direct 规则集下也绝不劫持 svchost.exe。
         assert_eq!(
             profile_engine.classify_dns_query(
                 Some(r"C:\Windows\System32\svchost.exe"),
@@ -1238,13 +1232,42 @@ mod tests {
                 "www.baidu.com",
                 true,
             ),
-            DnsHijackDecision::Passthrough
+            DnsHijackDecision::Hijack
         );
         assert_eq!(
             profile_engine.classify_dns_query(
                 Some(r"C:\Windows\System32\svchost.exe"),
                 Some("svchost.exe"),
                 "github.com",
+                true,
+            ),
+            DnsHijackDecision::Hijack
+        );
+        assert_eq!(
+            profile_engine.classify_dns_query(
+                Some(r"C:\Windows\System32\svchost.exe"),
+                Some("svchost.exe"),
+                "printer.local",
+                true,
+            ),
+            DnsHijackDecision::Passthrough
+        );
+        let direct_only_engine = RuleEngine::new(
+            vec![Rule::from_raw(
+                "LocalBypass",
+                true,
+                None,
+                Some("127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16"),
+                None,
+                Action::Direct,
+            )],
+            Action::Direct,
+        );
+        assert_eq!(
+            direct_only_engine.classify_dns_query(
+                Some(r"C:\Windows\System32\svchost.exe"),
+                Some("svchost.exe"),
+                "www.baidu.com",
                 true,
             ),
             DnsHijackDecision::Passthrough
