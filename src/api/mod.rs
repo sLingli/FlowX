@@ -33,6 +33,11 @@ const MAX_API_CONCURRENCY: usize = 128;
 const MAX_MUTATION_CONCURRENCY: usize = 16;
 const MAX_PING_CONCURRENCY: usize = 16;
 
+#[cfg(test)]
+pub(crate) type ElevateRunner = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+#[cfg(not(test))]
+type ElevateRunner = ();
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyNodeView {
     pub id: u32,
@@ -242,6 +247,8 @@ pub struct ApiServer {
     mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
     elevating: Arc<AtomicBool>,
+    #[cfg(test)]
+    elevate_runner: Option<ElevateRunner>,
     persist_timeout: Duration,
     started_at: Instant,
 }
@@ -269,6 +276,8 @@ impl ApiServer {
             mutation_semaphore: Arc::new(Semaphore::new(MAX_MUTATION_CONCURRENCY)),
             mutation_lock: Arc::new(Mutex::new(())),
             elevating: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            elevate_runner: None,
             persist_timeout: CONFIG_PERSIST_TIMEOUT,
             started_at: Instant::now(),
         }
@@ -277,6 +286,12 @@ impl ApiServer {
     #[cfg(test)]
     pub(crate) fn with_persist_timeout(mut self, timeout: Duration) -> Self {
         self.persist_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_elevate_runner(mut self, runner: ElevateRunner) -> Self {
+        self.elevate_runner = Some(runner);
         self
     }
 
@@ -395,6 +410,10 @@ impl ApiServer {
             let mutation_semaphore = Arc::clone(&self.mutation_semaphore);
             let mutation_lock = Arc::clone(&self.mutation_lock);
             let elevating = Arc::clone(&self.elevating);
+            #[cfg(test)]
+            let elevate_runner = self.elevate_runner.clone();
+            #[cfg(not(test))]
+            let elevate_runner: Option<ElevateRunner> = None;
             let persist_timeout = self.persist_timeout;
             let started_at = self.started_at;
             let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
@@ -417,6 +436,7 @@ impl ApiServer {
                     mutation_semaphore,
                     mutation_lock,
                     elevating,
+                    elevate_runner,
                     persist_timeout,
                     started_at,
                 )
@@ -791,6 +811,7 @@ async fn handle_api_request(
     mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
     elevating: Arc<AtomicBool>,
+    elevate_runner: Option<ElevateRunner>,
     persist_timeout: Duration,
     started_at: Instant,
 ) -> Result<()> {
@@ -955,6 +976,73 @@ async fn handle_api_request(
         return Ok(());
     }
 
+    let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
+
+    // POST /api/transparent/elevate 采用前置无锁一次性原子闸门：
+    // 1) 在排队等待 mutation_lock 之前先检查 elevating，避免 UAC 弹窗超过 5s 时并发请求返回 503 或取消后连续弹第二个 UAC；
+    // 2) 不持 mutation_lock 等待交互式 UAC 对话框，防止阻塞其它配置变更写接口。
+    if method == "POST" && path == "/api/transparent/elevate" {
+        if !req_body.trim().is_empty() && serde_json::from_str::<serde_json::Value>(req_body).is_err()
+        {
+            send_http_response(
+                &mut stream,
+                "400 Bad Request",
+                "application/json; charset=utf-8",
+                &json_error(
+                    locale,
+                    "ERR_INVALID_TRANSPARENT_BODY",
+                    "error.invalid_transparent_body",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let already_shutting_down = shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow());
+        if already_shutting_down
+            || elevating
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            send_http_response(
+                &mut stream,
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json_error(
+                    locale,
+                    "ERR_TRANSPARENT_ELEVATE_IN_PROGRESS",
+                    "error.transparent_elevate_in_progress",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let mut trigger_elevated_shutdown = false;
+        let (status, content_type, body) = handle_transparent_elevate_after_gate(
+            locale,
+            &elevating,
+            elevate_runner,
+            &mut trigger_elevated_shutdown,
+        )
+        .await;
+        if trigger_elevated_shutdown
+            && let Some(tx) = shutdown_tx.as_ref()
+        {
+            let _ = tx.send(true);
+        }
+        finish_api_response_and_maybe_shutdown(
+            &mut stream,
+            status,
+            content_type,
+            &body,
+            trigger_elevated_shutdown,
+            shutdown_tx.as_ref(),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let is_mutation = is_mutation_endpoint(method, path);
     let (mut mutation_guard, mut mutation_sem_permit) = if is_mutation {
         let Ok(sem_permit) = mutation_semaphore.try_acquire() else {
@@ -978,6 +1066,22 @@ async fn handle_api_request(
             .await?;
             return Ok(());
         };
+        if shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow()) {
+            drop(lock_guard);
+            drop(sem_permit);
+            send_http_response(
+                &mut stream,
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json_error(
+                    locale,
+                    "ERR_TRANSPARENT_ELEVATE_IN_PROGRESS",
+                    "error.transparent_elevate_in_progress",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         (Some(lock_guard), Some(sem_permit))
     } else {
         (None, None)
@@ -999,10 +1103,9 @@ async fn handle_api_request(
         (Arc::clone(&live_proxy_nodes), Arc::clone(&live_rule_engine))
     };
 
-    let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
     let mut should_persist = false;
     let mut rollback_transparent: Option<TransparentRollbackState> = None;
-    let mut trigger_elevated_shutdown = false;
+    let trigger_elevated_shutdown = false;
 
     let (mut status, mut content_type, mut body) = match (method, path) {
         ("OPTIONS", _) => ("204 No Content", "text/plain", String::new()),
@@ -1397,15 +1500,6 @@ async fn handle_api_request(
                 locale,
                 &mut should_persist,
                 &mut rollback_transparent,
-            )
-            .await
-        }
-        ("POST", "/api/transparent/elevate") => {
-            handle_transparent_elevate(
-                req_body,
-                locale,
-                &elevating,
-                &mut trigger_elevated_shutdown,
             )
             .await
         }
@@ -2709,46 +2803,30 @@ impl Drop for ElevateFlagResetGuard<'_> {
     }
 }
 
-async fn handle_transparent_elevate(
-    req_body: &str,
+async fn handle_transparent_elevate_after_gate(
     locale: Locale,
     elevating: &AtomicBool,
+    elevate_runner: Option<ElevateRunner>,
     trigger_elevated_shutdown: &mut bool,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
-    if !req_body.trim().is_empty() && serde_json::from_str::<serde_json::Value>(req_body).is_err() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_INVALID_TRANSPARENT_BODY",
-                "error.invalid_transparent_body",
-            ),
-        );
-    }
-
-    // 一次性原子闸门：拒绝同一生命周期内的并发或重复提权，防止连续弹出多个 UAC 并拉起双份提权进程
-    if elevating
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return (
-            "409 Conflict",
-            ct,
-            json_error(
-                locale,
-                "ERR_TRANSPARENT_ELEVATE_IN_PROGRESS",
-                "error.transparent_elevate_in_progress",
-            ),
-        );
-    }
     let mut reset_guard = ElevateFlagResetGuard {
         flag: elevating,
         armed: true,
     };
 
-    match tokio::task::spawn_blocking(|| relaunch_elevated_with_replace_pid(&[])).await {
+    #[cfg(test)]
+    let launch_fut = tokio::task::spawn_blocking(move || match elevate_runner {
+        Some(runner) => runner(),
+        None => relaunch_elevated_with_replace_pid(&[]),
+    });
+    #[cfg(not(test))]
+    let launch_fut = {
+        let _ = elevate_runner;
+        tokio::task::spawn_blocking(|| relaunch_elevated_with_replace_pid(&[]))
+    };
+
+    match launch_fut.await {
         Ok(Ok(())) => {
             reset_guard.armed = false;
             *trigger_elevated_shutdown = true;
@@ -5277,6 +5355,123 @@ mod tests {
 
         release_mutation_locks_before_response(&mut g_opt, &mut p_opt, true, Some(&elev_tx));
         assert!(waiter.await.unwrap(), "shutdown_tx must be visible before mutation_lock unlocks");
+    }
+
+    #[tokio::test]
+    async fn test_api_elevate_concurrent_during_blocking_uac_and_cancel_retry() {
+        use std::sync::atomic::AtomicUsize;
+
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        let entered_tx = Arc::new(std::sync::Mutex::new(Some(entered_tx)));
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+
+        let runner: ElevateRunner = {
+            let calls = Arc::clone(&calls);
+            let entered_tx = Arc::clone(&entered_tx);
+            let release_rx = Arc::clone(&release_rx);
+            Arc::new(move || {
+                let n = calls.fetch_add(1, Ordering::AcqRel) + 1;
+                if n == 1 {
+                    if let Some(tx) = entered_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    release_rx.lock().unwrap().recv().unwrap()
+                } else {
+                    Ok(())
+                }
+            })
+        };
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), nodes)
+            .with_shutdown_sender(shutdown_tx.clone())
+            .with_persist_timeout(Duration::from_millis(100))
+            .with_elevate_runner(runner);
+
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let rx_srv = shutdown_rx.clone();
+        let server_task = tokio::spawn(async move { srv.run(listener, rx_srv).await });
+
+        // 1. 请求 1 发起提权并阻塞在模拟 UAC 对话框阶段（远超 mutation_lock 的 100ms persist_timeout）
+        let raw_req1 = format!(
+            "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+            port
+        );
+        let req1 = tokio::spawn(async move { raw_http(addr, &raw_req1).await });
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        // 2. UAC 弹窗挂起期间并发发送第二个提权请求：必须立刻返回 409 Conflict（绝不阻塞或返回 503），且不会重入拉起第二个 UAC
+        let resp2 = tokio::time::timeout(
+            Duration::from_secs(1),
+            raw_http(
+                addr,
+                &format!(
+                    "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+                    port
+                ),
+            ),
+        )
+        .await
+        .expect("concurrent elevate must return 409 immediately without waiting on UAC");
+        assert!(resp2.starts_with("HTTP/1.1 409 Conflict"), "resp2: {resp2}");
+        assert!(resp2.contains("ERR_TRANSPARENT_ELEVATE_IN_PROGRESS"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+
+        // 3. UAC 弹窗挂起期间并发发送普通配置修改：不应被阻塞在 UAC 对话框上
+        let def_body = r#"{"action":"Direct"}"#;
+        let mut_resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            raw_http(
+                addr,
+                &format!(
+                    "POST /api/rules/default HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    port,
+                    def_body.len(),
+                    def_body
+                ),
+            ),
+        )
+        .await
+        .expect("regular mutations must not stall on interactive UAC");
+        assert!(mut_resp.starts_with("HTTP/1.1 200 OK"), "mut_resp: {mut_resp}");
+
+        // 4. 模拟用户在首个 UAC 取消授权：请求 1 返回 409 UAC_CANCELLED，且期间 calls 仍为 1（绝不弹出第二个 UAC）
+        release_tx
+            .send(Err(std::io::Error::other(
+                "ERR_TRANSPARENT_UAC_CANCELLED: User cancelled UAC prompt",
+            )))
+            .unwrap();
+        let resp1 = req1.await.unwrap();
+        assert!(resp1.starts_with("HTTP/1.1 409 Conflict"), "resp1: {resp1}");
+        assert!(resp1.contains("ERR_TRANSPARENT_UAC_CANCELLED"));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(!*shutdown_rx.borrow());
+
+        // 5. 取消之后允许重新发起提权；一旦成功即触发 shutdown_tx
+        let resp3 = raw_http(
+            addr,
+            &format!(
+                "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+                port
+            ),
+        )
+        .await;
+        assert!(resp3.starts_with("HTTP/1.1 200 OK"), "resp3: {resp3}");
+        assert!(resp3.contains(r#""relaunching":true"#));
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert!(*shutdown_rx.borrow());
+
+        let _ = server_task.await;
     }
 
     #[tokio::test]
