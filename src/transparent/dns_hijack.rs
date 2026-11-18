@@ -15,6 +15,7 @@ pub enum UdpDecision {
     DropQuic,
     DropFakeIp,
     HandleDns,
+    InspectDns,
 }
 
 /// 识别代表系统共享 DNS 解析器（如 Windows `svchost.exe` DNS Client）发起 UDP/53 查询的进程
@@ -186,7 +187,19 @@ pub fn decide_udp_packet(
 
             match re.classify_dns_query(proc_path, proc_name, &question.name, is_shared) {
                 DnsHijackDecision::Hijack => UdpDecision::HandleDns,
-                DnsHijackDecision::Passthrough => UdpDecision::Passthrough,
+                DnsHijackDecision::Passthrough => {
+                    if is_shared
+                        && re.should_inspect_shared_dns_for_app_proxy(
+                            proc_path,
+                            proc_name,
+                            &question.name,
+                        )
+                    {
+                        UdpDecision::InspectDns
+                    } else {
+                        UdpDecision::Passthrough
+                    }
+                }
             }
         }
         443 => {
@@ -525,5 +538,88 @@ mod tests {
             ),
             UdpDecision::DropQuic
         );
+
+        // 共享/未解析系统 DNS 发起外部域名查询且存在 DevProxy（target_domains=None）时应进入 InspectDns
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_dns,
+                Some(999_999),
+                true,
+                true,
+                Some(&app_proxy_engine),
+                Some(&real_tracker),
+                None,
+            ),
+            UdpDecision::InspectDns
+        );
+        // 纯直连策略下即便是共享/未解析系统 DNS 也应直接 Passthrough
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_dns,
+                Some(999_999),
+                true,
+                true,
+                Some(&direct_only_engine),
+                Some(&real_tracker),
+                None,
+            ),
+            UdpDecision::Passthrough
+        );
+
+        // 本地域名（localhost / .local）和显式前置全局直连域名（*.cn -> Direct）不进入 InspectDns
+        for local_domain in ["localhost", "printer.local"] {
+            let local_query = build_sample_dns_query(0x3344, local_domain, 1);
+            let mut local_pkt = Vec::new();
+            PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .udp(40010, 53)
+                .write(&mut local_pkt, &local_query)
+                .unwrap();
+            let parsed_local = parse_udp_packet(&local_pkt).unwrap();
+            assert_eq!(
+                decide_udp_packet(
+                    &parsed_local,
+                    Some(999_999),
+                    true,
+                    true,
+                    Some(&app_proxy_engine),
+                    Some(&real_tracker),
+                    None,
+                ),
+                UdpDecision::Passthrough,
+                "local domain {} must remain Passthrough",
+                local_domain
+            );
+        }
+
+        let cn_override_engine = build_engine(
+            vec![
+                rule_with("DirectCN", None, Some("*.cn"), Action::Direct),
+                rule_with("DevProxy", Some("chrome.exe"), None, Action::Proxy(101)),
+            ],
+            Action::Direct,
+        );
+        let cn_query = build_sample_dns_query(0x3355, "example.cn", 1);
+        let mut cn_pkt = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .udp(40011, 53)
+            .write(&mut cn_pkt, &cn_query)
+            .unwrap();
+        let parsed_cn = parse_udp_packet(&cn_pkt).unwrap();
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_cn,
+                Some(999_999),
+                true,
+                true,
+                Some(&cn_override_engine),
+                Some(&real_tracker),
+                None,
+            ),
+            UdpDecision::Passthrough
+        );
+
+        // 全局直连子网判定应准确命中 LocalBypass 的 192.168.0.0/16 并放过公网 IP
+        assert!(app_proxy_engine.matches_global_direct_subnet(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(!app_proxy_engine.matches_global_direct_subnet(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 }

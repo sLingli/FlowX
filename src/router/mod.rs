@@ -725,6 +725,86 @@ impl RuleEngine {
         }
     }
 
+    /// 当共享系统 DNS（如 `svchost.exe`）因避免污染直连进程而对某外部域名返回 `Passthrough` 时，
+    /// 检查规则集内是否存在被前序全局/系统直连规则放行、后续可达的仅限应用全通代理规则（如 `DevProxy`）。
+    /// 若存在，则透明层应进入 `InspectDns`（透传真实解析并缓存 IP->域名，必要时对 NXDOMAIN/投毒救援分配 Fake-IP）。
+    pub fn should_inspect_shared_dns_for_app_proxy(
+        &self,
+        process_path: Option<&str>,
+        process_name: Option<&str>,
+        qname: &str,
+    ) -> bool {
+        let local_hostname = parser::resolve_local_hostname();
+        if is_non_hijackable_local_qname(qname, &local_hostname) {
+            return false;
+        }
+
+        let ctx = RouteContext {
+            process_path,
+            process_name,
+            target_host: Some(qname),
+            target_ip: None,
+            target_port: 0,
+        };
+        let rules = self.current_rules();
+
+        for rule in rules.iter() {
+            if !rule.enabled {
+                continue;
+            }
+            if rule.target_domains.is_none() && rule.ports.is_some() {
+                continue;
+            }
+
+            let explicitly_scoped_to_other_app =
+                rule.application_patterns.is_some() && rule.matches_app_only(&ctx).is_err();
+
+            if explicitly_scoped_to_other_app {
+                if rule.target_domains.is_none()
+                    && rule.target_subnets.is_none()
+                    && rule.ports.is_none()
+                    && matches!(rule.action, Action::Proxy(_) | Action::Chain(_))
+                {
+                    return true;
+                }
+                continue;
+            }
+
+            let matched_qname = (rule.target_domains.is_none()
+                && rule.target_subnets.is_none()
+                && rule.ports.is_none())
+                || rule.matches_domain(qname);
+            if matched_qname && rule.ports.is_none() && rule.action == Action::Direct {
+                return false;
+            }
+        }
+
+        false
+    }
+
+    /// 判断目标 IP 是否命中全局直连子网规则（无应用限定且无端口限定，如默认 `LocalBypass` 的 `192.168.0.0/16`）
+    pub fn matches_global_direct_subnet(&self, ip: IpAddr) -> bool {
+        let canonical = ip.to_canonical();
+        let rules = self.current_rules();
+        for rule in rules.iter() {
+            if !rule.enabled
+                || rule.application_patterns.is_some()
+                || rule.ports.is_some()
+                || rule.action != Action::Direct
+            {
+                continue;
+            }
+            if rule
+                .target_subnets
+                .as_ref()
+                .is_some_and(|subs| subs.iter().any(|net| net.contains(&canonical)))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 当首包阶段 PID 未知时，判断给定 `(target_ip, target_port)` 前方是否存在可达的非 `Direct` 应用级规则（如 `DevProxy`）。
     ///
     /// 若在无条件全局匹配终止之前存在任何可能命中的 `application_patterns` 非 `Direct` 规则，则返回 `true`，

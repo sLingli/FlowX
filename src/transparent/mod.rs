@@ -648,8 +648,11 @@ impl NetRxContext {
                     self.stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
                 }
                 dns_hijack::UdpDecision::DropFakeIp => {}
-                dns_hijack::UdpDecision::HandleDns => {
-                    self.stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
+                dns_hijack::UdpDecision::HandleDns | dns_hijack::UdpDecision::InspectDns => {
+                    let inspect_mode = matches!(decision, dns_hijack::UdpDecision::InspectDns);
+                    if !inspect_mode {
+                        self.stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
+                    }
                     let owned_payload = udp.payload.to_vec();
                     let req_meta = (
                         udp.src_ip,
@@ -661,13 +664,23 @@ impl NetRxContext {
                     let net_inj = Arc::downgrade(&self.net_h);
                     let stop = Arc::clone(&self.stop_flag);
                     let dns = Arc::clone(&self.dns_srv);
+                    let rule_engine =
+                        inspect_mode.then(|| Arc::clone(&self.dispatcher_cfg.rule_engine));
                     let loopback = addr.loopback();
                     let join_handle = self.rt.spawn(async move {
                         let orig_dns_dst = std::net::SocketAddr::new(req_meta.1, req_meta.3);
-                        if let Some(resp_payload) = dns
-                            .process_transparent_query_bytes(&owned_payload, orig_dns_dst)
+                        let resp_payload = if let Some(re) = rule_engine.as_deref() {
+                            dns.process_transparent_inspect_query_bytes(
+                                &owned_payload,
+                                orig_dns_dst,
+                                Some(re),
+                            )
                             .await
-                        {
+                        } else {
+                            dns.process_transparent_query_bytes(&owned_payload, orig_dns_dst)
+                                .await
+                        };
+                        if let Some(resp_payload) = resp_payload {
                             if stop.load(Ordering::Acquire) {
                                 return;
                             }
