@@ -1339,7 +1339,9 @@ impl TransparentManager {
                         for flow in accepted.drain(..) {
                             stats.tcp_intercepted_total.fetch_add(1, Ordering::Relaxed);
                             let dcfg = Arc::clone(&dispatcher_cfg);
+                            let spawn_in_flight = dcfg.in_flight.as_ref().map(|t| t.enter());
                             rt.spawn(async move {
+                                let _spawn_in_flight = spawn_in_flight;
                                 if let Err(e) = dispatch_transparent_stream(
                                     dcfg,
                                     flow.stream,
@@ -1375,6 +1377,8 @@ impl TransparentManager {
                             let _ = net_h.send(&tx_pkt.data, &inj_addr);
                         }
                     }
+                    engine.abort_all_sessions();
+                    stats.active_flows.store(0, Ordering::Relaxed);
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn netstack actor thread: {e}")))?;
             startup_guard.threads.push(handle);
@@ -1498,6 +1502,7 @@ mod tests {
             proxy_nodes: Arc::new(RwLock::new(HashMap::new())),
             proxy_chains: Arc::new(HashMap::new()),
             self_ports: Vec::new(),
+            in_flight: None,
         });
         let dns_server = Arc::new(DnsServer::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -1620,6 +1625,7 @@ mod tests {
             proxy_nodes: Arc::new(RwLock::new(HashMap::new())),
             proxy_chains: Arc::new(HashMap::new()),
             self_ports: Vec::new(),
+            in_flight: None,
         });
         let dns_server = Arc::new(DnsServer::new(
             "127.0.0.1:0".parse().unwrap(),

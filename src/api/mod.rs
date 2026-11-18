@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
@@ -240,6 +241,7 @@ pub struct ApiServer {
     ping_semaphore: Arc<Semaphore>,
     mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
+    elevating: Arc<AtomicBool>,
     persist_timeout: Duration,
     started_at: Instant,
 }
@@ -266,6 +268,7 @@ impl ApiServer {
             ping_semaphore: Arc::new(Semaphore::new(MAX_PING_CONCURRENCY)),
             mutation_semaphore: Arc::new(Semaphore::new(MAX_MUTATION_CONCURRENCY)),
             mutation_lock: Arc::new(Mutex::new(())),
+            elevating: Arc::new(AtomicBool::new(false)),
             persist_timeout: CONFIG_PERSIST_TIMEOUT,
             started_at: Instant::now(),
         }
@@ -391,6 +394,7 @@ impl ApiServer {
             let ping_semaphore = Arc::clone(&self.ping_semaphore);
             let mutation_semaphore = Arc::clone(&self.mutation_semaphore);
             let mutation_lock = Arc::clone(&self.mutation_lock);
+            let elevating = Arc::clone(&self.elevating);
             let persist_timeout = self.persist_timeout;
             let started_at = self.started_at;
             let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
@@ -412,6 +416,7 @@ impl ApiServer {
                     ping_semaphore,
                     mutation_semaphore,
                     mutation_lock,
+                    elevating,
                     persist_timeout,
                     started_at,
                 )
@@ -785,6 +790,7 @@ async fn handle_api_request(
     ping_semaphore: Arc<Semaphore>,
     mutation_semaphore: Arc<Semaphore>,
     mutation_lock: Arc<Mutex<()>>,
+    elevating: Arc<AtomicBool>,
     persist_timeout: Duration,
     started_at: Instant,
 ) -> Result<()> {
@@ -1395,7 +1401,13 @@ async fn handle_api_request(
             .await
         }
         ("POST", "/api/transparent/elevate") => {
-            handle_transparent_elevate(req_body, locale, &mut trigger_elevated_shutdown).await
+            handle_transparent_elevate(
+                req_body,
+                locale,
+                &elevating,
+                &mut trigger_elevated_shutdown,
+            )
+            .await
         }
         _ => (
             "404 Not Found",
@@ -1462,9 +1474,14 @@ async fn handle_api_request(
         }
     }
 
-    // 内存与磁盘均提交/回滚完毕后立即释放写锁与并发许可，避免慢读客户端占用写通路
-    drop(mutation_guard.take());
-    drop(mutation_sem_permit.take());
+    // 内存与磁盘均提交/回滚完毕后立即释放写锁与并发许可，避免慢读客户端占用写通路；
+    // 若触发了提权交接停机，必须在释放 mutation_guard 之前先触发 shutdown_tx 止停接单窗口
+    release_mutation_locks_before_response(
+        &mut mutation_guard,
+        &mut mutation_sem_permit,
+        trigger_elevated_shutdown,
+        shutdown_tx.as_ref(),
+    );
 
     finish_api_response_and_maybe_shutdown(
         &mut stream,
@@ -1476,6 +1493,21 @@ async fn handle_api_request(
     )
     .await?;
     Ok(())
+}
+
+fn release_mutation_locks_before_response(
+    mutation_guard: &mut Option<tokio::sync::MutexGuard<'_, ()>>,
+    mutation_sem_permit: &mut Option<tokio::sync::SemaphorePermit<'_>>,
+    trigger_elevated_shutdown: bool,
+    shutdown_tx: Option<&watch::Sender<bool>>,
+) {
+    if trigger_elevated_shutdown
+        && let Some(tx) = shutdown_tx
+    {
+        let _ = tx.send(true);
+    }
+    drop(mutation_guard.take());
+    drop(mutation_sem_permit.take());
 }
 
 #[inline]
@@ -2664,9 +2696,23 @@ async fn handle_transparent_config(
     .await
 }
 
+struct ElevateFlagResetGuard<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl Drop for ElevateFlagResetGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, Ordering::Release);
+        }
+    }
+}
+
 async fn handle_transparent_elevate(
     req_body: &str,
     locale: Locale,
+    elevating: &AtomicBool,
     trigger_elevated_shutdown: &mut bool,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
@@ -2682,8 +2728,29 @@ async fn handle_transparent_elevate(
         );
     }
 
+    // 一次性原子闸门：拒绝同一生命周期内的并发或重复提权，防止连续弹出多个 UAC 并拉起双份提权进程
+    if elevating
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return (
+            "409 Conflict",
+            ct,
+            json_error(
+                locale,
+                "ERR_TRANSPARENT_ELEVATE_IN_PROGRESS",
+                "error.transparent_elevate_in_progress",
+            ),
+        );
+    }
+    let mut reset_guard = ElevateFlagResetGuard {
+        flag: elevating,
+        armed: true,
+    };
+
     match tokio::task::spawn_blocking(|| relaunch_elevated_with_replace_pid(&[])).await {
         Ok(Ok(())) => {
+            reset_guard.armed = false;
             *trigger_elevated_shutdown = true;
             ("200 OK", ct, r#"{"ok":true,"relaunching":true}"#.to_string())
         }
@@ -4956,6 +5023,7 @@ mod tests {
             proxy_nodes: Arc::clone(&nodes),
             proxy_chains: Arc::new(HashMap::new()),
             self_ports: vec![40001, 1053],
+            in_flight: None,
         });
         let dns_server = Arc::new(DnsServer::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -5157,6 +5225,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_api_elevate_one_shot_guard_and_shutdown_before_unlock() {
+        // 1. 当 elevating 原子闸门已被占用时，并发/重复 POST /api/transparent/elevate 必须立即返回 409 Conflict 且不清空闸门
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, re, nodes);
+        srv.elevating.store(true, Ordering::Release);
+
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let (shutdown_tx, rx) = watch::channel(false);
+        let elevating_ref = Arc::clone(&srv.elevating);
+        let server_task = tokio::spawn(async move { srv.run(listener, rx).await });
+
+        let resp = raw_http(
+            addr,
+            &format!(
+                "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}",
+                port
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 409 Conflict"), "resp: {resp}");
+        assert!(resp.contains("ERR_TRANSPARENT_ELEVATE_IN_PROGRESS"));
+        assert!(
+            elevating_ref.load(Ordering::Acquire),
+            "concurrent rejection must not clear active elevating gate"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = server_task.await;
+
+        // 2. 验证 release_mutation_locks_before_response 先触发 shutdown_tx 再释放 mutation_lock
+        let m_lock = Arc::new(Mutex::new(()));
+        let m_sem = Arc::new(Semaphore::new(1));
+        let (elev_tx, elev_rx) = watch::channel(false);
+
+        let mut g_opt = Some(m_lock.lock().await);
+        let mut p_opt = Some(m_sem.try_acquire().unwrap());
+
+        let waiter_lock = Arc::clone(&m_lock);
+        let waiter_rx = elev_rx.clone();
+        let waiter = tokio::spawn(async move {
+            let _g = waiter_lock.lock().await;
+            *waiter_rx.borrow()
+        });
+        tokio::task::yield_now().await;
+        assert!(!*elev_rx.borrow());
+
+        release_mutation_locks_before_response(&mut g_opt, &mut p_opt, true, Some(&elev_tx));
+        assert!(waiter.await.unwrap(), "shutdown_tx must be visible before mutation_lock unlocks");
+    }
+
+    #[tokio::test]
     async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_override() {
         use crate::dns::server::DnsServer;
         use crate::dns::FakeIpPool;
@@ -5191,6 +5314,7 @@ mod tests {
             proxy_nodes: Arc::clone(&nodes),
             proxy_chains: Arc::new(HashMap::new()),
             self_ports: vec![40001, 1053],
+            in_flight: None,
         });
         let dns_server = Arc::new(DnsServer::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -5298,6 +5422,7 @@ mod tests {
             proxy_nodes: Arc::clone(&nodes),
             proxy_chains: Arc::new(HashMap::new()),
             self_ports: vec![40001, 1053],
+            in_flight: None,
         });
         let dns_server = Arc::new(DnsServer::new(
             "127.0.0.1:0".parse().unwrap(),

@@ -241,6 +241,7 @@ fn translate_zh(key: &str) -> &'static str {
         "error.transparent_unsupported_os" => "当前操作系统不支持 WinDivert 透明代理（仅支持 Windows）",
         "error.transparent_uac_cancelled" => "管理员提权授权已取消或被系统拒绝",
         "error.transparent_already_elevated" => "当前进程已具备管理员权限",
+        "error.transparent_elevate_in_progress" => "管理员提权重启正在进行中，请完成当前 UAC 授权或等待重启完成",
         "error.transparent_elevate_failed" => "触发管理员提权重启失败",
         "error.transparent_start_failed" => "WinDivert 透明代理启动失败",
 
@@ -334,6 +335,7 @@ fn translate_en(key: &str) -> &'static str {
         "error.transparent_unsupported_os" => "WinDivert transparent proxy is only supported on Windows",
         "error.transparent_uac_cancelled" => "Administrator UAC elevation prompt was cancelled or denied",
         "error.transparent_already_elevated" => "FlowX is already running with Administrator privileges",
+        "error.transparent_elevate_in_progress" => "Administrator elevation relaunch is already in progress",
         "error.transparent_elevate_failed" => "Failed to launch elevated FlowX instance",
         "error.transparent_start_failed" => "Failed to start WinDivert transparent proxy",
 
@@ -392,6 +394,7 @@ mod tests {
             "error.transparent_unsupported_os",
             "error.transparent_uac_cancelled",
             "error.transparent_already_elevated",
+            "error.transparent_elevate_in_progress",
             "error.transparent_elevate_failed",
             "error.transparent_start_failed",
         ] {

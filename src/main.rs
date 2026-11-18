@@ -129,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
         proxy_nodes: Arc::clone(&proxy_nodes),
         proxy_chains: Arc::clone(&proxy_chains),
         self_ports: self_ports.clone(),
+        in_flight: Some(Arc::clone(&in_flight)),
     };
     let dispatcher = StreamDispatcher::new(dispatcher_config.clone())
         .with_in_flight(Arc::clone(&in_flight));

@@ -1516,6 +1516,42 @@ impl NetstackEngine {
             tx_out.push(EmittedIpPacket { data: pkt, meta });
         }
     }
+
+    /// 停机或协议栈卸载时立即关闭并唤醒全部活跃/半关闭透明连接，防止调度协程阻塞直至 120s 空闲超时
+    pub fn abort_all_sessions(&mut self) {
+        let drained: Vec<_> = self.intercepted.drain().map(|(_, sess)| sess).collect();
+        for session in drained {
+            let _ = self.sockets.remove(session.handle);
+            let mut wake_read: Option<Waker> = None;
+            let mut wake_write: Option<Waker> = None;
+            let mut wake_flush: Option<Waker> = None;
+            {
+                let mut inner = session.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
+                close_bridge_and_collect_wakers(
+                    &mut inner,
+                    true,
+                    &mut wake_read,
+                    &mut wake_write,
+                    &mut wake_flush,
+                );
+            }
+            if let Some(w) = wake_read {
+                w.wake();
+            }
+            if let Some(w) = wake_write {
+                w.wake();
+            }
+            if let Some(w) = wake_flush {
+                w.wake();
+            }
+        }
+    }
+}
+
+impl Drop for NetstackEngine {
+    fn drop(&mut self) {
+        self.abort_all_sessions();
+    }
 }
 
 #[cfg(test)]
@@ -2766,5 +2802,107 @@ mod tests {
         assert_eq!(emitted[0].meta.sub_if_idx, 2);
         assert_eq!(emitted[0].data[6], 44, "original Fragment header must stay intact");
         assert_eq!(emitted[0].data[40], 60, "original DestOpt extension header must stay intact");
+    }
+
+    #[tokio::test]
+    async fn test_netstack_engine_drop_wakes_pending_read_write_and_shutdown() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(Arc::clone(&signal));
+        let meta = PacketInterfaceMeta::default();
+        let re = RuleEngine::new(
+            vec![Rule::from_raw(
+                "ProxyAll",
+                true,
+                None,
+                None,
+                None,
+                Action::Proxy(1),
+            )],
+            Action::Direct,
+        );
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+
+        // 连接 1 与连接 2 先完成握手，避免后续 ack2 的 pump_internal 排空连接 1 的 to_socket 缓冲
+        let syn1 = build_syn([10, 0, 0, 2], 59201, [93, 184, 216, 34], 443, 100);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn1, meta, Some(7001), Some(&re), None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let sa1 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        let ack1 = build_ack([10, 0, 0, 2], 59201, [93, 184, 216, 34], 443, 101, sa1.seq + 1, false, &[]);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack1, meta, Some(7001), Some(&re), None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let flow1 = accepted.pop().unwrap();
+
+        let syn2 = build_syn([10, 0, 0, 2], 59202, [93, 184, 216, 34], 443, 200);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn2, meta, Some(7002), Some(&re), None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let sa2 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
+        let ack2 = build_ack([10, 0, 0, 2], 59202, [93, 184, 216, 34], 443, 201, sa2.seq + 1, false, &[]);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack2, meta, Some(7002), Some(&re), None, None, &mut accepted, &mut tx),
+            TcpIngestOutcome::Intercepted
+        ));
+        let flow2 = accepted.pop().unwrap();
+
+        // 连接 1：阻塞在 pending read() 和写满 BRIDGE_BUFFER_LIMIT 后的 pending write_all()
+        let (mut rd1, mut wr1) = flow1.stream.split_stream();
+        let fill_chunk = vec![0x41u8; BRIDGE_BUFFER_LIMIT];
+        wr1.write_all(&fill_chunk).await.unwrap();
+
+        let rd1_task = tokio::spawn(async move {
+            let mut buf = [0u8; 32];
+            rd1.read(&mut buf).await
+        });
+        let wr1_task = tokio::spawn(async move { wr1.write_all(b"BLOCKED_WRITE").await });
+
+        // 连接 2：阻塞在 pending read() 和 pending shutdown()
+        let (mut rd2, mut wr2) = flow2.stream.split_stream();
+        let rd2_task = tokio::spawn(async move {
+            let mut buf = [0u8; 32];
+            rd2.read(&mut buf).await
+        });
+        let sh2_task = tokio::spawn(async move { wr2.shutdown().await });
+
+        // 让各任务先进入 Poll::Pending 并注册 waker
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(engine.active_flow_count(), 2);
+
+        // 卸载/释放 NetstackEngine：所有活跃会话必须立刻唤醒报错并清理，不得永久挂起
+        drop(engine);
+
+        let r1 = tokio::time::timeout(Duration::from_secs(1), rd1_task)
+            .await
+            .expect("rd1 must wake promptly on engine drop")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(r1.kind(), io::ErrorKind::ConnectionReset);
+
+        let w1 = tokio::time::timeout(Duration::from_secs(1), wr1_task)
+            .await
+            .expect("wr1 must wake promptly on engine drop")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(w1.kind(), io::ErrorKind::ConnectionReset);
+
+        let r2 = tokio::time::timeout(Duration::from_secs(1), rd2_task)
+            .await
+            .expect("rd2 must wake promptly on engine drop")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(r2.kind(), io::ErrorKind::ConnectionReset);
+
+        let s2 = tokio::time::timeout(Duration::from_secs(1), sh2_task)
+            .await
+            .expect("sh2 must wake promptly on engine drop")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(s2.kind(), io::ErrorKind::ConnectionReset);
     }
 }

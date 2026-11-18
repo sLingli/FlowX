@@ -63,6 +63,8 @@ pub struct DispatcherConfig {
     pub proxy_chains: Arc<HashMap<u32, ProxyChain>>,
     /// FlowX 自身占用的服务端口（入站 / API / DNS），用于拦截指向自身的回环请求
     pub self_ports: Vec<u16>,
+    /// 全局在途任务追踪器（供透明代理连接及异步子任务纳入优雅停机排空）
+    pub in_flight: Option<Arc<InFlightTracker>>,
 }
 
 pub struct StreamDispatcher {
@@ -73,10 +75,11 @@ pub struct StreamDispatcher {
 
 impl StreamDispatcher {
     pub fn new(config: DispatcherConfig) -> Self {
+        let in_flight = config.in_flight.clone();
         Self {
             config: Arc::new(config),
             concurrency_limit: Arc::new(Semaphore::new(10000)), // 最大并发连接保护
-            in_flight: None,
+            in_flight,
         }
     }
 
@@ -337,6 +340,8 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
     pid_hint: Option<u32>,
     needs_domain_sniff: bool,
 ) -> Result<()> {
+    let _in_flight = config.in_flight.as_ref().map(|t| t.enter());
+
     // 1. 先检查原始目标是否指向 FlowX 自身监听端口，防止回环自连（无需额外等待嗅探）
     let raw_ip_target = TargetAddr::Ip(orig_dst);
     if is_self_target(&raw_ip_target, &config.bind_addr, &config.self_ports) {
@@ -585,6 +590,7 @@ mod tests {
             proxy_nodes: Arc::new(RwLock::new(HashMap::new())),
             proxy_chains: Arc::new(HashMap::new()),
             self_ports: vec![bind.port()],
+            in_flight: None,
         }
     }
 
@@ -1119,5 +1125,57 @@ mod tests {
         drop(app_22);
         handle_22.await.unwrap().unwrap();
         srv_22.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_tracks_in_flight_guard() {
+        let tracker = Arc::new(InFlightTracker::new());
+        let mut cfg = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "NeedSniProxy",
+                true,
+                None,
+                Some("track.example.org"),
+                None,
+                Action::Block,
+            )],
+        );
+        cfg.in_flight = Some(Arc::clone(&tracker));
+        let cfg = Arc::new(cfg);
+
+        assert_eq!(tracker.count(), 0);
+        let (mut app_side, disp_side) = tokio::io::duplex(4096);
+        let tracker_wait = Arc::clone(&tracker);
+        let disp_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                cfg,
+                disp_side,
+                "127.0.0.1:50120".parse().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+                true,
+            )
+            .await
+        });
+
+        // 在透明流进入 SNI 嗅探阻塞阶段时（尚未注册进 ConnectionManager），InFlightTracker 必须已计数 > 0
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            tracker.count() >= 1,
+            "transparent dispatch must hold InFlightTracker guard while sniffing"
+        );
+
+        let hello = build_test_tls_client_hello("track.example.org");
+        app_side.write_all(&hello).await.unwrap();
+        let mut eof_buf = [0u8; 8];
+        assert_eq!(app_side.read(&mut eof_buf).await.unwrap(), 0);
+        drop(app_side);
+
+        disp_handle.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), tracker_wait.wait_zero())
+            .await
+            .expect("InFlightTracker must drain to zero after transparent stream finishes");
+        assert_eq!(tracker.count(), 0);
     }
 }
