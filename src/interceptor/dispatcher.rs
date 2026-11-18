@@ -29,6 +29,24 @@ fn is_sniffable_default_port(port: u16) -> bool {
     matches!(port, 80 | 443 | 8080 | 8443)
 }
 
+#[inline]
+fn is_server_first_protocol_port(port: u16) -> bool {
+    matches!(port, 21 | 22 | 23 | 25 | 110 | 143 | 587 | 3306)
+}
+
+fn is_spoofed_local_hostname(host: &str, orig_dst_ip: IpAddr) -> bool {
+    let local_hostname = crate::router::parser::resolve_local_hostname();
+    let norm = host.trim().trim_end_matches('.');
+    let claims_local = crate::outbound::is_loopback_domain(host)
+        || (!local_hostname.is_empty()
+            && norm.eq_ignore_ascii_case(local_hostname.trim_end_matches('.')));
+    if !claims_local {
+        return false;
+    }
+    let local_ips = local_interface_ips();
+    !is_local_or_loopback_ip(orig_dst_ip, &local_ips)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProxyNodeEntry {
     pub id: u32,
@@ -361,7 +379,7 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
         None => config.tracker.find_by_connection_async(peer_addr, orig_dst).await,
     };
 
-    // 3. 若命中 Fake-IP 池直接还原域名；否则在规则需要或常见 HTTP/TLS 端口上非破坏性嗅探 SNI / Host
+    // 3. 若命中 Fake-IP 池直接还原域名；否则结合 DNS 实 IP 反向缓存与按需 SNI / Host 嗅探（避开服务端先说话协议卡死与伪造本机头）
     let (display_target, route_ip, dial_ip_on_direct, pending) =
         if config.fake_ip_pool.is_fake_ip_addr(orig_dst.ip()) {
             let domain = config.fake_ip_pool.restore_ip(orig_dst.ip()).ok_or_else(|| {
@@ -370,13 +388,14 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             let target = TargetAddr::Domain(domain, orig_dst.port());
             (target, None, None, Vec::new())
         } else {
+            let cached_domain = config.fake_ip_pool.lookup_real_ip_domain(orig_dst.ip());
             let domain_decision = config.rule_engine.needs_domain_for_routing(
                 proc_info.as_ref().map(|p| p.path.as_str()),
                 proc_info.as_ref().map(|p| p.name.as_str()),
                 Some(orig_dst.ip()),
                 orig_dst.port(),
             );
-            let need_sniff = needs_domain_sniff
+            let want_sniff = needs_domain_sniff
                 || match domain_decision {
                     crate::router::DomainNeedDecision::NeedsDomainSniff => true,
                     crate::router::DomainNeedDecision::Immediate(
@@ -386,17 +405,32 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                         Action::Direct | Action::Block,
                     ) => false,
                 };
+            let need_sniff = want_sniff
+                && !is_server_first_protocol_port(orig_dst.port())
+                && (cached_domain.is_none() || is_sniffable_default_port(orig_dst.port()));
             let (sniffed_host, buffered) = if need_sniff {
                 let outcome = crate::transparent::sniffer::peek_host_prefix(
                     &mut local_stream,
                     TRANSPARENT_SNIFF_TIMEOUT,
                 )
                 .await?;
-                (outcome.host, outcome.buffered)
+                let host = outcome.host.filter(|h| {
+                    if is_spoofed_local_hostname(h, orig_dst.ip()) {
+                        warn!(
+                            orig_dst = %orig_dst,
+                            spoofed_host = %h,
+                            "Ignored spoofed local hostname on remote destination IP"
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                });
+                (host, outcome.buffered)
             } else {
                 (None, Vec::new())
             };
-            match sniffed_host {
+            match sniffed_host.or(cached_domain) {
                 Some(host) => (
                     TargetAddr::Domain(host, orig_dst.port()),
                     Some(orig_dst.ip()),
@@ -1177,5 +1211,243 @@ mod tests {
             .await
             .expect("InFlightTracker must drain to zero after transparent stream finishes");
         assert_eq!(tracker.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_enforces_domain_port_rules_on_ssh_and_custom_ports_and_blocks_spoofed_localhost()
+    {
+        use crate::outbound::socks5::Socks5Client;
+
+        // 1. 端口+域名阻断规则 (ports="22", targets="*.foo", Block) 经 real_ip_to_domain 与 Fake-IP 均立即阻断 SSH，不绕过
+        let ssh_rules = vec![crate::router::Rule::from_raw(
+            "BlockFooSsh",
+            true,
+            None,
+            Some("*.foo"),
+            Some("22"),
+            Action::Block,
+        )];
+        let ssh_cfg = test_config("127.0.0.1:40001".parse().unwrap(), ssh_rules);
+        let ssh_real_ip: IpAddr = "93.184.216.50".parse().unwrap();
+        ssh_cfg
+            .fake_ip_pool
+            .record_real_ip_mappings("bastion.foo", &[ssh_real_ip]);
+        let ssh_cfg = Arc::new(ssh_cfg);
+
+        let (mut app_ssh, disp_ssh) = tokio::io::duplex(1024);
+        dispatch_transparent_stream(
+            Arc::clone(&ssh_cfg),
+            disp_ssh,
+            "127.0.0.1:50201".parse().unwrap(),
+            SocketAddr::new(ssh_real_ip, 22),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+        let mut probe = [0u8; 8];
+        assert_eq!(app_ssh.read(&mut probe).await.unwrap(), 0);
+
+        // 2. 自定义二进制端口规则 (ports="7777", targets="*.game", Proxy(1)) 经 real_ip_to_domain 自动以域名拨号代理，不空等 120ms
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_addr = socks_listener.local_addr().unwrap();
+        let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+        let socks_srv = tokio::spawn(async move {
+            let (mut s, _) = socks_listener.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 0x03, "port 7777 custom proto must still forward cached domain");
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l).await.unwrap();
+            let mut dom = vec![0u8; l[0] as usize];
+            s.read_exact(&mut dom).await.unwrap();
+            let mut p = [0u8; 2];
+            s.read_exact(&mut p).await.unwrap();
+            let _ = target_tx.send((String::from_utf8(dom).unwrap(), u16::from_be_bytes(p)));
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            s.write_all(b"GAME_SRV_HELLO").await.unwrap();
+        });
+
+        let game_cfg = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "GameProxy",
+                true,
+                None,
+                Some("*.game"),
+                Some("7777"),
+                Action::Proxy(1),
+            )],
+        );
+        let game_real_ip: IpAddr = "93.184.216.60".parse().unwrap();
+        game_cfg
+            .fake_ip_pool
+            .record_real_ip_mappings("login.game", &[game_real_ip]);
+        game_cfg.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "MockSocks".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: socks_addr.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(socks_addr.to_string())),
+            },
+        );
+        let (mut app_game, disp_game) = tokio::io::duplex(2048);
+        let game_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(game_cfg),
+                disp_game,
+                "127.0.0.1:50202".parse().unwrap(),
+                SocketAddr::new(game_real_ip, 7777),
+                None,
+                true,
+            )
+            .await
+        });
+        let mut game_hello = [0u8; 14];
+        tokio::time::timeout(Duration::from_secs(2), app_game.read_exact(&mut game_hello))
+            .await
+            .expect("custom port 7777 with cached domain must forward server banner immediately")
+            .unwrap();
+        assert_eq!(&game_hello, b"GAME_SRV_HELLO");
+        assert_eq!(target_rx.await.unwrap(), ("login.game".to_string(), 7777));
+        drop(app_game);
+        game_handle.await.unwrap().unwrap();
+        socks_srv.await.unwrap();
+
+        // 3. 未命中缓存的直连 SSH（端口 22）即使传入 needs_domain_sniff=true 也不得在嗅探阶段卡死，立刻放行服务端 banner
+        let ssh_socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ssh_socks_addr = ssh_socks.local_addr().unwrap();
+        let ssh_srv_task = tokio::spawn(async move {
+            let (mut s, _) = ssh_socks.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 10];
+            s.read_exact(&mut req).await.unwrap();
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            s.write_all(b"SSH-2.0-Immediate").await.unwrap();
+        });
+        let uncached_ssh_cfg = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "ProxyAll",
+                true,
+                None,
+                None,
+                None,
+                Action::Proxy(1),
+            )],
+        );
+        uncached_ssh_cfg.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "MockSocks22".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: ssh_socks_addr.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(ssh_socks_addr.to_string())),
+            },
+        );
+        let (mut app_u22, disp_u22) = tokio::io::duplex(2048);
+        let u22_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(uncached_ssh_cfg),
+                disp_u22,
+                "127.0.0.1:50203".parse().unwrap(),
+                "93.184.216.70:22".parse().unwrap(),
+                None,
+                true,
+            )
+            .await
+        });
+        let mut ssh_banner = [0u8; 17];
+        tokio::time::timeout(Duration::from_secs(2), app_u22.read_exact(&mut ssh_banner))
+            .await
+            .expect("port 22 SSH must not block waiting for client sniff even with needs_domain_sniff=true")
+            .unwrap();
+        assert_eq!(&ssh_banner, b"SSH-2.0-Immediate");
+        drop(app_u22);
+        u22_handle.await.unwrap().unwrap();
+        ssh_srv_task.await.unwrap();
+
+        // 4. 远端公网 IP:80 伪造 HTTP Host: localhost 不得命中 LocalBypass 绕过 DevProxy 直连公网 IP
+        let spoof_socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let spoof_socks_addr = spoof_socks.local_addr().unwrap();
+        let (spoof_tx, spoof_rx) = tokio::sync::oneshot::channel();
+        let spoof_srv = tokio::spawn(async move {
+            let (mut s, _) = spoof_socks.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 0x01, "spoofed Host: localhost on remote IP must stay as IP target for Proxy");
+            let mut ip = [0u8; 6];
+            s.read_exact(&mut ip).await.unwrap();
+            let dst = std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
+            let port = u16::from_be_bytes([ip[4], ip[5]]);
+            let _ = spoof_tx.send((dst, port));
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut req_buf = vec![0u8; 35];
+            s.read_exact(&mut req_buf).await.unwrap();
+            assert_eq!(&req_buf, b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            s.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        });
+        let spoof_cfg = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![
+                crate::router::Rule::from_raw("LocalBypass", true, None, Some("localhost"), None, Action::Direct),
+                crate::router::Rule::from_raw("DevProxy", true, None, None, None, Action::Proxy(1)),
+            ],
+        );
+        spoof_cfg.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "SpoofSocks".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: spoof_socks_addr.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(spoof_socks_addr.to_string())),
+            },
+        );
+        let (mut app_sp, disp_sp) = tokio::io::duplex(2048);
+        let sp_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(spoof_cfg),
+                disp_sp,
+                "127.0.0.1:50204".parse().unwrap(),
+                "93.184.216.80:80".parse().unwrap(),
+                None,
+                false,
+            )
+            .await
+        });
+        app_sp
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let (got_ip, got_port) = spoof_rx.await.unwrap();
+        assert_eq!(got_ip, std::net::Ipv4Addr::new(93, 184, 216, 80));
+        assert_eq!(got_port, 80);
+        let mut http_ack = [0u8; 19];
+        app_sp.read_exact(&mut http_ack).await.unwrap();
+        assert_eq!(&http_ack, b"HTTP/1.1 200 OK\r\n\r\n");
+        drop(app_sp);
+        sp_handle.await.unwrap().unwrap();
+        spoof_srv.await.unwrap();
     }
 }

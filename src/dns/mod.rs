@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 pub mod server;
 
+const MAX_REAL_IP_MAPPINGS: usize = 16_384;
+
 /// Fake-IP 线程安全分配池与双向映射表
 #[derive(Debug)]
 pub struct FakeIpPool {
@@ -21,6 +23,8 @@ struct PoolState {
     ip_to_domain: HashMap<Ipv4Addr, (String, Instant, u64)>,
     domain_to_ip: HashMap<String, (Ipv4Addr, Instant)>,
     expiry_heap: std::collections::BinaryHeap<std::cmp::Reverse<(Instant, u64, u32)>>,
+    /// 共享 DNS 检查/直连解析阶段记录的 真实 IP -> 域名 反向映射（不注入 Fake-IP，同时在 TCP 阶段免嗅探还原域名）
+    real_ip_to_domain: HashMap<IpAddr, (String, Instant)>,
 }
 
 impl PoolState {
@@ -31,6 +35,7 @@ impl PoolState {
             ip_to_domain: HashMap::new(),
             domain_to_ip: HashMap::new(),
             expiry_heap: std::collections::BinaryHeap::new(),
+            real_ip_to_domain: HashMap::new(),
         }
     }
 
@@ -235,11 +240,103 @@ impl FakeIpPool {
 
         state.ip_to_domain.retain(|_, (_, expire, _)| *expire > now);
         state.domain_to_ip.retain(|_, (_, expire)| *expire > now);
+        state.real_ip_to_domain.retain(|_, (_, expire)| *expire > now);
         if state.expiry_heap.len() > state.ip_to_domain.len().saturating_mul(4).max(256) {
             state.rebuild_expiry_heap();
         }
 
         before_count - state.ip_to_domain.len()
+    }
+
+    /// 记录通过上游 DNS 解析到的 真实单播 IP -> 域名 反向映射（不篡改系统 DNS 缓存，供后续 TCP 流量免嗅探识别域名）
+    pub fn record_real_ip_mappings(&self, domain: &str, ips: &[IpAddr]) {
+        let domain_lower = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if domain_lower.is_empty() || ips.is_empty() {
+            return;
+        }
+        let valid_ips: Vec<IpAddr> = ips
+            .iter()
+            .copied()
+            .filter_map(|ip| {
+                let canon = ip.to_canonical();
+                let usable = match canon {
+                    IpAddr::V4(v4) => {
+                        !v4.is_loopback()
+                            && !v4.is_unspecified()
+                            && !v4.is_broadcast()
+                            && !v4.is_multicast()
+                            && !self.is_fake_ip(&v4)
+                    }
+                    IpAddr::V6(v6) => {
+                        !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast()
+                    }
+                };
+                usable.then_some(canon)
+            })
+            .collect();
+        if valid_ips.is_empty() {
+            return;
+        }
+
+        let now = Instant::now();
+        let expire = now + self.ttl;
+        let mut state = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        if state.real_ip_to_domain.len() + valid_ips.len() > MAX_REAL_IP_MAPPINGS {
+            state.real_ip_to_domain.retain(|_, (_, exp)| *exp > now);
+            while state.real_ip_to_domain.len() + valid_ips.len() > MAX_REAL_IP_MAPPINGS {
+                let Some(oldest_ip) = state
+                    .real_ip_to_domain
+                    .iter()
+                    .min_by_key(|(_, (_, exp))| *exp)
+                    .map(|(k, _)| *k)
+                else {
+                    break;
+                };
+                state.real_ip_to_domain.remove(&oldest_ip);
+            }
+        }
+        for ip in valid_ips {
+            state
+                .real_ip_to_domain
+                .insert(ip, (domain_lower.clone(), expire));
+        }
+    }
+
+    /// 依据已记录的真实 IP 查询对应的域名（支持 TTL 过半自动滑动续期）
+    pub fn lookup_real_ip_domain(&self, ip: IpAddr) -> Option<String> {
+        let canon = ip.to_canonical();
+        let now = Instant::now();
+        let refresh_threshold = now + self.ttl / 2;
+        {
+            let state = self.inner.read().unwrap_or_else(|e| e.into_inner());
+            let (dom, exp) = state.real_ip_to_domain.get(&canon)?;
+            if *exp <= now {
+                return None;
+            }
+            if *exp > refresh_threshold {
+                return Some(dom.clone());
+            }
+        }
+
+        let mut state = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let (dom, exp) = state.real_ip_to_domain.get_mut(&canon)?;
+        if *exp <= now {
+            state.real_ip_to_domain.remove(&canon);
+            return None;
+        }
+        *exp = now + self.ttl;
+        Some(dom.clone())
+    }
+
+    /// 判断指定域名当前是否已分配未过期的 Fake-IP（供 AAAA/HTTPS 防泄漏一致响应）
+    pub fn has_active_fake_ip(&self, domain: &str) -> bool {
+        let domain_lower = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        let now = Instant::now();
+        let state = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        state
+            .domain_to_ip
+            .get(&domain_lower)
+            .is_some_and(|(_, expire)| *expire > now)
     }
 }
 
@@ -362,5 +459,43 @@ mod tests {
         }
         assert_eq!(pool.len(), 1000);
         assert!(pool.restore(&allocated[10]).is_some());
+    }
+
+    #[test]
+    fn test_real_ip_mapping_lookup_refresh_and_expiration() {
+        let pool = FakeIpPool::new_default().with_ttl(Duration::from_millis(80));
+        let real_v4: IpAddr = "93.184.216.34".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let fake_v4: IpAddr = IpAddr::V4(pool.allocate("fake-only.example"));
+
+        assert!(pool.has_active_fake_ip("fake-only.example"));
+        assert!(!pool.has_active_fake_ip("real.example"));
+
+        // Loopback 与 Fake-IP 不会被记录进 real_ip_to_domain
+        pool.record_real_ip_mappings("Real.Example.", &[real_v4, loopback, fake_v4]);
+        assert_eq!(
+            pool.lookup_real_ip_domain(real_v4).as_deref(),
+            Some("real.example")
+        );
+        assert_eq!(pool.lookup_real_ip_domain(loopback), None);
+        assert_eq!(pool.lookup_real_ip_domain(fake_v4), None);
+
+        // TTL 过半续期
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            pool.lookup_real_ip_domain(real_v4).as_deref(),
+            Some("real.example")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            pool.lookup_real_ip_domain(real_v4).as_deref(),
+            Some("real.example")
+        );
+
+        // 到期后清理失效
+        std::thread::sleep(Duration::from_millis(95));
+        pool.cleanup_expired();
+        assert_eq!(pool.lookup_real_ip_domain(real_v4), None);
+        assert!(!pool.has_active_fake_ip("fake-only.example"));
     }
 }
