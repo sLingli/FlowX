@@ -733,7 +733,12 @@ impl NetRxContext {
                 is_ipv6: tcp.is_ipv6,
                 bitfield: addr.raw_bitfield(),
             };
-            self.sig.push_outbound_tcp(raw.to_vec(), meta, pid);
+            self.sig.push_outbound_tcp_with_fragments(
+                raw.to_vec(),
+                meta,
+                pid,
+                fallback_fragments.map(|frags| frags.to_vec()),
+            );
             return true;
         }
 
@@ -1284,7 +1289,13 @@ impl TransparentManager {
                             engine.invalidate_passthrough_for_local_endpoint(local_ip, local_port);
                         }
 
-                        for (raw_ip, meta, pid) in batch.drain(..) {
+                        for netstack::OutboundTcpQueueItem {
+                            raw_ip,
+                            meta,
+                            pid,
+                            orig_fragments,
+                        } in batch.drain(..)
+                        {
                             match engine.ingest_outbound_tcp(
                                 raw_ip,
                                 meta,
@@ -1298,13 +1309,17 @@ impl TransparentManager {
                                 netstack::TcpIngestOutcome::Intercepted => {}
                                 netstack::TcpIngestOutcome::Passthrough(pkt) => {
                                     stats.tcp_passthrough_total.fetch_add(1, Ordering::Relaxed);
-                                    let passthru_addr =
-                                        windivert_ffi::WinDivertAddress::outbound_passthrough(
-                                            pkt.meta.if_idx,
-                                            pkt.meta.sub_if_idx,
-                                            pkt.meta.bitfield,
-                                        );
-                                    let _ = net_h.send(&pkt.data, &passthru_addr);
+                                    for passthru_pkt in
+                                        netstack::select_passthrough_packets(pkt, orig_fragments)
+                                    {
+                                        let passthru_addr =
+                                            windivert_ffi::WinDivertAddress::outbound_passthrough(
+                                                passthru_pkt.meta.if_idx,
+                                                passthru_pkt.meta.sub_if_idx,
+                                                passthru_pkt.meta.bitfield,
+                                            );
+                                        let _ = net_h.send(&passthru_pkt.data, &passthru_addr);
+                                    }
                                 }
                                 netstack::TcpIngestOutcome::InjectRst(mut rst_pkt) => {
                                     stats.tcp_blocked_rst_total.fetch_add(1, Ordering::Relaxed);

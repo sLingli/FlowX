@@ -113,7 +113,7 @@ fn ipv6_ext_len(nh: u8, slice: &[u8]) -> Option<usize> {
         return None;
     }
     match nh {
-        0 | 43 | 60 => Some(((slice[1] as usize) + 1) * 8),
+        0 | 43 | 60 | 135 | 139 | 140 => Some(((slice[1] as usize) + 1) * 8),
         51 => Some(((slice[1] as usize) + 2) * 4),
         _ => None,
     }
@@ -390,6 +390,27 @@ pub fn build_synthetic_tcp_rst(raw_ip: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// 投递至用户态协议栈工作线程的出站 TCP 队列项（若由分片重组而来则随附原始分片供直连透传回退）
+#[derive(Debug, Clone)]
+pub struct OutboundTcpQueueItem {
+    pub raw_ip: Vec<u8>,
+    pub meta: PacketInterfaceMeta,
+    pub pid: Option<u32>,
+    pub orig_fragments: Option<Vec<EmittedIpPacket>>,
+}
+
+/// 当 `ingest_outbound_tcp` 返回 `TcpIngestOutcome::Passthrough` 时，若该包来自 IP 分片重组，
+/// 则优先回退发射原始分片序列（完整保留 IPv6 扩展头与各片原始链路 MTU），否则发射单个直连报文。
+pub fn select_passthrough_packets(
+    single_pkt: EmittedIpPacket,
+    orig_fragments: Option<Vec<EmittedIpPacket>>,
+) -> Vec<EmittedIpPacket> {
+    match orig_fragments {
+        Some(frags) if !frags.is_empty() => frags,
+        _ => vec![single_pkt],
+    }
+}
+
 /// 跨 Async Tokio 任务与 `NetstackEngine` 工作线程的唤醒信箱（零轮询低延迟）
 pub struct NetstackSignal {
     state: Mutex<SignalState>,
@@ -398,7 +419,7 @@ pub struct NetstackSignal {
 
 #[derive(Default)]
 struct SignalState {
-    outbound_tcp: VecDeque<(Vec<u8>, PacketInterfaceMeta, Option<u32>)>,
+    outbound_tcp: VecDeque<OutboundTcpQueueItem>,
     closed_tcp_endpoints: VecDeque<(IpAddr, u16)>,
     pump_needed: bool,
     closed: bool,
@@ -424,11 +445,26 @@ impl NetstackSignal {
         meta: PacketInterfaceMeta,
         pid: Option<u32>,
     ) {
+        self.push_outbound_tcp_with_fragments(raw_ip, meta, pid, None);
+    }
+
+    pub fn push_outbound_tcp_with_fragments(
+        &self,
+        raw_ip: Vec<u8>,
+        meta: PacketInterfaceMeta,
+        pid: Option<u32>,
+        orig_fragments: Option<Vec<EmittedIpPacket>>,
+    ) {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if guard.closed {
             return;
         }
-        guard.outbound_tcp.push_back((raw_ip, meta, pid));
+        guard.outbound_tcp.push_back(OutboundTcpQueueItem {
+            raw_ip,
+            meta,
+            pid,
+            orig_fragments,
+        });
         self.cv.notify_one();
     }
 
@@ -464,7 +500,7 @@ impl NetstackSignal {
     pub fn wait_drain_or_timeout(
         &self,
         max_wait: Duration,
-        out_packets: &mut Vec<(Vec<u8>, PacketInterfaceMeta, Option<u32>)>,
+        out_packets: &mut Vec<OutboundTcpQueueItem>,
         out_closed_endpoints: &mut Vec<(IpAddr, u16)>,
     ) -> bool {
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -2627,5 +2663,108 @@ mod tests {
             assert_eq!(inner.to_app.len(), 70_000);
             assert!(inner.to_app.iter().all(|&b| b == 0x3C));
         }
+    }
+
+    #[test]
+    fn test_fragmented_tcp_passthrough_preserves_original_fragments_and_ext_headers() {
+        use crate::transparent::fragment::{FragmentOutcome, FragmentTracker};
+
+        let src6 = Ipv6Addr::new(0x2001, 0xdb8, 10, 20, 0, 0, 0, 1);
+        let dst6 = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+
+        let mut syn_hdr = TcpHeader::new(59111, 443, 123456, 65535);
+        syn_hdr.syn = true;
+        let payload = vec![0xABu8; 16];
+        let builder = PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64).tcp_header(syn_hdr);
+        let mut base_tcp = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut base_tcp, &payload).unwrap();
+        let tcp_seg = &base_tcp[40..];
+
+        // 构造带后置 DestOpt (nh=60 -> TCP 6) 扩展头的两片 IPv6 分片包
+        let mut fragmentable = Vec::with_capacity(8 + tcp_seg.len());
+        fragmentable.extend_from_slice(&[6, 0, 0, 0, 0, 0, 0, 0]);
+        fragmentable.extend_from_slice(tcp_seg);
+
+        let make_frag = |off: usize, mf: bool, chunk: &[u8]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(40 + 8 + chunk.len());
+            out.extend_from_slice(&[0x60, 0, 0, 0]);
+            out.extend_from_slice(&((8 + chunk.len()) as u16).to_be_bytes());
+            out.push(44);
+            out.push(64);
+            out.extend_from_slice(&src6.octets());
+            out.extend_from_slice(&dst6.octets());
+            out.push(60); // post-Fragment DestOpt
+            out.push(0);
+            let off_m = ((off as u16) & 0xFFF8) | if mf { 1 } else { 0 };
+            out.extend_from_slice(&off_m.to_be_bytes());
+            out.extend_from_slice(&0x5566_7788u32.to_be_bytes());
+            out.extend_from_slice(chunk);
+            out
+        };
+        let frag0 = make_frag(0, true, &fragmentable[..24]);
+        let frag1 = make_frag(24, false, &fragmentable[24..]);
+
+        let frag_meta = PacketInterfaceMeta {
+            if_idx: 7,
+            sub_if_idx: 2,
+            loopback: false,
+            is_ipv6: true,
+            bitfield: 0x0100,
+        };
+        let mut tracker = FragmentTracker::new();
+        assert!(matches!(
+            tracker.ingest(&frag0, frag_meta, None),
+            FragmentOutcome::Pending
+        ));
+        let FragmentOutcome::Reassembled {
+            full_packet,
+            orig_fragments,
+        } = tracker.ingest(&frag1, frag_meta, None)
+        else {
+            panic!("expected reassembled IPv6 TCP packet");
+        };
+        assert_eq!(orig_fragments.len(), 2);
+
+        // 模拟 NetRxContext -> NetstackSignal -> NetstackEngine(Action::Direct -> Passthrough)
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(Arc::clone(&signal));
+        signal.push_outbound_tcp_with_fragments(
+            full_packet,
+            frag_meta,
+            Some(9999),
+            Some(orig_fragments.clone()),
+        );
+        let mut drained = Vec::new();
+        let mut closed = Vec::new();
+        assert!(signal.wait_drain_or_timeout(Duration::from_millis(50), &mut drained, &mut closed));
+        assert_eq!(drained.len(), 1);
+        let item = drained.pop().unwrap();
+
+        let re = RuleEngine::new(Vec::new(), Action::Direct);
+        let mut accepted = Vec::new();
+        let mut tx = Vec::new();
+        let outcome = engine.ingest_outbound_tcp(
+            item.raw_ip,
+            item.meta,
+            item.pid,
+            Some(&re),
+            None,
+            None,
+            &mut accepted,
+            &mut tx,
+        );
+        let TcpIngestOutcome::Passthrough(single_pkt) = outcome else {
+            panic!("Direct rule must return TcpIngestOutcome::Passthrough");
+        };
+        assert!(accepted.is_empty());
+
+        let emitted = select_passthrough_packets(single_pkt, item.orig_fragments);
+        assert_eq!(emitted.len(), 2, "must emit exact original fragments instead of stripped single packet");
+        assert_eq!(emitted[0].data, frag0);
+        assert_eq!(emitted[1].data, frag1);
+        assert_eq!(emitted[0].meta.if_idx, 7);
+        assert_eq!(emitted[0].meta.sub_if_idx, 2);
+        assert_eq!(emitted[0].data[6], 44, "original Fragment header must stay intact");
+        assert_eq!(emitted[0].data[40], 60, "original DestOpt extension header must stay intact");
     }
 }

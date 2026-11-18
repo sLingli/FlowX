@@ -19,12 +19,21 @@ const IP_PROTO_FRAGMENT: u8 = 44;
 const IP_PROTO_AH: u8 = 51;
 const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_DESTOPT: u8 = 60;
+const IP_PROTO_MOBILITY: u8 = 135;
+const IP_PROTO_HIP: u8 = 139;
+const IP_PROTO_SHIM6: u8 = 140;
 
 #[inline]
 fn is_ipv6_extension_header(nh: u8) -> bool {
     matches!(
         nh,
-        IP_PROTO_HOPOPT | IP_PROTO_ROUTING | IP_PROTO_AH | IP_PROTO_DESTOPT
+        IP_PROTO_HOPOPT
+            | IP_PROTO_ROUTING
+            | IP_PROTO_AH
+            | IP_PROTO_DESTOPT
+            | IP_PROTO_MOBILITY
+            | IP_PROTO_HIP
+            | IP_PROTO_SHIM6
     )
 }
 
@@ -34,7 +43,12 @@ fn ipv6_ext_header_len(nh: u8, slice: &[u8]) -> Option<usize> {
         return None;
     }
     match nh {
-        IP_PROTO_HOPOPT | IP_PROTO_ROUTING | IP_PROTO_DESTOPT => Some(((slice[1] as usize) + 1) * 8),
+        IP_PROTO_HOPOPT
+        | IP_PROTO_ROUTING
+        | IP_PROTO_DESTOPT
+        | IP_PROTO_MOBILITY
+        | IP_PROTO_HIP
+        | IP_PROTO_SHIM6 => Some(((slice[1] as usize) + 1) * 8),
         IP_PROTO_AH => Some(((slice[1] as usize) + 2) * 4),
         _ => None,
     }
@@ -924,5 +938,111 @@ mod tests {
         );
         assert!(matches!(tracker.ingest(&nested_pkt, meta, None), FragmentOutcome::Drop));
         assert_eq!(tracker.active_group_count(), 0);
+    }
+
+    #[test]
+    fn test_ipv6_fragment_with_mobility_hip_shim6_ext_headers() {
+        let mut tracker = FragmentTracker::new();
+        let src6 = Ipv6Addr::new(0x2001, 0xdb8, 2, 3, 0, 0, 0, 10);
+        let dst6 = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x2222);
+        let meta = PacketInterfaceMeta {
+            if_idx: 6,
+            is_ipv6: true,
+            ..Default::default()
+        };
+
+        let mut hdr = etherparse::TcpHeader::new(58000, 443, 98765, 65535);
+        hdr.syn = true;
+        let payload = b"EXT135_139_140!";
+        let builder = PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64).tcp_header(hdr);
+        let mut full_v6 = Vec::with_capacity(builder.size(payload.len()));
+        builder.write(&mut full_v6, payload).unwrap();
+        let tcp_seg = &full_v6[40..];
+
+        // 1. Mobility (135) -> HIP (139) -> Shim6 (140) 位于 Fragment (44) 之后：
+        //    不可误判为非 TCP/UDP 扩展头而直接 PassthroughSingle，必须完整重组并交付内层 TCP
+        let mut post_frag = Vec::with_capacity(24 + tcp_seg.len());
+        // Mobility (nh=139, len=0 => 8B)
+        post_frag.extend_from_slice(&[IP_PROTO_HIP, 0, 0, 0, 0, 0, 0, 0]);
+        // HIP (nh=140, len=0 => 8B)
+        post_frag.extend_from_slice(&[IP_PROTO_SHIM6, 0, 0, 0, 0, 0, 0, 0]);
+        // Shim6 (nh=6 TCP, len=0 => 8B)
+        post_frag.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
+        post_frag.extend_from_slice(tcp_seg);
+
+        let f0 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_MOBILITY,
+            0x1351_3914,
+            0,
+            true,
+            &post_frag[..32],
+        );
+        let f1 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_MOBILITY,
+            0x1351_3914,
+            32,
+            false,
+            &post_frag[32..],
+        );
+
+        assert!(matches!(tracker.ingest(&f1, meta, None), FragmentOutcome::Pending));
+        let FragmentOutcome::Reassembled {
+            full_packet,
+            orig_fragments,
+        } = tracker.ingest(&f0, meta, None)
+        else {
+            panic!("expected Mobility/HIP/Shim6 post-Fragment IPv6 TCP packet to reassemble");
+        };
+        assert_eq!(orig_fragments.len(), 2);
+        let parsed = parse_tcp_packet(&full_packet).expect("reassembled TCP must parse");
+        assert!(parsed.is_ipv6 && parsed.syn && parsed.dst_port == 443);
+
+        // 2. Mobility (135) 位于 Fragment (44) 之前，HIP (139) 位于 Fragment 之后：
+        //    构建 [IPv6(nh=135)][Mobility(8B, nh=44)][Frag(nh=139)][HIP(8B, nh=6)][TCP SYN]
+        let mut pre_post_payload = Vec::with_capacity(8 + tcp_seg.len());
+        pre_post_payload.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
+        pre_post_payload.extend_from_slice(tcp_seg);
+        let build_pre_frag = |offset: usize, mf: bool, chunk: &[u8]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(40 + 8 + 8 + chunk.len());
+            out.extend_from_slice(&[0x60, 0, 0, 0]);
+            out.extend_from_slice(&((8 + 8 + chunk.len()) as u16).to_be_bytes());
+            out.push(IP_PROTO_MOBILITY);
+            out.push(64);
+            out.extend_from_slice(&src6.octets());
+            out.extend_from_slice(&dst6.octets());
+            // Mobility ext hdr -> nh=44, hdrlen=0 (8B)
+            out.extend_from_slice(&[IP_PROTO_FRAGMENT, 0, 0, 0, 0, 0, 0, 0]);
+            // Fragment hdr -> nh=139
+            out.push(IP_PROTO_HIP);
+            out.push(0);
+            let off_m = ((offset as u16) & 0xFFF8) | if mf { 1 } else { 0 };
+            out.extend_from_slice(&off_m.to_be_bytes());
+            out.extend_from_slice(&0x9988_7766u32.to_be_bytes());
+            out.extend_from_slice(chunk);
+            out
+        };
+        let pf0 = build_pre_frag(0, true, &pre_post_payload[..16]);
+        let pf1 = build_pre_frag(16, false, &pre_post_payload[16..]);
+        assert!(matches!(tracker.ingest(&pf0, meta, None), FragmentOutcome::Pending));
+        let FragmentOutcome::Reassembled { full_packet: full2, .. } =
+            tracker.ingest(&pf1, meta, None)
+        else {
+            panic!("expected pre-Fragment Mobility + post-Fragment HIP packet to reassemble");
+        };
+        let parsed2 = parse_tcp_packet(&full2).expect("reassembled pre/post ext TCP must parse");
+        assert!(parsed2.is_ipv6 && parsed2.syn && parsed2.dst_port == 443);
+
+        // 3. 验证单包未分片且含 SHIM6 (140) 前置扩展头的 Fake-IP UDP 包被拦截而非 passthrough
+        let fake_pool = FakeIpPool::new_default();
+        let fake_v4 = fake_pool.allocate("hip-shim6.example");
+        let fake_udp = make_ipv4_packet([10, 0, 0, 2], fake_v4.octets(), IP_PROTO_UDP, 0x1111, 0, false, &[0; 12]);
+        assert!(matches!(
+            tracker.ingest(&fake_udp, meta, Some(&fake_pool)),
+            FragmentOutcome::Drop
+        ));
     }
 }
