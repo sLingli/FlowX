@@ -394,10 +394,26 @@ fn is_non_hijackable_local_qname(qname: &str, local_hostname: &str) -> bool {
         || lower.ends_with(".localhost")
         || lower.ends_with(".local")
         || lower.ends_with(".lan")
+        || lower.ends_with(".localdomain")
         || lower.ends_with(".home.arpa")
         || lower == "arpa"
         || lower.ends_with(".arpa")
         || (!local_norm.is_empty() && lower == local_norm)
+}
+
+/// 常见家用/企业内网与 VPN 私有后缀（如 `.home`/`.corp`/`.internal`/`.intranet`/`.ts.net`）：
+/// 不应被无域名约束的通配规则或默认全局代理隐式劫持/拦截，仅在用户显式配置匹配该域名的规则时生效。
+fn is_implicit_private_qname(qname: &str) -> bool {
+    let norm = qname.trim().trim_end_matches('.');
+    if norm.is_empty() {
+        return false;
+    }
+    let lower = norm.to_ascii_lowercase();
+    lower.ends_with(".home")
+        || lower.ends_with(".corp")
+        || lower.ends_with(".internal")
+        || lower.ends_with(".intranet")
+        || lower.ends_with(".ts.net")
 }
 
 impl RuleEngine {
@@ -645,6 +661,7 @@ impl RuleEngine {
         if is_non_hijackable_local_qname(qname, &local_hostname) {
             return DnsHijackDecision::Passthrough;
         }
+        let is_implicit_private = is_implicit_private_qname(qname);
 
         let ctx = RouteContext {
             process_path,
@@ -666,14 +683,19 @@ impl RuleEngine {
                 continue;
             }
 
+            let wildcard_rule = rule.target_domains.is_none()
+                && rule.target_subnets.is_none()
+                && rule.ports.is_none();
+
             if !is_shared_system_dns {
                 if rule.matches_app_only(&ctx).is_err() {
                     continue;
                 }
-                let matched_qname = (rule.target_domains.is_none()
-                    && rule.target_subnets.is_none()
-                    && rule.ports.is_none())
-                    || rule.matches_domain(qname);
+                let matched_qname = if rule.action == Action::Direct {
+                    wildcard_rule || rule.matches_domain(qname)
+                } else {
+                    (wildcard_rule && !is_implicit_private) || rule.matches_domain(qname)
+                };
                 if !matched_qname {
                     continue;
                 }
@@ -703,10 +725,11 @@ impl RuleEngine {
                 continue;
             }
 
-            let matched_qname = (rule.target_domains.is_none()
-                && rule.target_subnets.is_none()
-                && rule.ports.is_none())
-                || rule.matches_domain(qname);
+            let matched_qname = if rule.action == Action::Direct {
+                wildcard_rule || rule.matches_domain(qname)
+            } else {
+                (wildcard_rule && !is_implicit_private) || rule.matches_domain(qname)
+            };
             if !matched_qname {
                 continue;
             }
@@ -718,17 +741,22 @@ impl RuleEngine {
             }
         }
 
-        if saw_other_app_domain_hijack || self.default_action() != Action::Direct {
+        if saw_other_app_domain_hijack
+            || (!is_implicit_private && self.default_action() != Action::Direct)
+        {
             DnsHijackDecision::Hijack
         } else {
             DnsHijackDecision::Passthrough
         }
     }
 
-    /// 当共享系统 DNS（如 `svchost.exe`）因避免污染直连进程而对某外部域名返回 `Passthrough` 时，
-    /// 检查规则集内是否存在被前序全局/系统直连规则放行、后续可达的仅限应用全通代理规则（如 `DevProxy`）。
-    /// 若存在，则透明层应进入 `InspectDns`（透传真实解析并缓存 IP->域名，必要时对 NXDOMAIN/投毒救援分配 Fake-IP）。
-    pub fn should_inspect_shared_dns_for_app_proxy(
+    /// 当共享系统 DNS（如 `svchost.exe`）因避免污染直连进程而对某域名返回 `Passthrough` 时，
+    /// 检查规则集内是否存在被前序全局/系统直连规则放行、后续可达且需要域名上下文的非 `Direct` 应用级规则：
+    /// 1) 上层“应用 + 域名(+端口)”非 `Direct` 规则（如 `ssh.exe + *.corp.example + 22 -> Proxy/Block` 叠加下层全局 `*.corp.example -> Direct`）；
+    /// 2) 仅限应用的无目标/无端口通配代理规则（如默认 `DevProxy`，排除私有内网/VPN 后缀）。
+    ///
+    /// 若存在，透明层进入严格被动观测 `InspectDns`（原样透传上下游报文，仅被动记录唯一 `real_ip -> domain`）。
+    pub fn should_inspect_shared_dns(
         &self,
         process_path: Option<&str>,
         process_name: Option<&str>,
@@ -738,6 +766,7 @@ impl RuleEngine {
         if is_non_hijackable_local_qname(qname, &local_hostname) {
             return false;
         }
+        let is_implicit_private = is_implicit_private_qname(qname);
 
         let ctx = RouteContext {
             process_path,
@@ -760,7 +789,14 @@ impl RuleEngine {
                 rule.application_patterns.is_some() && rule.matches_app_only(&ctx).is_err();
 
             if explicitly_scoped_to_other_app {
-                if rule.target_domains.is_none()
+                if rule.target_domains.is_some()
+                    && rule.matches_domain(qname)
+                    && rule.action != Action::Direct
+                {
+                    return true;
+                }
+                if !is_implicit_private
+                    && rule.target_domains.is_none()
                     && rule.target_subnets.is_none()
                     && rule.ports.is_none()
                     && matches!(rule.action, Action::Proxy(_) | Action::Chain(_))
@@ -1575,5 +1611,100 @@ mod tests {
             global_proxy.classify_dns_query(None, Some("svchost.exe"), "public.example", true),
             DnsHijackDecision::Hijack
         );
+
+        // P0-1：常见家用/企业内网与 Tailscale/VPN 后缀在通配/全局代理下不被隐式劫持，
+        // 但显式配置了目标域名规则时仍可生效
+        for priv_name in [
+            "nas.home",
+            "wiki.corp",
+            "app.internal",
+            "erp.intranet",
+            "box.ts.net",
+            "srv.localdomain",
+        ] {
+            assert_eq!(
+                global_proxy.classify_dns_query(None, Some("svchost.exe"), priv_name, true),
+                DnsHijackDecision::Passthrough,
+                "private domain {} must not be implicitly hijacked by default Proxy",
+                priv_name
+            );
+            assert!(
+                !profile_engine.should_inspect_shared_dns(None, Some("svchost.exe"), priv_name),
+                "private domain {} must not enter InspectDns under wildcard DevProxy",
+                priv_name
+            );
+        }
+        let explicit_corp_proxy = RuleEngine::new(
+            vec![Rule::from_raw(
+                "ExplicitCorp",
+                true,
+                None,
+                Some("*.corp"),
+                None,
+                Action::Proxy(101),
+            )],
+            Action::Direct,
+        );
+        assert_eq!(
+            explicit_corp_proxy.classify_dns_query(None, Some("svchost.exe"), "wiki.corp", true),
+            DnsHijackDecision::Hijack
+        );
+
+        // P1-2：上层“应用 + 域名(+端口)”非 Direct 规则叠加下层全局同域 Direct 规则时，
+        // classify_dns_query 维持 Passthrough（保护直连进程），同时 should_inspect_shared_dns 返回 true 进入被动观测
+        let app_over_global_direct = RuleEngine::new(
+            vec![
+                Rule::from_raw(
+                    "SshCorpProxy",
+                    true,
+                    Some("ssh.exe"),
+                    Some("*.corp.example"),
+                    Some("22"),
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
+                    "GameCorpBlock",
+                    true,
+                    Some("game.exe"),
+                    Some("*.game-corp.example"),
+                    None,
+                    Action::Block,
+                ),
+                Rule::from_raw(
+                    "GlobalCorpDirect",
+                    true,
+                    None,
+                    Some("*.corp.example; *.game-corp.example"),
+                    None,
+                    Action::Direct,
+                ),
+            ],
+            Action::Direct,
+        );
+        assert_eq!(
+            app_over_global_direct.classify_dns_query(
+                None,
+                Some("svchost.exe"),
+                "git.corp.example",
+                true,
+            ),
+            DnsHijackDecision::Passthrough
+        );
+        assert!(app_over_global_direct.should_inspect_shared_dns(
+            None,
+            Some("svchost.exe"),
+            "git.corp.example",
+        ));
+        assert!(app_over_global_direct.should_inspect_shared_dns(
+            None,
+            Some("svchost.exe"),
+            "play.game-corp.example",
+        ));
+        // 无关域名无通配代理规则时不进入 InspectDns
+        assert!(!app_over_global_direct.should_inspect_shared_dns(
+            None,
+            Some("svchost.exe"),
+            "unrelated.example",
+        ));
     }
 }

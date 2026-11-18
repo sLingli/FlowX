@@ -188,12 +188,13 @@ pub fn decide_udp_packet(
             match re.classify_dns_query(proc_path, proc_name, &question.name, is_shared) {
                 DnsHijackDecision::Hijack => UdpDecision::HandleDns,
                 DnsHijackDecision::Passthrough => {
+                    let is_link_local_v6_dns = matches!(
+                        pkt.dst_ip.to_canonical(),
+                        IpAddr::V6(v6) if v6.is_unicast_link_local()
+                    );
                     if is_shared
-                        && re.should_inspect_shared_dns_for_app_proxy(
-                            proc_path,
-                            proc_name,
-                            &question.name,
-                        )
+                        && !is_link_local_v6_dns
+                        && re.should_inspect_shared_dns(proc_path, proc_name, &question.name)
                     {
                         UdpDecision::InspectDns
                     } else {
@@ -566,8 +567,15 @@ mod tests {
             UdpDecision::Passthrough
         );
 
-        // 本地域名（localhost / .local）和显式前置全局直连域名（*.cn -> Direct）不进入 InspectDns
-        for local_domain in ["localhost", "printer.local"] {
+        // 本地域名与私有内网/VPN 后缀和显式前置全局直连域名（*.cn -> Direct）不进入 InspectDns
+        for local_domain in [
+            "localhost",
+            "printer.local",
+            "nas.home",
+            "box.ts.net",
+            "wiki.corp",
+            "srv.localdomain",
+        ] {
             let local_query = build_sample_dns_query(0x3344, local_domain, 1);
             let mut local_pkt = Vec::new();
             PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
@@ -586,10 +594,76 @@ mod tests {
                     None,
                 ),
                 UdpDecision::Passthrough,
-                "local domain {} must remain Passthrough",
+                "local/private domain {} must remain Passthrough",
                 local_domain
             );
         }
+
+        // 发往 fe80:: 链路本地 IPv6 DNS 服务器的 InspectDns 应直接 Passthrough，交由内核带原生 scope_id 发送
+        let mut ll_v6_dns_pkt = Vec::new();
+        PacketBuilder::ipv6(
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2).octets(),
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1).octets(),
+            64,
+        )
+        .udp(40012, 53)
+        .write(&mut ll_v6_dns_pkt, &query_payload)
+        .unwrap();
+        let parsed_ll_v6_dns = parse_udp_packet(&ll_v6_dns_pkt).unwrap();
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_ll_v6_dns,
+                Some(999_999),
+                true,
+                true,
+                Some(&app_proxy_engine),
+                Some(&real_tracker),
+                None,
+            ),
+            UdpDecision::Passthrough
+        );
+
+        // P1-2：上层“应用+域名+端口”规则叠加下层全局同域 Direct 规则，在共享系统 DNS 下必须进入 InspectDns
+        let layered_engine = RuleEngine::new(
+            vec![
+                Rule::from_raw(
+                    "SshCorpProxy",
+                    true,
+                    Some("ssh.exe"),
+                    Some("*.corp.example"),
+                    Some("22"),
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
+                    "GlobalCorpDirect",
+                    true,
+                    None,
+                    Some("*.corp.example"),
+                    None,
+                    Action::Direct,
+                ),
+            ],
+            Action::Direct,
+        );
+        let corp_query = build_sample_dns_query(0x3366, "git.corp.example", 1);
+        let mut corp_pkt = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+            .udp(40013, 53)
+            .write(&mut corp_pkt, &corp_query)
+            .unwrap();
+        let parsed_corp = parse_udp_packet(&corp_pkt).unwrap();
+        assert_eq!(
+            decide_udp_packet(
+                &parsed_corp,
+                Some(999_999),
+                true,
+                true,
+                Some(&layered_engine),
+                Some(&real_tracker),
+                None,
+            ),
+            UdpDecision::InspectDns
+        );
 
         let cn_override_engine = build_engine(
             vec![
