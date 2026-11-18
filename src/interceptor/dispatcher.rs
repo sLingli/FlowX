@@ -21,8 +21,13 @@ use crate::router::{Action, RouteContext, RuleEngine};
 
 /// 入站协议握手的最长等待时间（防止慢速握手占满并发名额）
 const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// 透明代理首包域名嗅探的最长等待时间（仅在规则需要域名或 HTTP/TLS 默认端口启用，避免拖慢服务端先说话协议）
+/// 透明代理首包域名嗅探的最长等待时间（仅在规则需要域名或代理命中 HTTP/TLS 默认端口时启用，避免拖慢服务端先说话协议）
 const TRANSPARENT_SNIFF_TIMEOUT: Duration = Duration::from_millis(120);
+
+#[inline]
+fn is_sniffable_default_port(port: u16) -> bool {
+    matches!(port, 80 | 443 | 8080 | 8443)
+}
 
 #[derive(Debug, Clone)]
 pub struct ProxyNodeEntry {
@@ -360,16 +365,22 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             let target = TargetAddr::Domain(domain, orig_dst.port());
             (target, None, None, Vec::new())
         } else {
+            let domain_decision = config.rule_engine.needs_domain_for_routing(
+                proc_info.as_ref().map(|p| p.path.as_str()),
+                proc_info.as_ref().map(|p| p.name.as_str()),
+                Some(orig_dst.ip()),
+                orig_dst.port(),
+            );
             let need_sniff = needs_domain_sniff
-                || matches!(
-                    config.rule_engine.needs_domain_for_routing(
-                        proc_info.as_ref().map(|p| p.path.as_str()),
-                        proc_info.as_ref().map(|p| p.name.as_str()),
-                        Some(orig_dst.ip()),
-                        orig_dst.port(),
-                    ),
-                    crate::router::DomainNeedDecision::NeedsDomainSniff
-                );
+                || match domain_decision {
+                    crate::router::DomainNeedDecision::NeedsDomainSniff => true,
+                    crate::router::DomainNeedDecision::Immediate(
+                        Action::Proxy(_) | Action::Chain(_),
+                    ) => is_sniffable_default_port(orig_dst.port()),
+                    crate::router::DomainNeedDecision::Immediate(
+                        Action::Direct | Action::Block,
+                    ) => false,
+                };
             let (sniffed_host, buffered) = if need_sniff {
                 let outcome = crate::transparent::sniffer::peek_host_prefix(
                     &mut local_stream,
@@ -952,5 +963,161 @@ mod tests {
         drop(app_side);
         disp_handle.await.unwrap().unwrap();
         srv_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_sniffs_http_tls_for_immediate_proxy_skips_other_ports() {
+        use crate::outbound::socks5::Socks5Client;
+
+        async fn spawn_mock_socks5_server(
+            expect_banner: Option<&'static [u8]>,
+        ) -> (SocketAddr, tokio::sync::oneshot::Receiver<(u8, String, u16)>, tokio::task::JoinHandle<()>)
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut greeting = [0u8; 3];
+                s.read_exact(&mut greeting).await.unwrap();
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+
+                let mut hdr = [0u8; 4];
+                s.read_exact(&mut hdr).await.unwrap();
+                let atyp = hdr[3];
+                let host = match atyp {
+                    0x01 => {
+                        let mut ip = [0u8; 4];
+                        s.read_exact(&mut ip).await.unwrap();
+                        std::net::Ipv4Addr::from(ip).to_string()
+                    }
+                    0x03 => {
+                        let mut len = [0u8; 1];
+                        s.read_exact(&mut len).await.unwrap();
+                        let mut dom = vec![0u8; len[0] as usize];
+                        s.read_exact(&mut dom).await.unwrap();
+                        String::from_utf8(dom).unwrap()
+                    }
+                    other => panic!("unexpected SOCKS5 atyp: {other}"),
+                };
+                let mut port_bytes = [0u8; 2];
+                s.read_exact(&mut port_bytes).await.unwrap();
+                let port = u16::from_be_bytes(port_bytes);
+                let _ = target_tx.send((atyp, host, port));
+
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
+                if let Some(banner) = expect_banner {
+                    s.write_all(banner).await.unwrap();
+                } else {
+                    let mut buf = [0u8; 256];
+                    let n = s.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    s.write_all(b"PROXIED_TLS_OK").await.unwrap();
+                }
+            });
+            (addr, target_rx, handle)
+        }
+
+        // 1. DevProxy-style Immediate(Proxy) on port 443 -> must sniff TLS SNI and pass ATYP 0x03 Domain to proxy
+        let (socks_addr_443, target_rx_443, srv_443) = spawn_mock_socks5_server(None).await;
+        let cfg_443 = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "DevProxy",
+                true,
+                None,
+                None,
+                None,
+                Action::Proxy(1),
+            )],
+        );
+        cfg_443.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "MockSocks".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: socks_addr_443.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(socks_addr_443.to_string())),
+            },
+        );
+        let (mut app_443, disp_443) = tokio::io::duplex(8192);
+        let handle_443 = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(cfg_443),
+                disp_443,
+                "127.0.0.1:50100".parse().unwrap(),
+                "93.184.216.34:443".parse().unwrap(),
+                None,
+                false,
+            )
+            .await
+        });
+        let hello = build_test_tls_client_hello("api.github.com");
+        app_443.write_all(&hello).await.unwrap();
+        let (atyp_443, host_443, port_443) = target_rx_443.await.unwrap();
+        assert_eq!(atyp_443, 0x03, "port 443 Immediate(Proxy) must sniff SNI as domain");
+        assert_eq!(host_443, "api.github.com");
+        assert_eq!(port_443, 443);
+        let mut ack_443 = [0u8; 14];
+        app_443.read_exact(&mut ack_443).await.unwrap();
+        assert_eq!(&ack_443, b"PROXIED_TLS_OK");
+        drop(app_443);
+        handle_443.await.unwrap().unwrap();
+        srv_443.await.unwrap();
+
+        // 2. Immediate(Proxy) on port 22 (SSH) -> must NOT wait 120ms for client-first sniff; connects immediately
+        let (socks_addr_22, target_rx_22, srv_22) =
+            spawn_mock_socks5_server(Some(b"SSH-2.0-OpenSSH")).await;
+        let cfg_22 = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "DevProxy",
+                true,
+                None,
+                None,
+                None,
+                Action::Proxy(1),
+            )],
+        );
+        cfg_22.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "MockSocks".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: socks_addr_22.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(socks_addr_22.to_string())),
+            },
+        );
+        let (mut app_22, disp_22) = tokio::io::duplex(4096);
+        let handle_22 = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(cfg_22),
+                disp_22,
+                "127.0.0.1:50101".parse().unwrap(),
+                "93.184.216.34:22".parse().unwrap(),
+                None,
+                false,
+            )
+            .await
+        });
+        let mut ssh_banner = [0u8; 15];
+        tokio::time::timeout(Duration::from_secs(2), app_22.read_exact(&mut ssh_banner))
+            .await
+            .expect("Port 22 Immediate(Proxy) must forward SSH server banner without sniffing delay")
+            .unwrap();
+        assert_eq!(&ssh_banner, b"SSH-2.0-OpenSSH");
+        let (atyp_22, host_22, port_22) = target_rx_22.await.unwrap();
+        assert_eq!(atyp_22, 0x01);
+        assert_eq!(host_22, "93.184.216.34");
+        assert_eq!(port_22, 22);
+        drop(app_22);
+        handle_22.await.unwrap().unwrap();
+        srv_22.await.unwrap();
     }
 }

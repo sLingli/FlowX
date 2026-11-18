@@ -320,18 +320,28 @@ pub enum DnsHijackDecision {
     Hijack,
 }
 
-/// 判定是否为非环回、非未指定、非广播多播且非 Fake-IP (`198.18.0.0/15`) 的有效单播 IP（覆盖公网及 RFC1918/CGNAT/ULA 私网）
-fn is_non_loopback_unicast_ip(ip: IpAddr) -> bool {
+/// 判定是否为可安全剪枝本机/LAN域名（`localhost` / `%ComputerName%`）的公网单播 IP（排除私网 RFC1918/CGNAT/ULA、环回、链路本地与 Fake-IP）
+fn is_public_unicast_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
-            !v4.is_loopback()
-                && !v4.is_unspecified()
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
                 && !v4.is_broadcast()
                 && !v4.is_multicast()
+                && !v4.is_unspecified()
+                && !(a == 100 && (b & 0xC0) == 64)
                 && !(a == 198 && (b & 0xFE) == 18)
         }
-        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified() && !v6.is_multicast(),
+        IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            !v6.is_loopback()
+                && !v6.is_unspecified()
+                && !v6.is_multicast()
+                && (seg0 & 0xfe00) != 0xfc00
+                && (seg0 & 0xffc0) != 0xfe80
+        }
     }
 }
 
@@ -343,7 +353,7 @@ fn rule_has_applicable_domain(
     if domains.is_empty() {
         return false;
     }
-    if target_ip.is_some_and(is_non_loopback_unicast_ip) {
+    if target_ip.is_some_and(is_public_unicast_ip) {
         domains.iter().any(|d| !d.is_host_local(local_hostname))
     } else {
         true
@@ -599,8 +609,9 @@ impl RuleEngine {
         }
     }
 
-    /// 结合进程与实际 DNS QNAME 判断 UDP/53 查询是否需要注入 Fake-IP（覆盖全部端口而非仅 80/443），
-    /// 并对共享系统 DNS 解析器（如 Windows `svchost.exe` `Dnscache`）免疫仅限进程且无域名约束规则的全局污染。
+    /// 结合进程与实际 DNS QNAME 判断 UDP/53 查询是否需要注入 Fake-IP，
+    /// 对共享系统 DNS 解析器（如 Windows `svchost.exe` `Dnscache`）绝不允许无域名约束的应用规则（如 `DevProxy`）污染全机缓存，
+    /// 并遵守全局直连规则优先级及端口限定隔离原则。
     pub fn classify_dns_query(
         &self,
         process_path: Option<&str>,
@@ -621,9 +632,11 @@ impl RuleEngine {
             target_port: 0,
         };
         let rules = self.current_rules();
+        let mut saw_other_app_domain_hijack = false;
 
         for rule in rules.iter() {
-            if !rule.enabled {
+            // 端口限定规则（例如仅代理 7777/仅阻断 22）不能在无端口语义的 DNS 阶段劫持整域 Fake-IP
+            if !rule.enabled || rule.ports.is_some() {
                 continue;
             }
 
@@ -637,46 +650,44 @@ impl RuleEngine {
                 if !matched_qname {
                     continue;
                 }
-                if rule.action != Action::Direct {
-                    return DnsHijackDecision::Hijack;
-                }
-                if rule.ports.is_none() {
-                    return DnsHijackDecision::Passthrough;
-                }
-                continue;
+                return if rule.action != Action::Direct {
+                    DnsHijackDecision::Hijack
+                } else {
+                    DnsHijackDecision::Passthrough
+                };
             }
 
             // 共享系统 DNS（如 svchost.exe）：
-            // 1) 显式针对 svchost.exe 本身的规则，或全局（无应用限定）规则按正常优先级生效（如先导全局 Direct/LocalBypass 直通）；
-            // 2) 若启用了针对特定应用的代理/阻断规则（如 DevProxy，含无目标通配或匹配外部域名），
-            //    则允许对外部查询域名前置分配 Fake-IP，使 node/git/antigravity 经由 Dnscache 解析后同样享受到无 DNS 泄漏的域名级代理。
+            // 1) 显式限定到其他应用的规则：仅当其明确指定域名且命中 qname 且非 Direct 时记录候选劫持，
+            //    绝不允许 target_domains=None 的仅应用规则（如 DevProxy）劫持全机 Dnscache，也不抢先覆盖后续全局 Direct 规则；
+            // 2) 全局无应用限定或显式匹配 svchost.exe 的规则按顺序权威生效。
             let explicitly_scoped_to_other_app = rule.application_patterns.is_some()
                 && rule.matches_app_only(&ctx).is_err();
 
             if explicitly_scoped_to_other_app {
-                let matched_qname = (rule.target_domains.is_none()
-                    && rule.target_subnets.is_none())
-                    || rule.matches_domain(qname);
-                if matched_qname && rule.action != Action::Direct {
-                    return DnsHijackDecision::Hijack;
+                if rule.target_domains.is_some()
+                    && rule.matches_domain(qname)
+                    && rule.action != Action::Direct
+                {
+                    saw_other_app_domain_hijack = true;
                 }
-            } else {
-                let matched_qname = (rule.target_domains.is_none()
-                    && rule.target_subnets.is_none())
-                    || rule.matches_domain(qname);
-                if !matched_qname {
-                    continue;
-                }
-                if rule.action != Action::Direct {
-                    return DnsHijackDecision::Hijack;
-                }
-                if rule.ports.is_none() {
-                    return DnsHijackDecision::Passthrough;
-                }
+                continue;
             }
+
+            let matched_qname = (rule.target_domains.is_none()
+                && rule.target_subnets.is_none())
+                || rule.matches_domain(qname);
+            if !matched_qname {
+                continue;
+            }
+            return if rule.action != Action::Direct {
+                DnsHijackDecision::Hijack
+            } else {
+                DnsHijackDecision::Passthrough
+            };
         }
 
-        if self.default_action() != Action::Direct {
+        if saw_other_app_domain_hijack || self.default_action() != Action::Direct {
             DnsHijackDecision::Hijack
         } else {
             DnsHijackDecision::Passthrough
@@ -1212,7 +1223,8 @@ mod tests {
             DomainNeedDecision::Immediate(Action::Direct)
         );
 
-        // DevProxy 应用访问非 192.168 非环回私网 IP 10.0.0.5 -> 同样剪枝 LocalBypass 本机域名，直接 Immediate(Proxy(101))
+        // DevProxy 应用访问非 192.168 私网 IP 10.0.0.5 -> 因主机名 (%ComputerName%) 可能解析到 10/8 本机网卡地址，
+        // is_public_unicast_ip(10.0.0.5)=false 保留 LocalBypass 域名嗅探保护
         assert_eq!(
             profile_engine.needs_domain_for_routing(
                 Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
@@ -1220,11 +1232,12 @@ mod tests {
                 Some(private_10),
                 8080,
             ),
-            DomainNeedDecision::Immediate(Action::Proxy(101))
+            DomainNeedDecision::NeedsDomainSniff
         );
 
-        // 启用 DevProxy 时，经 svchost.exe 发起的外部域名查询同样接入 Fake-IP，防止 node/git/antigravity 经系统 DNSclient 绕过远程解析；
-        // 但本地 / mDNS / 环回名仍强制直连，纯 Direct 规则集下也绝不劫持 svchost.exe。
+        // P0-1 防回归：default_profile 下 DevProxy（仅限应用且无域名条件）绝不劫持 svchost.exe 共享系统 DNS，
+        // 避免 Fake-IP 198.18.x.x 污染 Dnscache 导致全机直连软件失效或丢失 AAAA/QUIC/ICMP；
+        // 本地 / mDNS / 环回名及纯 Direct 规则集下同样放行 svchost.exe。
         assert_eq!(
             profile_engine.classify_dns_query(
                 Some(r"C:\Windows\System32\svchost.exe"),
@@ -1232,7 +1245,7 @@ mod tests {
                 "www.baidu.com",
                 true,
             ),
-            DnsHijackDecision::Hijack
+            DnsHijackDecision::Passthrough
         );
         assert_eq!(
             profile_engine.classify_dns_query(
@@ -1241,7 +1254,7 @@ mod tests {
                 "github.com",
                 true,
             ),
-            DnsHijackDecision::Hijack
+            DnsHijackDecision::Passthrough
         );
         assert_eq!(
             profile_engine.classify_dns_query(
@@ -1293,7 +1306,7 @@ mod tests {
             DnsHijackDecision::Passthrough
         );
 
-        // 非 80/443 端口限定域名规则、本机名、mDNS (.local)、rDNS (.arpa)、单标签主机名测试
+        // P1-3：端口限定规则隔离、共享 DNS 优先级（后续全局 Direct 覆盖靠前特定应用域名代理）、本机/mDNS/rDNS/单标签主机名测试
         let mixed_engine = RuleEngine::new(
             vec![
                 Rule::from_raw(
@@ -1321,6 +1334,38 @@ mod tests {
                     Action::Proxy(101),
                 ),
                 Rule::from_raw(
+                    "SshPortBlock",
+                    true,
+                    None,
+                    Some("*.sshport.example"),
+                    Some("22"),
+                    Action::Block,
+                ),
+                Rule::from_raw(
+                    "ChromeCnProxy",
+                    true,
+                    Some("chrome.exe"),
+                    Some("*.cn"),
+                    None,
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
+                    "GlobalCnDirect",
+                    true,
+                    None,
+                    Some("*.cn"),
+                    None,
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "AppSpecificDomainProxy",
+                    true,
+                    Some("ssh.exe"),
+                    Some("*.corp-tunnel.example"),
+                    None,
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
                     "FallbackGlobalProxy",
                     true,
                     None,
@@ -1332,9 +1377,32 @@ mod tests {
             Action::Direct,
         );
 
-        // 7777 端口限定的应用域名规则也能在 DNS 阶段正确捕获，不会再因硬编码 80/443 漏放
+        // 端口限定规则（ports=7777 或 ports=22）不得在 DNS 阶段劫持整域 Fake-IP
         assert_eq!(
             mixed_engine.classify_dns_query(None, Some("svchost.exe"), "login.game.example", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("game.exe"), "login.game.example", false),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "host.sshport.example", true),
+            DnsHijackDecision::Passthrough
+        );
+        // 全局 Direct 域名规则不得被靠前的其他应用专属规则反超劫持 shared Dnscache
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "www.baidu.cn", true),
+            DnsHijackDecision::Passthrough
+        );
+        // 但 chrome.exe 自身直发 UDP/53 仍优先匹配其靠前专属规则 ChromeCnProxy
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("chrome.exe"), "www.baidu.cn", false),
+            DnsHijackDecision::Hijack
+        );
+        // 无端口限定的显式应用域名代理规则在无后续全局 Direct 冲突时，允许在 svchost.exe 阶段预分配 Fake-IP
+        assert_eq!(
+            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "git.corp-tunnel.example", true),
             DnsHijackDecision::Hijack
         );
         assert_eq!(
