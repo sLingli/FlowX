@@ -782,29 +782,6 @@ impl RuleEngine {
         false
     }
 
-    /// 判断目标 IP 是否命中全局直连子网规则（无应用限定且无端口限定，如默认 `LocalBypass` 的 `192.168.0.0/16`）
-    pub fn matches_global_direct_subnet(&self, ip: IpAddr) -> bool {
-        let canonical = ip.to_canonical();
-        let rules = self.current_rules();
-        for rule in rules.iter() {
-            if !rule.enabled
-                || rule.application_patterns.is_some()
-                || rule.ports.is_some()
-                || rule.action != Action::Direct
-            {
-                continue;
-            }
-            if rule
-                .target_subnets
-                .as_ref()
-                .is_some_and(|subs| subs.iter().any(|net| net.contains(&canonical)))
-            {
-                return true;
-            }
-        }
-        false
-    }
-
     /// 当首包阶段 PID 未知时，判断给定 `(target_ip, target_port)` 前方是否存在可达的非 `Direct` 应用级规则（如 `DevProxy`）。
     ///
     /// 若在无条件全局匹配终止之前存在任何可能命中的 `application_patterns` 非 `Direct` 规则，则返回 `true`，

@@ -664,16 +664,13 @@ impl NetRxContext {
                     let net_inj = Arc::downgrade(&self.net_h);
                     let stop = Arc::clone(&self.stop_flag);
                     let dns = Arc::clone(&self.dns_srv);
-                    let rule_engine =
-                        inspect_mode.then(|| Arc::clone(&self.dispatcher_cfg.rule_engine));
                     let loopback = addr.loopback();
                     let join_handle = self.rt.spawn(async move {
                         let orig_dns_dst = std::net::SocketAddr::new(req_meta.1, req_meta.3);
-                        let resp_payload = if let Some(re) = rule_engine.as_deref() {
+                        let resp_payload = if inspect_mode {
                             dns.process_transparent_inspect_query_bytes(
                                 &owned_payload,
                                 orig_dns_dst,
-                                Some(re),
                             )
                             .await
                         } else {

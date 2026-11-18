@@ -377,13 +377,13 @@ fn build_dns_query_packet(tx_id: u16, domain: &str, qtype: u16) -> Result<(Vec<u
     Ok((pkt, q))
 }
 
-/// 解析 DNS 应答中的 A / AAAA（跟踪 CNAME 链），并过滤任何 Fake-IP 防止自环路
-fn parse_answer_ips(
+/// 解析 DNS 应答中的 A / AAAA（跟踪 CNAME 链）并返回记录的最小 TTL，同时过滤任何 Fake-IP 防止自环路
+fn parse_answer_ips_with_ttl(
     resp: &[u8],
     question: &DnsQuestion,
     first_answer_offset: usize,
     fake_ip_pool: Option<&FakeIpPool>,
-) -> Result<Vec<IpAddr>> {
+) -> Result<(Vec<IpAddr>, Option<u32>)> {
     let rcode = resp[3] & 0x0F;
     if rcode != 0 && rcode != 3 {
         bail!("Upstream DNS returned error RCODE={}", rcode);
@@ -405,6 +405,7 @@ fn parse_answer_ips(
     let mut allowed_names: HashSet<String> = HashSet::new();
     allowed_names.insert(question.name.to_ascii_lowercase());
     let mut ips = Vec::new();
+    let mut min_ttl: Option<u32> = None;
 
     for _ in 0..ancount {
         if offset >= resp.len() {
@@ -416,6 +417,12 @@ fn parse_answer_ips(
         }
         let rtype = u16::from_be_bytes([resp[next], resp[next + 1]]);
         let rclass = u16::from_be_bytes([resp[next + 2], resp[next + 3]]);
+        let ttl_secs = u32::from_be_bytes([
+            resp[next + 4],
+            resp[next + 5],
+            resp[next + 6],
+            resp[next + 7],
+        ]);
         let rdlength = u16::from_be_bytes([resp[next + 8], resp[next + 9]]) as usize;
         let rdata_start = next + 10;
         let rdata_end = rdata_start + rdlength;
@@ -441,6 +448,7 @@ fn parse_answer_ips(
                     );
                     if fake_ip_pool.is_none_or(|p| !p.is_fake_ip_addr(IpAddr::V4(v4))) {
                         ips.push(IpAddr::V4(v4));
+                        min_ttl = Some(min_ttl.map_or(ttl_secs, |cur| cur.min(ttl_secs)));
                     }
                 }
                 28 if rdlength == 16 => {
@@ -449,6 +457,7 @@ fn parse_answer_ips(
                     let v6 = Ipv6Addr::from(octets);
                     if fake_ip_pool.is_none_or(|p| !p.is_fake_ip_addr(IpAddr::V6(v6))) {
                         ips.push(IpAddr::V6(v6));
+                        min_ttl = Some(min_ttl.map_or(ttl_secs, |cur| cur.min(ttl_secs)));
                     }
                 }
                 _ => {}
@@ -457,7 +466,18 @@ fn parse_answer_ips(
         offset = rdata_end;
     }
 
-    Ok(ips)
+    Ok((ips, min_ttl))
+}
+
+/// 解析 DNS 应答中的 A / AAAA（跟踪 CNAME 链），并过滤任何 Fake-IP 防止自环路
+fn parse_answer_ips(
+    resp: &[u8],
+    question: &DnsQuestion,
+    first_answer_offset: usize,
+    fake_ip_pool: Option<&FakeIpPool>,
+) -> Result<Vec<IpAddr>> {
+    parse_answer_ips_with_ttl(resp, question, first_answer_offset, fake_ip_pool)
+        .map(|(ips, _)| ips)
 }
 
 async fn forward_upstream_udp(
@@ -590,9 +610,6 @@ pub(crate) async fn resolve_via_upstream_dns_with_options(
     }
 
     if !ips.is_empty() {
-        if let Some(pool) = fake_ip_pool {
-            pool.record_real_ip_mappings(domain, &ips);
-        }
         return Ok(ips);
     }
     if let Some(err) = last_err {
@@ -677,6 +694,27 @@ pub async fn handle_dns_query_bytes(
     query_bytes: &[u8],
     peer_label: Option<SocketAddr>,
 ) -> Option<Vec<u8>> {
+    handle_dns_query_bytes_with_orig_dns(
+        pool,
+        upstream_dns,
+        None,
+        block_ipv6,
+        upstream_limit,
+        query_bytes,
+        peer_label,
+    )
+    .await
+}
+
+async fn handle_dns_query_bytes_with_orig_dns(
+    pool: &FakeIpPool,
+    upstream_dns: SocketAddr,
+    orig_dns_hint: Option<SocketAddr>,
+    block_ipv6: bool,
+    upstream_limit: &Arc<Semaphore>,
+    query_bytes: &[u8],
+    peer_label: Option<SocketAddr>,
+) -> Option<Vec<u8>> {
     match DnsPacketParser::parse_question(query_bytes) {
         Ok((client_tx_id, question)) => {
             debug!(
@@ -697,9 +735,9 @@ pub async fn handle_dns_query_bytes(
                 ));
             }
 
-            // 2. For A (IPv4) queries, allocate Fake-IP and respond
+            // 2. For A (IPv4) queries, allocate Fake-IP and respond (recording orig_dns for split-horizon Direct fallback)
             if question.qtype == 1 && question.qclass == 1 {
-                let fake_ip = pool.allocate(&question.name);
+                let fake_ip = pool.allocate_with_dns(&question.name, orig_dns_hint);
                 return Some(DnsPacketParser::build_a_response(
                     client_tx_id,
                     query_bytes,
@@ -766,15 +804,17 @@ impl DnsServer {
         &self,
         query_bytes: &[u8],
         upstream_dns: SocketAddr,
+        orig_dns_hint: Option<SocketAddr>,
     ) -> Option<Vec<u8>> {
         let Ok(_permit) = self.concurrency_limit.clone().try_acquire_owned() else {
             warn!("[DNS Engine] Dropped transparent DNS query exceeding concurrency limit (5000)");
             return None;
         };
         let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
-        handle_dns_query_bytes(
+        handle_dns_query_bytes_with_orig_dns(
             &self.pool,
             upstream_dns,
+            orig_dns_hint,
             self.block_ipv6,
             &self.upstream_limit,
             query_bytes,
@@ -785,45 +825,49 @@ impl DnsServer {
 
     /// 直接处理原始 DNS 查询报文（与 UDP 监听端共用 Fake-IP 分配、IPv6/HTTPS 防泄漏屏蔽及上游受控转发逻辑）
     pub async fn process_query_bytes(&self, query_bytes: &[u8]) -> Option<Vec<u8>> {
-        self.process_query_with_upstream(query_bytes, self.upstream_dns)
+        self.process_query_with_upstream(query_bytes, self.upstream_dns, None)
             .await
     }
 
-    fn resolve_transparent_upstream(&self, orig_dst: SocketAddr) -> SocketAddr {
+    fn resolve_transparent_upstream(&self, orig_dst: SocketAddr) -> (SocketAddr, bool) {
         let dst_ip = orig_dst.ip().to_canonical();
         let bind_ip = self.bind_addr.ip().to_canonical();
         let points_to_self = orig_dst.port() == self.bind_addr.port()
             && self.bind_addr.port() != 0
             && (dst_ip == bind_ip || (bind_ip.is_unspecified() && dst_ip.is_loopback()));
+        let is_link_local_v6 = matches!(dst_ip, IpAddr::V6(v6) if v6.is_unicast_link_local());
         if orig_dst.port() == 0
             || dst_ip.is_unspecified()
             || self.pool.is_fake_ip_addr(dst_ip)
             || points_to_self
+            || is_link_local_v6
         {
-            self.upstream_dns
+            (self.upstream_dns, false)
         } else {
-            SocketAddr::new(dst_ip, orig_dst.port())
+            (SocketAddr::new(dst_ip, orig_dst.port()), true)
         }
     }
 
-    /// 透明代理专用 DNS 查询处理：保留原始报文目的 DNS 服务器 `orig_dst` 供非 `A/AAAA/HTTPS` 记录（如 `TXT`/`SRV`/`CNAME`）直达企业/VPN 原配 DNS，仅当目标无效或指向自身监听器时回退默认上游
+    /// 透明代理专用 DNS 查询处理：保留原始报文目的 DNS 服务器 `orig_dst` 供非 `A/AAAA/HTTPS` 记录直达企业/VPN 原配 DNS，
+    /// 同时在分配 Fake-IP 时记录原始 DNS 地址以便命中 `Direct` 时优先回源查询。
     pub async fn process_transparent_query_bytes(
         &self,
         query_bytes: &[u8],
         orig_dst: SocketAddr,
     ) -> Option<Vec<u8>> {
-        self.process_query_with_upstream(query_bytes, self.resolve_transparent_upstream(orig_dst))
+        let (effective_upstream, preserved_orig) = self.resolve_transparent_upstream(orig_dst);
+        let orig_dns_hint = preserved_orig.then_some(effective_upstream);
+        self.process_query_with_upstream(query_bytes, effective_upstream, orig_dns_hint)
             .await
     }
 
-    /// 共享系统 DNS（如 `svchost.exe`）透明探测处理：
-    /// 保留直连进程真实解析，同时缓存健康 `real_ip -> domain` 映射以支持非 HTTP/TLS 应用按域名路由；
-    /// 当域名前期已进入 Fake-IP 救援态，或上游 `A` 查询超时/失败/`NXDOMAIN`/空记录/返回本地或直连掩码投毒 IP 时，分配 Fake-IP 救援。
+    /// 共享系统 DNS（如 `svchost.exe`）严格被动观测处理：
+    /// 原样透传至原始上游 DNS 并原样返回全部应答（绝不伪造 Fake-IP、绝不篡改内网/回环/`0.0.0.0`/`NXDOMAIN`/`SERVFAIL`/`NODATA`/`AAAA`/`HTTPS`、
+    /// 超时失败直接返回 `None` 让 OS 正常主备切换），仅在收到健康 `RCODE=0` 的 `A`/`AAAA` 应答时被动记录带 TTL 的 `real_ip -> domain` 辅助映射。
     pub async fn process_transparent_inspect_query_bytes(
         &self,
         query_bytes: &[u8],
         orig_dst: SocketAddr,
-        rule_engine: Option<&crate::router::RuleEngine>,
     ) -> Option<Vec<u8>> {
         let Ok(_permit) = self.concurrency_limit.clone().try_acquire_owned() else {
             warn!("[DNS Engine] Dropped transparent inspect DNS query exceeding concurrency limit (5000)");
@@ -839,27 +883,13 @@ impl DnsServer {
             }
         };
 
-        if self.pool.has_active_fake_ip(&question.name) {
-            if question.qtype == 1 && question.qclass == 1 {
-                let fake_ip = self.pool.allocate(&question.name);
-                return Some(DnsPacketParser::build_a_response(
-                    client_tx_id,
-                    query_bytes,
-                    question.raw_len,
-                    fake_ip,
-                ));
-            }
-            if matches!(question.qtype, 28 | 64 | 65) && question.qclass == 1 {
-                return Some(DnsPacketParser::build_empty_response(
-                    client_tx_id,
-                    query_bytes,
-                    question.raw_len,
-                ));
-            }
+        // IPv6 链路本地 DNS（fe80::）缺少 scope_id 无法经临时 socket 直发，不替 OS 改道
+        if matches!(orig_dst.ip().to_canonical(), IpAddr::V6(v6) if v6.is_unicast_link_local()) {
+            return None;
         }
 
-        let effective_upstream = self.resolve_transparent_upstream(orig_dst);
-        let outcome = forward_raw_query_with_limit(
+        let (effective_upstream, _) = self.resolve_transparent_upstream(orig_dst);
+        match forward_raw_query_with_limit(
             &self.upstream_limit,
             effective_upstream,
             query_bytes,
@@ -867,88 +897,30 @@ impl DnsServer {
             &question,
             "inspect",
         )
-        .await;
-
-        if matches!(outcome, ForwardQueryOutcome::RateLimited) {
-            return None;
-        }
-
-        let is_poisoned_or_bypassed_ip = |ip: IpAddr| -> bool {
-            let ip = ip.to_canonical();
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || match ip {
-                    IpAddr::V4(v4) => v4.is_broadcast() || v4.is_link_local(),
-                    IpAddr::V6(v6) => v6.is_unicast_link_local(),
-                }
-                || self.pool.is_fake_ip_addr(ip)
-                || rule_engine.is_some_and(|re| re.matches_global_direct_subnet(ip))
-        };
-
-        let rescue_with_fake_ip = || -> Vec<u8> {
-            let fake_ip = self.pool.allocate(&question.name);
-            DnsPacketParser::build_a_response(client_tx_id, query_bytes, question.raw_len, fake_ip)
-        };
-
-        match outcome {
+        .await
+        {
             ForwardQueryOutcome::Response {
                 bytes: resp_bytes,
                 ans_off,
             } => {
-                let extract_healthy_ips = |resp: &[u8]| -> Option<Vec<IpAddr>> {
-                    if (resp[3] & 0x0F) != 0 {
-                        return None;
-                    }
-                    let ips = parse_answer_ips(resp, &question, ans_off, None).ok()?;
-                    (!ips.is_empty() && !ips.iter().copied().any(is_poisoned_or_bypassed_ip))
-                        .then_some(ips)
-                };
-
-                if matches!(question.qtype, 1 | 28) && question.qclass == 1 {
-                    if let Some(ips) = extract_healthy_ips(&resp_bytes) {
-                        self.pool.record_real_ip_mappings(&question.name, &ips);
-                        return Some(resp_bytes);
-                    }
-                    return Some(if question.qtype == 1 {
-                        rescue_with_fake_ip()
-                    } else {
-                        DnsPacketParser::build_empty_response(
-                            client_tx_id,
-                            query_bytes,
-                            question.raw_len,
-                        )
-                    });
+                if matches!(question.qtype, 1 | 28)
+                    && question.qclass == 1
+                    && (resp_bytes[3] & 0x0F) == 0
+                    && let Ok((ips, min_ttl)) = parse_answer_ips_with_ttl(
+                        &resp_bytes,
+                        &question,
+                        ans_off,
+                        Some(&self.pool),
+                    )
+                    && !ips.is_empty()
+                {
+                    let ttl_hint = min_ttl.map(|s| Duration::from_secs(u64::from(s)));
+                    self.pool
+                        .record_real_ip_mappings_with_ttl(&question.name, &ips, ttl_hint);
                 }
-
-                if matches!(question.qtype, 64 | 65) && question.qclass == 1 {
-                    let rcode = resp_bytes[3] & 0x0F;
-                    if rcode == 0 {
-                        return Some(resp_bytes);
-                    }
-                    return Some(DnsPacketParser::build_empty_response(
-                        client_tx_id,
-                        query_bytes,
-                        question.raw_len,
-                    ));
-                }
-
                 Some(resp_bytes)
             }
-            ForwardQueryOutcome::NoResponse => {
-                if question.qtype == 1 && question.qclass == 1 {
-                    Some(rescue_with_fake_ip())
-                } else if matches!(question.qtype, 28 | 64 | 65) && question.qclass == 1 {
-                    Some(DnsPacketParser::build_empty_response(
-                        client_tx_id,
-                        query_bytes,
-                        question.raw_len,
-                    ))
-                } else {
-                    None
-                }
-            }
-            ForwardQueryOutcome::RateLimited => None,
+            ForwardQueryOutcome::NoResponse | ForwardQueryOutcome::RateLimited => None,
         }
     }
 
@@ -1510,10 +1482,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_transparent_inspect_query_preserves_healthy_real_ip_and_rescues_nxdomain_or_poisoned_ip(
+    async fn test_process_transparent_inspect_query_is_strictly_passive_and_preserves_all_upstream_semantics(
     ) {
-        use crate::router::{Action, Rule, RuleEngine};
-
         let mock_up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mock_addr = mock_up.local_addr().unwrap();
         let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -1528,24 +1498,46 @@ mod tests {
                         let name = q.name.to_ascii_lowercase();
                         let mut resp = Vec::new();
                         resp.extend_from_slice(&txid.to_be_bytes());
-                        if name == "blocked.example" && q.qtype == 1 {
-                            // RCODE=3 (NXDOMAIN), ANCOUNT=0
+                        if name == "nxdomain.example" && q.qtype == 1 {
+                            // RCODE=3 (NXDOMAIN)
                             resp.extend_from_slice(&[0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                        } else if name == "servfail.example" && q.qtype == 1 {
+                            // RCODE=2 (SERVFAIL)
+                            resp.extend_from_slice(&[0x81, 0x82, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                             resp.extend_from_slice(&buf[12..q.raw_len]);
                         } else if name == "healthy.example" && q.qtype == 1 {
                             resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
                             resp.extend_from_slice(&buf[12..q.raw_len]);
                             resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
-                        } else if name == "poison-loopback.example" && q.qtype == 1 {
+                        } else if name == "dual-process.example" && q.qtype == 1 {
+                            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                            resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 35]);
+                        } else if name == "nas.home" && q.qtype == 1 {
+                            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                            resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 192, 168, 1, 10]);
+                        } else if name == "localtest.me" && q.qtype == 1 {
                             resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
                             resp.extend_from_slice(&buf[12..q.raw_len]);
                             resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
-                        } else if name == "poison-lan.example" && q.qtype == 1 {
+                        } else if name == "ads.tracker.example" && q.qtype == 1 {
                             resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
                             resp.extend_from_slice(&buf[12..q.raw_len]);
-                            resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 192, 168, 1, 1]);
+                            resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 0, 0, 0, 0]);
+                        } else if name == "v6only.example" && q.qtype == 1 {
+                            // Pure IPv6 domain: A query legally returns NOERROR ANCOUNT=0 (NODATA)
+                            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                        } else if name == "v6only.example" && q.qtype == 28 {
+                            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                            resp.extend_from_slice(&[
+                                0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0, 0, 0, 60, 0, 16,
+                                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+                            ]);
                         } else {
-                            // Empty NOERROR (e.g. healthy.example AAAA NODATA)
                             resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
                             resp.extend_from_slice(&buf[12..q.raw_len]);
                         }
@@ -1563,93 +1555,175 @@ mod tests {
             mock_addr,
             true,
         );
-        let engine = RuleEngine::new(
-            vec![
-                Rule::from_raw(
-                    "LocalBypass",
-                    true,
-                    None,
-                    Some("127.0.0.1; localhost; ::1; 192.168.0.0/16"),
-                    None,
-                    Action::Direct,
-                ),
-                Rule::from_raw("DevProxy", true, Some("chrome.exe"), None, None, Action::Proxy(1)),
-            ],
-            Action::Direct,
-        );
 
-        // 1. 健康外部域名：保留真实 IP 93.184.216.34 不污染直连进程，同时写入 real_ip -> domain 缓存
+        // 1. 健康外部域名：原样返回真实 IP 且被动写入 real_ip_to_domain
         let q_healthy = build_sample_query(0x1001, "healthy.example", 1);
         let r_healthy = server
-            .process_transparent_inspect_query_bytes(&q_healthy, mock_addr, Some(&engine))
+            .process_transparent_inspect_query_bytes(&q_healthy, mock_addr)
             .await
             .unwrap();
         assert_eq!(&r_healthy[0..2], &[0x10, 0x01]);
         assert_eq!(r_healthy[3] & 0x0F, 0);
         assert_eq!(&r_healthy[r_healthy.len() - 4..], &[93, 184, 216, 34]);
-        assert!(!pool.has_active_fake_ip("healthy.example"));
         assert_eq!(
             pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
                 .as_deref(),
             Some("healthy.example")
         );
 
-        let q_healthy_v6 = build_sample_query(0x1002, "healthy.example", 28);
-        let r_healthy_v6 = server
-            .process_transparent_inspect_query_bytes(&q_healthy_v6, mock_addr, Some(&engine))
-            .await
-            .unwrap();
-        assert_eq!(r_healthy_v6[3] & 0x0F, 0);
-        assert_eq!(&r_healthy_v6[6..8], &[0x00, 0x00]);
-
-        // 2. 上游 NXDOMAIN 域名：分配 Fake-IP 救援，并确保后续 AAAA 保持空 NOERROR 一致性
-        let q_blocked = build_sample_query(0x2001, "blocked.example", 1);
-        let r_blocked = server
-            .process_transparent_inspect_query_bytes(&q_blocked, mock_addr, Some(&engine))
-            .await
-            .unwrap();
-        assert_eq!(&r_blocked[0..2], &[0x20, 0x01]);
-        assert_eq!(r_blocked[3] & 0x0F, 0);
-        let blocked_fake = Ipv4Addr::new(
-            r_blocked[r_blocked.len() - 4],
-            r_blocked[r_blocked.len() - 3],
-            r_blocked[r_blocked.len() - 2],
-            r_blocked[r_blocked.len() - 1],
-        );
-        assert!(pool.is_fake_ip_addr(IpAddr::V4(blocked_fake)));
-        assert!(pool.has_active_fake_ip("blocked.example"));
-        assert_eq!(
-            pool.restore_ip(IpAddr::V4(blocked_fake)).as_deref(),
-            Some("blocked.example")
-        );
-
-        let q_blocked_v6 = build_sample_query(0x2002, "blocked.example", 28);
-        let r_blocked_v6 = server
-            .process_transparent_inspect_query_bytes(&q_blocked_v6, mock_addr, Some(&engine))
-            .await
-            .unwrap();
-        assert_eq!(r_blocked_v6[3] & 0x0F, 0);
-        assert_eq!(&r_blocked_v6[6..8], &[0x00, 0x00]);
-
-        // 3. 本地回环投毒 IP (127.0.0.1) 与直连掩码投毒 IP (192.168.1.1) 均触发 Fake-IP 救援
-        for (tx, domain) in [
-            (0x3001, "poison-loopback.example"),
-            (0x3002, "poison-lan.example"),
+        // 2. P0-1：内网 192.168.1.10 / 回环 127.0.0.1 / 广告屏蔽 0.0.0.0 全部原样透传，绝不伪造 Fake-IP
+        for (tx, domain, expected) in [
+            (0x2001, "nas.home", [192, 168, 1, 10]),
+            (0x2002, "localtest.me", [127, 0, 0, 1]),
+            (0x2003, "ads.tracker.example", [0, 0, 0, 0]),
         ] {
             let q = build_sample_query(tx, domain, 1);
             let r = server
-                .process_transparent_inspect_query_bytes(&q, mock_addr, Some(&engine))
+                .process_transparent_inspect_query_bytes(&q, mock_addr)
                 .await
                 .unwrap();
-            let ip = Ipv4Addr::new(r[r.len() - 4], r[r.len() - 3], r[r.len() - 2], r[r.len() - 1]);
-            assert!(
-                pool.is_fake_ip_addr(IpAddr::V4(ip)),
-                "poisoned domain {} must be rescued with Fake-IP, got {}",
-                domain,
-                ip
+            assert_eq!(r[3] & 0x0F, 0);
+            assert_eq!(
+                &r[r.len() - 4..],
+                &expected,
+                "InspectDns must preserve real IP {:?} verbatim for {}",
+                expected,
+                domain
             );
-            assert_eq!(pool.restore_ip(IpAddr::V4(ip)).as_deref(), Some(domain));
         }
+        assert!(pool.is_empty(), "InspectDns must never allocate Fake-IP");
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            None
+        );
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))),
+            None
+        );
+
+        // 3. P0-2：真实 NXDOMAIN、SERVFAIL、纯 IPv6 域名的 A NODATA + AAAA 均原样保留，绝不伪造 Fake-IP
+        let r_nx = server
+            .process_transparent_inspect_query_bytes(
+                &build_sample_query(0x3001, "nxdomain.example", 1),
+                mock_addr,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_nx[3] & 0x0F, 3, "NXDOMAIN must be preserved verbatim");
+        assert_eq!(&r_nx[6..8], &[0x00, 0x00]);
+
+        let r_sf = server
+            .process_transparent_inspect_query_bytes(
+                &build_sample_query(0x3002, "servfail.example", 1),
+                mock_addr,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_sf[3] & 0x0F, 2, "SERVFAIL must be preserved verbatim");
+
+        let r_v6_a = server
+            .process_transparent_inspect_query_bytes(
+                &build_sample_query(0x3003, "v6only.example", 1),
+                mock_addr,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_v6_a[3] & 0x0F, 0);
+        assert_eq!(
+            &r_v6_a[6..8],
+            &[0x00, 0x00],
+            "IPv6-only A NODATA must not be rewritten into Fake-IP"
+        );
+        let r_v6_aaaa = server
+            .process_transparent_inspect_query_bytes(
+                &build_sample_query(0x3004, "v6only.example", 28),
+                mock_addr,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_v6_aaaa[3] & 0x0F, 0);
+        assert_eq!(&r_v6_aaaa[6..8], &[0x00, 0x01]);
+        assert_eq!(
+            pool.lookup_real_ip_domain("2001:db8::1".parse().unwrap())
+                .as_deref(),
+            Some("v6only.example")
+        );
+
+        // 4. P0-2：上游不可达 / link-local IPv6 返回 None 交由 OS 主备 DNS 切换，不注入伪造应答
+        let closed_up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed_up.local_addr().unwrap();
+        drop(closed_up);
+        assert!(
+            server
+                .process_transparent_inspect_query_bytes(
+                    &build_sample_query(0x3005, "unreachable.example", 1),
+                    closed_addr,
+                )
+                .await
+                .is_none(),
+            "unreachable upstream must return None for OS DNS failover"
+        );
+        assert!(
+            server
+                .process_transparent_inspect_query_bytes(
+                    &build_sample_query(0x3006, "linklocal.example", 1),
+                    "[fe80::1]:53".parse().unwrap(),
+                )
+                .await
+                .is_none()
+        );
+
+        // 5. P1-3 + P0-1：即便其它进程（HandleDns）已为 dual-process.example 分配 Fake-IP（且记录了 orig_dst），
+        // 共享系统 DNS 的 InspectDns 仍必须原样返回真实上游 IP，绝不跨进程扩散 Fake-IP；
+        // 同时 resolve_via_upstream_dns 不得反向污染 real_ip_to_domain
+        let handle_resp = server
+            .process_transparent_query_bytes(
+                &build_sample_query(0x4001, "dual-process.example", 1),
+                mock_addr,
+            )
+            .await
+            .unwrap();
+        let allocated_fake = Ipv4Addr::new(
+            handle_resp[handle_resp.len() - 4],
+            handle_resp[handle_resp.len() - 3],
+            handle_resp[handle_resp.len() - 2],
+            handle_resp[handle_resp.len() - 1],
+        );
+        assert_eq!(
+            pool.restore_ip_with_dns(IpAddr::V4(allocated_fake)),
+            Some(("dual-process.example".to_string(), Some(mock_addr)))
+        );
+
+        let inspect_dual = server
+            .process_transparent_inspect_query_bytes(
+                &build_sample_query(0x4002, "dual-process.example", 1),
+                mock_addr,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            &inspect_dual[inspect_dual.len() - 4..],
+            &[93, 184, 216, 35],
+            "active Fake-IP from HandleDns must never leak into InspectDns"
+        );
+
+        // resolve_via_upstream_dns（直连解析/节点测速）不得写入 real_ip_to_domain
+        let direct_pool = FakeIpPool::new_default();
+        let resolved = resolve_via_upstream_dns_with_options(
+            "healthy.example",
+            mock_addr,
+            Some(&direct_pool),
+            Duration::from_secs(2),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+        assert_eq!(
+            direct_pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+            None,
+            "resolve_via_upstream_dns must not pollute real_ip_to_domain"
+        );
 
         let _ = stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), up_task).await;

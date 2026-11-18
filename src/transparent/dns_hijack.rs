@@ -617,9 +617,5 @@ mod tests {
             ),
             UdpDecision::Passthrough
         );
-
-        // 全局直连子网判定应准确命中 LocalBypass 的 192.168.0.0/16 并放过公网 IP
-        assert!(app_proxy_engine.matches_global_direct_subnet(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(!app_proxy_engine.matches_global_direct_subnet(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 }
