@@ -193,6 +193,19 @@ impl DirectOutbound {
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<OutboundTcpStream> {
+        Self::connect_guarded_with_dns_fallback(target, upstream_dns, None, fake_ip_pool, self_ports)
+            .await
+    }
+
+    /// 显式直连：若存在 `preferred_dns`（例如透明 Fake-IP 分配阶段记录的原路由器/企业分域 DNS），
+    /// 优先向 `preferred_dns` 解析；若失败且与默认 `upstream_dns` 不同，则在剩余预算内回退至 `upstream_dns`。
+    pub async fn connect_guarded_with_dns_fallback(
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        preferred_dns: Option<SocketAddr>,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<OutboundTcpStream> {
         let deadline = tokio::time::Instant::now() + DIRECT_CONNECT_TIMEOUT;
         let fut = async {
             match target {
@@ -222,11 +235,65 @@ impl DirectOutbound {
                             IpAddr::V6(Ipv6Addr::LOCALHOST),
                         ]
                     } else {
-                        let dns_budget = DIRECT_DNS_TIMEOUT
-                            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-                        resolve_via_upstream_dns(domain, upstream_dns, fake_ip_pool, dns_budget)
-                            .await
-                            .with_context(|| format!("Upstream DNS resolution failed for direct target {}", domain))?
+                        let dns_deadline = tokio::time::Instant::now()
+                            + DIRECT_DNS_TIMEOUT
+                                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                        let primary_dns = preferred_dns.unwrap_or(upstream_dns);
+                        let fallback_dns = preferred_dns
+                            .filter(|d| *d != upstream_dns)
+                            .map(|_| upstream_dns);
+                        let primary_budget = if fallback_dns.is_some() {
+                            (DIRECT_DNS_TIMEOUT / 2).min(
+                                dns_deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            )
+                        } else {
+                            dns_deadline.saturating_duration_since(tokio::time::Instant::now())
+                        };
+                        match resolve_via_upstream_dns(
+                            domain,
+                            primary_dns,
+                            fake_ip_pool,
+                            primary_budget,
+                        )
+                        .await
+                        {
+                            Ok(ips) => ips,
+                            Err(primary_err) => {
+                                if let Some(fb_dns) = fallback_dns {
+                                    let fb_budget = dns_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    if !fb_budget.is_zero() {
+                                        resolve_via_upstream_dns(
+                                            domain,
+                                            fb_dns,
+                                            fake_ip_pool,
+                                            fb_budget,
+                                        )
+                                        .await
+                                        .with_context(|| {
+                                            format!(
+                                                "Upstream DNS resolution failed for direct target {} (primary {}: {:#})",
+                                                domain, primary_dns, primary_err
+                                            )
+                                        })?
+                                    } else {
+                                        return Err(primary_err).with_context(|| {
+                                            format!(
+                                                "Upstream DNS resolution failed for direct target {}",
+                                                domain
+                                            )
+                                        });
+                                    }
+                                } else {
+                                    return Err(primary_err).with_context(|| {
+                                        format!(
+                                            "Upstream DNS resolution failed for direct target {}",
+                                            domain
+                                        )
+                                    });
+                                }
+                            }
+                        }
                     };
 
                     validate_direct_ips(&resolved_ips, *port, self_ports, fake_ip_pool, domain)?;

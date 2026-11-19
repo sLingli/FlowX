@@ -198,13 +198,25 @@ fn is_self_target(target: &TargetAddr, server_addr: &SocketAddr, self_ports: &[u
     false
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DialTargetPolicy {
+    /// 始终使用 `display_target` 拨号（显式代理入站 / Fake-IP 还原域名）
+    UseDisplayTarget,
+    /// 权威嗅探域名（TLS SNI / HTTP Host）：Direct 走真实 IP 免二次解析，Proxy/Chain 传域名由上游代理远程解析
+    IpOnDirectDomainOnProxy(SocketAddr),
+    /// 被动 DNS 缓存反查的唯一域名（启发式）：用于规则域名匹配与展示，但所有出站拨号一律使用原始真实 IP，
+    /// 防止共享 CDN/DoH/裸 IP 场景下把错误域名发给上游代理服务器
+    AlwaysUseRealIp(SocketAddr),
+}
+
 struct DispatchSession {
     inbound_label: &'static str,
     inbound_kind: Option<inbound::InboundKind>,
     proc_info: Option<ProcessInfo>,
     display_target: TargetAddr,
     route_ip: Option<IpAddr>,
-    dial_ip_on_direct: Option<SocketAddr>,
+    dial_policy: DialTargetPolicy,
+    direct_dns_override: Option<SocketAddr>,
     pending: Vec<u8>,
     http_body_framing: Option<inbound::HttpBodyFraming>,
     body_prefix: Vec<u8>,
@@ -243,9 +255,12 @@ async fn evaluate_and_relay_stream<S: RelayStream>(
 
     let (action, rule_name) = config.rule_engine.evaluate(&ctx);
 
-    // 若透明代理面对真实 IP + 嗅探域名且最终命中的是 Direct，直接拨号原始真实 IP，避免多余的上游 DNS 解析开销
-    let dial_target = match (&action, session.dial_ip_on_direct) {
-        (Action::Direct, Some(real_addr)) => TargetAddr::Ip(real_addr),
+    // 依据域名来源策略选择实际拨号目标：
+    // - 权威嗅探（SNI/Host）在 Direct 时直连原始真实 IP，Proxy/Chain 时提交域名远程解析；
+    // - 被动 DNS 缓存启发式域名一律按原始真实 IP 拨号，避免共享 IP/裸 IP 误发错误域名给远端代理。
+    let dial_target = match (&action, session.dial_policy) {
+        (Action::Direct, DialTargetPolicy::IpOnDirectDomainOnProxy(real_addr))
+        | (_, DialTargetPolicy::AlwaysUseRealIp(real_addr)) => TargetAddr::Ip(real_addr),
         _ => session.display_target.clone(),
     };
 
@@ -294,7 +309,7 @@ async fn evaluate_and_relay_stream<S: RelayStream>(
 
     let cancel_token = Arc::clone(&active_conn);
     let mut remote_stream = tokio::select! {
-        res = connect_outbound(config, &action, &dial_target) => {
+        res = connect_outbound(config, &action, &dial_target, session.direct_dns_override) => {
             match res {
                 Ok(s) => s,
                 Err(e) => {
@@ -379,14 +394,26 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
         None => config.tracker.find_by_connection_async(peer_addr, orig_dst).await,
     };
 
-    // 3. 若命中 Fake-IP 池直接还原域名；否则结合 DNS 实 IP 反向缓存与按需 SNI / Host 嗅探（避开服务端先说话协议卡死与伪造本机头）
-    let (display_target, route_ip, dial_ip_on_direct, pending) =
+    // 3. 若命中 Fake-IP 池直接还原域名与原始上游 DNS；否则优先按需嗅探 TLS SNI / HTTP Host，仅在无嗅探结果时回退至唯一被动 DNS 映射
+    let (display_target, route_ip, dial_policy, direct_dns_override, pending) =
         if config.fake_ip_pool.is_fake_ip_addr(orig_dst.ip()) {
-            let domain = config.fake_ip_pool.restore_ip(orig_dst.ip()).ok_or_else(|| {
-                anyhow!("Fake-IP {} domain mapping expired or does not exist", orig_dst.ip())
-            })?;
+            let (domain, orig_dns) = config
+                .fake_ip_pool
+                .restore_ip_with_dns(orig_dst.ip())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Fake-IP {} domain mapping expired or does not exist",
+                        orig_dst.ip()
+                    )
+                })?;
             let target = TargetAddr::Domain(domain, orig_dst.port());
-            (target, None, None, Vec::new())
+            (
+                target,
+                None,
+                DialTargetPolicy::UseDisplayTarget,
+                orig_dns,
+                Vec::new(),
+            )
         } else {
             let cached_domain = config.fake_ip_pool.lookup_real_ip_domain(orig_dst.ip());
             let domain_decision = config.rule_engine.needs_domain_for_routing(
@@ -405,9 +432,8 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                         Action::Direct | Action::Block,
                     ) => false,
                 };
-            let need_sniff = want_sniff
-                && !is_server_first_protocol_port(orig_dst.port())
-                && (cached_domain.is_none() || is_sniffable_default_port(orig_dst.port()));
+            // 除明确服务端先发协议端口外，绝不因存在被动缓存域名而跳过权威 TLS SNI / HTTP Host 嗅探（例如 8444/9443/2083 等非标准 HTTPS 端口）
+            let need_sniff = want_sniff && !is_server_first_protocol_port(orig_dst.port());
             let (sniffed_host, buffered) = if need_sniff {
                 let outcome = crate::transparent::sniffer::peek_host_prefix(
                     &mut local_stream,
@@ -430,17 +456,26 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             } else {
                 (None, Vec::new())
             };
-            match sniffed_host.or(cached_domain) {
-                Some(host) => (
+            match (sniffed_host, cached_domain) {
+                (Some(host), _) => (
                     TargetAddr::Domain(host, orig_dst.port()),
                     Some(orig_dst.ip()),
-                    Some(orig_dst),
+                    DialTargetPolicy::IpOnDirectDomainOnProxy(orig_dst),
+                    None,
                     buffered,
                 ),
-                None => (
+                (None, Some(host)) => (
+                    TargetAddr::Domain(host, orig_dst.port()),
+                    Some(orig_dst.ip()),
+                    DialTargetPolicy::AlwaysUseRealIp(orig_dst),
+                    None,
+                    buffered,
+                ),
+                (None, None) => (
                     TargetAddr::Ip(orig_dst),
                     Some(orig_dst.ip()),
-                    Some(orig_dst),
+                    DialTargetPolicy::UseDisplayTarget,
+                    None,
                     buffered,
                 ),
             }
@@ -464,7 +499,8 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             proc_info,
             display_target,
             route_ip,
-            dial_ip_on_direct,
+            dial_policy,
+            direct_dns_override,
             pending,
             http_body_framing: None,
             body_prefix: Vec::new(),
@@ -502,17 +538,17 @@ async fn handle_connection(
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
 
     // 3. If target is Fake-IP (IPv4 or IPv4-mapped IPv6), restore original domain (prevent DNS leak, let upstream proxy resolve)
-    let target = match &target {
+    let (target, direct_dns_override) = match &target {
         TargetAddr::Ip(addr) if config.fake_ip_pool.is_fake_ip_addr(addr.ip()) => {
-            match config.fake_ip_pool.restore_ip(addr.ip()) {
-                Some(domain) => TargetAddr::Domain(domain, addr.port()),
+            match config.fake_ip_pool.restore_ip_with_dns(addr.ip()) {
+                Some((domain, orig_dns)) => (TargetAddr::Domain(domain, addr.port()), orig_dns),
                 None => {
                     inbound::send_failure(&mut local_stream, kind, false).await.ok();
                     bail!("Fake-IP {} domain mapping expired or does not exist", addr.ip());
                 }
             }
         }
-        _ => target,
+        _ => (target, None),
     };
 
     // 4. Loop prevention: reject requests targeting FlowX internal service ports
@@ -541,7 +577,8 @@ async fn handle_connection(
             proc_info,
             display_target: target,
             route_ip,
-            dial_ip_on_direct: None,
+            dial_policy: DialTargetPolicy::UseDisplayTarget,
+            direct_dns_override,
             pending,
             http_body_framing,
             body_prefix,
@@ -555,13 +592,15 @@ async fn connect_outbound(
     config: &DispatcherConfig,
     action: &Action,
     target: &TargetAddr,
+    direct_dns_override: Option<SocketAddr>,
 ) -> Result<crate::outbound::OutboundTcpStream> {
     match action {
         Action::Block => bail!("Connection blocked by rule"),
         Action::Direct => {
-            DirectOutbound::connect_guarded(
+            DirectOutbound::connect_guarded_with_dns_fallback(
                 target,
                 config.upstream_dns,
+                direct_dns_override,
                 Some(config.fake_ip_pool.as_ref()),
                 &config.self_ports,
             )
@@ -1248,7 +1287,8 @@ mod tests {
         let mut probe = [0u8; 8];
         assert_eq!(app_ssh.read(&mut probe).await.unwrap(), 0);
 
-        // 2. 自定义二进制端口规则 (ports="7777", targets="*.game", Proxy(1)) 经 real_ip_to_domain 自动以域名拨号代理，不空等 120ms
+        // 2. 自定义二进制端口规则 (ports="7777", targets="*.game", Proxy(1)) 经唯一 real_ip_to_domain 命中域名规则，
+        // 但走代理时一律以原始真实 IPv4 拨号（AlwaysUseRealIp），避免把启发式缓存域名误发给远端代理
         let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_addr = socks_listener.local_addr().unwrap();
         let (target_tx, target_rx) = tokio::sync::oneshot::channel();
@@ -1259,17 +1299,21 @@ mod tests {
             s.write_all(&[0x05, 0x00]).await.unwrap();
             let mut hdr = [0u8; 4];
             s.read_exact(&mut hdr).await.unwrap();
-            assert_eq!(hdr[3], 0x03, "port 7777 custom proto must still forward cached domain");
-            let mut l = [0u8; 1];
-            s.read_exact(&mut l).await.unwrap();
-            let mut dom = vec![0u8; l[0] as usize];
-            s.read_exact(&mut dom).await.unwrap();
-            let mut p = [0u8; 2];
-            s.read_exact(&mut p).await.unwrap();
-            let _ = target_tx.send((String::from_utf8(dom).unwrap(), u16::from_be_bytes(p)));
+            assert_eq!(
+                hdr[3], 0x01,
+                "heuristic cached_domain fallback must dial real IPv4 on Proxy instead of unverified domain"
+            );
+            let mut addr_port = [0u8; 6];
+            s.read_exact(&mut addr_port).await.unwrap();
+            let ip = std::net::Ipv4Addr::new(addr_port[0], addr_port[1], addr_port[2], addr_port[3]);
+            let port = u16::from_be_bytes([addr_port[4], addr_port[5]]);
+            let _ = target_tx.send((ip, port));
             s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
                 .await
                 .unwrap();
+            let mut client_bin = [0u8; 4];
+            s.read_exact(&mut client_bin).await.unwrap();
+            assert_eq!(&client_bin, b"\xFE\xED\xFA\xCE");
             s.write_all(b"GAME_SRV_HELLO").await.unwrap();
         });
 
@@ -1311,13 +1355,18 @@ mod tests {
             )
             .await
         });
+        // 客户端首包发送非 TLS/非 HTTP 二进制魔数时，peek_host_prefix 立即 NotMatchable 放行并回退至唯一 cached_domain 路由
+        app_game.write_all(b"\xFE\xED\xFA\xCE").await.unwrap();
         let mut game_hello = [0u8; 14];
         tokio::time::timeout(Duration::from_secs(2), app_game.read_exact(&mut game_hello))
             .await
-            .expect("custom port 7777 with cached domain must forward server banner immediately")
+            .expect("custom port 7777 with binary client payload must relay without timeout")
             .unwrap();
         assert_eq!(&game_hello, b"GAME_SRV_HELLO");
-        assert_eq!(target_rx.await.unwrap(), ("login.game".to_string(), 7777));
+        assert_eq!(
+            target_rx.await.unwrap(),
+            (std::net::Ipv4Addr::new(93, 184, 216, 60), 7777)
+        );
         drop(app_game);
         game_handle.await.unwrap().unwrap();
         socks_srv.await.unwrap();
@@ -1449,5 +1498,235 @@ mod tests {
         drop(app_sp);
         sp_handle.await.unwrap().unwrap();
         spoof_srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_transparent_stream_sniffs_non_default_https_over_cached_ip_handles_cdn_ambiguity_and_uses_fake_ip_orig_dns(
+    ) {
+        use crate::outbound::socks5::Socks5Client;
+        use tokio::io::AsyncReadExt;
+
+        // 1. P1-1：非标准 HTTPS 端口 8444 即使存在过期/不同缓存域名，也不得跳过 TLS SNI 嗅探；
+        //    应提取真实 SNI 命中代理规则并向 SOCKS5 传递权威 SNI 域名
+        let socks_8444 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_8444_addr = socks_8444.local_addr().unwrap();
+        let client_hello = build_test_tls_client_hello("real-sni.example");
+        let expected_hello = client_hello.clone();
+        let (sni_tx, sni_rx) = tokio::sync::oneshot::channel();
+        let srv_8444 = tokio::spawn(async move {
+            let (mut s, _) = socks_8444.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 0x03, "authoritative TLS SNI must dial Domain on Proxy");
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l).await.unwrap();
+            let mut dom = vec![0u8; l[0] as usize];
+            s.read_exact(&mut dom).await.unwrap();
+            let mut p = [0u8; 2];
+            s.read_exact(&mut p).await.unwrap();
+            let _ = sni_tx.send((String::from_utf8(dom).unwrap(), u16::from_be_bytes(p)));
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut got_hello = vec![0u8; expected_hello.len()];
+            s.read_exact(&mut got_hello).await.unwrap();
+            assert_eq!(got_hello, expected_hello);
+            s.write_all(b"TLS_OK").await.unwrap();
+        });
+
+        let cfg_8444 = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "ProxyRealSni",
+                true,
+                None,
+                Some("real-sni.example"),
+                None,
+                Action::Proxy(1),
+            )],
+        );
+        cfg_8444.rule_engine.set_default_action(Action::Block);
+        let shared_ip: IpAddr = "93.184.216.90".parse().unwrap();
+        cfg_8444
+            .fake_ip_pool
+            .record_real_ip_mappings("stale-site.example", &[shared_ip]);
+        cfg_8444.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "SniSocks".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: socks_8444_addr.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(socks_8444_addr.to_string())),
+            },
+        );
+
+        let (mut app_tls, disp_tls) = tokio::io::duplex(4096);
+        let tls_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(cfg_8444),
+                disp_tls,
+                "127.0.0.1:50301".parse().unwrap(),
+                SocketAddr::new(shared_ip, 8444),
+                None,
+                true,
+            )
+            .await
+        });
+        app_tls.write_all(&client_hello).await.unwrap();
+        let mut tls_ack = [0u8; 6];
+        app_tls.read_exact(&mut tls_ack).await.unwrap();
+        assert_eq!(&tls_ack, b"TLS_OK");
+        assert_eq!(sni_rx.await.unwrap(), ("real-sni.example".to_string(), 8444));
+        drop(app_tls);
+        tls_handle.await.unwrap().unwrap();
+        srv_8444.await.unwrap();
+
+        // 2. P1-1：共享 CDN IP（两个域名同指 104.16.1.9 -> Ambiguous）在不可嗅探的端口 22 不得误用后写入域名命中错误 Block 规则，
+        //    而是直接以真实 IP 走 Proxy
+        let socks_cdn = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_cdn_addr = socks_cdn.local_addr().unwrap();
+        let srv_cdn = tokio::spawn(async move {
+            let (mut s, _) = socks_cdn.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 0x01, "ambiguous CDN IP must dial raw IPv4");
+            let mut ip_port = [0u8; 6];
+            s.read_exact(&mut ip_port).await.unwrap();
+            assert_eq!(&ip_port[0..4], &[104, 16, 1, 9]);
+            assert_eq!(u16::from_be_bytes([ip_port[4], ip_port[5]]), 22);
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            s.write_all(b"SSH-CDN").await.unwrap();
+        });
+        let cfg_cdn = test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![
+                crate::router::Rule::from_raw(
+                    "BlockSecondDomain",
+                    true,
+                    None,
+                    Some("second.cdn.example"),
+                    Some("22"),
+                    Action::Block,
+                ),
+                crate::router::Rule::from_raw("ProxyRest", true, None, None, None, Action::Proxy(1)),
+            ],
+        );
+        let cdn_ip: IpAddr = "104.16.1.9".parse().unwrap();
+        cfg_cdn
+            .fake_ip_pool
+            .record_real_ip_mappings("first.cdn.example", &[cdn_ip]);
+        cfg_cdn
+            .fake_ip_pool
+            .record_real_ip_mappings("second.cdn.example", &[cdn_ip]);
+        cfg_cdn.proxy_nodes.write().unwrap().insert(
+            1,
+            ProxyNodeEntry {
+                id: 1,
+                name: "CdnSocks".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: socks_cdn_addr.to_string(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new(socks_cdn_addr.to_string())),
+            },
+        );
+        let (mut app_cdn, disp_cdn) = tokio::io::duplex(2048);
+        let cdn_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(cfg_cdn),
+                disp_cdn,
+                "127.0.0.1:50302".parse().unwrap(),
+                SocketAddr::new(cdn_ip, 22),
+                None,
+                true,
+            )
+            .await
+        });
+        let mut ssh_cdn = [0u8; 7];
+        app_cdn.read_exact(&mut ssh_cdn).await.unwrap();
+        assert_eq!(&ssh_cdn, b"SSH-CDN");
+        drop(app_cdn);
+        cdn_handle.await.unwrap().unwrap();
+        srv_cdn.await.unwrap();
+
+        // 3. P0-1 防御纵深：Fake-IP 命中 Direct 时优先向 allocate_with_dns 记录的原分域 DNS 回源解析，
+        //    即使默认 upstream_dns 不可达也可连通内网目标
+        let echo_srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_srv.local_addr().unwrap().port();
+        let echo_task = tokio::spawn(async move {
+            let (mut s, _) = echo_srv.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"PING");
+            s.write_all(b"PONG").await.unwrap();
+        });
+
+        let corp_dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let corp_dns_addr = corp_dns.local_addr().unwrap();
+        let (dns_stop_tx, mut dns_stop_rx) = tokio::sync::watch::channel(false);
+        let corp_dns_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    recv = corp_dns.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = recv else { break };
+                        let (txid, q) = crate::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                        let mut resp = Vec::new();
+                        resp.extend_from_slice(&txid.to_be_bytes());
+                        if q.qtype == 1 {
+                            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                            resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+                        } else {
+                            resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                            resp.extend_from_slice(&buf[12..q.raw_len]);
+                        }
+                        let _ = corp_dns.send_to(&resp, peer).await;
+                    }
+                    _ = dns_stop_rx.changed() => break,
+                }
+            }
+        });
+
+        let closed_default_dns = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dead_dns_addr = closed_default_dns.local_addr().unwrap();
+        drop(closed_default_dns);
+
+        let mut split_cfg = test_config("127.0.0.1:40001".parse().unwrap(), vec![]);
+        split_cfg.upstream_dns = dead_dns_addr;
+        let fake_corp = split_cfg
+            .fake_ip_pool
+            .allocate_with_dns("intranet.corp.example", Some(corp_dns_addr));
+
+        let (mut app_corp, disp_corp) = tokio::io::duplex(2048);
+        let corp_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                Arc::new(split_cfg),
+                disp_corp,
+                "127.0.0.1:50303".parse().unwrap(),
+                SocketAddr::new(IpAddr::V4(fake_corp), echo_port),
+                None,
+                false,
+            )
+            .await
+        });
+        app_corp.write_all(b"PING").await.unwrap();
+        let mut pong = [0u8; 4];
+        app_corp.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"PONG");
+        drop(app_corp);
+        corp_handle.await.unwrap().unwrap();
+        echo_task.await.unwrap();
+        let _ = dns_stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), corp_dns_task).await;
     }
 }
