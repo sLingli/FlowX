@@ -1,6 +1,9 @@
-# FlowX
-
-基于 Rust 异步运行时（Tokio）构建的跨平台（Windows / Linux / macOS）进程级透明代理与分流引擎，内建混合协议入站、Windows WinDivert 系统级透明接管、Fake-IP / 被动观测 DNS、XML 配置持久化及单文件 Web 控制台。
+<div align="center">
+  <img src="icon.svg" alt="FlowX" width="120" height="120">
+  <h1>FlowX</h1>
+  <p><strong>基于 Rust 异步运行时（Tokio）构建的跨平台进程级透明代理与分流引擎</strong></p>
+  <p>Windows / Linux / macOS · 混合协议入站 · WinDivert 系统级透明接管 · Fake-IP / 被动观测 DNS · XML 配置持久化 · 单文件 Web 控制台</p>
+</div>
 
 ## 平台支持
 

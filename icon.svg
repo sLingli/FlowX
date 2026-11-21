@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none">
+  <style>
+    svg { color: #171717; }
+    .fx-accent-stroke { stroke: #0f766e; }
+    .fx-accent-fill { fill: #0f766e; }
+    @media (prefers-color-scheme: dark) {
+      svg { color: #ededed; }
+      .fx-accent-stroke { stroke: #2dd4bf; }
+      .fx-accent-fill { fill: #2dd4bf; }
+    }
+  </style>
+  <!-- Continuous F stem -> top bar -> X (\) diagonal -->
+  <path d="M4.2 18V6H11.2L19.2 18" stroke="currentColor" stroke-width="2.05" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- F middle bar pointing to X center -->
+  <path d="M4.2 12H9.2" stroke="currentColor" stroke-width="2.05" stroke-linecap="round"/>
+  <!-- X (/) diagonal in Signal Teal -->
+  <path class="fx-accent-stroke" d="M11.2 18L19.2 6" stroke="#2dd4bf" stroke-width="2.05" stroke-linecap="round"/>
+  <!-- Centered pivot node at exact intersection (15.2, 12) -->
+  <circle class="fx-accent-fill" cx="15.2" cy="12" r="2.2" fill="#2dd4bf"/>
+</svg>
