@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::dns::FakeIpPool;
 use crate::interceptor::process::ProcessTracker;
-use crate::outbound::bypass::is_tcp_port_bypassed;
+use crate::outbound::bypass::is_tcp_port_bypassed_for_family;
 use crate::outbound::RelayStream;
 use crate::router::{Action, DomainNeedDecision, RuleEngine};
 
@@ -534,6 +534,7 @@ struct BridgeInner {
     socket_closed: bool,
     app_read_closed: bool,
     app_write_closed: bool,
+    write_half_dropped: bool,
     graceful_shutdown: bool,
     fin_sent_to_socket: bool,
     read_waker: Option<Waker>,
@@ -551,6 +552,7 @@ impl Default for BridgeInner {
             socket_closed: false,
             app_read_closed: false,
             app_write_closed: false,
+            write_half_dropped: false,
             graceful_shutdown: false,
             fin_sent_to_socket: false,
             read_waker: None,
@@ -649,6 +651,7 @@ impl Drop for SmoltcpWriteHalf {
         {
             let mut inner = self.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.app_write_closed = true;
+            inner.write_half_dropped = true;
             inner.write_waker = None;
             inner.flush_waker = None;
         }
@@ -770,7 +773,6 @@ impl AsyncWrite for SmoltcpWriteHalf {
         let wake_now = {
             let mut inner = self.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.app_write_closed = true;
-            inner.graceful_shutdown = true;
             if inner.socket_errored {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::ConnectionReset,
@@ -778,6 +780,9 @@ impl AsyncWrite for SmoltcpWriteHalf {
                 )));
             }
             if inner.to_socket.is_empty() && (inner.fin_sent_to_socket || inner.socket_closed) {
+                // 仅在写缓冲已完全排空且 FIN 已送入协议栈（或连接已关闭）时才标记 graceful_shutdown，
+                // 避免缓冲非空时 future 被取消并丢弃句柄后跳过 sock.abort() 导致槽位永久泄漏
+                inner.graceful_shutdown = true;
                 return Poll::Ready(Ok(()));
             }
             if inner.socket_closed {
@@ -1086,8 +1091,9 @@ impl NetstackEngine {
         let now = Instant::now();
         self.maybe_prune_passthrough(now);
 
-        // 1. 最先检查 FlowX 自身绕过端口或当前进程 PID，避免代理出口自回环
-        if is_tcp_port_bypassed(pkt.src_port) || pid.is_some_and(|p| p != 0 && p == std::process::id())
+        // 1. 最先检查 FlowX 自身同地址族绕过端口或当前进程 PID，避免代理出口自回环
+        if is_tcp_port_bypassed_for_family(pkt.src_port, pkt.is_ipv6)
+            || pid.is_some_and(|p| p != 0 && p == std::process::id())
         {
             if pkt.rst {
                 self.passthrough.remove(&key);
@@ -1384,9 +1390,9 @@ impl NetstackEngine {
                         }
                     }
 
-                    // E. 非优雅关闭中止检查（先于 Step D！）：双端已弃用且未触发 shutdown() 时立刻 abort 发 RST 并释放槽位
+                    // E. 非优雅关闭中止检查（先于 Step D！）：双端句柄均已丢弃且未完成优雅 shutdown / 未发 FIN 时立刻 abort 发 RST 并释放槽位
                     let ungraceful_drop = inner.app_read_closed
-                        && inner.app_write_closed
+                        && inner.write_half_dropped
                         && !inner.graceful_shutdown
                         && !inner.fin_sent_to_socket;
                     let syn_timed_out = !session.ever_established
@@ -2904,5 +2910,76 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(s2.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_poll_shutdown_with_buffered_data_aborts_and_frees_slot() {
+        use tokio::io::AsyncWriteExt;
+
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(signal);
+        let meta = PacketInterfaceMeta::default();
+        let client_ip = [10, 0, 0, 42];
+        let server_ip = [93, 184, 216, 88];
+        let mut accepted = Vec::new();
+        let mut tx_out = Vec::new();
+
+        // 完成 TCP 三次握手进入 Established
+        let syn = build_syn(client_ip, 52010, server_ip, 443, 1000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack = parse_tcp_packet(&tx_out[0].data).unwrap();
+        assert!(syn_ack.syn && syn_ack.ack);
+        tx_out.clear();
+        let ack = build_ack(
+            client_ip,
+            52010,
+            server_ip,
+            443,
+            1001,
+            syn_ack.seq.wrapping_add(1),
+            false,
+            &[],
+        );
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            TcpIngestOutcome::Intercepted
+        ));
+        assert_eq!(engine.active_flow_count(), 1);
+        let flow = accepted.pop().unwrap();
+        let (rd, mut wr) = flow.stream.split_stream();
+
+        // 写入超 smoltcp 发送缓冲 (128 KiB) 的数据，让 bridge.to_socket 保持非空
+        let big_payload = vec![0x5Au8; 256 * 1024];
+        wr.write_all(&big_payload).await.unwrap();
+        tx_out.clear();
+        engine.pump(&mut tx_out);
+
+        // 发起 shutdown()，poll 一次进入 Pending 后立即取消 future 并丢弃读/写双端句柄
+        {
+            let shutdown_fut = wr.shutdown();
+            let timed_out = tokio::time::timeout(Duration::from_millis(20), shutdown_fut).await;
+            assert!(
+                timed_out.is_err(),
+                "shutdown must remain pending while to_socket cannot drain"
+            );
+        }
+        drop(wr);
+        drop(rd);
+
+        // 再次 pump：必须触发 sock.abort() 吐出 RST 并释放槽位（绝不因提前置 graceful_shutdown=true 而永久泄漏）
+        tx_out.clear();
+        engine.pump(&mut tx_out);
+        assert_eq!(
+            engine.active_flow_count(),
+            0,
+            "dropping halves after cancelled poll_shutdown must abort and free slot"
+        );
+        assert!(
+            tx_out.iter().any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst)),
+            "ungraceful abort after cancelled poll_shutdown should emit RST"
+        );
     }
 }
