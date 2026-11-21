@@ -21,17 +21,12 @@ use crate::router::{Action, RouteContext, RuleEngine};
 
 /// 入站协议握手的最长等待时间（防止慢速握手占满并发名额）
 const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// 透明代理首包域名嗅探的最长等待时间（仅在规则需要域名或代理命中 HTTP/TLS 默认端口时启用，避免拖慢服务端先说话协议）
+/// 透明代理首包域名嗅探的最长等待时间（用于需要域名上下文的规则或代理流，避免拖慢服务端先说话协议）
 const TRANSPARENT_SNIFF_TIMEOUT: Duration = Duration::from_millis(120);
 
 #[inline]
-fn is_sniffable_default_port(port: u16) -> bool {
-    matches!(port, 80 | 443 | 8080 | 8443)
-}
-
-#[inline]
 fn is_server_first_protocol_port(port: u16) -> bool {
-    matches!(port, 21 | 22 | 23 | 25 | 110 | 143 | 587 | 3306)
+    matches!(port, 21 | 22 | 23 | 25 | 110 | 143 | 587 | 3306 | 5900)
 }
 
 fn is_spoofed_local_hostname(host: &str, orig_dst_ip: IpAddr) -> bool {
@@ -271,16 +266,30 @@ async fn evaluate_and_relay_stream<S: RelayStream>(
         Action::Chain(id) => format!("Chain({})", id),
     };
 
-    info!(
-        "[Route Match] [{}] Process: {} (PID: {}) -> Target: {}:{} => Rule: {} => Action: {}",
-        session.inbound_label,
-        proc_name,
-        pid,
-        session.display_target.host_string(),
-        session.display_target.port(),
-        rule_name,
-        action_str
-    );
+    if dial_target != session.display_target {
+        info!(
+            "[Route Match] [{}] Process: {} (PID: {}) -> Target: {}:{} (Dial: {}) => Rule: {} => Action: {}",
+            session.inbound_label,
+            proc_name,
+            pid,
+            session.display_target.host_string(),
+            session.display_target.port(),
+            dial_target.to_authority_string(),
+            rule_name,
+            action_str
+        );
+    } else {
+        info!(
+            "[Route Match] [{}] Process: {} (PID: {}) -> Target: {}:{} => Rule: {} => Action: {}",
+            session.inbound_label,
+            proc_name,
+            pid,
+            session.display_target.host_string(),
+            session.display_target.port(),
+            rule_name,
+            action_str
+        );
+    }
 
     // 6. 注册到连接监视器并使用 RAII 守卫
     // 注意：连接快照只保存机器可读的 action_type / action_id，展示文案由 API 层按请求语言本地化
@@ -352,14 +361,26 @@ async fn evaluate_and_relay_stream<S: RelayStream>(
         }
         _ => relay_stream_monitored(local_stream, remote_stream, Some(&active_conn)).await?,
     };
-    info!(
-        "[Relay Complete] [{}] {}:{} Upload: {} B, Download: {} B",
-        action_str,
-        session.display_target.host_string(),
-        session.display_target.port(),
-        up + session.pending.len() as u64,
-        down
-    );
+    if dial_target != session.display_target {
+        info!(
+            "[Relay Complete] [{}] {}:{} (Dial: {}) Upload: {} B, Download: {} B",
+            action_str,
+            session.display_target.host_string(),
+            session.display_target.port(),
+            dial_target.to_authority_string(),
+            up + session.pending.len() as u64,
+            down
+        );
+    } else {
+        info!(
+            "[Relay Complete] [{}] {}:{} Upload: {} B, Download: {} B",
+            action_str,
+            session.display_target.host_string(),
+            session.display_target.port(),
+            up + session.pending.len() as u64,
+            down
+        );
+    }
     Ok(())
 }
 
@@ -371,7 +392,7 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
     peer_addr: SocketAddr,
     orig_dst: SocketAddr,
     pid_hint: Option<u32>,
-    needs_domain_sniff: bool,
+    _needs_domain_sniff: bool,
 ) -> Result<()> {
     let _in_flight = config.in_flight.as_ref().map(|t| t.enter());
 
@@ -416,23 +437,25 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             )
         } else {
             let cached_domain = config.fake_ip_pool.lookup_real_ip_domain(orig_dst.ip());
+            // 异步补全进程归属后重新做权威判定，避免 SYN 期因 PID 未就绪残留的过期 needs_domain_sniff
+            // 覆盖已确定的 Immediate(Direct | Block)，同时在 Immediate(Proxy | Chain) 下对所有非服务端先发端口
+            // （含 8444/9443/2083/3000 等非标准 HTTPS/HTTP 端口）均尝试 TLS SNI / HTTP Host 嗅探。
             let domain_decision = config.rule_engine.needs_domain_for_routing(
                 proc_info.as_ref().map(|p| p.path.as_str()),
                 proc_info.as_ref().map(|p| p.name.as_str()),
                 Some(orig_dst.ip()),
                 orig_dst.port(),
             );
-            let want_sniff = needs_domain_sniff
-                || match domain_decision {
-                    crate::router::DomainNeedDecision::NeedsDomainSniff => true,
-                    crate::router::DomainNeedDecision::Immediate(
-                        Action::Proxy(_) | Action::Chain(_),
-                    ) => is_sniffable_default_port(orig_dst.port()),
-                    crate::router::DomainNeedDecision::Immediate(
-                        Action::Direct | Action::Block,
-                    ) => false,
-                };
-            // 除明确服务端先发协议端口外，绝不因存在被动缓存域名而跳过权威 TLS SNI / HTTP Host 嗅探（例如 8444/9443/2083 等非标准 HTTPS 端口）
+            let want_sniff = match domain_decision {
+                crate::router::DomainNeedDecision::NeedsDomainSniff => true,
+                crate::router::DomainNeedDecision::Immediate(
+                    Action::Proxy(_) | Action::Chain(_),
+                ) => true,
+                crate::router::DomainNeedDecision::Immediate(
+                    Action::Direct | Action::Block,
+                ) => false,
+            };
+            // 除明确服务端先发协议端口外，绝不因存在被动缓存域名或非标准端口而跳过权威 TLS SNI / HTTP Host 嗅探
             let need_sniff = want_sniff && !is_server_first_protocol_port(orig_dst.port());
             let (sniffed_host, buffered) = if need_sniff {
                 let outcome = crate::transparent::sniffer::peek_host_prefix(
@@ -1730,5 +1753,170 @@ mod tests {
         echo_task.await.unwrap();
         let _ = dns_stop_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(1), corp_dns_task).await;
+    }
+
+    #[tokio::test]
+    async fn test_p1_1_devproxy_immediate_proxy_sniffs_nonstandard_https_http_and_p2_1_stale_sniff_does_not_delay_direct_or_block(
+    ) {
+        use crate::outbound::socks5::Socks5Client;
+
+        // 1. P1-1: 默认 DevProxy（无域名条件，Immediate(Proxy(1)), needs_domain_sniff=false）
+        //    在非标准 HTTPS 端口 8444 与 HTTP 端口 3000 上仍须嗅探 TLS SNI / HTTP Host 并传域名给远端代理
+        for (port, payload, expected_host) in [
+            (8444u16, build_test_tls_client_hello("portal.nonstd.example"), "portal.nonstd.example"),
+            (3000u16, b"GET /health HTTP/1.1\r\nHost: web.dev.example:3000\r\n\r\n".to_vec(), "web.dev.example"),
+        ] {
+            let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socks_addr = socks_listener.local_addr().unwrap();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let expected_payload = payload.clone();
+            let srv = tokio::spawn(async move {
+                let (mut s, _) = socks_listener.accept().await.unwrap();
+                let mut g = [0u8; 3];
+                s.read_exact(&mut g).await.unwrap();
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let mut hdr = [0u8; 4];
+                s.read_exact(&mut hdr).await.unwrap();
+                assert_eq!(hdr[3], 0x03, "DevProxy Immediate(Proxy) on :{port} must sniff and dial Domain");
+                let mut l = [0u8; 1];
+                s.read_exact(&mut l).await.unwrap();
+                let mut dom = vec![0u8; l[0] as usize];
+                s.read_exact(&mut dom).await.unwrap();
+                let mut p = [0u8; 2];
+                s.read_exact(&mut p).await.unwrap();
+                let _ = tx.send((String::from_utf8(dom).unwrap(), u16::from_be_bytes(p)));
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
+                let mut got = vec![0u8; expected_payload.len()];
+                s.read_exact(&mut got).await.unwrap();
+                assert_eq!(got, expected_payload);
+                s.write_all(b"OK_NONSTD").await.unwrap();
+            });
+
+            let cfg = test_config(
+                "127.0.0.1:40001".parse().unwrap(),
+                vec![crate::router::Rule::from_raw(
+                    "DevProxy",
+                    true,
+                    None,
+                    None,
+                    None,
+                    Action::Proxy(1),
+                )],
+            );
+            // 即使缓存了过期/不同域名，也不得跳过非标准端口上的权威嗅探
+            let orig_ip: IpAddr = "93.184.216.91".parse().unwrap();
+            cfg.fake_ip_pool
+                .record_real_ip_mappings("stale-cached.example", &[orig_ip]);
+            cfg.proxy_nodes.write().unwrap().insert(
+                1,
+                ProxyNodeEntry {
+                    id: 1,
+                    name: "NonStdSocks".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: socks_addr.to_string(),
+                    username: None,
+                    client: ProxyNode::Socks5(Socks5Client::new(socks_addr.to_string())),
+                },
+            );
+            let (mut app, disp) = tokio::io::duplex(4096);
+            let h = tokio::spawn(async move {
+                dispatch_transparent_stream(
+                    Arc::new(cfg),
+                    disp,
+                    "127.0.0.1:50401".parse().unwrap(),
+                    SocketAddr::new(orig_ip, port),
+                    None,
+                    false, // Immediate(Proxy) from NetstackEngine passes needs_domain_sniff=false
+                )
+                .await
+            });
+            app.write_all(&payload).await.unwrap();
+            let mut ack = [0u8; 9];
+            app.read_exact(&mut ack).await.unwrap();
+            assert_eq!(&ack, b"OK_NONSTD");
+            assert_eq!(rx.await.unwrap(), (expected_host.to_string(), port));
+            drop(app);
+            h.await.unwrap().unwrap();
+            srv.await.unwrap();
+        }
+
+        // 2. P2-1: 即使 SYN 阶段传入了过期的 needs_domain_sniff=true，异步判定为 Immediate(Direct | Block) 后
+        //    不得再等待 120ms 嗅探（例如静默 Block 应毫秒级关闭，服务端先发的直连端口应立即转发 banner）
+        let block_cfg = Arc::new(test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "BlockAll",
+                true,
+                None,
+                None,
+                None,
+                Action::Block,
+            )],
+        ));
+        let (mut app_blk, disp_blk) = tokio::io::duplex(1024);
+        let start_blk = std::time::Instant::now();
+        let blk_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                block_cfg,
+                disp_blk,
+                "127.0.0.1:50402".parse().unwrap(),
+                "93.184.216.92:2222".parse().unwrap(),
+                None,
+                true, // stale SYN-time needs_domain_sniff=true
+            )
+            .await
+        });
+        let mut eof = [0u8; 4];
+        assert_eq!(app_blk.read(&mut eof).await.unwrap(), 0);
+        blk_handle.await.unwrap().unwrap();
+        assert!(
+            start_blk.elapsed() < Duration::from_millis(80),
+            "Immediate(Block) must not wait 120ms for stale SYN needs_domain_sniff, took {:?}",
+            start_blk.elapsed()
+        );
+
+        let direct_origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let direct_origin_addr = direct_origin.local_addr().unwrap();
+        let direct_srv = tokio::spawn(async move {
+            let (mut s, _) = direct_origin.accept().await.unwrap();
+            s.write_all(b"SSH-2.0-CustomPort").await.unwrap();
+        });
+        let direct_cfg = Arc::new(test_config(
+            "127.0.0.1:40001".parse().unwrap(),
+            vec![crate::router::Rule::from_raw(
+                "DirectAll",
+                true,
+                None,
+                None,
+                None,
+                Action::Direct,
+            )],
+        ));
+        let (mut app_dir, disp_dir) = tokio::io::duplex(1024);
+        let start_dir = std::time::Instant::now();
+        let dir_handle = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                direct_cfg,
+                disp_dir,
+                "127.0.0.1:50403".parse().unwrap(),
+                direct_origin_addr,
+                None,
+                true, // stale SYN-time needs_domain_sniff=true
+            )
+            .await
+        });
+        let mut banner = [0u8; 18];
+        app_dir.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"SSH-2.0-CustomPort");
+        assert!(
+            start_dir.elapsed() < Duration::from_millis(80),
+            "Immediate(Direct) must not wait 120ms for stale SYN needs_domain_sniff, took {:?}",
+            start_dir.elapsed()
+        );
+        drop(app_dir);
+        dir_handle.await.unwrap().unwrap();
+        direct_srv.await.unwrap();
     }
 }
