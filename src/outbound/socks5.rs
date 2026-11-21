@@ -30,7 +30,7 @@ impl Socks5Client {
     }
 
     /// Establish initial TCP connection through proxy address and handshake (with 10s timeout protection)
-    pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
+    pub async fn connect(&self, target: &TargetAddr) -> Result<OutboundTcpStream> {
         self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
             .await
     }
@@ -41,10 +41,9 @@ impl Socks5Client {
         upstream_dns: SocketAddr,
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
-    ) -> Result<TcpStream> {
+    ) -> Result<OutboundTcpStream> {
         self.connect_with_policy_guarded(target, upstream_dns, fake_ip_pool, self_ports)
             .await
-            .map(OutboundTcpStream::into_inner)
     }
 
     pub async fn connect_with_policy_guarded(

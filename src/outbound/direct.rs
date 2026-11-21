@@ -1,7 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::net::TcpStream;
 
 use crate::dns::server::resolve_via_upstream_dns;
 use crate::dns::FakeIpPool;
@@ -169,10 +168,8 @@ pub(crate) async fn connect_proxy_tcp(
     fake_ip_pool: Option<&FakeIpPool>,
     self_ports: &[u16],
     role: &str,
-) -> Result<TcpStream> {
-    connect_proxy_tcp_guarded(proxy_addr, upstream_dns, fake_ip_pool, self_ports, role)
-        .await
-        .map(OutboundTcpStream::into_inner)
+) -> Result<OutboundTcpStream> {
+    connect_proxy_tcp_guarded(proxy_addr, upstream_dns, fake_ip_pool, self_ports, role).await
 }
 
 impl DirectOutbound {
@@ -181,10 +178,8 @@ impl DirectOutbound {
         upstream_dns: SocketAddr,
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
-    ) -> Result<TcpStream> {
-        Self::connect_guarded(target, upstream_dns, fake_ip_pool, self_ports)
-            .await
-            .map(OutboundTcpStream::into_inner)
+    ) -> Result<OutboundTcpStream> {
+        Self::connect_guarded(target, upstream_dns, fake_ip_pool, self_ports).await
     }
 
     pub async fn connect_guarded(

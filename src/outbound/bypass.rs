@@ -16,10 +16,14 @@ pub enum BypassProtocol {
     Udp,
 }
 
-/// 进程全局无锁出站端口绕过注册表，用于 WinDivert 透明拦截模式下防止 FlowX 自身出站流与上游 DNS 查询发生自环。
+/// 进程全局无锁出站端口绕过注册表（按协议与 IPv4/IPv6 地址族隔离），
+/// 用于 WinDivert 透明拦截模式下防止 FlowX 自身出站流与上游 DNS 查询发生自环，
+/// 同时避免同端口跨地址族误绕过其它应用流量。
 struct BypassPortRegistry {
-    tcp: Box<[AtomicU32]>,
-    udp: Box<[AtomicU32]>,
+    tcp_v4: Box<[AtomicU32]>,
+    tcp_v6: Box<[AtomicU32]>,
+    udp_v4: Box<[AtomicU32]>,
+    udp_v6: Box<[AtomicU32]>,
 }
 
 impl BypassPortRegistry {
@@ -31,16 +35,20 @@ impl BypassPortRegistry {
                 .into_boxed_slice()
         };
         Self {
-            tcp: make_table(),
-            udp: make_table(),
+            tcp_v4: make_table(),
+            tcp_v6: make_table(),
+            udp_v4: make_table(),
+            udp_v6: make_table(),
         }
     }
 
     #[inline]
-    fn table(&self, proto: BypassProtocol) -> &[AtomicU32] {
-        match proto {
-            BypassProtocol::Tcp => &self.tcp,
-            BypassProtocol::Udp => &self.udp,
+    fn table(&self, proto: BypassProtocol, is_ipv6: bool) -> &[AtomicU32] {
+        match (proto, is_ipv6) {
+            (BypassProtocol::Tcp, false) => &self.tcp_v4,
+            (BypassProtocol::Tcp, true) => &self.tcp_v6,
+            (BypassProtocol::Udp, false) => &self.udp_v4,
+            (BypassProtocol::Udp, true) => &self.udp_v6,
         }
     }
 }
@@ -66,12 +74,17 @@ pub fn is_transparent_active() -> bool {
 #[derive(Debug)]
 pub struct BypassPortGuard {
     proto: BypassProtocol,
+    is_ipv6: bool,
     port: u16,
 }
 
 impl BypassPortGuard {
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub fn is_ipv6(&self) -> bool {
+        self.is_ipv6
     }
 }
 
@@ -80,26 +93,52 @@ impl Drop for BypassPortGuard {
         if self.port == 0 {
             return;
         }
-        registry().table(self.proto)[self.port as usize].fetch_sub(1, Ordering::Release);
+        registry().table(self.proto, self.is_ipv6)[self.port as usize]
+            .fetch_sub(1, Ordering::Release);
     }
 }
 
-/// 在发起真实出站连线或发包前注册本地源端口，确保内核 emit 首包前已可见。
-pub fn register_bypass_port(proto: BypassProtocol, port: u16) -> BypassPortGuard {
+/// 按协议与地址族登记本地源端口，确保内核 emit 首包前已可见。
+pub fn register_bypass_port_for_family(
+    proto: BypassProtocol,
+    is_ipv6: bool,
+    port: u16,
+) -> BypassPortGuard {
     if port != 0 {
-        registry().table(proto)[port as usize].fetch_add(1, Ordering::SeqCst);
+        registry().table(proto, is_ipv6)[port as usize].fetch_add(1, Ordering::SeqCst);
     }
-    BypassPortGuard { proto, port }
+    BypassPortGuard {
+        proto,
+        is_ipv6,
+        port,
+    }
+}
+
+/// 登记 IPv4 本地源端口（兼容快捷入口）。
+pub fn register_bypass_port(proto: BypassProtocol, port: u16) -> BypassPortGuard {
+    register_bypass_port_for_family(proto, false, port)
+}
+
+#[inline]
+pub fn is_tcp_port_bypassed_for_family(port: u16, is_ipv6: bool) -> bool {
+    port != 0
+        && registry().table(BypassProtocol::Tcp, is_ipv6)[port as usize].load(Ordering::Acquire) > 0
+}
+
+#[inline]
+pub fn is_udp_port_bypassed_for_family(port: u16, is_ipv6: bool) -> bool {
+    port != 0
+        && registry().table(BypassProtocol::Udp, is_ipv6)[port as usize].load(Ordering::Acquire) > 0
 }
 
 #[inline]
 pub fn is_tcp_port_bypassed(port: u16) -> bool {
-    port != 0 && registry().table(BypassProtocol::Tcp)[port as usize].load(Ordering::Acquire) > 0
+    is_tcp_port_bypassed_for_family(port, false)
 }
 
 #[inline]
 pub fn is_udp_port_bypassed(port: u16) -> bool {
-    port != 0 && registry().table(BypassProtocol::Udp)[port as usize].load(Ordering::Acquire) > 0
+    is_udp_port_bypassed_for_family(port, false)
 }
 
 fn normalize_connect_addr(addr: SocketAddr) -> SocketAddr {
@@ -130,8 +169,18 @@ impl OutboundTcpStream {
         }
     }
 
-    pub fn into_inner(self) -> TcpStream {
-        self.inner
+    /// 显式拆解底层 `TcpStream` 与绕过守卫；调用方需确保 `TcpStream` 先于守卫析构。
+    pub fn into_parts(self) -> (TcpStream, Option<Arc<BypassPortGuard>>) {
+        (self.inner, self._bypass_guard)
+    }
+
+    /// 仅当未持有绕过守卫（显式模式）时解包为裸 `TcpStream`，杜绝透明模式下提前释放端口守卫。
+    pub fn try_into_inner(self) -> std::result::Result<TcpStream, Self> {
+        if self._bypass_guard.is_some() {
+            Err(self)
+        } else {
+            Ok(self.inner)
+        }
     }
 
     pub fn into_split(self) -> (GuardedReadHalf, GuardedWriteHalf) {
@@ -275,6 +324,8 @@ pub async fn connect_tcp_guarded(addr: SocketAddr) -> std::io::Result<OutboundTc
             _bypass_guard: None,
         });
     }
+    // 守卫必须声明于 socket 及 connect future 之前，确保连接失败、panic 或取消时 LIFO 析构顺序先关闭 socket 再释放端口守卫
+    let guard: Option<Arc<BypassPortGuard>>;
     let sock = match target {
         SocketAddr::V4(_) => {
             let s = TcpSocket::new_v4()?;
@@ -287,12 +338,16 @@ pub async fn connect_tcp_guarded(addr: SocketAddr) -> std::io::Result<OutboundTc
             s
         }
     };
-    let local_port = sock.local_addr()?.port();
-    let guard = Arc::new(register_bypass_port(BypassProtocol::Tcp, local_port));
+    let local_addr = sock.local_addr()?;
+    guard = Some(Arc::new(register_bypass_port_for_family(
+        BypassProtocol::Tcp,
+        local_addr.is_ipv6(),
+        local_addr.port(),
+    )));
     let stream = sock.connect(target).await?;
     Ok(OutboundTcpStream {
         inner: stream,
-        _bypass_guard: Some(guard),
+        _bypass_guard: guard,
     })
 }
 
@@ -312,13 +367,17 @@ impl Deref for GuardedUdpSocket {
 
 /// 绑定临时 UDP 套接字；透明代理激活时自动登记本地源端口至 UDP 绕过表（供上游 DNS 查询使用）。
 pub async fn bind_udp_guarded(local_bind: &str) -> std::io::Result<GuardedUdpSocket> {
+    // 守卫先于 socket 声明，防止中途错误路径下守卫早于 socket 释放
+    let mut guard: Option<BypassPortGuard> = None;
     let socket = UdpSocket::bind(local_bind).await?;
-    let guard = if is_transparent_active() {
-        let local_port = socket.local_addr()?.port();
-        Some(register_bypass_port(BypassProtocol::Udp, local_port))
-    } else {
-        None
-    };
+    if is_transparent_active() {
+        let local_addr = socket.local_addr()?;
+        guard = Some(register_bypass_port_for_family(
+            BypassProtocol::Udp,
+            local_addr.is_ipv6(),
+            local_addr.port(),
+        ));
+    }
     Ok(GuardedUdpSocket {
         socket,
         _bypass_guard: guard,
@@ -424,7 +483,55 @@ mod tests {
         let guarded = bind_udp_guarded("127.0.0.1:0").await.unwrap();
         let port = guarded.local_addr().unwrap().port();
         assert!(is_udp_port_bypassed(port));
+        assert!(
+            !is_udp_port_bypassed_for_family(port, true),
+            "IPv4 UDP guard must not bypass same IPv6 port"
+        );
         drop(guarded);
         assert!(!is_udp_port_bypassed(port));
+    }
+
+    #[tokio::test]
+    async fn test_bypass_port_ipv4_ipv6_isolation_and_try_into_inner() {
+        let _lock = TEST_ACTIVE_MUTEX.lock().await;
+        let _reset = TransparentActiveReset;
+        set_transparent_active(true);
+
+        let port = 59124u16;
+        let g_v4 = register_bypass_port_for_family(BypassProtocol::Tcp, false, port);
+        assert!(is_tcp_port_bypassed_for_family(port, false));
+        assert!(!is_tcp_port_bypassed_for_family(port, true));
+
+        let g_v6 = register_bypass_port_for_family(BypassProtocol::Tcp, true, port);
+        assert!(is_tcp_port_bypassed_for_family(port, false));
+        assert!(is_tcp_port_bypassed_for_family(port, true));
+
+        drop(g_v4);
+        assert!(!is_tcp_port_bypassed_for_family(port, false));
+        assert!(is_tcp_port_bypassed_for_family(port, true));
+        drop(g_v6);
+        assert!(!is_tcp_port_bypassed_for_family(port, true));
+
+        // Guarded OutboundTcpStream must refuse try_into_inner so bypass guard cannot drop prematurely
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client_res, accept_res) = tokio::join!(connect_tcp_guarded(addr), listener.accept());
+        let client = client_res.unwrap();
+        let _server = accept_res.unwrap().0;
+        let local_port = client.local_addr().unwrap().port();
+        assert!(is_tcp_port_bypassed_for_family(local_port, false));
+
+        let guarded_again = client
+            .try_into_inner()
+            .expect_err("try_into_inner must reject stream with active bypass guard");
+        assert!(is_tcp_port_bypassed_for_family(local_port, false));
+
+        let (raw_stream, guard_opt) = guarded_again.into_parts();
+        assert!(guard_opt.is_some());
+        assert!(is_tcp_port_bypassed_for_family(local_port, false));
+        drop(raw_stream);
+        assert!(is_tcp_port_bypassed_for_family(local_port, false));
+        drop(guard_opt);
+        assert!(!is_tcp_port_bypassed_for_family(local_port, false));
     }
 }

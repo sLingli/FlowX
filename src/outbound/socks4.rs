@@ -29,7 +29,7 @@ impl Socks4Client {
         self
     }
 
-    pub async fn connect(&self, target: &TargetAddr) -> Result<TcpStream> {
+    pub async fn connect(&self, target: &TargetAddr) -> Result<OutboundTcpStream> {
         self.connect_with_policy(target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
             .await
     }
@@ -40,10 +40,9 @@ impl Socks4Client {
         upstream_dns: SocketAddr,
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
-    ) -> Result<TcpStream> {
+    ) -> Result<OutboundTcpStream> {
         self.connect_with_policy_guarded(target, upstream_dns, fake_ip_pool, self_ports)
             .await
-            .map(OutboundTcpStream::into_inner)
     }
 
     pub async fn connect_with_policy_guarded(
@@ -109,8 +108,17 @@ impl Socks4Client {
                 req.extend_from_slice(self.user_id.as_bytes());
                 req.push(0x00);
             }
-            TargetAddr::Ip(SocketAddr::V6(_)) => {
-                bail!("SOCKS4 protocol does not support IPv6 target addresses");
+            TargetAddr::Ip(SocketAddr::V6(v6)) => {
+                if let Some(v4) = v6.ip().to_ipv4_mapped() {
+                    req.extend_from_slice(&v4.octets());
+                    req.extend_from_slice(self.user_id.as_bytes());
+                    req.push(0x00);
+                } else {
+                    bail!(
+                        "SOCKS4 protocol does not support IPv6 target addresses ({}); use a SOCKS5 or HTTP proxy node instead",
+                        v6
+                    );
+                }
             }
             TargetAddr::Domain(domain, _) => {
                 if domain.contains('\0') {
