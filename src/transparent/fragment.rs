@@ -78,7 +78,11 @@ fn walk_ipv6_ext_headers(mut nh: u8, data: &[u8]) -> ExtWalk {
         nh = data[pos];
         pos += ext_len;
     }
-    ExtWalk::NestedFragOrMalformed
+    if nh == IP_PROTO_FRAGMENT || is_ipv6_extension_header(nh) {
+        ExtWalk::NestedFragOrMalformed
+    } else {
+        ExtWalk::Transport { proto: nh, offset: pos }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -94,6 +98,8 @@ pub struct FragmentKey {
 pub enum FragmentOutcome {
     /// 非 TCP/UDP 的合法报文（如大包 ICMP 分片）：直接单包放行
     PassthroughSingle,
+    /// 重组校验后确认为非 TCP/UDP（如携带后置扩展头的 IPv6 ICMPv6/ESP/NoNext）的合法分片组：逐片放行原始分片
+    PassthroughGroup(Vec<EmittedIpPacket>),
     /// 非法分片、重叠分片攻击或发往 Fake-IP 的未认证流量：直接丢弃
     Drop,
     /// 尚缺其余分片，已进入有界缓存等待完整重组（严禁提前放行）
@@ -242,10 +248,62 @@ impl FragmentTracker {
                 is_ipv6,
             } => {
                 let is_fake_ip = fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(key.dst_ip));
+                let frag_payload = &raw[payload_start..payload_end];
 
-                // 仅允许纯 ICMPv4 / ICMPv6 且尚未存在同 ID 组时单包放行；
-                // TCP / UDP 以及任何携带 IPv6 扩展头（可能隐藏后续 TCP/UDP 或嵌套分片）的分片均进入有界重组。
+                // RFC 6946: IPv6 原子分片（offset == 0 && !M）必须完全隔离处理，绝不与 self.groups 中任何同 ID 组交互或互相破坏
+                if is_ipv6 && frag_offset == 0 && !more_fragments {
+                    let ext_before_frag = v6_frag_hdr_offset.saturating_sub(40);
+                    let max_payload = u16::MAX as usize - ext_before_frag;
+                    if frag_payload.is_empty() || frag_payload.len() > max_payload {
+                        return FragmentOutcome::Drop;
+                    }
+                    let ExtWalk::Transport {
+                        proto: final_proto,
+                        offset: ext_offset,
+                    } = walk_ipv6_ext_headers(v6_frag_next_hdr, frag_payload)
+                    else {
+                        return FragmentOutcome::Drop;
+                    };
+                    if !matches!(final_proto, IP_PROTO_TCP | IP_PROTO_UDP) {
+                        return if is_fake_ip {
+                            FragmentOutcome::Drop
+                        } else {
+                            FragmentOutcome::PassthroughSingle
+                        };
+                    }
+                    let transport_slice = &frag_payload[ext_offset..];
+                    if is_fake_ip && final_proto == IP_PROTO_UDP && transport_slice.len() >= 4 {
+                        let dst_port = u16::from_be_bytes([transport_slice[2], transport_slice[3]]);
+                        if dst_port != 53 {
+                            return FragmentOutcome::Drop;
+                        }
+                    }
+                    let Ok(mut base_header) = <[u8; 40]>::try_from(&raw[..40]) else {
+                        return FragmentOutcome::Drop;
+                    };
+                    let Ok(payload_len_u16) = u16::try_from(transport_slice.len()) else {
+                        return FragmentOutcome::Drop;
+                    };
+                    base_header[6] = final_proto;
+                    base_header[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
+                    let mut full_packet = Vec::with_capacity(40 + transport_slice.len());
+                    full_packet.extend_from_slice(&base_header);
+                    full_packet.extend_from_slice(transport_slice);
+                    return FragmentOutcome::Reassembled {
+                        full_packet,
+                        orig_fragments: vec![EmittedIpPacket {
+                            data: raw.to_vec(),
+                            meta,
+                        }],
+                    };
+                }
+
+                // 携带 post-Fragment 扩展头的 IPv6 分片（如 DestOpt/AH/Mobility -> ICMPv6/ESP/NoNext/TCP/UDP）
+                // 无论首片还是后续片先到达，统一走同一重组组，待完整解析最终传输协议后再决定 Reassembled 或 PassthroughGroup；
+                // 无 post-Fragment 扩展头的非 TCP/UDP 报文（如纯 ICMPv4/ICMPv6/ESP）在不冲突已有组时直接单包放行。
+                let has_v6_post_frag_ext = is_ipv6 && is_ipv6_extension_header(v6_frag_next_hdr);
                 if !is_fake_ip
+                    && !has_v6_post_frag_ext
                     && matches!(proto, IP_PROTO_ICMPV4 | IP_PROTO_ICMPV6)
                     && !self.groups.contains_key(&key)
                 {
@@ -253,6 +311,7 @@ impl FragmentTracker {
                 }
                 let needs_reassembly = proto == IP_PROTO_TCP
                     || proto == IP_PROTO_UDP
+                    || has_v6_post_frag_ext
                     || (is_ipv6 && is_ipv6_extension_header(proto));
                 if !needs_reassembly {
                     self.remove_group(&key);
@@ -262,8 +321,6 @@ impl FragmentTracker {
                         FragmentOutcome::PassthroughSingle
                     };
                 }
-
-                let frag_payload = &raw[payload_start..payload_end];
 
                 // RFC 791 / RFC 8200 合法性检查：非末尾分片载荷长度必须为 8 字节正整数倍
                 if more_fragments && (frag_payload.is_empty() || !frag_payload.len().is_multiple_of(8)) {
@@ -306,6 +363,54 @@ impl FragmentTracker {
                     return FragmentOutcome::Drop;
                 }
 
+                if is_ipv6 && frag_offset == 0 && raw.len() < 40 {
+                    self.remove_group(&key);
+                    return FragmentOutcome::Drop;
+                }
+
+                // 先在已有组上执行全部一致性、重复与重叠分片校验，全部通过后再调用 ensure_capacity_for，
+                // 防止畸形/重叠/重复分片攻击提前驱逐其它正常重组组！
+                if let Some(existing_group) = self.groups.get(&key) {
+                    if let Some(prev_total) = existing_group.expected_total_len {
+                        if (!more_fragments && prev_total != chunk_end) || chunk_end > prev_total {
+                            self.remove_group(&key);
+                            return FragmentOutcome::Drop;
+                        }
+                    } else if !more_fragments
+                        && let Some((&last_off, last_chunk)) = existing_group.chunks.iter().next_back()
+                        && last_off + last_chunk.payload.len() > chunk_end
+                    {
+                        self.remove_group(&key);
+                        return FragmentOutcome::Drop;
+                    }
+
+                    if let Some(existing) = existing_group.chunks.get(&frag_offset) {
+                        if existing.payload.as_slice() == frag_payload {
+                            return FragmentOutcome::Pending;
+                        }
+                        self.remove_group(&key);
+                        return FragmentOutcome::Drop;
+                    }
+                    if let Some((&prev_off, prev_chunk)) =
+                        existing_group.chunks.range(..frag_offset).next_back()
+                        && prev_off + prev_chunk.payload.len() > frag_offset
+                    {
+                        self.remove_group(&key);
+                        return FragmentOutcome::Drop;
+                    }
+                    if let Some((&next_off, _)) =
+                        existing_group.chunks.range((frag_offset + 1)..).next()
+                        && chunk_end > next_off
+                    {
+                        self.remove_group(&key);
+                        return FragmentOutcome::Drop;
+                    }
+                    if existing_group.chunks.len() >= MAX_CHUNKS_PER_GROUP {
+                        self.remove_group(&key);
+                        return FragmentOutcome::Drop;
+                    }
+                }
+
                 self.ensure_capacity_for(&key, incoming_cost);
 
                 let group = self
@@ -313,50 +418,8 @@ impl FragmentTracker {
                     .entry(key)
                     .or_insert_with(|| FragmentGroup::new(now));
 
-                if let Some(prev_total) = group.expected_total_len {
-                    if !more_fragments && prev_total != chunk_end {
-                        self.remove_group(&key);
-                        return FragmentOutcome::Drop;
-                    }
-                    if chunk_end > prev_total {
-                        self.remove_group(&key);
-                        return FragmentOutcome::Drop;
-                    }
-                } else if !more_fragments {
-                    // 确保此前已到达的任何分片都没有越过尾片宣告的总长度
-                    if let Some((&last_off, last_chunk)) = group.chunks.iter().next_back()
-                        && last_off + last_chunk.payload.len() > chunk_end
-                    {
-                        self.remove_group(&key);
-                        return FragmentOutcome::Drop;
-                    }
+                if !more_fragments && group.expected_total_len.is_none() {
                     group.expected_total_len = Some(chunk_end);
-                }
-
-                // 重叠分片检查（拦截 TearDrop / 首片传输头覆盖逃逸攻击）
-                if let Some(existing) = group.chunks.get(&frag_offset) {
-                    if existing.payload.as_slice() == frag_payload {
-                        return FragmentOutcome::Pending;
-                    }
-                    self.remove_group(&key);
-                    return FragmentOutcome::Drop;
-                }
-                if let Some((&prev_off, prev_chunk)) = group.chunks.range(..frag_offset).next_back()
-                    && prev_off + prev_chunk.payload.len() > frag_offset
-                {
-                    self.remove_group(&key);
-                    return FragmentOutcome::Drop;
-                }
-                if let Some((&next_off, _)) = group.chunks.range((frag_offset + 1)..).next()
-                    && chunk_end > next_off
-                {
-                    self.remove_group(&key);
-                    return FragmentOutcome::Drop;
-                }
-
-                if group.chunks.len() >= MAX_CHUNKS_PER_GROUP {
-                    self.remove_group(&key);
-                    return FragmentOutcome::Drop;
                 }
 
                 if frag_offset == 0 && group.first_prefix.is_none() {
@@ -393,11 +456,21 @@ impl FragmentTracker {
 
                 let completed = self.remove_group(&key).expect("group just inserted");
                 match build_reassembled_ip_packet(completed) {
-                    Some((full_packet, orig_fragments)) => FragmentOutcome::Reassembled {
+                    ReassemblyBuild::Transport {
+                        full_packet,
+                        orig_fragments,
+                    } => FragmentOutcome::Reassembled {
                         full_packet,
                         orig_fragments,
                     },
-                    None => FragmentOutcome::Drop,
+                    ReassemblyBuild::NonTransport(orig_fragments) => {
+                        if is_fake_ip {
+                            FragmentOutcome::Drop
+                        } else {
+                            FragmentOutcome::PassthroughGroup(orig_fragments)
+                        }
+                    }
+                    ReassemblyBuild::Malformed => FragmentOutcome::Drop,
                 }
             }
         }
@@ -463,9 +536,22 @@ fn is_group_complete(group: &FragmentGroup) -> bool {
     cursor == total_len
 }
 
-fn build_reassembled_ip_packet(group: FragmentGroup) -> Option<(Vec<u8>, Vec<EmittedIpPacket>)> {
-    let total_payload_len = group.expected_total_len?;
-    let prefix = group.first_prefix?;
+enum ReassemblyBuild {
+    Transport {
+        full_packet: Vec<u8>,
+        orig_fragments: Vec<EmittedIpPacket>,
+    },
+    NonTransport(Vec<EmittedIpPacket>),
+    Malformed,
+}
+
+fn build_reassembled_ip_packet(group: FragmentGroup) -> ReassemblyBuild {
+    let Some(total_payload_len) = group.expected_total_len else {
+        return ReassemblyBuild::Malformed;
+    };
+    let Some(prefix) = group.first_prefix else {
+        return ReassemblyBuild::Malformed;
+    };
 
     let mut orig_fragments = Vec::with_capacity(group.chunks.len());
     let mut assembled_payload = Vec::with_capacity(total_payload_len);
@@ -474,13 +560,17 @@ fn build_reassembled_ip_packet(group: FragmentGroup) -> Option<(Vec<u8>, Vec<Emi
         orig_fragments.push(chunk.raw_packet);
     }
     if assembled_payload.len() != total_payload_len {
-        return None;
+        return ReassemblyBuild::Malformed;
     }
 
     match prefix {
         ReassemblyPrefix::Ipv4 { mut header } => {
-            let full_len = header.len().checked_add(assembled_payload.len())?;
-            let total_len_u16 = u16::try_from(full_len).ok()?;
+            let Some(full_len) = header.len().checked_add(assembled_payload.len()) else {
+                return ReassemblyBuild::Malformed;
+            };
+            let Ok(total_len_u16) = u16::try_from(full_len) else {
+                return ReassemblyBuild::Malformed;
+            };
             header[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
             header[6..8].copy_from_slice(&[0, 0]);
             recompute_ipv4_checksum(&mut header);
@@ -488,7 +578,10 @@ fn build_reassembled_ip_packet(group: FragmentGroup) -> Option<(Vec<u8>, Vec<Emi
             let mut out = Vec::with_capacity(full_len);
             out.extend_from_slice(&header);
             out.extend_from_slice(&assembled_payload);
-            Some((out, orig_fragments))
+            ReassemblyBuild::Transport {
+                full_packet: out,
+                orig_fragments,
+            }
         }
         ReassemblyPrefix::Ipv6 {
             mut base_header,
@@ -499,20 +592,25 @@ fn build_reassembled_ip_packet(group: FragmentGroup) -> Option<(Vec<u8>, Vec<Emi
                 offset: ext_offset,
             } = walk_ipv6_ext_headers(frag_next_hdr, &assembled_payload)
             else {
-                return None;
+                return ReassemblyBuild::Malformed;
             };
             if !matches!(final_proto, IP_PROTO_TCP | IP_PROTO_UDP) {
-                return None;
+                return ReassemblyBuild::NonTransport(orig_fragments);
             }
             let transport_slice = &assembled_payload[ext_offset..];
-            let payload_len_u16 = u16::try_from(transport_slice.len()).ok()?;
+            let Ok(payload_len_u16) = u16::try_from(transport_slice.len()) else {
+                return ReassemblyBuild::Malformed;
+            };
             base_header[6] = final_proto;
             base_header[4..6].copy_from_slice(&payload_len_u16.to_be_bytes());
 
             let mut out = Vec::with_capacity(40 + transport_slice.len());
             out.extend_from_slice(&base_header);
             out.extend_from_slice(transport_slice);
-            Some((out, orig_fragments))
+            ReassemblyBuild::Transport {
+                full_packet: out,
+                orig_fragments,
+            }
         }
     }
 }
@@ -623,7 +721,7 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
     let mut next_hdr = raw[6];
     let mut pos = 40usize;
 
-    for _ in 0..8 {
+    for step in 0..=8 {
         match next_hdr {
             IP_PROTO_FRAGMENT => {
                 if lso_or_oversized || pos + 8 > end {
@@ -671,6 +769,9 @@ fn parse_ipv6_fragment(raw: &[u8]) -> FragmentParse {
                 };
             }
             other if is_ipv6_extension_header(other) => {
+                if step == 8 {
+                    return FragmentParse::Malformed;
+                }
                 let Some(ext_len) = ipv6_ext_header_len(other, &raw[pos..end]) else {
                     return FragmentParse::Malformed;
                 };
@@ -1036,13 +1137,169 @@ mod tests {
         let parsed2 = parse_tcp_packet(&full2).expect("reassembled pre/post ext TCP must parse");
         assert!(parsed2.is_ipv6 && parsed2.syn && parsed2.dst_port == 443);
 
-        // 3. 验证单包未分片且含 SHIM6 (140) 前置扩展头的 Fake-IP UDP 包被拦截而非 passthrough
+        // 3. 验证单包未分片且含 SHIM6 (140) 前置扩展头的 IPv6-mapped Fake-IP UDP 包被拦截而非 passthrough
         let fake_pool = FakeIpPool::new_default();
         let fake_v4 = fake_pool.allocate("hip-shim6.example");
-        let fake_udp = make_ipv4_packet([10, 0, 0, 2], fake_v4.octets(), IP_PROTO_UDP, 0x1111, 0, false, &[0; 12]);
+        let fake_v6 = fake_v4.to_ipv6_mapped();
+        let mut fake_shim6_udp = Vec::with_capacity(40 + 8 + 12);
+        fake_shim6_udp.extend_from_slice(&[0x60, 0, 0, 0]);
+        fake_shim6_udp.extend_from_slice(&(20u16).to_be_bytes());
+        fake_shim6_udp.push(IP_PROTO_SHIM6);
+        fake_shim6_udp.push(64);
+        fake_shim6_udp.extend_from_slice(&src6.octets());
+        fake_shim6_udp.extend_from_slice(&fake_v6.octets());
+        // SHIM6 ext hdr (8B) -> nh = UDP (17)
+        fake_shim6_udp.extend_from_slice(&[IP_PROTO_UDP, 0, 0, 0, 0, 0, 0, 0]);
+        // 截断/普通 UDP payload
+        fake_shim6_udp.extend_from_slice(&[0x30, 0x39, 0x01, 0xBB, 0x00, 0x0C, 0, 0, 1, 2, 3, 4]);
         assert!(matches!(
-            tracker.ingest(&fake_udp, meta, Some(&fake_pool)),
+            tracker.ingest(&fake_shim6_udp, meta, Some(&fake_pool)),
             FragmentOutcome::Drop
+        ));
+    }
+
+    #[test]
+    fn test_fragment_rfc6946_atomic_isolation_post_frag_non_tcp_8th_ext_header_and_eviction_order() {
+        let mut tracker = FragmentTracker::new();
+        let meta = PacketInterfaceMeta {
+            is_ipv6: true,
+            ..Default::default()
+        };
+        let src6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10);
+        let dst6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 20);
+
+        // 1. RFC 6946: 同 ID 的普通分片正在等待时，到达的原子分片 (offset=0, !M) 必须独立完成且绝不破坏原有重组组
+        let mut full_tcp = Vec::new();
+        PacketBuilder::ipv6(src6.octets(), dst6.octets(), 64)
+            .tcp(50000, 443, 1, 65535)
+            .syn()
+            .write(&mut full_tcp, &[])
+            .unwrap();
+        let tcp_seg = &full_tcp[40..];
+        let shared_id = 0xCAFE_0001u32;
+        let normal_f0 = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 0, true, &tcp_seg[..16]);
+        let normal_f1 = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 16, false, &tcp_seg[16..]);
+        let atomic = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 0, false, tcp_seg);
+
+        assert!(matches!(tracker.ingest(&normal_f0, meta, None), FragmentOutcome::Pending));
+        assert_eq!(tracker.active_group_count(), 1);
+        assert!(matches!(
+            tracker.ingest(&atomic, meta, None),
+            FragmentOutcome::Reassembled { .. }
+        ));
+        assert_eq!(
+            tracker.active_group_count(),
+            1,
+            "RFC 6946 atomic fragment must not disturb existing pending group with same ident"
+        );
+        assert!(matches!(
+            tracker.ingest(&normal_f1, meta, None),
+            FragmentOutcome::Reassembled { .. }
+        ));
+        assert_eq!(tracker.active_group_count(), 0);
+
+        // 2. Post-Fragment 扩展头后接非 TCP/UDP (ICMPv6 58 / ESP 50 / NoNext 59)：无论分片乱序与否均平滑 PassthroughGroup
+        for non_transport_proto in [IP_PROTO_ICMPV6, 50u8, 59u8] {
+            let mut post_payload = Vec::new();
+            post_payload.extend_from_slice(&[non_transport_proto, 0, 0, 0, 0, 0, 0, 0]); // DestOpt 8B -> proto
+            post_payload.extend_from_slice(&[0xAA; 16]);
+            let f0 = make_ipv6_frag_packet(
+                src6,
+                dst6,
+                IP_PROTO_DESTOPT,
+                0xABCD_0000 + non_transport_proto as u32,
+                0,
+                true,
+                &post_payload[..16],
+            );
+            let f1 = make_ipv6_frag_packet(
+                src6,
+                dst6,
+                IP_PROTO_DESTOPT,
+                0xABCD_0000 + non_transport_proto as u32,
+                16,
+                false,
+                &post_payload[16..],
+            );
+            // 先收 f1 再收 f0，确认不丢弃也不卡死
+            assert!(matches!(tracker.ingest(&f1, meta, None), FragmentOutcome::Pending));
+            match tracker.ingest(&f0, meta, None) {
+                FragmentOutcome::PassthroughGroup(frags) => assert_eq!(frags.len(), 2),
+                other => panic!(
+                    "expected PassthroughGroup for post-frag proto {non_transport_proto}, got {other:?}"
+                ),
+            }
+        }
+
+        // 3. 第 8 层扩展头边界：8 个有效扩展头 + TCP 必须通过；9 个扩展头必须返回 Malformed/Drop
+        let mut ext8_data = Vec::new();
+        for _ in 0..7 {
+            ext8_data.extend_from_slice(&[IP_PROTO_DESTOPT, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        ext8_data.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            walk_ipv6_ext_headers(IP_PROTO_DESTOPT, &ext8_data),
+            ExtWalk::Transport { proto: IP_PROTO_TCP, offset: 64 }
+        ));
+        let mut ext9_data = Vec::new();
+        for _ in 0..8 {
+            ext9_data.extend_from_slice(&[IP_PROTO_DESTOPT, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        ext9_data.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(matches!(
+            walk_ipv6_ext_headers(IP_PROTO_DESTOPT, &ext9_data),
+            ExtWalk::NestedFragOrMalformed
+        ));
+
+        // 4. ensure_capacity_for 滞后于重叠/重复校验：满容时收到某已有组的非法重叠片仅丢弃该组，不驱逐其他健康组
+        let mut cap_tracker = FragmentTracker::new();
+        let meta4 = PacketInterfaceMeta::default();
+        let t0 = Instant::now();
+        for i in 0..MAX_FRAGMENT_GROUPS {
+            let pkt = make_ipv4_packet(
+                [10, 0, (i >> 8) as u8, (i & 0xFF) as u8],
+                [93, 184, 216, 34],
+                IP_PROTO_UDP,
+                (i as u16).wrapping_add(1),
+                0,
+                true,
+                &[0u8; 16],
+            );
+            assert!(matches!(
+                cap_tracker.ingest_at(t0 + Duration::from_micros(i as u64), &pkt, meta4, None),
+                FragmentOutcome::Pending
+            ));
+        }
+        assert_eq!(cap_tracker.active_group_count(), MAX_FRAGMENT_GROUPS);
+        // 给最后一组发送重叠分片（offset=8 与已有 0..16 重叠）：应仅删除该组（变成 MAX-1），绝不误删最早的健康组 (i=0)
+        let last = MAX_FRAGMENT_GROUPS - 1;
+        let overlap = make_ipv4_packet(
+            [10, 0, (last >> 8) as u8, (last & 0xFF) as u8],
+            [93, 184, 216, 34],
+            IP_PROTO_UDP,
+            (last as u16).wrapping_add(1),
+            8,
+            false,
+            &[1u8; 16],
+        );
+        assert!(matches!(
+            cap_tracker.ingest_at(t0 + Duration::from_secs(1), &overlap, meta4, None),
+            FragmentOutcome::Drop
+        ));
+        assert_eq!(cap_tracker.active_group_count(), MAX_FRAGMENT_GROUPS - 1);
+        // 验证最早的健康组 (i=0) 仍然存活并可正常完成重组
+        let finish_first = make_ipv4_packet(
+            [10, 0, 0, 0],
+            [93, 184, 216, 34],
+            IP_PROTO_UDP,
+            1,
+            16,
+            false,
+            &[2u8; 8],
+        );
+        assert!(matches!(
+            cap_tracker.ingest_at(t0 + Duration::from_secs(1), &finish_first, meta4, None),
+            FragmentOutcome::Reassembled { .. }
         ));
     }
 }

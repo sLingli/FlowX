@@ -1237,6 +1237,9 @@ impl TransparentManager {
                             fragment::FragmentOutcome::PassthroughSingle => {
                                 let _ = ctx.net_h.send(raw, &addr);
                             }
+                            fragment::FragmentOutcome::PassthroughGroup(orig_fragments) => {
+                                ctx.emit_passthrough(&[], &addr, Some(&orig_fragments));
+                            }
                             fragment::FragmentOutcome::Drop
                             | fragment::FragmentOutcome::Pending => {}
                             fragment::FragmentOutcome::Reassembled {
