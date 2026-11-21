@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const MAX_SNIFF_BYTES: usize = 4096;
+const MAX_SNIFF_BYTES: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniffOutcome {
@@ -10,18 +10,32 @@ pub struct SniffOutcome {
     pub buffered: Vec<u8>,
 }
 
-/// 校验嗅探到的域名是否合法（ASCII 可打印主机名，排除 IP 字面量与控制/路径危险字符）
+/// 按 RFC 1035 / RFC 1123 / RFC 6066 严格校验嗅探到的域名：
+/// 排除标准与非规范数字 IPv4（`127.1` / `0177.0.0.1` / `0x7f000001` / `2130706433`）、IPv6 字面量、
+/// 空标签（前导点/连续点）、下划线、超 63 字节标签以及以 `-` 开头或结尾的标签。
 pub fn is_valid_sniffed_host(host: &str) -> bool {
     let trimmed = host.trim().trim_end_matches('.');
     if trimmed.is_empty() || trimmed.len() > 253 {
         return false;
     }
-    if trimmed.parse::<IpAddr>().is_ok() {
+    if trimmed.parse::<IpAddr>().is_ok()
+        || crate::outbound::parse_noncanonical_ipv4(trimmed).is_some()
+    {
         return false;
     }
-    trimmed.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')
-    })
+    for label in trimmed.split('.') {
+        let bytes = label.as_bytes();
+        if bytes.is_empty() || bytes.len() > 63 {
+            return false;
+        }
+        if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+            return false;
+        }
+        if !bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+            return false;
+        }
+    }
+    true
 }
 
 /// 非破坏性预读客户端首段载荷，提取 TLS `ClientHello` SNI 或 HTTP `Host` 请求头，并原样保留所有已读字节以便后续转发。
@@ -152,90 +166,109 @@ fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
     }
 }
 
-/// 解析 TLS Record -> Handshake(ClientHello) -> Extensions -> SNI (`server_name`, ext type `0x0000`)
+/// 解析单条或跨多条 TLS Record 拆分的 Handshake(ClientHello) -> Extensions -> SNI (`server_name`, ext type `0x0000`)
 fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
-    // TLS Record header = 5 bytes: ContentType(1)=0x16, LegacyVer(2)=0x03 0x00..0x04, Length(2)
-    if buf.len() < 5 {
-        return SniffProbe::NeedMore;
+    // 1. 顺序解包连续的 TLS Handshake (0x16) 记录载荷，重组逻辑握手字节流（不修改原始 buffered）
+    let mut hs_stream = Vec::with_capacity(buf.len());
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let rem = buf.len() - pos;
+        if rem < 5 {
+            if buf[pos] != 0x16
+                || (rem >= 2 && buf[pos + 1] != 0x03)
+                || (rem >= 3 && buf[pos + 2] > 0x04)
+            {
+                return if pos == 0 {
+                    SniffProbe::NotMatchable
+                } else {
+                    break;
+                };
+            }
+            break;
+        }
+        if buf[pos] != 0x16 || buf[pos + 1] != 0x03 || buf[pos + 2] > 0x04 {
+            if pos == 0 {
+                return SniffProbe::NotMatchable;
+            }
+            break;
+        }
+        let rec_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
+        if rec_len == 0 || rec_len > 16_384 {
+            return SniffProbe::NotMatchable;
+        }
+        pos += 5;
+        let avail = buf.len() - pos;
+        if avail < rec_len {
+            hs_stream.extend_from_slice(&buf[pos..]);
+            break;
+        }
+        hs_stream.extend_from_slice(&buf[pos..pos + rec_len]);
+        pos += rec_len;
     }
-    if buf[0] != 0x16 || buf[1] != 0x03 || buf[2] > 0x04 {
-        return SniffProbe::NotMatchable;
-    }
-    let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    let payload = &buf[5..];
-    let declared_total = rec_len.min(MAX_SNIFF_BYTES - 5);
 
-    // Handshake header = 4 bytes: HandshakeType(1)=0x01 (ClientHello), Length(3)
-    if payload.len() < 4 {
-        return if payload.len() < declared_total {
+    // 2. Handshake header = 4 bytes: HandshakeType(1)=0x01 (ClientHello), Length(3)
+    if hs_stream.len() < 4 {
+        return if buf.len() < MAX_SNIFF_BYTES {
             SniffProbe::NeedMore
         } else {
             SniffProbe::NotMatchable
         };
     }
-    if payload[0] != 0x01 {
+    if hs_stream[0] != 0x01 {
         return SniffProbe::NotMatchable;
     }
-    let hs_len = ((payload[1] as usize) << 16) | ((payload[2] as usize) << 8) | (payload[3] as usize);
-    let body = &payload[4..];
-    let need_bytes = hs_len.min(declared_total.saturating_sub(4));
+    let hs_len =
+        ((hs_stream[1] as usize) << 16) | ((hs_stream[2] as usize) << 8) | (hs_stream[3] as usize);
+    let body_all = &hs_stream[4..];
+    let body = &body_all[..body_all.len().min(hs_len)];
+
+    let need_more_if_incomplete = |body_len: usize| {
+        if body_len < hs_len && buf.len() < MAX_SNIFF_BYTES {
+            SniffProbe::NeedMore
+        } else {
+            SniffProbe::NotMatchable
+        }
+    };
 
     // ClientHello: Version(2) + Random(32) + SessionIdLen(1)
     let mut off = 34usize;
     if body.len() <= off {
-        return if body.len() < need_bytes && buf.len() < MAX_SNIFF_BYTES {
-            SniffProbe::NeedMore
-        } else {
-            SniffProbe::NotMatchable
-        };
+        return need_more_if_incomplete(body.len());
     }
     let sid_len = body[off] as usize;
     off += 1 + sid_len;
 
     // CipherSuitesLen(2)
     if body.len() < off + 2 {
-        return if body.len() < need_bytes && buf.len() < MAX_SNIFF_BYTES {
-            SniffProbe::NeedMore
-        } else {
-            SniffProbe::NotMatchable
-        };
+        return need_more_if_incomplete(body.len());
     }
     let cs_len = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
     off += 2 + cs_len;
 
     // CompressionMethodsLen(1)
     if body.len() <= off {
-        return if body.len() < need_bytes && buf.len() < MAX_SNIFF_BYTES {
-            SniffProbe::NeedMore
-        } else {
-            SniffProbe::NotMatchable
-        };
+        return need_more_if_incomplete(body.len());
     }
     let comp_len = body[off] as usize;
     off += 1 + comp_len;
 
     // ExtensionsLen(2)
     if body.len() < off + 2 {
-        return if body.len() < need_bytes && buf.len() < MAX_SNIFF_BYTES {
-            SniffProbe::NeedMore
-        } else {
-            SniffProbe::NotMatchable
-        };
+        return need_more_if_incomplete(body.len());
     }
     let ext_total = u16::from_be_bytes([body[off], body[off + 1]]) as usize;
     off += 2;
-    let ext_end = off.saturating_add(ext_total);
+    let ext_end = off.saturating_add(ext_total).min(hs_len);
 
     while off + 4 <= body.len() && off + 4 <= ext_end {
         let ext_type = u16::from_be_bytes([body[off], body[off + 1]]);
         let ext_len = u16::from_be_bytes([body[off + 2], body[off + 3]]) as usize;
         off += 4;
+        if off + ext_len > ext_end {
+            return SniffProbe::NotMatchable;
+        }
         if off + ext_len > body.len() {
-            return if buf.len() < MAX_SNIFF_BYTES {
-                SniffProbe::NeedMore
-            } else {
-                SniffProbe::NotMatchable
-            };
+            return need_more_if_incomplete(body.len());
         }
         if ext_type == 0x0000 {
             // server_name list: list_len(2) + entries [name_type(1) + name_len(2) + host]
@@ -246,7 +279,8 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
                 let mut pos = 2usize;
                 while pos + 3 <= list_end {
                     let name_type = ext_data[pos];
-                    let name_len = u16::from_be_bytes([ext_data[pos + 1], ext_data[pos + 2]]) as usize;
+                    let name_len =
+                        u16::from_be_bytes([ext_data[pos + 1], ext_data[pos + 2]]) as usize;
                     pos += 3;
                     if pos + name_len > list_end {
                         break;
@@ -267,8 +301,8 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
         off += ext_len;
     }
 
-    if body.len() < ext_end && body.len() < need_bytes && buf.len() < MAX_SNIFF_BYTES {
-        SniffProbe::NeedMore
+    if body.len() < ext_end {
+        need_more_if_incomplete(body.len())
     } else {
         SniffProbe::NotMatchable
     }
@@ -370,5 +404,66 @@ mod tests {
             .unwrap();
         assert_eq!(out_silent.host, None);
         assert!(out_silent.buffered.is_empty());
+    }
+
+    #[test]
+    fn test_strict_sniffed_host_validation() {
+        assert!(is_valid_sniffed_host("api-1.github.com"));
+        assert!(is_valid_sniffed_host("localhost."));
+        for invalid in [
+            "",
+            ".example.com",
+            "a..b.com",
+            "bad_host.example",
+            "-leading.example",
+            "trailing-.example",
+            "127.0.0.1",
+            "::1",
+            "127.1",
+            "0177.0.0.1",
+            "0x7f000001",
+            "2130706433",
+            &format!("{}.example", "a".repeat(64)),
+        ] {
+            assert!(
+                !is_valid_sniffed_host(invalid),
+                "expected invalid host to be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_peek_multi_record_tls_client_hello_sni_preserves_raw_records() {
+        let single = build_tls_client_hello("Multi-Record.Example.ORG");
+        let hs_bytes = &single[5..];
+        // 将同一个 ClientHello 握手拆分成 4 条独立 TLS Record（跨 4B 握手头与 SNI 域名内部）
+        let mut multi_record = Vec::new();
+        for chunk in [
+            &hs_bytes[..2],
+            &hs_bytes[2..25],
+            &hs_bytes[25..hs_bytes.len() - 8],
+            &hs_bytes[hs_bytes.len() - 8..],
+        ] {
+            multi_record.push(0x16);
+            multi_record.extend_from_slice(&[0x03, 0x01]);
+            multi_record.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            multi_record.extend_from_slice(chunk);
+        }
+        let expected_raw = multi_record.clone();
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            for part in multi_record.chunks(17) {
+                client.write_all(part).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let out = peek_host_prefix(&mut server, Duration::from_millis(400))
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(out.host.as_deref(), Some("multi-record.example.org"));
+        assert_eq!(out.buffered, expected_raw);
     }
 }
