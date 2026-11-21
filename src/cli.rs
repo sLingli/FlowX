@@ -1809,64 +1809,101 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 0,
                 },
             )?;
-            let settings = if std::path::Path::new(&opts.config_path).exists() {
-                load_offline_runtime_readonly(&opts.config_path)?.transparent
+            let (mode_label, st_val) = if let Some((st, val)) =
+                api_request_or_offline(opts, "GET", "/api/transparent/status", None).await?
+            {
+                ("ONLINE", ensure_api_ok(st, val)?)
             } else {
-                TransparentSettings::default()
+                let settings = if std::path::Path::new(&opts.config_path).exists() {
+                    load_offline_runtime_readonly(&opts.config_path)?.transparent
+                } else {
+                    TransparentSettings::default()
+                };
+                ("OFFLINE", serde_json::to_value(probe_status(&settings))?)
             };
-            let st = probe_status(&settings);
+            let supported = st_val["supported"].as_bool().unwrap_or(false);
+            let elevated = st_val["elevated"].as_bool().unwrap_or(false);
+            let running = st_val["running"].as_bool().unwrap_or(false);
+            let dll_found = st_val["dll_found"].as_bool().unwrap_or(false);
+            let sys_found = st_val["sys_found"].as_bool().unwrap_or(false);
+            let dll_path = st_val["dll_path"].as_str().map(str::to_string);
+            let sys_path = st_val["sys_path"].as_str().map(str::to_string);
+            let configured_dll_path = st_val["configured_dll_path"].as_str().map(str::to_string);
+            let searched_dirs: Vec<String> = st_val["searched_dirs"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let config_enabled = st_val["enabled"].as_bool().unwrap_or(false);
+            let hijack_dns = st_val["hijack_dns"].as_bool().unwrap_or(true);
+            let block_quic = st_val["block_quic_for_proxied"].as_bool().unwrap_or(true);
+            let last_error = st_val["last_error"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+
             let mut issues: Vec<String> = Vec::new();
-            if !st.supported {
+            if !supported {
                 issues.push(
                     "WinDivert transparent proxy is only supported on Windows hosts.".to_string(),
                 );
             }
-            if !st.elevated {
+            if !elevated {
                 issues.push(
-                    "Current process lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
+                    "Target FlowX instance lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
                 );
             }
-            if !st.dll_found || !st.sys_found {
+            if !dll_found || !sys_found {
                 issues.push(format!(
                     "Missing WinDivert binaries (dll_found={}, sys_found={}); place WinDivert.dll and WinDivert64.sys next to flowx.exe or set --dll-path. Searched: {:?}",
-                    st.dll_found, st.sys_found, st.searched_dirs
+                    dll_found, sys_found, searched_dirs
                 ));
             }
-            let ready = st.supported && st.elevated && st.dll_found && st.sys_found;
+            if let Some(ref err) = last_error {
+                issues.push(format!("Last runtime error: {}", err));
+            }
+            let ready = supported && elevated && dll_found && sys_found;
             let report = json!({
+                "mode": mode_label,
                 "ready": ready,
+                "running": running,
                 "config_path": opts.config_path,
-                "supported": st.supported,
-                "elevated": st.elevated,
-                "dll_found": st.dll_found,
-                "sys_found": st.sys_found,
-                "dll_path": st.dll_path,
-                "sys_path": st.sys_path,
-                "configured_dll_path": st.configured_dll_path,
-                "searched_dirs": st.searched_dirs,
-                "config_enabled": st.enabled,
-                "hijack_dns": st.hijack_dns,
-                "block_quic_for_proxied": st.block_quic_for_proxied,
+                "supported": supported,
+                "elevated": elevated,
+                "dll_found": dll_found,
+                "sys_found": sys_found,
+                "dll_path": dll_path,
+                "sys_path": sys_path,
+                "configured_dll_path": configured_dll_path,
+                "searched_dirs": searched_dirs,
+                "config_enabled": config_enabled,
+                "hijack_dns": hijack_dns,
+                "block_quic_for_proxied": block_quic,
+                "last_error": last_error,
                 "issues": issues,
             });
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                println!("Transparent Proxy Doctor:");
+                println!("Transparent Proxy Doctor [{}]:", mode_label);
                 println!("  Ready:         {}", ready);
-                println!("  Windows Host:  {}", st.supported);
-                println!("  Elevated:      {}", st.elevated);
+                println!("  Running:       {}", running);
+                println!("  Windows Host:  {}", supported);
+                println!("  Elevated:      {}", elevated);
                 println!(
                     "  WinDivert DLL: found={} ({})",
-                    st.dll_found,
-                    st.dll_path.as_deref().unwrap_or("-")
+                    dll_found,
+                    dll_path.as_deref().unwrap_or("-")
                 );
                 println!(
                     "  WinDivert SYS: found={} ({})",
-                    st.sys_found,
-                    st.sys_path.as_deref().unwrap_or("-")
+                    sys_found,
+                    sys_path.as_deref().unwrap_or("-")
                 );
-                println!("  Search Dirs:   {:?}", st.searched_dirs);
+                println!("  Search Dirs:   {:?}", searched_dirs);
                 if issues.is_empty() {
                     println!("  Issues:        none");
                 } else {
@@ -4075,5 +4112,69 @@ mod tests {
         assert!(updated.transparent_settings.dll_path.is_none());
 
         let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    #[tokio::test]
+    async fn test_cli_transparent_doctor_respects_explicit_api() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 1. 显式传入不可达 --api 时，doctor 必须报错，绝不静默回退离线探测
+        let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--api".into(),
+                format!("http://{}", dead_addr),
+                "--json".into(),
+                "transparent".into(),
+                "doctor".into(),
+            ])
+            .await
+            .is_err(),
+            "flowx transparent doctor with unreachable --api must fail instead of falling back offline"
+        );
+
+        // 2. 显式传入在线 --api 时，doctor 必须请求 /api/transparent/status
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap();
+        let (path_tx, path_rx) = tokio::sync::oneshot::channel::<String>();
+        let mock_srv = tokio::spawn(async move {
+            let (mut s, _) = mock_listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 2048];
+            let n = s.read(&mut req_buf).await.unwrap();
+            let req_line = String::from_utf8_lossy(&req_buf[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let _ = path_tx.send(req_line);
+            let body = r#"{"supported":true,"enabled":true,"running":true,"elevated":true,"dll_found":true,"sys_found":true,"dll_path":"C:\\FlowX\\WinDivert.dll","sys_path":"C:\\FlowX\\WinDivert64.sys","searched_dirs":["C:\\FlowX"],"hijack_dns":true,"block_quic_for_proxied":true,"configured_dll_path":null,"last_error":null}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            s.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            format!("http://{}", mock_addr),
+            "--json".into(),
+            "transparent".into(),
+            "doctor".into(),
+        ])
+        .await
+        .unwrap();
+        mock_srv.await.unwrap();
+        let req_line = path_rx.await.unwrap();
+        assert!(
+            req_line.starts_with("GET /api/transparent/status "),
+            "expected GET /api/transparent/status, got: {req_line}"
+        );
     }
 }
