@@ -500,6 +500,7 @@ fn shutdown_and_join_runtime(
     signal: &netstack::NetstackSignal,
     socket_handle: &windivert_ffi::WinDivertHandle,
     network_handle: &windivert_ffi::WinDivertHandle,
+    dns_inspect_handle: &windivert_ffi::WinDivertHandle,
     threads: Vec<JoinHandle<()>>,
     dns_abort_handles: &Mutex<Vec<tokio::task::AbortHandle>>,
 ) {
@@ -508,6 +509,7 @@ fn shutdown_and_join_runtime(
     signal.close();
     let _ = socket_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
     let _ = network_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
+    let _ = dns_inspect_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
     for th in threads {
         let _ = th.join();
     }
@@ -525,6 +527,7 @@ struct PartialRuntimeGuard {
     signal: Arc<netstack::NetstackSignal>,
     socket_handle: Arc<windivert_ffi::WinDivertHandle>,
     network_handle: Arc<windivert_ffi::WinDivertHandle>,
+    dns_inspect_handle: Arc<windivert_ffi::WinDivertHandle>,
     threads: Vec<JoinHandle<()>>,
     dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
@@ -541,6 +544,7 @@ impl Drop for PartialRuntimeGuard {
             &self.signal,
             &self.socket_handle,
             &self.network_handle,
+            &self.dns_inspect_handle,
             threads,
             &self.dns_abort_handles,
         );
@@ -553,6 +557,7 @@ struct ActiveRuntime {
     signal: Arc<netstack::NetstackSignal>,
     socket_handle: Arc<windivert_ffi::WinDivertHandle>,
     network_handle: Arc<windivert_ffi::WinDivertHandle>,
+    dns_inspect_handle: Arc<windivert_ffi::WinDivertHandle>,
     threads: Vec<JoinHandle<()>>,
     dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     driver_version: Option<String>,
@@ -581,6 +586,13 @@ pub(crate) fn windivert_network_filter() -> &'static str {
     "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255) or fragment)"
 }
 
+/// WinDivert NETWORK 层纯旁路只读嗅探过滤表达式（`SNIFF | RECV_ONLY`）：
+/// 仅复制入站 UDP/53 应答供 `InspectDns` 被动学习 `real_ip -> domain`，绝不阻塞、篡改或丢弃任何 OS 原生 DNS 报文
+#[cfg(any(windows, test))]
+pub(crate) fn windivert_dns_inspect_inbound_filter() -> &'static str {
+    "inbound and !loopback and !impostor and udp.SrcPort == 53"
+}
+
 #[cfg(windows)]
 struct NetRxContext {
     stop_flag: Arc<AtomicBool>,
@@ -589,6 +601,7 @@ struct NetRxContext {
     sig: Arc<netstack::NetstackSignal>,
     dispatcher_cfg: Arc<DispatcherConfig>,
     dns_srv: Arc<DnsServer>,
+    inspect_table: Arc<dns_hijack::PendingInspectDnsTable>,
     stats: Arc<TransparentStatsCounters>,
     live_dns: Arc<AtomicBool>,
     live_quic: Arc<AtomicBool>,
@@ -623,7 +636,7 @@ impl NetRxContext {
         let net_data = addr.network();
 
         if let Some(udp) = dns_hijack::parse_udp_packet(raw) {
-            if crate::outbound::bypass::is_udp_port_bypassed(udp.src_port) {
+            if crate::outbound::bypass::is_udp_port_bypassed_for_family(udp.src_port, udp.is_ipv6) {
                 self.emit_passthrough(raw, addr, fallback_fragments);
                 return true;
             }
@@ -631,7 +644,7 @@ impl NetRxContext {
             let remote_ep = std::net::SocketAddr::new(udp.dst_ip, udp.dst_port);
             let allow_os_fallback = matches!(udp.dst_port, 53 | 443);
             let pid = resolve_outbound_pid(&self.table, 17, local_ep, remote_ep, allow_os_fallback);
-            let decision = dns_hijack::decide_udp_packet(
+            let decision = dns_hijack::decide_udp_packet_with_if_idx(
                 &udp,
                 pid,
                 self.live_dns.load(Ordering::Acquire),
@@ -639,6 +652,7 @@ impl NetRxContext {
                 Some(&self.dispatcher_cfg.rule_engine),
                 Some(&self.dispatcher_cfg.tracker),
                 Some(&self.dispatcher_cfg.fake_ip_pool),
+                net_data.if_idx,
             );
             match decision {
                 dns_hijack::UdpDecision::Passthrough => {
@@ -648,11 +662,20 @@ impl NetRxContext {
                     self.stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
                 }
                 dns_hijack::UdpDecision::DropFakeIp => {}
-                dns_hijack::UdpDecision::HandleDns | dns_hijack::UdpDecision::InspectDns => {
-                    let inspect_mode = matches!(decision, dns_hijack::UdpDecision::InspectDns);
-                    if !inspect_mode {
-                        self.stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
-                    }
+                dns_hijack::UdpDecision::InspectDns => {
+                    // 严格无侵入被动观测：登记出站查询后立即放行原包（保留 OS 原生 socket / VPN 接口绑定 / EDNS0 尺寸 / fe80:: scope_id），
+                    // 由独立入站 SNIFF|RECV_ONLY 句柄异步旁路学习应答中的 real_ip -> domain，绝不吞包或黑洞丢包。
+                    self.inspect_table.record_outbound_query(
+                        udp.src_ip,
+                        udp.dst_ip,
+                        udp.src_port,
+                        udp.dst_port,
+                        udp.payload,
+                    );
+                    self.emit_passthrough(raw, addr, fallback_fragments);
+                }
+                dns_hijack::UdpDecision::HandleDns => {
+                    self.stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
                     let owned_payload = udp.payload.to_vec();
                     let req_meta = (
                         udp.src_ip,
@@ -666,17 +689,23 @@ impl NetRxContext {
                     let dns = Arc::clone(&self.dns_srv);
                     let loopback = addr.loopback();
                     let join_handle = self.rt.spawn(async move {
-                        let orig_dns_dst = std::net::SocketAddr::new(req_meta.1, req_meta.3);
-                        let resp_payload = if inspect_mode {
-                            dns.process_transparent_inspect_query_bytes(
-                                &owned_payload,
-                                orig_dns_dst,
-                            )
-                            .await
-                        } else {
-                            dns.process_transparent_query_bytes(&owned_payload, orig_dns_dst)
-                                .await
+                        // 完整保留 IPv6 链路本地 DNS（fe80::）对应的接口索引 scope_id
+                        let orig_dns_dst = match req_meta.1 {
+                            std::net::IpAddr::V6(v6)
+                                if v6.is_unicast_link_local() && net_data.if_idx != 0 =>
+                            {
+                                std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                                    v6,
+                                    req_meta.3,
+                                    0,
+                                    net_data.if_idx,
+                                ))
+                            }
+                            ip => std::net::SocketAddr::new(ip, req_meta.3),
                         };
+                        let resp_payload = dns
+                            .process_transparent_query_bytes(&owned_payload, orig_dns_dst)
+                            .await;
                         if let Some(resp_payload) = resp_payload {
                             if stop.load(Ordering::Acquire) {
                                 return;
@@ -718,7 +747,7 @@ impl NetRxContext {
         }
 
         if let Some(tcp) = netstack::parse_tcp_packet(raw) {
-            if crate::outbound::bypass::is_tcp_port_bypassed(tcp.src_port) {
+            if crate::outbound::bypass::is_tcp_port_bypassed_for_family(tcp.src_port, tcp.is_ipv6) {
                 self.stats
                     .tcp_passthrough_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -1080,6 +1109,22 @@ impl TransparentManager {
             })?,
         );
 
+        let dns_inspect_filter = windivert_dns_inspect_inbound_filter();
+        let dns_inspect_handle = Arc::new(
+            windivert_ffi::WinDivertHandle::open(
+                Arc::clone(&api),
+                dns_inspect_filter,
+                windivert_ffi::WinDivertLayer::Network,
+                -10,
+                windivert_ffi::SOCKET_LAYER_FLAGS,
+            )
+            .map_err(|e| {
+                self.set_error(format!(
+                    "ERR_TRANSPARENT_OPEN_NETWORK_LAYER: {e}"
+                ))
+            })?,
+        );
+
         let _ = network_handle.set_param(
             windivert_ffi::WinDivertParam::QueueLength,
             windivert_ffi::WINDIVERT_PARAM_QUEUE_LENGTH_MAX,
@@ -1103,6 +1148,7 @@ impl TransparentManager {
         let pid_table = Arc::new(pid_table::SocketPidTable::new());
         let signal = Arc::new(netstack::NetstackSignal::new());
         let dns_abort_handles = Arc::new(Mutex::new(Vec::new()));
+        let inspect_table = Arc::new(dns_hijack::PendingInspectDnsTable::new());
 
         let mut startup_guard = PartialRuntimeGuard {
             armed: true,
@@ -1110,7 +1156,8 @@ impl TransparentManager {
             signal: Arc::clone(&signal),
             socket_handle: Arc::clone(&socket_handle),
             network_handle: Arc::clone(&network_handle),
-            threads: Vec::with_capacity(3),
+            dns_inspect_handle: Arc::clone(&dns_inspect_handle),
+            threads: Vec::with_capacity(4),
             dns_abort_handles: Arc::clone(&dns_abort_handles),
         };
         crate::outbound::bypass::set_transparent_active(true);
@@ -1177,6 +1224,7 @@ impl TransparentManager {
                 sig: Arc::clone(&signal),
                 dispatcher_cfg: Arc::clone(&self.dispatcher_config),
                 dns_srv: Arc::clone(&self.dns_server),
+                inspect_table: Arc::clone(&inspect_table),
                 stats: Arc::clone(&self.stats),
                 live_dns: Arc::clone(&self.live_hijack_dns),
                 live_quic: Arc::clone(&self.live_block_quic),
@@ -1266,6 +1314,55 @@ impl TransparentManager {
                     }
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn network recv thread: {e}")))?;
+            startup_guard.threads.push(handle);
+        }
+
+        // 2b. 入站被动 DNS 应答旁路嗅探线程（SNIFF | RECV_ONLY）：零阻塞学习 InspectDns 真实 IP 映射
+        {
+            let stop = Arc::clone(&stop_flag);
+            let sniff_h = Arc::clone(&dns_inspect_handle);
+            let inspect_tbl = Arc::clone(&inspect_table);
+            let fake_ip_pool = Arc::clone(&self.dispatcher_config.fake_ip_pool);
+            let handle = std::thread::Builder::new()
+                .name("flowx-windivert-dns-sniff".to_string())
+                .spawn(move || {
+                    let mut buf = vec![0u8; INITIAL_NET_RX_BUF_LEN];
+                    while !stop.load(Ordering::Acquire) {
+                        let (len, _addr) = match sniff_h.recv(&mut buf) {
+                            Ok(res) => res,
+                            Err(e) => {
+                                if stop.load(Ordering::Acquire)
+                                    || matches!(e.raw_os_error(), Some(6 | 232 | 995))
+                                {
+                                    break;
+                                }
+                                if e.raw_os_error() == Some(WINDOWS_ERROR_INSUFFICIENT_BUFFER)
+                                    && let Some(next_len) = next_net_rx_buf_len(buf.len())
+                                {
+                                    buf.resize(next_len, 0);
+                                    continue;
+                                }
+                                debug!(error = %e, "WinDivert passive DNS sniff recv transient error");
+                                std::thread::yield_now();
+                                continue;
+                            }
+                        };
+                        if len == 0 {
+                            continue;
+                        }
+                        if let Some(udp) = dns_hijack::parse_udp_packet(&buf[..len]) {
+                            inspect_tbl.observe_inbound_response(
+                                udp.src_ip,
+                                udp.dst_ip,
+                                udp.src_port,
+                                udp.dst_port,
+                                udp.payload,
+                                &fake_ip_pool,
+                            );
+                        }
+                    }
+                })
+                .map_err(|e| self.set_error(format!("Failed to spawn passive DNS sniff thread: {e}")))?;
             startup_guard.threads.push(handle);
         }
 
@@ -1405,6 +1502,7 @@ impl TransparentManager {
             signal,
             socket_handle,
             network_handle,
+            dns_inspect_handle,
             threads,
             dns_abort_handles,
             driver_version: driver_version.clone(),
@@ -1430,11 +1528,13 @@ impl TransparentManager {
             &rt.signal,
             &rt.socket_handle,
             &rt.network_handle,
+            &rt.dns_inspect_handle,
             rt.threads,
             &rt.dns_abort_handles,
         );
         drop(rt.socket_handle);
         drop(rt.network_handle);
+        drop(rt.dns_inspect_handle);
         self.stats.active_flows.store(0, Ordering::Relaxed);
 
         if let Err(e) = flush_dns_cache() {

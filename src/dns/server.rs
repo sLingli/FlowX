@@ -409,6 +409,52 @@ fn build_dns_query_packet(tx_id: u16, domain: &str, qtype: u16) -> Result<(Vec<u
     Ok((pkt, q))
 }
 
+/// 从 DNS 响应报文中快速窥探 `(tx_id, qname_lower, qtype, qclass)`（供被动入站响应观测器按五元组+TxID+QType 精确匹配）
+pub(crate) fn peek_dns_response_key(resp: &[u8]) -> Option<(u16, String, u16, u16)> {
+    if resp.len() < 12 || (resp[2] & 0x80) == 0 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([resp[4], resp[5]]);
+    if qdcount < 1 {
+        return None;
+    }
+    let tx_id = u16::from_be_bytes([resp[0], resp[1]]);
+    let (qname, next_off) = decode_dns_name(resp, 12).ok()?;
+    if next_off + 4 > resp.len() {
+        return None;
+    }
+    let qtype = u16::from_be_bytes([resp[next_off], resp[next_off + 1]]);
+    let qclass = u16::from_be_bytes([resp[next_off + 2], resp[next_off + 3]]);
+    Some((tx_id, qname.to_ascii_lowercase(), qtype, qclass))
+}
+
+/// 严格校验并被动学习一条入站 DNS 响应中的 `real_ip -> domain` 映射（绝不修改或阻塞报文）
+pub(crate) fn observe_passive_dns_response(
+    pool: &FakeIpPool,
+    expected_tx_id: u16,
+    question: &DnsQuestion,
+    resp_bytes: &[u8],
+) -> bool {
+    if !matches!(question.qtype, 1 | 28) || question.qclass != 1 {
+        return false;
+    }
+    let Ok(ans_off) = validate_upstream_dns_response(expected_tx_id, question, resp_bytes) else {
+        return false;
+    };
+    if (resp_bytes[3] & 0x0F) != 0 {
+        return false;
+    }
+    if let Ok((ips, min_ttl)) =
+        parse_answer_ips_with_ttl(resp_bytes, question, ans_off, Some(pool))
+        && !ips.is_empty()
+    {
+        let ttl_hint = min_ttl.map(|s| Duration::from_secs(u64::from(s)));
+        pool.record_real_ip_mappings_with_ttl(&question.name, &ips, ttl_hint);
+        return true;
+    }
+    false
+}
+
 /// 解析 DNS 应答中的 A / AAAA（支持乱序与多跳 CNAME 链，计入链上 CNAME 最小 TTL，限定 RDATA 边界，并过滤任何 Fake-IP 防止自环路）
 fn parse_answer_ips_with_ttl(
     resp: &[u8],

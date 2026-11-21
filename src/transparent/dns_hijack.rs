@@ -1,13 +1,183 @@
+use std::collections::HashMap;
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
+use etherparse::PacketBuilder;
 
-use crate::dns::server::DnsPacketParser;
+use crate::dns::server::{
+    observe_passive_dns_response, peek_dns_response_key, DnsPacketParser, DnsQuestion,
+};
 use crate::dns::FakeIpPool;
 use crate::interceptor::process::ProcessTracker;
-use crate::outbound::bypass::is_udp_port_bypassed;
+use crate::outbound::bypass::is_udp_port_bypassed_for_family;
 use crate::router::{Action, DnsHijackDecision, DomainNeedDecision, RuleEngine};
+
+const MAX_PENDING_INSPECT_DNS: usize = 4096;
+const PENDING_INSPECT_DNS_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct InspectDnsKey {
+    client_ip: IpAddr,
+    server_ip: IpAddr,
+    client_port: u16,
+    server_port: u16,
+    tx_id: u16,
+    qtype: u16,
+}
+
+#[derive(Debug, Clone)]
+struct PendingInspectEntry {
+    question: DnsQuestion,
+    recorded_at: Instant,
+}
+
+/// 严格被动观测表：记录放行（`emit_passthrough`）的出站 `InspectDns` 查询元组，
+/// 由独立的 `WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY` 入站监听线程匹配真实 DNS 响应并学习 `real_ip -> domain`。
+/// 绝不吞包、不重发 socket、不阻塞/限流/丢弃超长 EDNS0 或 VPN/多宿主/`fe80::` DNS 响应。
+#[derive(Debug, Default)]
+pub struct PendingInspectDnsTable {
+    entries: Mutex<HashMap<InspectDnsKey, PendingInspectEntry>>,
+}
+
+impl PendingInspectDnsTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record_outbound_query(
+        &self,
+        client_ip: IpAddr,
+        server_ip: IpAddr,
+        client_port: u16,
+        server_port: u16,
+        query_payload: &[u8],
+    ) -> bool {
+        self.record_outbound_query_at(
+            Instant::now(),
+            client_ip,
+            server_ip,
+            client_port,
+            server_port,
+            query_payload,
+        )
+    }
+
+    pub(crate) fn record_outbound_query_at(
+        &self,
+        now: Instant,
+        client_ip: IpAddr,
+        server_ip: IpAddr,
+        client_port: u16,
+        server_port: u16,
+        query_payload: &[u8],
+    ) -> bool {
+        let Ok((tx_id, question)) = DnsPacketParser::parse_question(query_payload) else {
+            return false;
+        };
+        if !matches!(question.qtype, 1 | 28) || question.qclass != 1 {
+            return false;
+        }
+        let key = InspectDnsKey {
+            client_ip: client_ip.to_canonical(),
+            server_ip: server_ip.to_canonical(),
+            client_port,
+            server_port,
+            tx_id,
+            qtype: question.qtype,
+        };
+        let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_PENDING_INSPECT_DNS && !map.contains_key(&key) {
+            map.retain(|_, v| now.saturating_duration_since(v.recorded_at) <= PENDING_INSPECT_DNS_TTL);
+            if map.len() >= MAX_PENDING_INSPECT_DNS
+                && let Some(oldest_key) = map
+                    .iter()
+                    .min_by_key(|(_, v)| v.recorded_at)
+                    .map(|(k, _)| *k)
+            {
+                map.remove(&oldest_key);
+            }
+        }
+        map.insert(
+            key,
+            PendingInspectEntry {
+                question,
+                recorded_at: now,
+            },
+        );
+        true
+    }
+
+    pub fn observe_inbound_response(
+        &self,
+        server_ip: IpAddr,
+        client_ip: IpAddr,
+        server_port: u16,
+        client_port: u16,
+        resp_payload: &[u8],
+        fake_ip_pool: &FakeIpPool,
+    ) -> bool {
+        self.observe_inbound_response_at(
+            Instant::now(),
+            server_ip,
+            client_ip,
+            server_port,
+            client_port,
+            resp_payload,
+            fake_ip_pool,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn observe_inbound_response_at(
+        &self,
+        now: Instant,
+        server_ip: IpAddr,
+        client_ip: IpAddr,
+        server_port: u16,
+        client_port: u16,
+        resp_payload: &[u8],
+        fake_ip_pool: &FakeIpPool,
+    ) -> bool {
+        let Some((tx_id, qname_lower, qtype, qclass)) = peek_dns_response_key(resp_payload) else {
+            return false;
+        };
+        if !matches!(qtype, 1 | 28) || qclass != 1 {
+            return false;
+        }
+        let key = InspectDnsKey {
+            client_ip: client_ip.to_canonical(),
+            server_ip: server_ip.to_canonical(),
+            client_port,
+            server_port,
+            tx_id,
+            qtype,
+        };
+        let entry = {
+            let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let matched = map.get(&key).is_some_and(|e| {
+                now.saturating_duration_since(e.recorded_at) <= PENDING_INSPECT_DNS_TTL
+                    && e.question.name.eq_ignore_ascii_case(&qname_lower)
+            });
+            if matched {
+                map.remove(&key)
+            } else {
+                if map
+                    .get(&key)
+                    .is_some_and(|e| now.saturating_duration_since(e.recorded_at) > PENDING_INSPECT_DNS_TTL)
+                {
+                    map.remove(&key);
+                }
+                None
+            }
+        };
+        let Some(entry) = entry else {
+            return false;
+        };
+        observe_passive_dns_response(fake_ip_pool, tx_id, &entry.question, resp_payload)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDecision {
@@ -53,45 +223,117 @@ pub struct ParsedUdpPacket<'a> {
     pub is_ipv6: bool,
 }
 
-/// 解析原始 IPv4/IPv6 UDP 报文；分片包或非 UDP 报文返回 `None`
+#[inline]
+fn ipv6_ext_len(nh: u8, slice: &[u8]) -> Option<usize> {
+    if slice.len() < 2 {
+        return None;
+    }
+    match nh {
+        0 | 43 | 60 | 135 | 139 | 140 => Some(((slice[1] as usize) + 1) * 8),
+        51 => Some(((slice[1] as usize) + 2) * 4),
+        _ => None,
+    }
+}
+
+/// 解析原始 IPv4/IPv6 UDP 报文（支持 IPv6 扩展头 0/43/51/60/135/139/140 及 Windows 卸载 `length == 0` 包）；
+/// 分片包、截断畸形包或非 UDP 报文返回 `None`
 pub fn parse_udp_packet(raw_ip: &[u8]) -> Option<ParsedUdpPacket<'_>> {
-    let sliced = SlicedPacket::from_ip(raw_ip).ok()?;
-    let (src_ip, dst_ip, is_ipv6) = match sliced.net? {
-        NetSlice::Ipv4(ipv4) => {
-            if ipv4.is_payload_fragmented() {
+    let ver = raw_ip.first()? >> 4;
+    let (src_ip, dst_ip, udp_slice, is_ipv6) = match ver {
+        4 => {
+            if raw_ip.len() < 20 {
                 return None;
             }
-            let hdr = ipv4.header();
-            (
-                IpAddr::V4(hdr.source_addr()),
-                IpAddr::V4(hdr.destination_addr()),
-                false,
-            )
+            let ihl = ((raw_ip[0] & 0x0F) as usize) * 4;
+            if ihl < 20 || raw_ip.len() < ihl {
+                return None;
+            }
+            let flags_frag = u16::from_be_bytes([raw_ip[6], raw_ip[7]]);
+            if (flags_frag & 0x2000) != 0 || (flags_frag & 0x1FFF) != 0 {
+                return None;
+            }
+            if raw_ip[9] != 17 {
+                return None;
+            }
+            let hdr_total_len = u16::from_be_bytes([raw_ip[2], raw_ip[3]]) as usize;
+            let ip_end = if hdr_total_len == 0 || raw_ip.len() > u16::MAX as usize {
+                raw_ip.len()
+            } else if hdr_total_len >= ihl && hdr_total_len <= raw_ip.len() {
+                hdr_total_len
+            } else {
+                return None;
+            };
+            let src = IpAddr::V4(Ipv4Addr::new(raw_ip[12], raw_ip[13], raw_ip[14], raw_ip[15]));
+            let dst = IpAddr::V4(Ipv4Addr::new(raw_ip[16], raw_ip[17], raw_ip[18], raw_ip[19]));
+            (src, dst, &raw_ip[ihl..ip_end], false)
         }
-        NetSlice::Ipv6(ipv6) => {
-            if ipv6.is_payload_fragmented() {
+        6 => {
+            if raw_ip.len() < 40 {
                 return None;
             }
-            let hdr = ipv6.header();
-            (
-                IpAddr::V6(hdr.source_addr()),
-                IpAddr::V6(hdr.destination_addr()),
-                true,
-            )
+            let hdr_payload_len = u16::from_be_bytes([raw_ip[4], raw_ip[5]]) as usize;
+            let offload_override =
+                (hdr_payload_len == 0 && raw_ip.len() > 40) || raw_ip.len() > 40 + u16::MAX as usize;
+            let ip_end = if offload_override {
+                raw_ip.len()
+            } else {
+                let end = 40usize.checked_add(hdr_payload_len)?;
+                if end > raw_ip.len() || hdr_payload_len == 0 {
+                    return None;
+                }
+                end
+            };
+
+            let mut next_hdr = raw_ip[6];
+            let mut pos = 40usize;
+            for _ in 0..8 {
+                if next_hdr == 17 {
+                    break;
+                }
+                if next_hdr == 44 {
+                    return None;
+                }
+                let ext_len = ipv6_ext_len(next_hdr, &raw_ip[pos..ip_end])?;
+                if pos + ext_len > ip_end {
+                    return None;
+                }
+                next_hdr = raw_ip[pos];
+                pos += ext_len;
+            }
+            if next_hdr != 17 || pos >= ip_end {
+                return None;
+            }
+
+            let src_octets: [u8; 16] = raw_ip[8..24].try_into().ok()?;
+            let dst_octets: [u8; 16] = raw_ip[24..40].try_into().ok()?;
+            let src = IpAddr::V6(Ipv6Addr::from(src_octets));
+            let dst = IpAddr::V6(Ipv6Addr::from(dst_octets));
+            (src, dst, &raw_ip[pos..ip_end], true)
         }
         _ => return None,
     };
 
-    let TransportSlice::Udp(udp) = sliced.transport? else {
+    if udp_slice.len() < 8 {
+        return None;
+    }
+    let src_port = u16::from_be_bytes([udp_slice[0], udp_slice[1]]);
+    let dst_port = u16::from_be_bytes([udp_slice[2], udp_slice[3]]);
+    let udp_len = u16::from_be_bytes([udp_slice[4], udp_slice[5]]) as usize;
+    let payload = if udp_len == 0 {
+        // Windows UDP 校验和/长度卸载（USO / offload）或 IPv6 Jumbogram UDP length == 0
+        &udp_slice[8..]
+    } else if udp_len >= 8 && udp_len <= udp_slice.len() {
+        &udp_slice[8..udp_len]
+    } else {
         return None;
     };
 
     Some(ParsedUdpPacket {
         src_ip: src_ip.to_canonical(),
         dst_ip: dst_ip.to_canonical(),
-        src_port: udp.source_port(),
-        dst_port: udp.destination_port(),
-        payload: udp.payload(),
+        src_port,
+        dst_port,
+        payload,
         is_ipv6,
     })
 }
@@ -134,7 +376,7 @@ pub fn build_udp_reply_ip_packet(
     }
 }
 
-/// 判定出站 UDP 报文动作：自环/放行端口直通、UDP/53 选择性劫持至内置 DNS、UDP/443 QUIC 选择性丢弃降级 TCP
+/// 判定出站 UDP 报文动作：自环/放行端口直通、UDP/53 选择性劫持或被动观测、UDP/443 QUIC 选择性丢弃降级 TCP
 pub fn decide_udp_packet(
     pkt: &ParsedUdpPacket<'_>,
     pid: Option<u32>,
@@ -144,8 +386,34 @@ pub fn decide_udp_packet(
     tracker: Option<&ProcessTracker>,
     fake_ip_pool: Option<&FakeIpPool>,
 ) -> UdpDecision {
-    // 第一优先防回环：本进程注册的绕过 UDP 端口或当前进程发出的流量绝对放行
-    if is_udp_port_bypassed(pkt.src_port) || pid.is_some_and(|p| p != 0 && p == std::process::id())
+    decide_udp_packet_with_if_idx(
+        pkt,
+        pid,
+        hijack_dns,
+        block_quic_for_proxied,
+        rule_engine,
+        tracker,
+        fake_ip_pool,
+        0,
+    )
+}
+
+/// 携带网络接口索引 `if_idx` 的出站 UDP 裁决入口：
+/// 当 `if_idx != 0`（真实网卡发出的报文，采用无侵入放行+入站旁路嗅探）时，`fe80::` 链路本地 IPv6 DNS 也可进入 `InspectDns` 被动学习真实 IP 映射。
+#[allow(clippy::too_many_arguments)]
+pub fn decide_udp_packet_with_if_idx(
+    pkt: &ParsedUdpPacket<'_>,
+    pid: Option<u32>,
+    hijack_dns: bool,
+    block_quic_for_proxied: bool,
+    rule_engine: Option<&RuleEngine>,
+    tracker: Option<&ProcessTracker>,
+    fake_ip_pool: Option<&FakeIpPool>,
+    if_idx: u32,
+) -> UdpDecision {
+    // 第一优先防回环：本进程注册的同地址族绕过 UDP 端口或当前进程发出的流量绝对放行
+    if is_udp_port_bypassed_for_family(pkt.src_port, pkt.is_ipv6)
+        || pid.is_some_and(|p| p != 0 && p == std::process::id())
     {
         return UdpDecision::Passthrough;
     }
@@ -188,12 +456,13 @@ pub fn decide_udp_packet(
             match re.classify_dns_query(proc_path, proc_name, &question.name, is_shared) {
                 DnsHijackDecision::Hijack => UdpDecision::HandleDns,
                 DnsHijackDecision::Passthrough => {
-                    let is_link_local_v6_dns = matches!(
-                        pkt.dst_ip.to_canonical(),
-                        IpAddr::V6(v6) if v6.is_unicast_link_local()
-                    );
+                    let unscoped_link_local_v6_dns = if_idx == 0
+                        && matches!(
+                            pkt.dst_ip.to_canonical(),
+                            IpAddr::V6(v6) if v6.is_unicast_link_local()
+                        );
                     if is_shared
-                        && !is_link_local_v6_dns
+                        && !unscoped_link_local_v6_dns
                         && re.should_inspect_shared_dns(proc_path, proc_name, &question.name)
                     {
                         UdpDecision::InspectDns
@@ -690,6 +959,112 @@ mod tests {
                 None,
             ),
             UdpDecision::Passthrough
+        );
+
+        // P1-3: 当具备真实网卡接口索引 (if_idx != 0) 时，fe80:: 链路本地 IPv6 DNS 进入无侵入被动 InspectDns
+        assert_eq!(
+            decide_udp_packet_with_if_idx(
+                &parsed_ll_v6_dns,
+                Some(999_999),
+                true,
+                true,
+                Some(&app_proxy_engine),
+                Some(&real_tracker),
+                None,
+                7,
+            ),
+            UdpDecision::InspectDns
+        );
+    }
+
+    #[test]
+    fn test_p1_4_parse_udp_packet_with_ipv6_mobility_hip_shim6_and_offload_zero_len() {
+        let src6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst6 = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let payload = build_sample_dns_query(0xCAFE, "ext-hdr-udp.example", 1);
+
+        // 1. P1-4: 未分片 IPv6 UDP 携带 135 (Mobility) -> 139 (HIP) -> 140 (SHIM6) 扩展头，必须完整解析而非掉入 FragmentTracker 丢弃
+        let mut udp_hdr = Vec::with_capacity(8 + payload.len());
+        udp_hdr.extend_from_slice(&51234u16.to_be_bytes());
+        udp_hdr.extend_from_slice(&53u16.to_be_bytes());
+        udp_hdr.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        udp_hdr.extend_from_slice(&0u16.to_be_bytes());
+        udp_hdr.extend_from_slice(&payload);
+
+        let mut raw_v6 = Vec::new();
+        raw_v6.extend_from_slice(&[0x60, 0, 0, 0]);
+        raw_v6.extend_from_slice(&((24 + udp_hdr.len()) as u16).to_be_bytes());
+        raw_v6.push(135); // Mobility
+        raw_v6.push(64);
+        raw_v6.extend_from_slice(&src6.octets());
+        raw_v6.extend_from_slice(&dst6.octets());
+        raw_v6.extend_from_slice(&[139, 0, 0, 0, 0, 0, 0, 0]); // Mobility (8B) -> HIP
+        raw_v6.extend_from_slice(&[140, 0, 0, 0, 0, 0, 0, 0]); // HIP (8B) -> SHIM6
+        raw_v6.extend_from_slice(&[17, 0, 0, 0, 0, 0, 0, 0]); // SHIM6 (8B) -> UDP
+        raw_v6.extend_from_slice(&udp_hdr);
+
+        let parsed = parse_udp_packet(&raw_v6)
+            .expect("unfragmented IPv6 UDP with Mobility/HIP/SHIM6 extension headers must parse");
+        assert!(parsed.is_ipv6);
+        assert_eq!(parsed.src_ip, IpAddr::V6(src6));
+        assert_eq!(parsed.dst_ip, IpAddr::V6(dst6));
+        assert_eq!(parsed.src_port, 51234);
+        assert_eq!(parsed.dst_port, 53);
+        assert_eq!(parsed.payload, payload.as_slice());
+
+        // 2. P3-5: Windows Offload UDP length == 0（以及 IPv4 total_len == 0）必须正确解析
+        let mut offload_v4 = Vec::new();
+        PacketBuilder::ipv4([10, 0, 0, 2], [8, 8, 8, 8], 64)
+            .udp(55555, 53)
+            .write(&mut offload_v4, &payload)
+            .unwrap();
+        offload_v4[2] = 0;
+        offload_v4[3] = 0; // IPv4 total_len = 0 offload
+        offload_v4[24] = 0;
+        offload_v4[25] = 0; // UDP length = 0 offload
+        let parsed_offload =
+            parse_udp_packet(&offload_v4).expect("Windows offload UDP length==0 must parse");
+        assert_eq!(parsed_offload.dst_port, 53);
+        assert_eq!(parsed_offload.payload, payload.as_slice());
+
+        // 3. 真正的截断畸形 UDP（1 <= udp_len < 8 或 udp_len > slice）仍须返回 None
+        let mut malformed_v4 = offload_v4.clone();
+        malformed_v4[24] = 0;
+        malformed_v4[25] = 4; // invalid udp_len < 8
+        assert!(parse_udp_packet(&malformed_v4).is_none());
+    }
+
+    #[test]
+    fn test_p1_3_pending_inspect_dns_table_passive_observation_including_fe80_and_spoof_rejection() {
+        let pool = FakeIpPool::new_default();
+        let table = PendingInspectDnsTable::new();
+        let client_ip: IpAddr = "fe80::2".parse().unwrap();
+        let server_ip: IpAddr = "fe80::1".parse().unwrap();
+        let query = build_sample_dns_query(0x7123, "passive-v6.example", 1);
+
+        assert!(table.record_outbound_query(client_ip, server_ip, 52000, 53, &query));
+
+        let mut resp = Vec::new();
+        resp.extend_from_slice(&0x7123u16.to_be_bytes());
+        resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        resp.extend_from_slice(&query[12..]);
+        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 45, 0, 4, 93, 184, 216, 77]);
+
+        // 错误源服务器伪造包不得命中或消耗待观测项
+        let spoof_ip: IpAddr = "fe80::99".parse().unwrap();
+        assert!(!table.observe_inbound_response(spoof_ip, client_ip, 53, 52000, &resp, &pool));
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 77))),
+            None
+        );
+
+        // 合法 fe80::1 入站响应应被动学习 real_ip -> domain，且无任何 Fake-IP 分配
+        assert!(table.observe_inbound_response(server_ip, client_ip, 53, 52000, &resp, &pool));
+        assert!(pool.is_empty());
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 77)))
+                .as_deref(),
+            Some("passive-v6.example")
         );
     }
 }
