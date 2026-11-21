@@ -127,6 +127,22 @@ flowx conn list --json
 flowx conn kill 42 --json
 ```
 
+### 6. Windows 系统级透明代理管理 (`flowx transparent`)
+支持在线（同步守护进程与 XML）与离线（读写 `<TransparentProxy>`）管理，`doctor` 同样遵循 `--api` / `$FLOWX_API` 优先在线查询：
+```bash
+# 查询透明代理运行状态、驱动探测与统计计数
+flowx transparent status --json
+
+# 诊断 Windows 宿主环境、管理员权限与 WinDivert.dll / WinDivert64.sys 就绪状态
+flowx transparent doctor --json
+
+# 热启 / 热停透明代理或修改 DNS 劫持 / QUIC 阻断 / 自定义 DLL 路径
+flowx transparent enable --json
+flowx transparent disable --json
+flowx transparent config --hijack-dns --block-quic --dll-path "C:\tools\WinDivert.dll" --json
+flowx transparent config --clear-dll-path --json
+```
+
 ---
 
 ## 三、 路由规则语法规范与安全准则

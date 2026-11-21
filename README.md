@@ -1,14 +1,14 @@
 # FlowX
 
-基于 Rust 异步运行时（Tokio）构建的跨平台（Windows / Linux / macOS）进程级代理与分流引擎，内建混合协议入站、Fake-IP DNS、XML 配置持久化及单文件 Web 控制台。
+基于 Rust 异步运行时（Tokio）构建的跨平台（Windows / Linux / macOS）进程级透明代理与分流引擎，内建混合协议入站、Windows WinDivert 系统级透明接管、Fake-IP / 被动观测 DNS、XML 配置持久化及单文件 Web 控制台。
 
 ## 平台支持
 
-| 平台 | 进程四元组追踪 | 停机信号 |
-|---|---|---|
-| Windows | `GetExtendedTcpTable` + `QueryFullProcessImageNameW` | `Ctrl+C` |
-| Linux | `/proc/net/tcp[6]` → socket inode → `/proc/<pid>/fd` → `/proc/<pid>/exe` | `SIGINT` / `SIGTERM`（兼容 `systemctl stop`） |
-| macOS | `libproc` (`proc_listpids` / `PROC_PIDFDSOCKETINFO` / `PROC_PIDTBSDINFO`，兼容双栈 `INI_IPV4 \| INI_IPV6`) | `SIGINT` / `SIGTERM`（兼容 `launchd`） |
+| 平台 | 进程四元组追踪 | 透明代理 | 停机信号 |
+|---|---|---|---|
+| Windows | `GetExtendedTcpTable` + WinDivert `SOCKET` 层 + `QueryFullProcessImageNameW` | 支持（WinDivert 2.2 + `smoltcp` 用户态 TCP/IP 栈） | `Ctrl+C` |
+| Linux | `/proc/net/tcp[6]` → socket inode → `/proc/<pid>/fd` → `/proc/<pid>/exe` | 本地混合入站模式 | `SIGINT` / `SIGTERM`（兼容 `systemctl stop`） |
+| macOS | `libproc` (`proc_listpids` / `PROC_PIDFDSOCKETINFO` / `PROC_PIDTBSDINFO`，兼容双栈 `INI_IPV4 \| INI_IPV6`) | 本地混合入站模式 | `SIGINT` / `SIGTERM`（兼容 `launchd`） |
 
 - **Unix 权限**：默认端口（`1053` / `40001` / `40080`）均大于 1024，普通用户即可运行，且在 Unix 下写回 `flowx.xml` 时强制使用 `0600` 私有文件权限；普通用户仅能反查同用户下发起的进程连接，Linux 跨用户识别可通过 `sudo` 或授予 `CAP_SYS_PTRACE` + `CAP_DAC_READ_SEARCH` 能力（`sudo setcap cap_sys_ptrace,cap_dac_read_search+ep ./flowx`），macOS 跨用户进程反查需以 `sudo` 运行。
 - **规则跨平台互通与安全限制**：应用程序规则中的 `.exe` 后缀双向兼容，`git.exe` 可匹配 Linux / macOS 下的 `git`，`git` 也可匹配 Windows 下的 `git.exe`；`%ComputerName%` / `%HOSTNAME%` 在拆词之后解析并过滤 `;` / 通配符 / CIDR 等元字符，防止主机名注入。
@@ -28,14 +28,27 @@
 # 运行后台守护引擎（首次运行若无配置文件会自动创建 flowx.xml）
 cargo run
 
-# 指定自定义配置文件启动守护引擎
+# 指定自定义配置文件启动守护引擎，或临时覆写透明代理启动开关（不改写磁盘 persisted enabled）
 cargo run -- --config my-profile.xml
+cargo run -- --transparent
+cargo run -- --no-transparent
 
 # 运行全部单元测试
 cargo test
 ```
 
-启动后在浏览器打开 `http://127.0.0.1:40080` 即可查看实时吞吐图表、活动连接、新增/编辑/测速代理节点、调整分流规则与默认兜底策略，或使用内置「路由规则命中模拟器」干跑测试规则。
+启动后在浏览器打开 `http://127.0.0.1:40080` 即可查看实时吞吐图表、活动连接、开关系统级透明代理、新增/编辑/测速代理节点、调整分流规则与默认兜底策略，或使用内置「路由规则命中模拟器」干跑测试规则。
+
+### Windows 系统级透明代理（WinDivert）
+
+Windows 下支持通过 WinDivert 2.2 实现无需逐一配置应用代理的系统级透明接管：
+
+1. **驱动准备**：从 WinDivert 官方发行包获取同版本 `WinDivert.dll` 与 `WinDivert64.sys`，将两者放置于 `flowx.exe` 同级目录（或通过 Web 控制台 / `flowx transparent config --dll-path <绝对路径>` / `<TransparentProxy><DllPath>` 指定同目录成对文件）。
+2. **权限要求**：开启透明接管需要管理员权限。可直接以管理员终端启动 `flowx --transparent`，或在普通用户启动后于 Web 控制台点击「以管理员重启并开启」通过 UAC 自动平滑交接端口（`--replace-pid`）。
+3. **DNS 与域名路由边界**：
+   - **选择性 Fake-IP 与纯被动观测 (`InspectDns`)**：仅对命中域名/代理规则的独立进程分配 Fake-IP（保留原始分域 DNS 及 IPv6 `fe80::` 接口 `scope_id`，支持多 DNS 并存且权威 `NXDOMAIN` 不泄露至公网 DNS）；对共享系统 DNS 解析器（如 `svchost.exe` `Dnscache`）采用原包直通 + 独立入站 `SNIFF | RECV_ONLY` 旁路观测学习 `real_ip -> domain`，绝不吞包或影响 VPN/多网卡/EDNS0 响应。
+   - **TLS SNI / HTTP Host 首包嗅探**：命中代理规则时，除明确服务端先发协议端口（如 `21/22/23/25/110/143/587/3306/5900`）外，在标准与非标准端口（如 `443`、`8444`、`9443`、`2083`、`3000`）均优先执行支持多 Record `ClientHello` 的权威 SNI/Host 嗅探，并将权威域名提交给远端代理。
+   - **内网/VPN 私有后缀边界说明**：`.lan`、`.localdomain`、`.home`、`.corp`、`.internal`、`.intranet`、`.ts.net` 等私有后缀在 **DNS 阶段** 不会被 `DevProxy` 等无域名通配规则或全局默认代理隐式劫持（用户显式编写匹配这些后缀的规则仍可生效）；但请注意，若这些域名解析到的真实 IP（如企业内网 `10.0.0.0/8`、`172.16.0.0/12` 或 Tailscale CGNAT `100.64.0.0/10`）不在默认 `LocalBypass` 的 `192.168.0.0/16` 范围内，**TCP 阶段** 命中 `DevProxy`（如 `chrome.exe -> Proxy`）的连接仍会通过 TLS SNI 送往代理节点。如需对这些内网/VPN 网段或后缀直连，请将其补充到 `LocalBypass`（例如追加 `10.0.0.0/8; 172.16.0.0/12; 100.64.0.0/10; *.ts.net; *.corp`）。
 
 ### CLI 控制子命令（支持在线热调用与离线 XML 直改）
 
@@ -68,6 +81,14 @@ flowx default Proxy:101
 
 # 干跑模拟流量命中哪条规则并输出逐条匹配轨迹
 flowx sim --app "git.exe" --target "api.github.com:443"
+
+# Windows 透明代理状态、诊断与配置管理（均支持 --api / $FLOWX_API 在线查询与 --offline 离线修改）
+flowx transparent status
+flowx transparent doctor --json
+flowx transparent enable
+flowx transparent disable
+flowx transparent config --hijack-dns --block-quic --dll-path "C:\tools\WinDivert.dll"
+flowx transparent config --clear-dll-path
 ```
 
 ### AI Agent 技能支持

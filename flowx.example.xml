@@ -1,6 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Profile version="1">
   <DefaultAction type="Direct"/>
+  <!-- Windows 系统级透明代理配置（需将 WinDivert.dll 与 WinDivert64.sys 置于 flowx.exe 同级目录，或通过 DllPath 指定绝对路径） -->
+  <TransparentProxy enabled="false">
+    <HijackDns>true</HijackDns>
+    <BlockQuicForProxied>true</BlockQuicForProxied>
+    <!-- 可选：<DllPath>C:\tools\WinDivert\WinDivert.dll</DllPath> -->
+  </TransparentProxy>
   <ProxyList>
     <Proxy id="101" type="SOCKS5">
       <Name>Node-101 (主节点)</Name>
@@ -11,6 +17,7 @@
   <RuleList>
     <Rule enabled="true">
       <Name>LocalBypass</Name>
+      <!-- 如需直连企业内网 10/8、172.16/12 或 Tailscale CGNAT 100.64/10，可按需追加对应网段或 *.ts.net / *.corp 等后缀 -->
       <Targets>127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16</Targets>
       <Action type="Direct"/>
     </Rule>
