@@ -2515,7 +2515,7 @@
                 <div class="tp-option-row stacked">
                   <label class="tp-option-title" for="tp-dll-path" data-i18n="tp_dll_label">Custom WinDivert.dll path (optional)</label>
                   <div class="tp-dll-row">
-                    <input type="text" class="tp-dll-input mono" id="tp-dll-path" oninput="markTransparentDllDirty()" data-i18n-placeholder="tp_dll_placeholder" placeholder="Auto-detect next to flowx.exe or enter C:\tools\WinDivert.dll">
+                    <input type="text" class="tp-dll-input mono" id="tp-dll-path" autocorrect="off" autocapitalize="none" spellcheck="false" oninput="markTransparentDllDirty()" data-i18n-placeholder="tp_dll_placeholder" placeholder="Auto-detect next to flowx.exe or enter C:\tools\WinDivert.dll">
                     <button type="button" class="btn btn-sm" id="btn-tp-save-dll" onclick="saveTransparentDllPath()" data-i18n="tp_btn_save_dll">Save</button>
                     <button type="button" class="btn btn-sm" id="btn-tp-clear-dll" onclick="clearTransparentDllPath()" data-i18n="tp_btn_clear_dll">Reset</button>
                   </div>
@@ -3142,7 +3142,19 @@
         toast_tp_config_fail: '更新透明代理配置失败',
         toast_tp_elevating: '正在请求 Windows UAC 管理员权限重启 FlowX',
         toast_tp_elevated: 'FlowX 已以管理员身份重启并接管端口',
-        toast_tp_elevate_fail: '提权重启失败'
+        toast_tp_elevate_fail: '提权重启失败',
+        tp_err_requires_admin: '开启系统级透明代理需要管理员权限',
+        tp_err_missing_driver: '未找到 WinDivert.dll 或 WinDivert64.sys 驱动文件',
+        tp_err_unsupported_os: '当前操作系统不支持 WinDivert 透明代理（仅支持 Windows）',
+        tp_err_load_failed: '加载 WinDivert.dll 失败',
+        tp_err_open_socket: '打开 WinDivert SOCKET 层句柄失败',
+        tp_err_open_network: '打开 WinDivert NETWORK 层句柄失败',
+        tp_err_uac_cancelled: '管理员 UAC 提权授权已取消或被拒绝',
+        tp_err_elevate_in_progress: '管理员提权重启正在进行中',
+        tp_err_already_elevated: '当前进程已具备管理员权限',
+        tp_err_elevate_failed: '触发管理员提权重启失败',
+        tp_err_invalid_dll_path: 'WinDivert DLL 路径无效或包含非法字符',
+        tp_err_start_failed: 'WinDivert 透明代理启动失败'
       },
       'en-US': {
         app_title: 'FlowX — Transparent Proxy & Process Routing Console',
@@ -3434,7 +3446,19 @@
         toast_tp_config_fail: 'Failed to update transparent proxy configuration',
         toast_tp_elevating: 'Requesting Windows UAC elevation to restart FlowX',
         toast_tp_elevated: 'FlowX restarted with Administrator privileges',
-        toast_tp_elevate_fail: 'Administrator elevation failed'
+        toast_tp_elevate_fail: 'Administrator elevation failed',
+        tp_err_requires_admin: 'Administrator privileges are required to enable transparent proxy',
+        tp_err_missing_driver: 'WinDivert.dll or WinDivert64.sys binaries were not found',
+        tp_err_unsupported_os: 'WinDivert transparent proxy is only supported on Windows',
+        tp_err_load_failed: 'Failed to load WinDivert.dll',
+        tp_err_open_socket: 'Failed to open WinDivert SOCKET layer handle',
+        tp_err_open_network: 'Failed to open WinDivert NETWORK layer handle',
+        tp_err_uac_cancelled: 'Administrator UAC elevation prompt was cancelled or denied',
+        tp_err_elevate_in_progress: 'Administrator elevation relaunch is already in progress',
+        tp_err_already_elevated: 'FlowX is already running with Administrator privileges',
+        tp_err_elevate_failed: 'Failed to launch elevated FlowX instance',
+        tp_err_invalid_dll_path: 'Invalid WinDivert DLL path or illegal characters',
+        tp_err_start_failed: 'Failed to start WinDivert transparent proxy'
       }
     };
 
@@ -3453,6 +3477,7 @@
       pendingForcedPoll: false,
       pollTimerId: null,
       pollSeq: 0,
+      tpSeq: 0,
       nodesSeq: 0,
       rulesSeq: 0,
       simSeq: 0,
@@ -4053,7 +4078,12 @@
         renderChart();
 
         if (sysData) {
-          state.system = sysData;
+          if (state.tpBusy || state.tpElevating) {
+            const preservedTp = state.system ? state.system.transparent : undefined;
+            state.system = preservedTp !== undefined ? { ...sysData, transparent: preservedTp } : sysData;
+          } else {
+            state.system = sysData;
+          }
           renderSystemInfo();
         }
 
@@ -4157,7 +4187,6 @@
 
       const elevateBtn = document.getElementById('btn-tp-elevate');
       elevateBtn.style.display = supported && !elevated ? 'inline-flex' : 'none';
-      elevateBtn.disabled = state.tpBusy || state.tpElevating;
 
       const masterEl = document.getElementById('tp-toggle-switch');
       const dnsEl = document.getElementById('tp-hijack-dns');
@@ -4175,12 +4204,13 @@
         }
       }
       const locked = state.tpBusy || state.tpElevating || !supported;
+      elevateBtn.disabled = locked;
       masterEl.disabled = locked;
-      dnsEl.disabled = state.tpBusy || state.tpElevating;
-      quicEl.disabled = state.tpBusy || state.tpElevating;
-      dllInput.disabled = state.tpBusy || state.tpElevating;
-      saveBtn.disabled = state.tpBusy || state.tpElevating;
-      clearBtn.disabled = state.tpBusy || state.tpElevating;
+      dnsEl.disabled = locked;
+      quicEl.disabled = locked;
+      dllInput.disabled = locked;
+      saveBtn.disabled = locked;
+      clearBtn.disabled = locked;
 
       const driverEl = document.getElementById('tp-driver-status');
       if (dllFound && sysFound) {
@@ -4222,7 +4252,7 @@
       } else if (tp && d.last_error && !(!elevated && String(d.last_error).startsWith('ERR_TRANSPARENT_REQUIRES_ADMIN:'))) {
         alertBox.className = 'tp-alert error';
         alertBox.setAttribute('role', 'alert');
-        alertText.textContent = d.last_error;
+        alertText.textContent = formatTransparentError(d.last_error);
         alertBox.style.display = 'flex';
       } else if (tp && !elevated) {
         alertText.textContent = t('tp_msg_need_admin');
@@ -4232,21 +4262,56 @@
       }
     }
 
+    function formatTransparentError(raw) {
+      const msg = String(raw || '').trim();
+      const map = [
+        ['ERR_TRANSPARENT_REQUIRES_ADMIN:', 'tp_err_requires_admin'],
+        ['ERR_TRANSPARENT_MISSING_DRIVER:', 'tp_err_missing_driver'],
+        ['ERR_TRANSPARENT_UNSUPPORTED_OS:', 'tp_err_unsupported_os'],
+        ['ERR_TRANSPARENT_LOAD_FAILED:', 'tp_err_load_failed'],
+        ['ERR_TRANSPARENT_OPEN_SOCKET_LAYER:', 'tp_err_open_socket'],
+        ['ERR_TRANSPARENT_OPEN_NETWORK_LAYER:', 'tp_err_open_network'],
+        ['ERR_TRANSPARENT_UAC_CANCELLED:', 'tp_err_uac_cancelled'],
+        ['ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:', 'tp_err_elevate_in_progress'],
+        ['ERR_TRANSPARENT_ALREADY_ELEVATED:', 'tp_err_already_elevated'],
+        ['ERR_TRANSPARENT_ELEVATE_FAILED:', 'tp_err_elevate_failed'],
+        ['ERR_TRANSPARENT_INVALID_DLL_PATH:', 'tp_err_invalid_dll_path'],
+        ['ERR_TRANSPARENT_START_FAILED:', 'tp_err_start_failed']
+      ];
+      for (const [prefix, key] of map) {
+        if (msg.startsWith(prefix)) {
+          const localized = t(key);
+          const detail = msg.slice(prefix.length).trim();
+          // 英文错误仅附加简短诊断明细（如底层 Win32 错误码），常规文案直接使用当前界面语言
+          if (state.lang === 'zh-CN' && (prefix === 'ERR_TRANSPARENT_REQUIRES_ADMIN:' || prefix === 'ERR_TRANSPARENT_UNSUPPORTED_OS:' || prefix === 'ERR_TRANSPARENT_UAC_CANCELLED:' || prefix === 'ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:' || prefix === 'ERR_TRANSPARENT_ALREADY_ELEVATED:')) {
+            return localized;
+          }
+          return detail ? `${localized} (${detail})` : localized;
+        }
+      }
+      return msg;
+    }
+
     function markTransparentDllDirty() {
-      state.tpDllDirty = true;
+      const dllInput = document.getElementById('tp-dll-path');
+      const saved = (state.system && state.system.transparent && state.system.transparent.configured_dll_path) || '';
+      state.tpDllDirty = Boolean(dllInput && dllInput.value !== saved);
     }
 
     async function applyTransparentStatusPayload(data) {
+      ++state.pollSeq;
       if (!state.system) state.system = {};
       state.system.transparent = data;
       renderTransparentCard(data);
     }
 
     async function refreshTransparentStatus() {
+      const myTpSeq = ++state.tpSeq;
       try {
         const res = await fetchWithTimeout('/api/transparent/status');
         if (res.ok) {
           const data = await res.json();
+          if (myTpSeq !== state.tpSeq) return;
           await applyTransparentStatusPayload(data);
         }
       } catch (_) {}
@@ -4255,6 +4320,7 @@
     async function onTransparentToggleChange(enabled) {
       if (state.tpBusy || state.tpElevating) return;
       state.tpBusy = true;
+      const myTpSeq = ++state.tpSeq;
       renderTransparentCard(state.system.transparent);
       try {
         const res = await fetchWithTimeout('/api/transparent/toggle', {
@@ -4263,6 +4329,7 @@
           body: JSON.stringify({ enabled: Boolean(enabled) })
         });
         const data = await res.json().catch(() => ({}));
+        if (myTpSeq !== state.tpSeq) return;
         if (res.ok) {
           await applyTransparentStatusPayload(data);
           showToast(t(enabled ? 'toast_tp_enabled' : 'toast_tp_disabled'));
@@ -4271,6 +4338,7 @@
           await refreshTransparentStatus();
         }
       } catch (e) {
+        if (myTpSeq !== state.tpSeq) return;
         showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
         await refreshTransparentStatus();
       } finally {
@@ -4282,6 +4350,9 @@
     async function sendTransparentConfig(payload) {
       if (state.tpBusy || state.tpElevating) return false;
       state.tpBusy = true;
+      const myTpSeq = ++state.tpSeq;
+      const touchesDll = Object.prototype.hasOwnProperty.call(payload, 'dll_path')
+        || Object.prototype.hasOwnProperty.call(payload, 'clear_dll_path');
       renderTransparentCard(state.system.transparent);
       try {
         const res = await fetchWithTimeout('/api/transparent/config', {
@@ -4290,8 +4361,9 @@
           body: JSON.stringify(payload)
         });
         const data = await res.json().catch(() => ({}));
+        if (myTpSeq !== state.tpSeq) return false;
         if (res.ok) {
-          state.tpDllDirty = false;
+          if (touchesDll) state.tpDllDirty = false;
           await applyTransparentStatusPayload(data);
           showToast(t('toast_tp_config_saved'));
           return true;
@@ -4300,6 +4372,7 @@
         await refreshTransparentStatus();
         return false;
       } catch (e) {
+        if (myTpSeq !== state.tpSeq) return false;
         showToast(t('toast_req_fail', { error: netErrText(e) }), 'error');
         await refreshTransparentStatus();
         return false;
@@ -4320,7 +4393,6 @@
     }
 
     async function clearTransparentDllPath() {
-      document.getElementById('tp-dll-path').value = '';
       await sendTransparentConfig({ clear_dll_path: true });
     }
 
