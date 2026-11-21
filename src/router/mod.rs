@@ -153,6 +153,27 @@ impl Rule {
         }
     }
 
+    /// 判断规则是否因禁用或 Fail-Closed 空匹配集（非法/空白 apps、ports 或 targets 解析出 `Some(vec![])`）而永远不可匹配
+    pub(crate) fn is_unmatchable(&self) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if self.application_patterns.as_ref().is_some_and(Vec::is_empty) {
+            return true;
+        }
+        if self.ports.as_ref().is_some_and(Vec::is_empty) {
+            return true;
+        }
+        let has_target_constraint = self.target_domains.is_some() || self.target_subnets.is_some();
+        if has_target_constraint
+            && self.target_domains.as_ref().is_none_or(Vec::is_empty)
+            && self.target_subnets.as_ref().is_none_or(Vec::is_empty)
+        {
+            return true;
+        }
+        false
+    }
+
     /// 仅评估启用状态与应用进程约束（供端口无关的 DNS 预判与通用匹配复用）
     pub fn matches_app_only(&self, ctx: &RouteContext) -> Result<(), &'static str> {
         if !self.enabled {
@@ -393,23 +414,23 @@ fn is_non_hijackable_local_qname(qname: &str, local_hostname: &str) -> bool {
     lower == "localhost"
         || lower.ends_with(".localhost")
         || lower.ends_with(".local")
-        || lower.ends_with(".lan")
-        || lower.ends_with(".localdomain")
         || lower.ends_with(".home.arpa")
         || lower == "arpa"
         || lower.ends_with(".arpa")
         || (!local_norm.is_empty() && lower == local_norm)
 }
 
-/// 常见家用/企业内网与 VPN 私有后缀（如 `.home`/`.corp`/`.internal`/`.intranet`/`.ts.net`）：
-/// 不应被无域名约束的通配规则或默认全局代理隐式劫持/拦截，仅在用户显式配置匹配该域名的规则时生效。
+/// 常见家用/企业内网与 VPN 私有后缀（如 `.lan`/`.localdomain`/`.home`/`.corp`/`.internal`/`.intranet`/`.ts.net`）：
+/// 不应被无域名约束的通配规则或默认全局代理隐式劫持/拦截，但允许用户显式配置匹配该域名的规则生效。
 fn is_implicit_private_qname(qname: &str) -> bool {
     let norm = qname.trim().trim_end_matches('.');
     if norm.is_empty() {
         return false;
     }
     let lower = norm.to_ascii_lowercase();
-    lower.ends_with(".home")
+    lower.ends_with(".lan")
+        || lower.ends_with(".localdomain")
+        || lower.ends_with(".home")
         || lower.ends_with(".corp")
         || lower.ends_with(".internal")
         || lower.ends_with(".intranet")
@@ -612,7 +633,7 @@ impl RuleEngine {
         let mut speculative_actions: Vec<Action> = Vec::new();
 
         for rule in rules.iter() {
-            if rule.matches_app_and_port(&ctx).is_err() {
+            if rule.is_unmatchable() || rule.matches_app_and_port(&ctx).is_err() {
                 continue;
             }
             if rule.target_domains.is_none() && rule.target_subnets.is_none() {
@@ -674,7 +695,7 @@ impl RuleEngine {
         let mut saw_other_app_domain_hijack = false;
 
         for rule in rules.iter() {
-            if !rule.enabled {
+            if rule.is_unmatchable() {
                 continue;
             }
             // 无域名目标却仅限端口的规则（如仅 port 22 -> Block）不应在无端口语义的 DNS 阶段劫持整域 Fake-IP；
@@ -778,7 +799,7 @@ impl RuleEngine {
         let rules = self.current_rules();
 
         for rule in rules.iter() {
-            if !rule.enabled {
+            if rule.is_unmatchable() {
                 continue;
             }
             if rule.target_domains.is_none() && rule.ports.is_some() {
@@ -831,7 +852,7 @@ impl RuleEngine {
         let rules = self.current_rules();
 
         for rule in rules.iter() {
-            if !rule.enabled || rule.matches_port_only(target_port).is_err() {
+            if rule.is_unmatchable() || rule.matches_port_only(target_port).is_err() {
                 continue;
             }
             let wildcard_target = rule.target_domains.is_none() && rule.target_subnets.is_none();
@@ -1705,6 +1726,96 @@ mod tests {
             None,
             Some("svchost.exe"),
             "unrelated.example",
+        ));
+
+        // P2-3: 显式针对 *.lan / *.localdomain 的 Proxy/Block 规则必须在 DNS 阶段生效（不再被前置无条件短路）
+        let explicit_lan_proxy = RuleEngine::new(
+            vec![Rule::from_raw(
+                "ExplicitLan",
+                true,
+                None,
+                Some("*.lan; *.localdomain"),
+                None,
+                Action::Proxy(101),
+            )],
+            Action::Direct,
+        );
+        assert_eq!(
+            explicit_lan_proxy.classify_dns_query(None, Some("svchost.exe"), "router.lan", true),
+            DnsHijackDecision::Hijack
+        );
+        assert_eq!(
+            explicit_lan_proxy.classify_dns_query(None, Some("svchost.exe"), "srv.localdomain", true),
+            DnsHijackDecision::Hijack
+        );
+        // .local (mDNS) 仍保持不可劫持
+        let explicit_mdns = RuleEngine::new(
+            vec![Rule::from_raw(
+                "ExplicitLocal",
+                true,
+                None,
+                Some("*.local"),
+                None,
+                Action::Proxy(101),
+            )],
+            Action::Direct,
+        );
+        assert_eq!(
+            explicit_mdns.classify_dns_query(None, Some("svchost.exe"), "printer.local", true),
+            DnsHijackDecision::Passthrough
+        );
+
+        // P3-4: Fail-Closed 空规则（非法 apps 或 ports 产生 Some(vec![])）不得污染 DNS 预判或触发 InspectDns
+        let dead_rules_engine = RuleEngine::new(
+            vec![
+                Rule::from_raw(
+                    "DeadAppsDomain",
+                    true,
+                    Some(";;;"),
+                    Some("*.dead.example"),
+                    None,
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
+                    "DeadPortsDomain",
+                    true,
+                    None,
+                    Some("*.deadport.example"),
+                    Some("not-a-port"),
+                    Action::Proxy(101),
+                ),
+                Rule::from_raw(
+                    "DeadAppsWildcard",
+                    true,
+                    Some(";;;"),
+                    None,
+                    None,
+                    Action::Proxy(101),
+                ),
+            ],
+            Action::Direct,
+        );
+        assert_eq!(
+            dead_rules_engine.classify_dns_query(None, Some("svchost.exe"), "a.dead.example", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert_eq!(
+            dead_rules_engine.classify_dns_query(None, Some("svchost.exe"), "a.deadport.example", true),
+            DnsHijackDecision::Passthrough
+        );
+        assert!(!dead_rules_engine.should_inspect_shared_dns(
+            None,
+            Some("svchost.exe"),
+            "a.dead.example",
+        ));
+        assert!(!dead_rules_engine.should_inspect_shared_dns(
+            None,
+            Some("svchost.exe"),
+            "public.example",
+        ));
+        assert!(!dead_rules_engine.has_reachable_app_scoped_override(
+            Some("93.184.216.34".parse().unwrap()),
+            443,
         ));
     }
 }
