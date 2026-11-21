@@ -244,6 +244,7 @@ fn translate_zh(key: &str) -> &'static str {
         "error.transparent_elevate_in_progress" => "管理员提权重启正在进行中，请完成当前 UAC 授权或等待重启完成",
         "error.transparent_elevate_failed" => "触发管理员提权重启失败",
         "error.transparent_start_failed" => "WinDivert 透明代理启动失败",
+        "error.server_shutting_down" => "FlowX 服务正在关闭，暂不接受新的变更请求",
 
         _ => "未知错误",
     }
@@ -338,6 +339,7 @@ fn translate_en(key: &str) -> &'static str {
         "error.transparent_elevate_in_progress" => "Administrator elevation relaunch is already in progress",
         "error.transparent_elevate_failed" => "Failed to launch elevated FlowX instance",
         "error.transparent_start_failed" => "Failed to start WinDivert transparent proxy",
+        "error.server_shutting_down" => "FlowX server is shutting down and cannot accept new mutations",
 
         _ => "Unknown error",
     }
@@ -397,6 +399,7 @@ mod tests {
             "error.transparent_elevate_in_progress",
             "error.transparent_elevate_failed",
             "error.transparent_start_failed",
+            "error.server_shutting_down",
         ] {
             assert_ne!(t(Locale::Zh, key), "未知错误", "missing zh key: {key}");
             assert_ne!(t(Locale::En, key), "Unknown error", "missing en key: {key}");

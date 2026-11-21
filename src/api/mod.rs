@@ -998,11 +998,33 @@ async fn handle_api_request(
             return Ok(());
         }
 
-        let already_shutting_down = shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow());
-        if already_shutting_down
-            || elevating
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
+        if elevating.load(Ordering::Acquire) {
+            send_http_response(
+                &mut stream,
+                "409 Conflict",
+                "application/json; charset=utf-8",
+                &json_error(
+                    locale,
+                    "ERR_TRANSPARENT_ELEVATE_IN_PROGRESS",
+                    "error.transparent_elevate_in_progress",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow()) {
+            send_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json_error(locale, "ERR_SERVER_SHUTTING_DOWN", "error.server_shutting_down"),
+            )
+            .await?;
+            return Ok(());
+        }
+        if elevating
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
         {
             send_http_response(
                 &mut stream,
@@ -1017,20 +1039,28 @@ async fn handle_api_request(
             .await?;
             return Ok(());
         }
+        // Double-check 防止刚拿到闸门的同时收到 Ctrl+C 停机信号
+        if shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow()) {
+            elevating.store(false, Ordering::Release);
+            send_http_response(
+                &mut stream,
+                "503 Service Unavailable",
+                "application/json; charset=utf-8",
+                &json_error(locale, "ERR_SERVER_SHUTTING_DOWN", "error.server_shutting_down"),
+            )
+            .await?;
+            return Ok(());
+        }
 
         let mut trigger_elevated_shutdown = false;
         let (status, content_type, body) = handle_transparent_elevate_after_gate(
             locale,
-            &elevating,
+            Arc::clone(&elevating),
+            shutdown_tx.clone(),
             elevate_runner,
             &mut trigger_elevated_shutdown,
         )
         .await;
-        if trigger_elevated_shutdown
-            && let Some(tx) = shutdown_tx.as_ref()
-        {
-            let _ = tx.send(true);
-        }
         finish_api_response_and_maybe_shutdown(
             &mut stream,
             status,
@@ -1069,15 +1099,24 @@ async fn handle_api_request(
         if shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow()) {
             drop(lock_guard);
             drop(sem_permit);
-            send_http_response(
-                &mut stream,
-                "409 Conflict",
-                "application/json; charset=utf-8",
-                &json_error(
-                    locale,
+            let (st, code, key) = if elevating.load(Ordering::Acquire) {
+                (
+                    "409 Conflict",
                     "ERR_TRANSPARENT_ELEVATE_IN_PROGRESS",
                     "error.transparent_elevate_in_progress",
-                ),
+                )
+            } else {
+                (
+                    "503 Service Unavailable",
+                    "ERR_SERVER_SHUTTING_DOWN",
+                    "error.server_shutting_down",
+                )
+            };
+            send_http_response(
+                &mut stream,
+                st,
+                "application/json; charset=utf-8",
+                &json_error(locale, code, key),
             )
             .await?;
             return Ok(());
@@ -1616,7 +1655,6 @@ fn is_mutation_endpoint(method: &str, path: &str) -> bool {
                     | "/api/rules/toggle"
                     | "/api/rules/move"
                     | "/api/transparent/toggle"
-                    | "/api/transparent/elevate"
             )
             | ("PUT" | "POST", "/api/transparent/config")
     )
@@ -2790,12 +2828,12 @@ async fn handle_transparent_config(
     .await
 }
 
-struct ElevateFlagResetGuard<'a> {
-    flag: &'a AtomicBool,
+struct ElevateFlagResetGuard {
+    flag: Arc<AtomicBool>,
     armed: bool,
 }
 
-impl Drop for ElevateFlagResetGuard<'_> {
+impl Drop for ElevateFlagResetGuard {
     fn drop(&mut self) {
         if self.armed {
             self.flag.store(false, Ordering::Release);
@@ -2805,30 +2843,43 @@ impl Drop for ElevateFlagResetGuard<'_> {
 
 async fn handle_transparent_elevate_after_gate(
     locale: Locale,
-    elevating: &AtomicBool,
+    elevating: Arc<AtomicBool>,
+    shutdown_tx: Option<watch::Sender<bool>>,
     elevate_runner: Option<ElevateRunner>,
     trigger_elevated_shutdown: &mut bool,
 ) -> (&'static str, &'static str, String) {
     let ct = "application/json; charset=utf-8";
-    let mut reset_guard = ElevateFlagResetGuard {
-        flag: elevating,
-        armed: true,
-    };
 
-    #[cfg(test)]
-    let launch_fut = tokio::task::spawn_blocking(move || match elevate_runner {
-        Some(runner) => runner(),
-        None => relaunch_elevated_with_replace_pid(&[]),
+    // 将 ElevateFlagResetGuard 与 shutdown_tx 同步迁入 spawn_blocking 内部：
+    // 1) 若客户端在 UAC 弹窗期间断开或取消异步 future，elevating 绝不会提前复位（杜绝弹第二个 UAC），
+    //    且用户最终点允许后阻塞线程仍会立即发送 shutdown_tx(true) 平滑交接端口；
+    // 2) ShellExecuteW 返回 Ok(()) 的同一阻塞线程内立刻广播 shutdown_tx(true)，彻底消除返回到主协程间的竞态窗口。
+    let launch_fut = tokio::task::spawn_blocking(move || {
+        let mut reset_guard = ElevateFlagResetGuard {
+            flag: elevating,
+            armed: true,
+        };
+        #[cfg(test)]
+        let res = match elevate_runner {
+            Some(runner) => runner(),
+            None => relaunch_elevated_with_replace_pid(&[]),
+        };
+        #[cfg(not(test))]
+        let res = {
+            let _ = elevate_runner;
+            relaunch_elevated_with_replace_pid(&[])
+        };
+        if res.is_ok() {
+            reset_guard.armed = false;
+            if let Some(tx) = shutdown_tx.as_ref() {
+                let _ = tx.send(true);
+            }
+        }
+        res
     });
-    #[cfg(not(test))]
-    let launch_fut = {
-        let _ = elevate_runner;
-        tokio::task::spawn_blocking(|| relaunch_elevated_with_replace_pid(&[]))
-    };
 
     match launch_fut.await {
         Ok(Ok(())) => {
-            reset_guard.armed = false;
             *trigger_elevated_shutdown = true;
             ("200 OK", ct, r#"{"ok":true,"relaunching":true}"#.to_string())
         }
@@ -5272,7 +5323,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_elevate_is_mutation_and_always_signals_shutdown() {
-        assert!(is_mutation_endpoint("POST", "/api/transparent/elevate"));
+        // /api/transparent/elevate 使用前置独立原子闸门，不再落入 mutation_lock 死分支
+        assert!(!is_mutation_endpoint("POST", "/api/transparent/elevate"));
+        assert!(is_mutation_endpoint("POST", "/api/transparent/toggle"));
         assert!(!is_mutation_endpoint("GET", "/api/transparent/status"));
 
         // 即使响应写入期间客户端提前断开连接，触发提权重启停机时仍必须广播 shutdown_tx
@@ -5472,6 +5525,106 @@ mod tests {
         assert!(*shutdown_rx.borrow());
 
         let _ = server_task.await;
+
+        // 6. 验证 Ctrl+C 正常停机（shutdown_tx=true 且 elevating=false）不会误报 ERR_TRANSPARENT_ELEVATE_IN_PROGRESS，
+        //    而是返回 503 ERR_SERVER_SHUTTING_DOWN；同时验证异步 future 取消后 ElevateFlagResetGuard 仍留在 blocking 线程内
+        let (ctrl_c_tx, _ctrl_c_rx) = watch::channel(true);
+        let mgr2 = Arc::new(ConnectionManager::new());
+        let re2 = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes2 = Arc::new(RwLock::new(HashMap::new()));
+        let mut_lock = Arc::new(Mutex::new(()));
+        let mut_sem = Arc::new(Semaphore::new(4));
+        let ping_sem = Arc::new(Semaphore::new(4));
+        let elev_flag = Arc::new(AtomicBool::new(false));
+        let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let p2 = a2.port();
+        let h2 = tokio::spawn(async move {
+            let (stream, _) = l2.accept().await.unwrap();
+            handle_api_request(
+                stream,
+                p2,
+                Arc::new(vec![p2]),
+                mgr2,
+                re2,
+                nodes2,
+                None,
+                None,
+                None,
+                Some(ctrl_c_tx),
+                ping_sem,
+                mut_sem,
+                mut_lock,
+                elev_flag,
+                None,
+                Duration::from_secs(1),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        });
+        let shutdown_resp = raw_http(
+            a2,
+            &format!(
+                "POST /api/rules/default HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: 19\r\n\r\n{{\"action\":\"Direct\"}}",
+                p2
+            ),
+        )
+        .await;
+        h2.await.unwrap();
+        assert!(
+            shutdown_resp.starts_with("HTTP/1.1 503 Service Unavailable"),
+            "Ctrl+C shutdown should return 503, got: {shutdown_resp}"
+        );
+        assert!(shutdown_resp.contains("ERR_SERVER_SHUTTING_DOWN"));
+        assert!(!shutdown_resp.contains("ERR_TRANSPARENT_ELEVATE_IN_PROGRESS"));
+
+        // 7. 异步 future 被取消时，spawn_blocking 内的 ElevateFlagResetGuard 仍持续锁住 elevating 直到 UAC 返回，
+        //    且用户确认后仍立即广播 shutdown_tx
+        let (uac_in_tx, uac_in_rx) = std::sync::mpsc::channel::<()>();
+        let (uac_out_tx, uac_out_rx) = std::sync::mpsc::channel::<std::io::Result<()>>();
+        let uac_in_tx = Arc::new(std::sync::Mutex::new(Some(uac_in_tx)));
+        let uac_out_rx = Arc::new(std::sync::Mutex::new(uac_out_rx));
+        let blocking_runner: ElevateRunner = Arc::new(move || {
+            if let Some(tx) = uac_in_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            uac_out_rx.lock().unwrap().recv().unwrap()
+        });
+        let elev_cancel_flag = Arc::new(AtomicBool::new(true));
+        let (cancel_sd_tx, cancel_sd_rx) = watch::channel(false);
+        let cancelled_task = tokio::spawn({
+            let flag = Arc::clone(&elev_cancel_flag);
+            let sd_tx = cancel_sd_tx.clone();
+            async move {
+                let mut trig = false;
+                let _ = handle_transparent_elevate_after_gate(
+                    Locale::En,
+                    flag,
+                    Some(sd_tx),
+                    Some(blocking_runner),
+                    &mut trig,
+                )
+                .await;
+            }
+        });
+        tokio::task::spawn_blocking(move || uac_in_rx.recv().unwrap())
+            .await
+            .unwrap();
+        cancelled_task.abort();
+        let _ = cancelled_task.await;
+        assert!(
+            elev_cancel_flag.load(Ordering::Acquire),
+            "elevating must remain true while blocking UAC thread is still open after async cancel"
+        );
+        uac_out_tx.send(Ok(())).unwrap();
+        let mut rx_wait = cancel_sd_rx.clone();
+        tokio::time::timeout(Duration::from_secs(1), rx_wait.changed())
+            .await
+            .expect("blocking thread must still signal shutdown_tx when UAC succeeds after async cancel")
+            .unwrap();
+        assert!(*cancel_sd_rx.borrow());
+        assert!(elev_cancel_flag.load(Ordering::Acquire));
     }
 
     #[tokio::test]
