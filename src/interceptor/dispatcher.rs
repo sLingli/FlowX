@@ -216,7 +216,7 @@ struct DispatchSession {
     display_target: TargetAddr,
     route_ip: Option<IpAddr>,
     dial_policy: DialTargetPolicy,
-    direct_dns_override: Option<SocketAddr>,
+    direct_dns_overrides: Vec<SocketAddr>,
     pending: Vec<u8>,
     http_body_framing: Option<inbound::HttpBodyFraming>,
     body_prefix: Vec<u8>,
@@ -309,7 +309,7 @@ async fn evaluate_and_relay_stream<S: RelayStream>(
 
     let cancel_token = Arc::clone(&active_conn);
     let mut remote_stream = tokio::select! {
-        res = connect_outbound(config, &action, &dial_target, session.direct_dns_override) => {
+        res = connect_outbound(config, &action, &dial_target, &session.direct_dns_overrides) => {
             match res {
                 Ok(s) => s,
                 Err(e) => {
@@ -395,11 +395,11 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
     };
 
     // 3. 若命中 Fake-IP 池直接还原域名与原始上游 DNS；否则优先按需嗅探 TLS SNI / HTTP Host，仅在无嗅探结果时回退至唯一被动 DNS 映射
-    let (display_target, route_ip, dial_policy, direct_dns_override, pending) =
+    let (display_target, route_ip, dial_policy, direct_dns_overrides, pending) =
         if config.fake_ip_pool.is_fake_ip_addr(orig_dst.ip()) {
-            let (domain, orig_dns) = config
+            let (domain, orig_dns_list) = config
                 .fake_ip_pool
-                .restore_ip_with_dns(orig_dst.ip())
+                .restore_ip_with_dns_list(orig_dst.ip())
                 .ok_or_else(|| {
                     anyhow!(
                         "Fake-IP {} domain mapping expired or does not exist",
@@ -411,7 +411,7 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                 target,
                 None,
                 DialTargetPolicy::UseDisplayTarget,
-                orig_dns,
+                orig_dns_list,
                 Vec::new(),
             )
         } else {
@@ -461,21 +461,21 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                     TargetAddr::Domain(host, orig_dst.port()),
                     Some(orig_dst.ip()),
                     DialTargetPolicy::IpOnDirectDomainOnProxy(orig_dst),
-                    None,
+                    Vec::new(),
                     buffered,
                 ),
                 (None, Some(host)) => (
                     TargetAddr::Domain(host, orig_dst.port()),
                     Some(orig_dst.ip()),
                     DialTargetPolicy::AlwaysUseRealIp(orig_dst),
-                    None,
+                    Vec::new(),
                     buffered,
                 ),
                 (None, None) => (
                     TargetAddr::Ip(orig_dst),
                     Some(orig_dst.ip()),
                     DialTargetPolicy::UseDisplayTarget,
-                    None,
+                    Vec::new(),
                     buffered,
                 ),
             }
@@ -500,7 +500,7 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
             display_target,
             route_ip,
             dial_policy,
-            direct_dns_override,
+            direct_dns_overrides,
             pending,
             http_body_framing: None,
             body_prefix: Vec::new(),
@@ -538,17 +538,19 @@ async fn handle_connection(
     let pid = proc_info.as_ref().map(|p| p.pid).unwrap_or(0);
 
     // 3. If target is Fake-IP (IPv4 or IPv4-mapped IPv6), restore original domain (prevent DNS leak, let upstream proxy resolve)
-    let (target, direct_dns_override) = match &target {
+    let (target, direct_dns_overrides) = match &target {
         TargetAddr::Ip(addr) if config.fake_ip_pool.is_fake_ip_addr(addr.ip()) => {
-            match config.fake_ip_pool.restore_ip_with_dns(addr.ip()) {
-                Some((domain, orig_dns)) => (TargetAddr::Domain(domain, addr.port()), orig_dns),
+            match config.fake_ip_pool.restore_ip_with_dns_list(addr.ip()) {
+                Some((domain, orig_dns_list)) => {
+                    (TargetAddr::Domain(domain, addr.port()), orig_dns_list)
+                }
                 None => {
                     inbound::send_failure(&mut local_stream, kind, false).await.ok();
                     bail!("Fake-IP {} domain mapping expired or does not exist", addr.ip());
                 }
             }
         }
-        _ => (target, None),
+        _ => (target, Vec::new()),
     };
 
     // 4. Loop prevention: reject requests targeting FlowX internal service ports
@@ -578,7 +580,7 @@ async fn handle_connection(
             display_target: target,
             route_ip,
             dial_policy: DialTargetPolicy::UseDisplayTarget,
-            direct_dns_override,
+            direct_dns_overrides,
             pending,
             http_body_framing,
             body_prefix,
@@ -592,15 +594,15 @@ async fn connect_outbound(
     config: &DispatcherConfig,
     action: &Action,
     target: &TargetAddr,
-    direct_dns_override: Option<SocketAddr>,
+    direct_dns_overrides: &[SocketAddr],
 ) -> Result<crate::outbound::OutboundTcpStream> {
     match action {
         Action::Block => bail!("Connection blocked by rule"),
         Action::Direct => {
-            DirectOutbound::connect_guarded_with_dns_fallback(
+            DirectOutbound::connect_guarded_with_dns_candidates(
                 target,
                 config.upstream_dns,
-                direct_dns_override,
+                direct_dns_overrides,
                 Some(config.fake_ip_pool.as_ref()),
                 &config.self_ports,
             )

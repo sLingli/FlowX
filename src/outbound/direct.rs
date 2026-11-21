@@ -2,8 +2,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::dns::server::resolve_via_upstream_dns;
-use crate::dns::FakeIpPool;
+use crate::dns::server::{resolve_via_upstream_dns, DnsNxDomainError};
+use crate::dns::{
+    canonicalize_socket_addr_preserving_scope, sanitize_upstream_dns_addr, FakeIpPool,
+};
 use super::bypass::{connect_tcp_guarded, OutboundTcpStream};
 use super::{is_local_or_loopback_ip, is_loopback_domain, local_interface_ips, TargetAddr};
 
@@ -188,16 +190,31 @@ impl DirectOutbound {
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<OutboundTcpStream> {
-        Self::connect_guarded_with_dns_fallback(target, upstream_dns, None, fake_ip_pool, self_ports)
+        Self::connect_guarded_with_dns_candidates(target, upstream_dns, &[], fake_ip_pool, self_ports)
             .await
     }
 
     /// 显式直连：若存在 `preferred_dns`（例如透明 Fake-IP 分配阶段记录的原路由器/企业分域 DNS），
-    /// 优先向 `preferred_dns` 解析；若失败且与默认 `upstream_dns` 不同，则在剩余预算内回退至 `upstream_dns`。
+    /// 优先向清洗后的 `preferred_dns` 解析；若网络不可达/超时则回退至 `upstream_dns`，
+    /// 若权威 `orig_dns` 返回 `NXDOMAIN` 则绝不向公网 `upstream_dns` 泄露内网不存在域名。
     pub async fn connect_guarded_with_dns_fallback(
         target: &TargetAddr,
         upstream_dns: SocketAddr,
         preferred_dns: Option<SocketAddr>,
+        fake_ip_pool: Option<&FakeIpPool>,
+        self_ports: &[u16],
+    ) -> Result<OutboundTcpStream> {
+        let slice = preferred_dns.as_slice();
+        Self::connect_guarded_with_dns_candidates(target, upstream_dns, slice, fake_ip_pool, self_ports)
+            .await
+    }
+
+    /// 支持多 `orig_dns` 候选列表的显式直连回源解析（企业 VPN DNS + 备选网卡 DNS 共存时依次尝试，
+    /// 发起查询前过滤 `169.254/16` / `255.255.255.255` / Fake-IP / 未带 `scope_id` 的 `fe80::` / `self_ports`）。
+    pub async fn connect_guarded_with_dns_candidates(
+        target: &TargetAddr,
+        upstream_dns: SocketAddr,
+        preferred_dns_list: &[SocketAddr],
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<OutboundTcpStream> {
@@ -233,61 +250,107 @@ impl DirectOutbound {
                         let dns_deadline = tokio::time::Instant::now()
                             + DIRECT_DNS_TIMEOUT
                                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-                        let primary_dns = preferred_dns.unwrap_or(upstream_dns);
-                        let fallback_dns = preferred_dns
-                            .filter(|d| *d != upstream_dns)
-                            .map(|_| upstream_dns);
-                        let primary_budget = if fallback_dns.is_some() {
-                            (DIRECT_DNS_TIMEOUT / 2).min(
-                                dns_deadline.saturating_duration_since(tokio::time::Instant::now()),
-                            )
-                        } else {
-                            dns_deadline.saturating_duration_since(tokio::time::Instant::now())
-                        };
-                        match resolve_via_upstream_dns(
-                            domain,
-                            primary_dns,
-                            fake_ip_pool,
-                            primary_budget,
-                        )
-                        .await
-                        {
-                            Ok(ips) => ips,
-                            Err(primary_err) => {
-                                if let Some(fb_dns) = fallback_dns {
-                                    let fb_budget = dns_deadline
-                                        .saturating_duration_since(tokio::time::Instant::now());
-                                    if !fb_budget.is_zero() {
-                                        resolve_via_upstream_dns(
-                                            domain,
-                                            fb_dns,
-                                            fake_ip_pool,
-                                            fb_budget,
-                                        )
-                                        .await
-                                        .with_context(|| {
-                                            format!(
-                                                "Upstream DNS resolution failed for direct target {} (primary {}: {:#})",
-                                                domain, primary_dns, primary_err
-                                            )
-                                        })?
-                                    } else {
-                                        return Err(primary_err).with_context(|| {
-                                            format!(
-                                                "Upstream DNS resolution failed for direct target {}",
-                                                domain
-                                            )
-                                        });
+                        let canonical_upstream =
+                            canonicalize_socket_addr_preserving_scope(upstream_dns);
+                        let mut orig_candidates: Vec<SocketAddr> = Vec::new();
+                        for &cand in preferred_dns_list {
+                            if let Some(clean) =
+                                sanitize_upstream_dns_addr(cand, fake_ip_pool, self_ports)
+                                && !orig_candidates.contains(&clean)
+                            {
+                                orig_candidates.push(clean);
+                            }
+                        }
+                        let has_fallback_upstream = !orig_candidates.contains(&canonical_upstream);
+                        let total_servers =
+                            orig_candidates.len() + usize::from(has_fallback_upstream);
+
+                        let mut resolved: Option<Vec<IpAddr>> = None;
+                        let mut last_err: Option<(SocketAddr, anyhow::Error)> = None;
+                        let mut saw_authoritative_nxdomain = false;
+
+                        for (idx, &dns_server) in orig_candidates.iter().enumerate() {
+                            let rem = dns_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            if rem.is_zero() {
+                                break;
+                            }
+                            let remaining_servers = (total_servers - idx) as u32;
+                            let budget = if remaining_servers <= 1 {
+                                rem
+                            } else {
+                                (rem / remaining_servers)
+                                    .max(Duration::from_millis(300))
+                                    .min(DIRECT_DNS_TIMEOUT / 2)
+                                    .min(rem)
+                            };
+                            match resolve_via_upstream_dns(domain, dns_server, fake_ip_pool, budget)
+                                .await
+                            {
+                                Ok(ips) => {
+                                    resolved = Some(ips);
+                                    break;
+                                }
+                                Err(err) => {
+                                    if err.downcast_ref::<DnsNxDomainError>().is_some() {
+                                        saw_authoritative_nxdomain = true;
                                     }
-                                } else {
-                                    return Err(primary_err).with_context(|| {
-                                        format!(
-                                            "Upstream DNS resolution failed for direct target {}",
-                                            domain
-                                        )
-                                    });
+                                    last_err = Some((dns_server, err));
                                 }
                             }
+                        }
+
+                        if let Some(ips) = resolved {
+                            ips
+                        } else if saw_authoritative_nxdomain && !orig_candidates.is_empty() {
+                            // 权威 orig_dns 已明确返回 NXDOMAIN：禁止将内网不存在主机名回退泄露至公网 upstream_dns
+                            let (srv, err) = last_err.expect("nxdomain must record error");
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "Authoritative original DNS {} returned NXDOMAIN for direct target {} (skipped public DNS fallback)",
+                                    srv, domain
+                                )
+                            });
+                        } else if has_fallback_upstream {
+                            let fb_budget = dns_deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            if !fb_budget.is_zero() {
+                                resolve_via_upstream_dns(
+                                    domain,
+                                    canonical_upstream,
+                                    fake_ip_pool,
+                                    fb_budget,
+                                )
+                                .await
+                                .with_context(|| match &last_err {
+                                    Some((primary_dns, primary_err)) => format!(
+                                        "Upstream DNS resolution failed for direct target {} (primary {}: {:#})",
+                                        domain, primary_dns, primary_err
+                                    ),
+                                    None => format!(
+                                        "Upstream DNS resolution failed for direct target {}",
+                                        domain
+                                    ),
+                                })?
+                            } else if let Some((_, err)) = last_err {
+                                return Err(err).with_context(|| {
+                                    format!(
+                                        "Upstream DNS resolution failed for direct target {}",
+                                        domain
+                                    )
+                                });
+                            } else {
+                                bail!("Upstream DNS resolution timed out for direct target {}", domain);
+                            }
+                        } else if let Some((_, err)) = last_err {
+                            return Err(err).with_context(|| {
+                                format!(
+                                    "Upstream DNS resolution failed for direct target {}",
+                                    domain
+                                )
+                            });
+                        } else {
+                            bail!("Upstream DNS resolution failed for direct target {}", domain);
                         }
                     };
 
@@ -503,5 +566,115 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(empty_err, CandidateConnectError::NoCandidates));
+    }
+
+    #[tokio::test]
+    async fn test_direct_outbound_skips_unusable_preferred_dns_and_does_not_leak_nxdomain() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // 1. P3-1: 权威 orig_dns 返回 NXDOMAIN 时绝不得回退查询公网 fallback upstream_dns
+        let corp_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let corp_addr = corp_dns.local_addr().unwrap();
+        let public_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let public_addr = public_dns.local_addr().unwrap();
+        let public_hits = Arc::new(AtomicUsize::new(0));
+        let public_hits_c = Arc::clone(&public_hits);
+
+        let (stop_tx, mut stop_rx1) = tokio::sync::watch::channel(false);
+        let mut stop_rx2 = stop_tx.subscribe();
+        let corp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    r = corp_dns.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = r else { break };
+                        let (txid, q) = DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                        let mut resp = Vec::new();
+                        resp.extend_from_slice(&txid.to_be_bytes());
+                        resp.extend_from_slice(&[0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+                        resp.extend_from_slice(&buf[12..q.raw_len]);
+                        let _ = corp_dns.send_to(&resp, peer).await;
+                    }
+                    _ = stop_rx1.changed() => break,
+                }
+            }
+        });
+        let pub_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            loop {
+                tokio::select! {
+                    r = public_dns.recv_from(&mut buf) => {
+                        let Ok((n, peer)) = r else { break };
+                        public_hits_c.fetch_add(1, Ordering::Relaxed);
+                        let (txid, q) = DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                        let resp = if q.qtype == 1 {
+                            let mut r = Vec::new();
+                            r.extend_from_slice(&txid.to_be_bytes());
+                            r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                            r.extend_from_slice(&buf[12..q.raw_len]);
+                            r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+                            r
+                        } else {
+                            DnsPacketParser::build_empty_response(txid, &buf, q.raw_len)
+                        };
+                        let _ = public_dns.send_to(&resp, peer).await;
+                    }
+                    _ = stop_rx2.changed() => break,
+                }
+            }
+        });
+
+        let err = DirectOutbound::connect_guarded_with_dns_fallback(
+            &TargetAddr::Domain("missing-secret.corp.example".into(), 443),
+            public_addr,
+            Some(corp_addr),
+            None,
+            &[1053, 40001, 40080],
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("NXDOMAIN"),
+            "expected NXDOMAIN error, got: {err:#}"
+        );
+        assert_eq!(
+            public_hits.load(Ordering::Relaxed),
+            0,
+            "authoritative NXDOMAIN from orig_dns must never fall back to public upstream_dns"
+        );
+
+        // 2. P2-2: 不可用的 preferred_dns（如 self_port / 169.254/16 / Fake-IP / 255.255.255.255）在发起查询前直接过滤，
+        //    立即使用 fallback upstream_dns 建连成功，不浪费 1.5s 预算
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let start = std::time::Instant::now();
+        let stream = DirectOutbound::connect_guarded_with_dns_candidates(
+            &TargetAddr::Domain("filtered-pref.example".into(), ok_port),
+            public_addr,
+            &[
+                "127.0.0.1:1053".parse().unwrap(),
+                "169.254.1.1:53".parse().unwrap(),
+                "255.255.255.255:53".parse().unwrap(),
+                "198.18.0.10:53".parse().unwrap(),
+                "[fe80::1]:53".parse().unwrap(),
+            ],
+            None,
+            &[1053, 40001, 40080],
+        )
+        .await
+        .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(800),
+            "unusable preferred_dns entries must be filtered before querying"
+        );
+        drop(stream);
+        accept_task.await.unwrap();
+        assert!(public_hits.load(Ordering::Relaxed) >= 1);
+
+        let _ = stop_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(1), corp_task).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), pub_task).await;
     }
 }

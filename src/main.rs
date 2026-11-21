@@ -67,15 +67,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 2. 初始化核心组件与端口规划
-    let fake_ip_pool = Arc::new(FakeIpPool::new_default());
-    let process_tracker = Arc::new(ProcessTracker::new());
-    let connection_manager = Arc::new(ConnectionManager::new());
-
     let dns_bind: SocketAddr = "127.0.0.1:1053".parse()?;
     let upstream_dns: SocketAddr = "223.5.5.5:53".parse()?;
     let dispatcher_bind: SocketAddr = "127.0.0.1:40001".parse()?;
     let api_bind: SocketAddr = "127.0.0.1:40080".parse()?;
     let self_ports = vec![dispatcher_bind.port(), api_bind.port(), dns_bind.port()];
+
+    let fake_ip_pool = Arc::new(FakeIpPool::new_default().with_self_ports(self_ports.clone()));
+    let process_tracker = Arc::new(ProcessTracker::new());
+    let connection_manager = Arc::new(ConnectionManager::new());
 
     // 3. 从 XML 配置文件加载代理节点与路由规则（缺失时自动生成默认配置）
     let config_store = Arc::new(ConfigStore::new(&config_path));
