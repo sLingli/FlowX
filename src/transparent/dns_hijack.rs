@@ -179,6 +179,47 @@ impl PendingInspectDnsTable {
     }
 }
 
+/// 同步观测一条入站 IP 报文（支持未分片 UDP/53 及经 `FragmentTracker` 重组后的 IPv4/IPv6 分片大包 EDNS0/DNSSEC 应答）。
+/// 调用方必须在完成本函数调用后再将原始报文 `raw` 原样重注入系统网络栈，从而建立严格的 `happens-before` 顺序，
+/// 彻底消除高并发下「入站 DNS 应答落盘 vs 业务进程 TCP SYN」竞态；无论返回 `true` 或 `false`，调用方都无条件原样重注入。
+pub fn observe_inbound_dns_packet_for_inspect(
+    raw: &[u8],
+    meta: crate::transparent::netstack::PacketInterfaceMeta,
+    inbound_fragments: &mut crate::transparent::fragment::FragmentTracker,
+    inspect_table: &PendingInspectDnsTable,
+    fake_ip_pool: &FakeIpPool,
+) -> bool {
+    if let Some(udp) = parse_udp_packet(raw) {
+        if udp.src_port != 53 {
+            return false;
+        }
+        return inspect_table.observe_inbound_response(
+            udp.src_ip,
+            udp.dst_ip,
+            udp.src_port,
+            udp.dst_port,
+            udp.payload,
+            fake_ip_pool,
+        );
+    }
+
+    if let crate::transparent::fragment::FragmentOutcome::Reassembled { full_packet, .. } =
+        inbound_fragments.ingest(raw, meta, None)
+        && let Some(udp) = parse_udp_packet(&full_packet)
+        && udp.src_port == 53
+    {
+        return inspect_table.observe_inbound_response(
+            udp.src_ip,
+            udp.dst_ip,
+            udp.src_port,
+            udp.dst_port,
+            udp.payload,
+            fake_ip_pool,
+        );
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpDecision {
     Passthrough,
@@ -1066,5 +1107,201 @@ mod tests {
                 .as_deref(),
             Some("passive-v6.example")
         );
+    }
+
+    #[test]
+    fn test_p1_and_p2_4_inline_inbound_dns_observation_handles_unfragmented_and_fragmented_v4_v6_edns0() {
+        use crate::transparent::fragment::FragmentTracker;
+        use crate::transparent::netstack::PacketInterfaceMeta;
+
+        let pool = FakeIpPool::new_default();
+        let table = PendingInspectDnsTable::new();
+        let mut frags = FragmentTracker::new();
+        let meta = PacketInterfaceMeta::default();
+
+        // 1. 未分片入站 UDP/53 应答：调用 observe_inbound_dns_packet_for_inspect 后立即完成落盘（早于重注入 OS）
+        let client_v4 = Ipv4Addr::new(10, 0, 0, 2);
+        let server_v4 = Ipv4Addr::new(8, 8, 8, 8);
+        let q1 = build_sample_dns_query(0x5101, "ssh.corp.example", 1);
+        assert!(table.record_outbound_query(
+            IpAddr::V4(client_v4),
+            IpAddr::V4(server_v4),
+            51001,
+            53,
+            &q1,
+        ));
+        let mut dns_resp1 = Vec::new();
+        dns_resp1.extend_from_slice(&0x5101u16.to_be_bytes());
+        dns_resp1.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        dns_resp1.extend_from_slice(&q1[12..]);
+        dns_resp1.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 10, 20, 30, 40]);
+        let mut raw_unfrag = Vec::new();
+        PacketBuilder::ipv4(server_v4.octets(), client_v4.octets(), 64)
+            .udp(53, 51001)
+            .write(&mut raw_unfrag, &dns_resp1)
+            .unwrap();
+        assert!(observe_inbound_dns_packet_for_inspect(
+            &raw_unfrag,
+            meta,
+            &mut frags,
+            &table,
+            &pool,
+        ));
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40)))
+                .as_deref(),
+            Some("ssh.corp.example")
+        );
+
+        // 2. IPv4 乱序分片大包 EDNS0/DNSSEC UDP/53 应答：先到尾片返回 false，收到首片重组瞬间同步落盘
+        let q2 = build_sample_dns_query(0x5102, "dnssec-v4.example", 1);
+        assert!(table.record_outbound_query(
+            IpAddr::V4(client_v4),
+            IpAddr::V4(server_v4),
+            51002,
+            53,
+            &q2,
+        ));
+        let mut dns_resp2 = Vec::new();
+        dns_resp2.extend_from_slice(&0x5102u16.to_be_bytes());
+        // ANCOUNT=1, ARCOUNT=1 (附带大块 TXT/OPT 模拟 >1500B EDNS0/DNSSEC 载荷)
+        dns_resp2.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01]);
+        dns_resp2.extend_from_slice(&q2[12..]);
+        dns_resp2.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 81]);
+        // 附加一条 OPT RR (type=41, payload 1500B)
+        dns_resp2.push(0x00);
+        dns_resp2.extend_from_slice(&[0x00, 41, 0x10, 0x00, 0, 0, 0, 0]);
+        dns_resp2.extend_from_slice(&1500u16.to_be_bytes());
+        dns_resp2.extend(std::iter::repeat_n(0x41u8, 1500));
+
+        let mut udp_bytes = Vec::with_capacity(8 + dns_resp2.len());
+        udp_bytes.extend_from_slice(&53u16.to_be_bytes());
+        udp_bytes.extend_from_slice(&51002u16.to_be_bytes());
+        udp_bytes.extend_from_slice(&((8 + dns_resp2.len()) as u16).to_be_bytes());
+        udp_bytes.extend_from_slice(&[0, 0]);
+        udp_bytes.extend_from_slice(&dns_resp2);
+
+        let split = 1024usize; // 8 字节倍数
+        let build_v4_frag = |id: u16, offset_bytes: usize, more: bool, chunk: &[u8]| {
+            let total_len = (20 + chunk.len()) as u16;
+            let flags_off = ((offset_bytes / 8) as u16) | if more { 0x2000 } else { 0 };
+            let mut pkt = Vec::with_capacity(20 + chunk.len());
+            pkt.push(0x45);
+            pkt.push(0);
+            pkt.extend_from_slice(&total_len.to_be_bytes());
+            pkt.extend_from_slice(&id.to_be_bytes());
+            pkt.extend_from_slice(&flags_off.to_be_bytes());
+            pkt.push(64);
+            pkt.push(17);
+            pkt.extend_from_slice(&[0, 0]);
+            pkt.extend_from_slice(&server_v4.octets());
+            pkt.extend_from_slice(&client_v4.octets());
+            pkt.extend_from_slice(chunk);
+            pkt
+        };
+        let v4_f0 = build_v4_frag(0x1234, 0, true, &udp_bytes[..split]);
+        let v4_f1 = build_v4_frag(0x1234, split, false, &udp_bytes[split..]);
+
+        // 乱序到达：尾片先到 -> Pending，尚未学习
+        assert!(!observe_inbound_dns_packet_for_inspect(
+            &v4_f1,
+            meta,
+            &mut frags,
+            &table,
+            &pool,
+        ));
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 81))),
+            None
+        );
+        // 首片到达 -> 重组并同步落盘
+        assert!(observe_inbound_dns_packet_for_inspect(
+            &v4_f0,
+            meta,
+            &mut frags,
+            &table,
+            &pool,
+        ));
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 81)))
+                .as_deref(),
+            Some("dnssec-v4.example")
+        );
+
+        // 3. IPv6 乱序分片 UDP/53 应答：同样在最终片同步学习 real_ip -> domain
+        let client_v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let server_v6: Ipv6Addr = "2001:db8::53".parse().unwrap();
+        let q3 = build_sample_dns_query(0x5103, "dnssec-v6.example", 1);
+        assert!(table.record_outbound_query(
+            IpAddr::V6(client_v6),
+            IpAddr::V6(server_v6),
+            51003,
+            53,
+            &q3,
+        ));
+        let mut dns_resp3 = Vec::new();
+        dns_resp3.extend_from_slice(&0x5103u16.to_be_bytes());
+        dns_resp3.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        dns_resp3.extend_from_slice(&q3[12..]);
+        dns_resp3.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 82]);
+        let mut udp_v6 = Vec::with_capacity(8 + dns_resp3.len());
+        udp_v6.extend_from_slice(&53u16.to_be_bytes());
+        udp_v6.extend_from_slice(&51003u16.to_be_bytes());
+        udp_v6.extend_from_slice(&((8 + dns_resp3.len()) as u16).to_be_bytes());
+        udp_v6.extend_from_slice(&[0, 0]);
+        udp_v6.extend_from_slice(&dns_resp3);
+
+        let split_v6 = 32usize; // 8 字节倍数
+        let build_v6_frag = |ident: u32, offset_bytes: usize, more: bool, chunk: &[u8]| {
+            let mut pkt = Vec::with_capacity(48 + chunk.len());
+            pkt.extend_from_slice(&[0x60, 0, 0, 0]);
+            pkt.extend_from_slice(&((8 + chunk.len()) as u16).to_be_bytes());
+            pkt.push(44); // Fragment
+            pkt.push(64);
+            pkt.extend_from_slice(&server_v6.octets());
+            pkt.extend_from_slice(&client_v6.octets());
+            pkt.push(17); // Next Header = UDP
+            pkt.push(0);
+            let off_flags = ((offset_bytes as u16) & 0xFFF8) | if more { 1 } else { 0 };
+            pkt.extend_from_slice(&off_flags.to_be_bytes());
+            pkt.extend_from_slice(&ident.to_be_bytes());
+            pkt.extend_from_slice(chunk);
+            pkt
+        };
+        let v6_f0 = build_v6_frag(0xABCD_0001, 0, true, &udp_v6[..split_v6]);
+        let v6_f1 = build_v6_frag(0xABCD_0001, split_v6, false, &udp_v6[split_v6..]);
+        assert!(!observe_inbound_dns_packet_for_inspect(
+            &v6_f1,
+            meta,
+            &mut frags,
+            &table,
+            &pool,
+        ));
+        assert!(observe_inbound_dns_packet_for_inspect(
+            &v6_f0,
+            meta,
+            &mut frags,
+            &table,
+            &pool,
+        ));
+        assert_eq!(
+            pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 82)))
+                .as_deref(),
+            Some("dnssec-v6.example")
+        );
+
+        // 4. 非 DNS 入站分片/UDP 报文安全返回 false，不影响状态机
+        let mut non_dns_udp = Vec::new();
+        PacketBuilder::ipv4(server_v4.octets(), client_v4.octets(), 64)
+            .udp(443, 51004)
+            .write(&mut non_dns_udp, &[1, 2, 3, 4])
+            .unwrap();
+        assert!(!observe_inbound_dns_packet_for_inspect(
+            &non_dns_udp,
+            meta,
+            &mut frags,
+            &table,
+            &pool,
+        ));
     }
 }

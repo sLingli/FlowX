@@ -586,11 +586,12 @@ pub(crate) fn windivert_network_filter() -> &'static str {
     "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255) or fragment)"
 }
 
-/// WinDivert NETWORK 层纯旁路只读嗅探过滤表达式（`SNIFF | RECV_ONLY`）：
-/// 仅复制入站 UDP/53 应答供 `InspectDns` 被动学习 `real_ip -> domain`，绝不阻塞、篡改或丢弃任何 OS 原生 DNS 报文
+/// WinDivert NETWORK 层入站 `InspectDns` 同步观测过滤表达式（配合 `DNS_INSPECT_LAYER_FLAGS = 0` 内联拦截-重注入）：
+/// 捕获入站 UDP/53 应答与入站 IP 分片（覆盖大包 DNSSEC / EDNS0），先同步落盘 `real_ip -> domain` 后再无条件原样重注入 OS，
+/// 彻底消除高并发下「入站 DNS 应答 vs 业务进程 TCP SYN」竞态且绝不丢弃或篡改任何入站报文
 #[cfg(any(windows, test))]
 pub(crate) fn windivert_dns_inspect_inbound_filter() -> &'static str {
-    "inbound and !loopback and !impostor and udp.SrcPort == 53"
+    "inbound and !loopback and !impostor and (udp.SrcPort == 53 or fragment)"
 }
 
 #[cfg(windows)]
@@ -663,8 +664,8 @@ impl NetRxContext {
                 }
                 dns_hijack::UdpDecision::DropFakeIp => {}
                 dns_hijack::UdpDecision::InspectDns => {
-                    // 严格无侵入被动观测：登记出站查询后立即放行原包（保留 OS 原生 socket / VPN 接口绑定 / EDNS0 尺寸 / fe80:: scope_id），
-                    // 由独立入站 SNIFF|RECV_ONLY 句柄异步旁路学习应答中的 real_ip -> domain，绝不吞包或黑洞丢包。
+                    // 严格无侵入观测：登记出站查询后立即放行原包（保留 OS 原生 socket / VPN 接口绑定 / EDNS0 尺寸 / fe80:: scope_id），
+                    // 由独立入站内联句柄（flags=0）在把应答重注入 OS 之前同步学习 real_ip -> domain，消除 DNS 应答与 TCP SYN 竞态。
                     self.inspect_table.record_outbound_query(
                         udp.src_ip,
                         udp.dst_ip,
@@ -1110,13 +1111,15 @@ impl TransparentManager {
         );
 
         let dns_inspect_filter = windivert_dns_inspect_inbound_filter();
+        // 使用 priority = 10（高于 network_handle 的 0），避免 HandleDns 注入的入站 Fake-IP 应答反复命中本句柄；
+        // 使用 DNS_INSPECT_LAYER_FLAGS (0) 内联拦截-重注入，在把包交回 OS 之前同步落盘 real_ip -> domain。
         let dns_inspect_handle = Arc::new(
             windivert_ffi::WinDivertHandle::open(
                 Arc::clone(&api),
                 dns_inspect_filter,
                 windivert_ffi::WinDivertLayer::Network,
-                -10,
-                windivert_ffi::SOCKET_LAYER_FLAGS,
+                10,
+                windivert_ffi::DNS_INSPECT_LAYER_FLAGS,
             )
             .map_err(|e| {
                 self.set_error(format!(
@@ -1125,15 +1128,17 @@ impl TransparentManager {
             })?,
         );
 
-        let _ = network_handle.set_param(
-            windivert_ffi::WinDivertParam::QueueLength,
-            windivert_ffi::WINDIVERT_PARAM_QUEUE_LENGTH_MAX,
-        );
-        let _ = network_handle.set_param(
-            windivert_ffi::WinDivertParam::QueueTime,
-            windivert_ffi::WINDIVERT_PARAM_QUEUE_TIME_DEFAULT,
-        );
-        let _ = network_handle.set_param(windivert_ffi::WinDivertParam::QueueSize, 16_777_216);
+        for handle in [&network_handle, &dns_inspect_handle] {
+            let _ = handle.set_param(
+                windivert_ffi::WinDivertParam::QueueLength,
+                windivert_ffi::WINDIVERT_PARAM_QUEUE_LENGTH_MAX,
+            );
+            let _ = handle.set_param(
+                windivert_ffi::WinDivertParam::QueueTime,
+                windivert_ffi::WINDIVERT_PARAM_QUEUE_TIME_DEFAULT,
+            );
+            let _ = handle.set_param(windivert_ffi::WinDivertParam::QueueSize, 16_777_216);
+        }
 
         let driver_version = network_handle
             .version()
@@ -1317,7 +1322,8 @@ impl TransparentManager {
             startup_guard.threads.push(handle);
         }
 
-        // 2b. 入站被动 DNS 应答旁路嗅探线程（SNIFF | RECV_ONLY）：零阻塞学习 InspectDns 真实 IP 映射
+        // 2b. 入站同步 DNS 应答观测线程（内联拦截-落盘-重注入）：覆盖未分片 UDP/53 与分片大包 EDNS0/DNSSEC，
+        //     先同步学习 real_ip -> domain 再无条件原样重注入 OS，消除与后续 TCP SYN 的竞态且零丢包
         {
             let stop = Arc::clone(&stop_flag);
             let sniff_h = Arc::clone(&dns_inspect_handle);
@@ -1327,8 +1333,9 @@ impl TransparentManager {
                 .name("flowx-windivert-dns-sniff".to_string())
                 .spawn(move || {
                     let mut buf = vec![0u8; INITIAL_NET_RX_BUF_LEN];
+                    let mut inbound_fragments = fragment::FragmentTracker::new();
                     while !stop.load(Ordering::Acquire) {
-                        let (len, _addr) = match sniff_h.recv(&mut buf) {
+                        let (len, addr) = match sniff_h.recv(&mut buf) {
                             Ok(res) => res,
                             Err(e) => {
                                 if stop.load(Ordering::Acquire)
@@ -1342,7 +1349,7 @@ impl TransparentManager {
                                     buf.resize(next_len, 0);
                                     continue;
                                 }
-                                debug!(error = %e, "WinDivert passive DNS sniff recv transient error");
+                                debug!(error = %e, "WinDivert inbound DNS observer recv transient error");
                                 std::thread::yield_now();
                                 continue;
                             }
@@ -1350,19 +1357,27 @@ impl TransparentManager {
                         if len == 0 {
                             continue;
                         }
-                        if let Some(udp) = dns_hijack::parse_udp_packet(&buf[..len]) {
-                            inspect_tbl.observe_inbound_response(
-                                udp.src_ip,
-                                udp.dst_ip,
-                                udp.src_port,
-                                udp.dst_port,
-                                udp.payload,
-                                &fake_ip_pool,
-                            );
-                        }
+                        let raw = &buf[..len];
+                        let net_data = addr.network();
+                        let frag_meta = netstack::PacketInterfaceMeta {
+                            if_idx: net_data.if_idx,
+                            sub_if_idx: net_data.sub_if_idx,
+                            loopback: addr.loopback(),
+                            is_ipv6: addr.ipv6(),
+                            bitfield: addr.raw_bitfield(),
+                        };
+                        let _ = dns_hijack::observe_inbound_dns_packet_for_inspect(
+                            raw,
+                            frag_meta,
+                            &mut inbound_fragments,
+                            &inspect_tbl,
+                            &fake_ip_pool,
+                        );
+                        // 无论是否命中观测表或是否分片，都在观测完成后无条件原样重注入 OS
+                        let _ = sniff_h.send(raw, &addr);
                     }
                 })
-                .map_err(|e| self.set_error(format!("Failed to spawn passive DNS sniff thread: {e}")))?;
+                .map_err(|e| self.set_error(format!("Failed to spawn inbound DNS observer thread: {e}")))?;
             startup_guard.threads.push(handle);
         }
 
@@ -1705,6 +1720,11 @@ mod tests {
         assert!(f.contains("198.18.0.0"));
         assert!(f.contains("198.19.255.255"));
         assert!(f.contains("or fragment"));
+
+        let inbound_f = windivert_dns_inspect_inbound_filter();
+        assert!(inbound_f.contains("inbound"));
+        assert!(inbound_f.contains("udp.SrcPort == 53"));
+        assert!(inbound_f.contains("or fragment"));
     }
 
     #[test]

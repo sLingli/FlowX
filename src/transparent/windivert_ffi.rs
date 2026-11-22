@@ -22,6 +22,10 @@ pub const WINDIVERT_FLAG_FRAGMENTS: u64 = 0x0020;
 /// WinDivert `SOCKET` 层必须同时开启 `SNIFF | RECV_ONLY` 旁路嗅探；仅传 `RECV_ONLY` 会按阻断分流模式挂起或失败宿主机所有 socket 操作
 pub const SOCKET_LAYER_FLAGS: u64 = WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY;
 
+/// 入站 `InspectDns` 同步观测句柄标志：使用标准内联拦截-重注入模式（`0`），确保 `observe_inbound_response`
+/// 写入 `real_ip_cache` 严格发生在将原包重注入 Windows `svchost.exe` 之前（建立 happens-before 消除与后续 TCP SYN 的竞态）
+pub const DNS_INSPECT_LAYER_FLAGS: u64 = 0;
+
 pub const WINDIVERT_PARAM_QUEUE_LENGTH_DEFAULT: u64 = 4096;
 pub const WINDIVERT_PARAM_QUEUE_LENGTH_MAX: u64 = 16384;
 pub const WINDIVERT_PARAM_QUEUE_TIME_DEFAULT: u64 = 2000;
@@ -835,6 +839,10 @@ mod tests {
         assert_eq!(
             SOCKET_LAYER_FLAGS,
             WINDIVERT_FLAG_SNIFF | WINDIVERT_FLAG_RECV_ONLY
+        );
+        assert_eq!(
+            DNS_INSPECT_LAYER_FLAGS, 0,
+            "inline inbound DNS observer must intercept and reinject synchronously instead of async SNIFF|RECV_ONLY"
         );
     }
 
