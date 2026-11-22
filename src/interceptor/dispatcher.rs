@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -21,12 +21,86 @@ use crate::router::{Action, RouteContext, RuleEngine};
 
 /// 入站协议握手的最长等待时间（防止慢速握手占满并发名额）
 const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// 透明代理首包域名嗅探的最长等待时间（用于需要域名上下文的规则或代理流，避免拖慢服务端先说话协议）
+/// 透明代理首包域名嗅探的最长等待时间（用于规则依赖域名或常见 HTTP/TLS 端口）
 const TRANSPARENT_SNIFF_TIMEOUT: Duration = Duration::from_millis(120);
+/// `Immediate(Proxy | Chain)` 在非常见 HTTP/TLS 端口上的机会式嗅探短超时（本地客户端先发 TLS/HTTP 通常 < 2ms，
+/// 同时将未知自定义服务端先发端口的首连探测成本压低至 25ms 并自动学习，后续连接零延迟）
+const TRANSPARENT_OPPORTUNISTIC_SNIFF_TIMEOUT: Duration = Duration::from_millis(25);
+const SERVER_FIRST_CACHE_TTL: Duration = Duration::from_secs(300);
+const SERVER_FIRST_CACHE_MAX_ENTRIES: usize = 1024;
 
 #[inline]
 fn is_server_first_protocol_port(port: u16) -> bool {
-    matches!(port, 21 | 22 | 23 | 25 | 110 | 143 | 587 | 3306 | 5900)
+    matches!(
+        port,
+        21 | 22 | 23 | 25 | 110 | 143 | 587 | 2222 | 2525 | 3306 | 3307 | 5900..=5909
+    )
+}
+
+#[inline]
+fn is_common_http_tls_port(port: u16) -> bool {
+    matches!(
+        port,
+        80 | 443
+            | 2052
+            | 2053
+            | 2082
+            | 2083
+            | 2086
+            | 2087
+            | 2095
+            | 2096
+            | 3000
+            | 3001
+            | 5000
+            | 5173
+            | 8000
+            | 8008
+            | 8080
+            | 8443
+            | 8444
+            | 8888
+            | 9000
+            | 9090
+            | 9443
+    )
+}
+
+fn server_first_endpoint_cache() -> &'static Mutex<HashMap<(IpAddr, u16), Instant>> {
+    static CACHE: OnceLock<Mutex<HashMap<(IpAddr, u16), Instant>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_learned_server_first_endpoint(key: (IpAddr, u16)) -> bool {
+    let now = Instant::now();
+    let map = server_first_endpoint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.get(&key).is_some_and(|exp| *exp > now)
+}
+
+fn record_server_first_endpoint(key: (IpAddr, u16)) {
+    let now = Instant::now();
+    let expire = now + SERVER_FIRST_CACHE_TTL;
+    let mut map = server_first_endpoint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if map.len() >= SERVER_FIRST_CACHE_MAX_ENTRIES && !map.contains_key(&key) {
+        map.retain(|_, exp| *exp > now);
+        if map.len() >= SERVER_FIRST_CACHE_MAX_ENTRIES
+            && let Some(oldest) = map.iter().min_by_key(|(_, exp)| **exp).map(|(k, _)| *k)
+        {
+            map.remove(&oldest);
+        }
+    }
+    map.insert(key, expire);
+}
+
+fn clear_server_first_endpoint(key: (IpAddr, u16)) {
+    let mut map = server_first_endpoint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.remove(&key);
 }
 
 fn is_spoofed_local_hostname(host: &str, orig_dst_ip: IpAddr) -> bool {
@@ -446,23 +520,40 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                 Some(orig_dst.ip()),
                 orig_dst.port(),
             );
-            let want_sniff = match domain_decision {
-                crate::router::DomainNeedDecision::NeedsDomainSniff => true,
+            let (want_sniff, opportunistic_sniff) = match domain_decision {
+                crate::router::DomainNeedDecision::NeedsDomainSniff => (true, false),
                 crate::router::DomainNeedDecision::Immediate(
                     Action::Proxy(_) | Action::Chain(_),
-                ) => true,
+                ) => (true, !is_common_http_tls_port(orig_dst.port())),
                 crate::router::DomainNeedDecision::Immediate(
                     Action::Direct | Action::Block,
-                ) => false,
+                ) => (false, false),
             };
-            // 除明确服务端先发协议端口外，绝不因存在被动缓存域名或非标准端口而跳过权威 TLS SNI / HTTP Host 嗅探
-            let need_sniff = want_sniff && !is_server_first_protocol_port(orig_dst.port());
+            let ep_key = (orig_dst.ip().to_canonical(), orig_dst.port());
+            let skip_learned_server_first =
+                opportunistic_sniff && is_learned_server_first_endpoint(ep_key);
+            // 除已知服务端先发协议端口与已学习的自定义服务端先发端点外，绝不因被动缓存域名或非标准端口跳过权威嗅探
+            let need_sniff = want_sniff
+                && !is_server_first_protocol_port(orig_dst.port())
+                && !skip_learned_server_first;
+            let sniff_timeout = if opportunistic_sniff {
+                TRANSPARENT_OPPORTUNISTIC_SNIFF_TIMEOUT
+            } else {
+                TRANSPARENT_SNIFF_TIMEOUT
+            };
             let (sniffed_host, buffered) = if need_sniff {
                 let outcome = crate::transparent::sniffer::peek_host_prefix(
                     &mut local_stream,
-                    TRANSPARENT_SNIFF_TIMEOUT,
+                    sniff_timeout,
                 )
                 .await?;
+                if opportunistic_sniff {
+                    if outcome.timed_out && outcome.buffered.is_empty() {
+                        record_server_first_endpoint(ep_key);
+                    } else if !outcome.buffered.is_empty() {
+                        clear_server_first_endpoint(ep_key);
+                    }
+                }
                 let host = outcome.host.filter(|h| {
                     if is_spoofed_local_hostname(h, orig_dst.ip()) {
                         warn!(
@@ -1918,5 +2009,196 @@ mod tests {
         drop(app_dir);
         dir_handle.await.unwrap().unwrap();
         direct_srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_p2_3_immediate_proxy_avoids_120ms_stall_on_alt_and_custom_server_first_ports_while_sniffing_custom_https(
+    ) {
+        use crate::outbound::socks5::Socks5Client;
+        use tokio::io::AsyncReadExt;
+
+        let make_devproxy_cfg = |socks_addr: SocketAddr| {
+            let cfg = test_config(
+                "127.0.0.1:40001".parse().unwrap(),
+                vec![crate::router::Rule::from_raw(
+                    "DevProxy",
+                    true,
+                    None,
+                    None,
+                    None,
+                    Action::Proxy(1),
+                )],
+            );
+            cfg.proxy_nodes.write().unwrap().insert(
+                1,
+                ProxyNodeEntry {
+                    id: 1,
+                    name: "MockSocks".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: socks_addr.to_string(),
+                    username: None,
+                    client: ProxyNode::Socks5(Socks5Client::new(socks_addr.to_string())),
+                },
+            );
+            Arc::new(cfg)
+        };
+
+        // 1. 常见非标准服务端先发端口（SSH 2222 / MySQL 3307 / VNC 5901）：首连即零等待直吐 banner
+        for port in [2222u16, 3307u16, 5901u16] {
+            let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let socks_addr = socks.local_addr().unwrap();
+            let srv = tokio::spawn(async move {
+                let (mut s, _) = socks.accept().await.unwrap();
+                let mut g = [0u8; 3];
+                s.read_exact(&mut g).await.unwrap();
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let mut req = [0u8; 10];
+                s.read_exact(&mut req).await.unwrap();
+                assert_eq!(req[3], 0x01);
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
+                s.write_all(b"SRV_BANNER_FAST").await.unwrap();
+            });
+            let cfg = make_devproxy_cfg(socks_addr);
+            let (mut app, disp) = tokio::io::duplex(1024);
+            let started = std::time::Instant::now();
+            let handle = tokio::spawn(async move {
+                dispatch_transparent_stream(
+                    cfg,
+                    disp,
+                    "127.0.0.1:50501".parse().unwrap(),
+                    SocketAddr::new("93.184.216.95".parse().unwrap(), port),
+                    None,
+                    false,
+                )
+                .await
+            });
+            let mut banner = [0u8; 15];
+            app.read_exact(&mut banner).await.unwrap();
+            assert_eq!(&banner, b"SRV_BANNER_FAST");
+            assert!(
+                started.elapsed() < Duration::from_millis(60),
+                "alt server-first port {} must skip sniff without stalling, took {:?}",
+                port,
+                started.elapsed()
+            );
+            drop(app);
+            handle.await.unwrap().unwrap();
+            srv.await.unwrap();
+        }
+
+        // 2. 任意自定义服务端先发端口（如 22022）：首连最多等 25ms 机会式超时（远低于 120ms）并自动学习，
+        //    后续再次连接同一端点直接零延迟跳过嗅探
+        let custom_ep = SocketAddr::new("93.184.216.96".parse().unwrap(), 22022);
+        clear_server_first_endpoint((custom_ep.ip(), custom_ep.port()));
+        let socks_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_c_addr = socks_c.local_addr().unwrap();
+        let srv_c = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = socks_c.accept().await.unwrap();
+                let mut g = [0u8; 3];
+                s.read_exact(&mut g).await.unwrap();
+                s.write_all(&[0x05, 0x00]).await.unwrap();
+                let mut req = [0u8; 10];
+                s.read_exact(&mut req).await.unwrap();
+                s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                    .await
+                    .unwrap();
+                s.write_all(b"SSH-2.0-Custom22022").await.unwrap();
+            }
+        });
+        let cfg_c = make_devproxy_cfg(socks_c_addr);
+        for attempt in 0..2 {
+            let (mut app, disp) = tokio::io::duplex(1024);
+            let cfg_clone = Arc::clone(&cfg_c);
+            let started = std::time::Instant::now();
+            let handle = tokio::spawn(async move {
+                dispatch_transparent_stream(
+                    cfg_clone,
+                    disp,
+                    "127.0.0.1:50502".parse().unwrap(),
+                    custom_ep,
+                    None,
+                    false,
+                )
+                .await
+            });
+            let mut banner = [0u8; 19];
+            app.read_exact(&mut banner).await.unwrap();
+            assert_eq!(&banner, b"SSH-2.0-Custom22022");
+            let elapsed = started.elapsed();
+            if attempt == 0 {
+                assert!(
+                    elapsed < Duration::from_millis(90),
+                    "1st connect to unknown server-first port 22022 must use short opportunistic timeout (<90ms), took {:?}",
+                    elapsed
+                );
+                assert!(is_learned_server_first_endpoint((custom_ep.ip(), custom_ep.port())));
+            } else {
+                assert!(
+                    elapsed < Duration::from_millis(30),
+                    "2nd connect to learned server-first port 22022 must skip sniff immediately, took {:?}",
+                    elapsed
+                );
+            }
+            drop(app);
+            handle.await.unwrap().unwrap();
+        }
+        srv_c.await.unwrap();
+
+        // 3. 任意非常见 HTTPS 端口（如 18443）在 DevProxy 下仍能在 25ms 机会式窗口内秒提 TLS SNI 并传权威域名给代理
+        let custom_tls_ep = SocketAddr::new("93.184.216.97".parse().unwrap(), 18443);
+        clear_server_first_endpoint((custom_tls_ep.ip(), custom_tls_ep.port()));
+        let socks_t = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_t_addr = socks_t.local_addr().unwrap();
+        let (sni_tx, sni_rx) = tokio::sync::oneshot::channel();
+        let hello = build_test_tls_client_hello("custom-port.example");
+        let expected_hello = hello.clone();
+        let srv_t = tokio::spawn(async move {
+            let (mut s, _) = socks_t.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 0x03, "arbitrary HTTPS port 18443 must still dial authoritative SNI domain");
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l).await.unwrap();
+            let mut dom = vec![0u8; l[0] as usize];
+            s.read_exact(&mut dom).await.unwrap();
+            let mut p = [0u8; 2];
+            s.read_exact(&mut p).await.unwrap();
+            let _ = sni_tx.send((String::from_utf8(dom).unwrap(), u16::from_be_bytes(p)));
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut got = vec![0u8; expected_hello.len()];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected_hello);
+            s.write_all(b"OK18443").await.unwrap();
+        });
+        let cfg_t = make_devproxy_cfg(socks_t_addr);
+        let (mut app_t, disp_t) = tokio::io::duplex(4096);
+        let h_t = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                cfg_t,
+                disp_t,
+                "127.0.0.1:50503".parse().unwrap(),
+                custom_tls_ep,
+                None,
+                false,
+            )
+            .await
+        });
+        app_t.write_all(&hello).await.unwrap();
+        let mut ack = [0u8; 7];
+        app_t.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"OK18443");
+        assert_eq!(sni_rx.await.unwrap(), ("custom-port.example".to_string(), 18443));
+        assert!(!is_learned_server_first_endpoint((custom_tls_ep.ip(), custom_tls_ep.port())));
+        drop(app_t);
+        h_t.await.unwrap().unwrap();
+        srv_t.await.unwrap();
     }
 }
