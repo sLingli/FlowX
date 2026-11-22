@@ -343,7 +343,7 @@ impl ApiServer {
         Ok(listener)
     }
 
-    /// 启动异步 HTTP API 监听服务（支持并发连接限流、任务追踪与优雅停机）
+    /// 启动异步 HTTP API 监听服务（支持并发连接限流、内部在途排空与优雅停机）
     pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         let actual_port = listener.local_addr().unwrap_or(self.bind_addr).port();
         let mut self_ports = self.self_ports.clone();
@@ -351,6 +351,9 @@ impl ApiServer {
             self_ports.push(actual_port);
         }
         let self_ports = Arc::new(self_ports);
+        // 无论外部是否注入 `with_in_flight(...)`，均在 `run()` 内部追踪已派生的请求协程，
+        // 停机前优雅排空在途响应写回（防止独立调用 `ApiServer::run` 时 `elevate` 提前触发 `shutdown_tx` 导致丢失 200 OK）
+        let local_in_flight = Arc::new(InFlightTracker::new());
 
         loop {
             if *shutdown_rx.borrow() {
@@ -381,8 +384,10 @@ impl ApiServer {
                 Ok(p) => p,
                 Err(_) => {
                     let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
+                    let _local_guard = local_in_flight.enter();
                     tokio::spawn(async move {
                         let _in_flight = _in_flight;
+                        let _local_guard = _local_guard;
                         let _ = tokio::time::timeout(
                             Duration::from_secs(2),
                             send_http_response(
@@ -417,10 +422,12 @@ impl ApiServer {
             let persist_timeout = self.persist_timeout;
             let started_at = self.started_at;
             let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
+            let _local_guard = local_in_flight.enter();
 
             tokio::spawn(async move {
                 let _permit = permit;
                 let _in_flight = _in_flight;
+                let _local_guard = _local_guard;
                 if let Err(e) = handle_api_request(
                     stream,
                     actual_port,
@@ -446,6 +453,8 @@ impl ApiServer {
                 }
             });
         }
+        drop(listener);
+        let _ = tokio::time::timeout(Duration::from_secs(5), local_in_flight.wait_zero()).await;
         Ok(())
     }
 }
@@ -5831,5 +5840,49 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    #[tokio::test]
+    async fn test_p2_6_standalone_api_server_run_drains_elevate_response_before_exiting() {
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // 显式不调用 `.with_in_flight(...)`，模拟独立启动 ApiServer::run 的调用方
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, re, nodes)
+            .with_shutdown_sender(shutdown_tx)
+            .with_elevate_runner(Arc::new(|| {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            }));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let server_task = tokio::spawn(async move { srv.run(listener, shutdown_rx).await });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\n\r\n"
+        );
+        client.write_all(req.as_bytes()).await.unwrap();
+
+        // 必须等到 `handle_api_request` 完整写完并刷出 200 OK 后 `run()` 才返回
+        tokio::time::timeout(Duration::from_secs(3), server_task)
+            .await
+            .expect("ApiServer::run must exit cleanly after draining elevate response")
+            .unwrap()
+            .unwrap();
+
+        let mut resp_bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut resp_bytes))
+            .await
+            .expect("200 OK response must already be flushed before ApiServer::run returns")
+            .unwrap();
+        let resp = String::from_utf8_lossy(&resp_bytes);
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK") && resp.contains(r#""relaunching":true"#),
+            "expected complete 200 OK elevate response after run() drained, got: {resp}"
+        );
     }
 }
