@@ -2133,6 +2133,7 @@ mod tests {
         .await
         .unwrap_err();
         let msg = format!("{reset_err:#}");
+        assert!(!msg.is_empty());
         // Windows 立即触发 ConnectionReset，其它平台可能超时；Windows 下不得误报为 timed out
         #[cfg(windows)]
         assert!(

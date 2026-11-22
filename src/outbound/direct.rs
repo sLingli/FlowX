@@ -292,10 +292,15 @@ impl DirectOutbound {
                                     break;
                                 }
                                 Err(err) => {
-                                    if err.downcast_ref::<DnsNxDomainError>().is_some() {
-                                        saw_authoritative_nxdomain = true;
-                                    }
+                                    let is_nxdomain =
+                                        err.downcast_ref::<DnsNxDomainError>().is_some();
                                     last_err = Some((dns_server, err));
+                                    if is_nxdomain {
+                                        // 优先序靠前的权威 orig_dns（如内网/VPN DNS）已明确返回 NXDOMAIN：
+                                        // 立即跳出循环，绝不继续向后续公网/备选候选 DNS 泄露内网不存在主机名或覆盖错误归因
+                                        saw_authoritative_nxdomain = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -642,6 +647,28 @@ mod tests {
             public_hits.load(Ordering::Relaxed),
             0,
             "authoritative NXDOMAIN from orig_dns must never fall back to public upstream_dns"
+        );
+
+        // 1b. P2-5: 多 orig_candidates（例如 [corp_addr, public_addr]）中首个权威 DNS 返回 NXDOMAIN 时必须立刻 break，
+        //     绝不继续查询列表后续公网/备选 DNS 或被其抢答/超时覆盖错误归因
+        let multi_err = DirectOutbound::connect_guarded_with_dns_candidates(
+            &TargetAddr::Domain("missing-multi.corp.example".into(), 443),
+            public_addr,
+            &[corp_addr, public_addr],
+            None,
+            &[1053, 40001, 40080],
+        )
+        .await
+        .unwrap_err();
+        let multi_msg = format!("{multi_err:#}");
+        assert!(
+            multi_msg.contains("NXDOMAIN") && multi_msg.contains(&corp_addr.to_string()),
+            "expected authoritative NXDOMAIN attributed to {corp_addr}, got: {multi_msg}"
+        );
+        assert_eq!(
+            public_hits.load(Ordering::Relaxed),
+            0,
+            "NXDOMAIN on orig_candidates[0] must break immediately without querying orig_candidates[1]"
         );
 
         // 2. P2-2: 不可用的 preferred_dns（如 self_port / 169.254/16 / Fake-IP / 255.255.255.255）在发起查询前直接过滤，
