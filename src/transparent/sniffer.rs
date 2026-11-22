@@ -8,6 +8,7 @@ const MAX_SNIFF_BYTES: usize = 8192;
 pub struct SniffOutcome {
     pub host: Option<String>,
     pub buffered: Vec<u8>,
+    pub timed_out: bool,
 }
 
 /// 按 RFC 1035 / RFC 1123 / RFC 6066 严格校验嗅探到的域名：
@@ -46,6 +47,7 @@ pub async fn peek_host_prefix<R: AsyncRead + Unpin>(
     let mut buffered = Vec::with_capacity(512);
     let mut tmp = [0u8; 1024];
     let deadline = tokio::time::Instant::now() + max_wait;
+    let mut timed_out = false;
 
     loop {
         if buffered.len() >= MAX_SNIFF_BYTES {
@@ -53,6 +55,7 @@ pub async fn peek_host_prefix<R: AsyncRead + Unpin>(
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            timed_out = true;
             break;
         }
 
@@ -67,6 +70,7 @@ pub async fn peek_host_prefix<R: AsyncRead + Unpin>(
                         return Ok(SniffOutcome {
                             host: Some(host),
                             buffered,
+                            timed_out: false,
                         });
                     }
                     SniffProbe::NotMatchable => break,
@@ -74,7 +78,10 @@ pub async fn peek_host_prefix<R: AsyncRead + Unpin>(
                 }
             }
             Ok(Err(e)) => return Err(e),
-            Err(_) => break,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
         }
     }
 
@@ -82,7 +89,11 @@ pub async fn peek_host_prefix<R: AsyncRead + Unpin>(
         SniffProbe::Found(h) => Some(h),
         SniffProbe::NotMatchable | SniffProbe::NeedMore => None,
     };
-    Ok(SniffOutcome { host, buffered })
+    Ok(SniffOutcome {
+        host,
+        buffered,
+        timed_out,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -129,37 +140,82 @@ fn looks_like_http_request(buf: &[u8]) -> bool {
     false
 }
 
+fn parse_http_host_value(raw_val: &str) -> Option<String> {
+    let val = raw_val.trim_matches(|c| c == ' ' || c == '\t');
+    if val.is_empty() || val.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+        return None;
+    }
+    if val.starts_with('[') {
+        // IPv6 `[::1]:80` 字面量直接跳过，不作为域名
+        return None;
+    }
+    let host_part = if let Some((h, p)) = val.split_once(':') {
+        // 严格要求冒号右侧为合法十进制端口号 (1..=65535)，杜绝未加方括号的 IPv6（如 dead:beef::1）或畸形端口串被截断误判
+        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let port = p.parse::<u16>().ok()?;
+        if port == 0 {
+            return None;
+        }
+        h
+    } else {
+        val
+    };
+    let normalized = host_part.trim_end_matches('.').to_ascii_lowercase();
+    is_valid_sniffed_host(&normalized).then_some(normalized)
+}
+
 fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
-    // 扫描按 CRLF 切分的行；未见头尾且仍有剩余缓冲额度时可继续读取
+    // 扫描完整请求头直至空行（\r\n\r\n），校验端口合法性、拒绝 obs-fold 续行与重复 Host 冲突
     let mut start = 0usize;
+    let mut is_request_line = true;
     let mut header_end = false;
+    let mut found_host: Option<String> = None;
+
     while let Some(rel_lf) = buf[start..].iter().position(|&b| b == b'\n') {
         let line_end = start + rel_lf;
-        let line = buf[start..line_end].strip_suffix(b"\r").unwrap_or(&buf[start..line_end]);
+        let line = buf[start..line_end]
+            .strip_suffix(b"\r")
+            .unwrap_or(&buf[start..line_end]);
         start = line_end + 1;
+
+        if is_request_line {
+            is_request_line = false;
+            continue;
+        }
         if line.is_empty() {
             header_end = true;
             break;
         }
-        if line.len() > 5 && line[..5].eq_ignore_ascii_case(b"host:") {
-            if let Ok(raw_val) = std::str::from_utf8(&line[5..]) {
-                let val = raw_val.trim();
-                let host = if let Some(rest) = val.strip_prefix('[') {
-                    // IPv6 `[::1]:80` 字面量直接跳过，不作为域名
-                    rest.split(']').next().unwrap_or("")
-                } else {
-                    val.split(':').next().unwrap_or("")
-                };
-                let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
-                if is_valid_sniffed_host(&normalized) {
-                    return SniffProbe::Found(normalized);
-                }
-                return SniffProbe::NotMatchable;
-            }
+        // RFC 9112 禁止 obs-fold（前导空格/Tab 续行），防止 Host 续行走私
+        if matches!(line.first(), Some(b' ' | b'\t')) {
             return SniffProbe::NotMatchable;
         }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            return SniffProbe::NotMatchable;
+        };
+        let name = &line[..colon];
+        if name.trim_ascii_end().eq_ignore_ascii_case(b"host") {
+            if name.len() != 4 || found_host.is_some() {
+                return SniffProbe::NotMatchable;
+            }
+            let Ok(raw_val) = std::str::from_utf8(&line[colon + 1..]) else {
+                return SniffProbe::NotMatchable;
+            };
+            let Some(host) = parse_http_host_value(raw_val) else {
+                return SniffProbe::NotMatchable;
+            };
+            found_host = Some(host);
+        }
     }
-    if header_end || buf.len() >= MAX_SNIFF_BYTES {
+
+    if header_end {
+        match found_host {
+            Some(host) => SniffProbe::Found(host),
+            None => SniffProbe::NotMatchable,
+        }
+    } else if buf.len() >= MAX_SNIFF_BYTES {
         SniffProbe::NotMatchable
     } else {
         SniffProbe::NeedMore
@@ -171,6 +227,7 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
     // 1. 顺序解包连续的 TLS Handshake (0x16) 记录载荷，重组逻辑握手字节流（不修改原始 buffered）
     let mut hs_stream = Vec::with_capacity(buf.len());
     let mut pos = 0usize;
+    let mut handshake_terminated = false;
     while pos < buf.len() {
         let rem = buf.len() - pos;
         if rem < 5 {
@@ -178,11 +235,11 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
                 || (rem >= 2 && buf[pos + 1] != 0x03)
                 || (rem >= 3 && buf[pos + 2] > 0x04)
             {
-                return if pos == 0 {
-                    SniffProbe::NotMatchable
-                } else {
-                    break;
-                };
+                if pos == 0 {
+                    return SniffProbe::NotMatchable;
+                }
+                handshake_terminated = true;
+                break;
             }
             break;
         }
@@ -190,11 +247,16 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
             if pos == 0 {
                 return SniffProbe::NotMatchable;
             }
+            handshake_terminated = true;
             break;
         }
         let rec_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
         if rec_len == 0 || rec_len > 16_384 {
-            return SniffProbe::NotMatchable;
+            if pos == 0 {
+                return SniffProbe::NotMatchable;
+            }
+            handshake_terminated = true;
+            break;
         }
         pos += 5;
         let avail = buf.len() - pos;
@@ -208,7 +270,7 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
 
     // 2. Handshake header = 4 bytes: HandshakeType(1)=0x01 (ClientHello), Length(3)
     if hs_stream.len() < 4 {
-        return if buf.len() < MAX_SNIFF_BYTES {
+        return if !handshake_terminated && buf.len() < MAX_SNIFF_BYTES {
             SniffProbe::NeedMore
         } else {
             SniffProbe::NotMatchable
@@ -223,7 +285,7 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
     let body = &body_all[..body_all.len().min(hs_len)];
 
     let need_more_if_incomplete = |body_len: usize| {
-        if body_len < hs_len && buf.len() < MAX_SNIFF_BYTES {
+        if !handshake_terminated && body_len < hs_len && buf.len() < MAX_SNIFF_BYTES {
             SniffProbe::NeedMore
         } else {
             SniffProbe::NotMatchable
@@ -465,5 +527,93 @@ mod tests {
         writer.await.unwrap();
         assert_eq!(out.host.as_deref(), Some("multi-record.example.org"));
         assert_eq!(out.buffered, expected_raw);
+    }
+
+    #[tokio::test]
+    async fn test_p2_1_incomplete_tls_client_hello_followed_by_non_handshake_fails_immediately() {
+        let single = build_tls_client_hello("fast-fail.example");
+        let hs_bytes = &single[5..];
+        // 首条 0x16 Record 仅包含不完整的 ClientHello，紧跟一条非 0x16 (Alert 0x15) Record
+        let partial = &hs_bytes[..18];
+        let mut malformed = Vec::new();
+        malformed.push(0x16);
+        malformed.extend_from_slice(&[0x03, 0x01]);
+        malformed.extend_from_slice(&(partial.len() as u16).to_be_bytes());
+        malformed.extend_from_slice(partial);
+        malformed.extend_from_slice(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]);
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(&malformed).await.unwrap();
+
+        let started = std::time::Instant::now();
+        // 客户端保持打开不发新数据：必须立即返回 NotMatchable，绝不卡满 250ms 超时
+        let out = peek_host_prefix(&mut server, Duration::from_millis(250))
+            .await
+            .unwrap();
+        assert_eq!(out.host, None);
+        assert!(!out.timed_out);
+        assert_eq!(out.buffered, malformed);
+        assert!(
+            started.elapsed() < Duration::from_millis(80),
+            "incomplete ClientHello followed by non-0x16 record stalled for {:?}",
+            started.elapsed()
+        );
+        drop(client);
+
+        // 若首条 0x16 Record 已包含完整 ClientHello + SNI，后接 0x14 CCS (TLS 1.3 0-RTT) 仍可提取 SNI
+        let mut with_ccs = single.clone();
+        with_ccs.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        let (mut c2, mut s2) = tokio::io::duplex(4096);
+        c2.write_all(&with_ccs).await.unwrap();
+        let out2 = peek_host_prefix(&mut s2, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert_eq!(out2.host.as_deref(), Some("fast-fail.example"));
+        assert!(!out2.timed_out);
+        drop(c2);
+    }
+
+    #[tokio::test]
+    async fn test_p2_2_http_host_validates_port_rejects_unbracketed_ipv6_duplicate_host_and_obs_fold() {
+        for bad_req in [
+            b"GET / HTTP/1.1\r\nHost: dead:beef::1\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com:notaport\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com:0\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com:99999\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com:\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: good.example\r\nHost: evil.example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: good.example\r\nHost: good.example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: good.example\r\n .continued.example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nX-Test: a\r\n\tfolded\r\nHost: good.example\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost : good.example\r\n\r\n".as_slice(),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            client.write_all(bad_req).await.unwrap();
+            let started = std::time::Instant::now();
+            let out = peek_host_prefix(&mut server, Duration::from_millis(200))
+                .await
+                .unwrap();
+            assert_eq!(
+                out.host,
+                None,
+                "malformed/conflicting HTTP Host must be rejected: {:?}",
+                String::from_utf8_lossy(bad_req)
+            );
+            assert!(!out.timed_out);
+            assert_eq!(out.buffered, bad_req);
+            assert!(started.elapsed() < Duration::from_millis(80));
+            drop(client);
+        }
+
+        // 合法带端口的 HTTP Host 正常提取并保留完整报文
+        let good_req = b"GET /api HTTP/1.1\r\nHost: Service.Example.COM:8444\r\nX-Ok: 1\r\n\r\n";
+        let (mut c_ok, mut s_ok) = tokio::io::duplex(1024);
+        c_ok.write_all(good_req).await.unwrap();
+        let out_ok = peek_host_prefix(&mut s_ok, Duration::from_millis(200))
+            .await
+            .unwrap();
+        assert_eq!(out_ok.host.as_deref(), Some("service.example.com"));
+        assert!(!out_ok.timed_out);
+        assert_eq!(out_ok.buffered, good_req);
     }
 }
