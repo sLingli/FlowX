@@ -24,17 +24,24 @@ const INBOUND_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// 透明代理首包域名嗅探的最长等待时间（用于规则依赖域名或常见 HTTP/TLS 端口）
 const TRANSPARENT_SNIFF_TIMEOUT: Duration = Duration::from_millis(120);
 /// `Immediate(Proxy | Chain)` 在非常见 HTTP/TLS 端口上的机会式嗅探短超时（本地客户端先发 TLS/HTTP 通常 < 2ms，
-/// 同时将未知自定义服务端先发端口的首连探测成本压低至 25ms 并自动学习，后续连接零延迟）
+/// 同时将未知自定义服务端先发端口的探测成本压低至 25ms，连续超时达阈值后按指数退避学习并支持半开探测恢复）
 const TRANSPARENT_OPPORTUNISTIC_SNIFF_TIMEOUT: Duration = Duration::from_millis(25);
+const SERVER_FIRST_LEARN_THRESHOLD: u8 = 2;
+const SERVER_FIRST_CANDIDATE_TTL: Duration = Duration::from_secs(30);
 const SERVER_FIRST_CACHE_TTL: Duration = Duration::from_secs(300);
 const SERVER_FIRST_CACHE_MAX_ENTRIES: usize = 1024;
 
+/// 严格标准服务端先发协议端口（FTP/SSH/Telnet/SMTP/POP3/IMAP/Submission/MySQL/VNC）：始终跳过首包嗅探
 #[inline]
-fn is_server_first_protocol_port(port: u16) -> bool {
-    matches!(
-        port,
-        21 | 22 | 23 | 25 | 110 | 143 | 587 | 2222 | 2525 | 3306 | 3307 | 5900..=5909
-    )
+fn is_strict_server_first_port(port: u16) -> bool {
+    matches!(port, 21 | 22 | 23 | 25 | 110 | 143 | 587 | 3306 | 5900)
+}
+
+/// 常见非标准服务端先发备选端口（如 SSH 2222 / SMTP 2525 / MySQL 3307 / VNC 5901..5909）：
+/// 仅在无需域名的机会式嗅探中跳过，避免阻断 `NeedsDomainSniff` 域名规则（如 2222 上的 HTTPS/管理面板）
+#[inline]
+fn is_alt_server_first_port(port: u16) -> bool {
+    matches!(port, 2222 | 2525 | 3307 | 5901..=5909)
 }
 
 #[inline]
@@ -66,34 +73,86 @@ fn is_common_http_tls_port(port: u16) -> bool {
     )
 }
 
-fn server_first_endpoint_cache() -> &'static Mutex<HashMap<(IpAddr, u16), Instant>> {
-    static CACHE: OnceLock<Mutex<HashMap<(IpAddr, u16), Instant>>> = OnceLock::new();
+#[derive(Debug, Clone, Copy)]
+struct ServerFirstEntry {
+    consecutive_timeouts: u8,
+    next_probe_at: Instant,
+    expires_at: Instant,
+}
+
+fn server_first_backoff(consecutive_timeouts: u8) -> (Duration, Duration) {
+    match consecutive_timeouts {
+        0..=1 => (Duration::ZERO, SERVER_FIRST_CANDIDATE_TTL),
+        2 => (Duration::from_secs(15), Duration::from_secs(60)),
+        3 => (Duration::from_secs(60), Duration::from_secs(180)),
+        _ => (Duration::from_secs(120), SERVER_FIRST_CACHE_TTL),
+    }
+}
+
+fn server_first_endpoint_cache() -> &'static Mutex<HashMap<(IpAddr, u16), ServerFirstEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<(IpAddr, u16), ServerFirstEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn is_learned_server_first_endpoint(key: (IpAddr, u16)) -> bool {
-    let now = Instant::now();
-    let map = server_first_endpoint_cache()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    map.get(&key).is_some_and(|exp| *exp > now)
-}
-
-fn record_server_first_endpoint(key: (IpAddr, u16)) {
-    let now = Instant::now();
-    let expire = now + SERVER_FIRST_CACHE_TTL;
+/// 判断是否应跳过当前端点的机会式嗅探：
+/// - 连续超时未达 `SERVER_FIRST_LEARN_THRESHOLD`（2 次）时不跳过，防止单次慢启动/预连接误封；
+/// - 超过 `next_probe_at` 时原子放行单次半开探测（并推进下一次探测时间防并发惊群），使 `clear_server_first_endpoint` 真正可达。
+fn should_skip_opportunistic_sniff_at(key: (IpAddr, u16), now: Instant) -> bool {
     let mut map = server_first_endpoint_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
+    let Some(entry) = map.get_mut(&key) else {
+        return false;
+    };
+    if entry.expires_at <= now {
+        map.remove(&key);
+        return false;
+    }
+    if entry.consecutive_timeouts < SERVER_FIRST_LEARN_THRESHOLD {
+        return false;
+    }
+    if now >= entry.next_probe_at {
+        let (probe_wait, _) = server_first_backoff(entry.consecutive_timeouts);
+        entry.next_probe_at = now + probe_wait;
+        return false;
+    }
+    true
+}
+
+fn should_skip_opportunistic_sniff(key: (IpAddr, u16)) -> bool {
+    should_skip_opportunistic_sniff_at(key, Instant::now())
+}
+
+fn record_server_first_endpoint_at(key: (IpAddr, u16), now: Instant) {
+    let mut map = server_first_endpoint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let next_count = map
+        .get(&key)
+        .filter(|e| e.expires_at > now)
+        .map_or(1, |e| e.consecutive_timeouts.saturating_add(1));
+    let (probe_wait, ttl) = server_first_backoff(next_count);
+    let entry = ServerFirstEntry {
+        consecutive_timeouts: next_count,
+        next_probe_at: now + probe_wait,
+        expires_at: now + ttl,
+    };
     if map.len() >= SERVER_FIRST_CACHE_MAX_ENTRIES && !map.contains_key(&key) {
-        map.retain(|_, exp| *exp > now);
+        map.retain(|_, e| e.expires_at > now);
         if map.len() >= SERVER_FIRST_CACHE_MAX_ENTRIES
-            && let Some(oldest) = map.iter().min_by_key(|(_, exp)| **exp).map(|(k, _)| *k)
+            && let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, e)| e.expires_at)
+                .map(|(k, _)| *k)
         {
             map.remove(&oldest);
         }
     }
-    map.insert(key, expire);
+    map.insert(key, entry);
+}
+
+fn record_server_first_endpoint(key: (IpAddr, u16)) {
+    record_server_first_endpoint_at(key, Instant::now());
 }
 
 fn clear_server_first_endpoint(key: (IpAddr, u16)) {
@@ -101,6 +160,13 @@ fn clear_server_first_endpoint(key: (IpAddr, u16)) {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     map.remove(&key);
+}
+
+pub(crate) fn clear_server_first_endpoint_cache() {
+    let mut map = server_first_endpoint_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    map.clear();
 }
 
 fn is_spoofed_local_hostname(host: &str, orig_dst_ip: IpAddr) -> bool {
@@ -530,11 +596,14 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                 ) => (false, false),
             };
             let ep_key = (orig_dst.ip().to_canonical(), orig_dst.port());
+            let skip_alt_server_first =
+                opportunistic_sniff && is_alt_server_first_port(orig_dst.port());
             let skip_learned_server_first =
-                opportunistic_sniff && is_learned_server_first_endpoint(ep_key);
+                opportunistic_sniff && should_skip_opportunistic_sniff(ep_key);
             // 除已知服务端先发协议端口与已学习的自定义服务端先发端点外，绝不因被动缓存域名或非标准端口跳过权威嗅探
             let need_sniff = want_sniff
-                && !is_server_first_protocol_port(orig_dst.port())
+                && !is_strict_server_first_port(orig_dst.port())
+                && !skip_alt_server_first
                 && !skip_learned_server_first;
             let sniff_timeout = if opportunistic_sniff {
                 TRANSPARENT_OPPORTUNISTIC_SNIFF_TIMEOUT
@@ -2088,14 +2157,14 @@ mod tests {
             srv.await.unwrap();
         }
 
-        // 2. 任意自定义服务端先发端口（如 22022）：首连最多等 25ms 机会式超时（远低于 120ms）并自动学习，
-        //    后续再次连接同一端点直接零延迟跳过嗅探
+        // 2. 任意自定义服务端先发端口（如 22022）：需连续 2 次 25ms 静默超时才进入退避跳过（防单次慢启动误封），
+        //    第 3 次起零延迟跳过嗅探
         let custom_ep = SocketAddr::new("93.184.216.96".parse().unwrap(), 22022);
         clear_server_first_endpoint((custom_ep.ip(), custom_ep.port()));
         let socks_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_c_addr = socks_c.local_addr().unwrap();
         let srv_c = tokio::spawn(async move {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut s, _) = socks_c.accept().await.unwrap();
                 let mut g = [0u8; 3];
                 s.read_exact(&mut g).await.unwrap();
@@ -2109,7 +2178,7 @@ mod tests {
             }
         });
         let cfg_c = make_devproxy_cfg(socks_c_addr);
-        for attempt in 0..2 {
+        for attempt in 0..3 {
             let (mut app, disp) = tokio::io::duplex(1024);
             let cfg_clone = Arc::clone(&cfg_c);
             let started = std::time::Instant::now();
@@ -2128,17 +2197,17 @@ mod tests {
             app.read_exact(&mut banner).await.unwrap();
             assert_eq!(&banner, b"SSH-2.0-Custom22022");
             let elapsed = started.elapsed();
-            if attempt == 0 {
+            if attempt < 2 {
                 assert!(
                     elapsed < Duration::from_millis(90),
-                    "1st connect to unknown server-first port 22022 must use short opportunistic timeout (<90ms), took {:?}",
+                    "attempt {} to unknown server-first port 22022 must use short opportunistic timeout (<90ms), took {:?}",
+                    attempt,
                     elapsed
                 );
-                assert!(is_learned_server_first_endpoint((custom_ep.ip(), custom_ep.port())));
             } else {
                 assert!(
                     elapsed < Duration::from_millis(30),
-                    "2nd connect to learned server-first port 22022 must skip sniff immediately, took {:?}",
+                    "3rd connect to learned server-first port 22022 must skip sniff immediately, took {:?}",
                     elapsed
                 );
             }
@@ -2146,6 +2215,110 @@ mod tests {
             handle.await.unwrap().unwrap();
         }
         srv_c.await.unwrap();
+
+        // 2b. 单次慢启动超时不得拉黑端点；已学习端点在退避探测窗口到期后必须放行单次半开探测并可被清除恢复
+        let probe_key: (IpAddr, u16) = ("93.184.216.98".parse().unwrap(), 24443);
+        clear_server_first_endpoint(probe_key);
+        let t0 = Instant::now();
+        record_server_first_endpoint_at(probe_key, t0);
+        assert!(
+            !should_skip_opportunistic_sniff_at(probe_key, t0 + Duration::from_millis(5)),
+            "single 25ms timeout must NOT blacklist endpoint"
+        );
+        record_server_first_endpoint_at(probe_key, t0 + Duration::from_millis(50));
+        assert!(
+            should_skip_opportunistic_sniff_at(probe_key, t0 + Duration::from_secs(1)),
+            "2 consecutive timeouts should suppress sniff during backoff window"
+        );
+        // 退避窗口（15s）到期后：仅放行 1 次半开探测，并发后续连接仍跳过，收到字节调用 clear 后彻底恢复
+        assert!(
+            !should_skip_opportunistic_sniff_at(probe_key, t0 + Duration::from_secs(16)),
+            "half-open probe must be allowed after backoff interval so clear_server_first_endpoint is reachable"
+        );
+        assert!(
+            should_skip_opportunistic_sniff_at(probe_key, t0 + Duration::from_secs(16)),
+            "concurrent connection during half-open probe must still skip sniff"
+        );
+        clear_server_first_endpoint(probe_key);
+        assert!(!should_skip_opportunistic_sniff_at(
+            probe_key,
+            t0 + Duration::from_secs(17)
+        ));
+
+        // 2c. NeedsDomainSniff 规则下端口 2222 绝不可被当作服务端先发端口无条件跳过（需提取 TLS SNI）
+        let domain_2222_socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let domain_2222_socks_addr = domain_2222_socks.local_addr().unwrap();
+        let (sni2222_tx, sni2222_rx) = tokio::sync::oneshot::channel();
+        let hello_2222 = build_test_tls_client_hello("panel.2222.example");
+        let expected_2222 = hello_2222.clone();
+        let srv_2222 = tokio::spawn(async move {
+            let (mut s, _) = domain_2222_socks.accept().await.unwrap();
+            let mut g = [0u8; 3];
+            s.read_exact(&mut g).await.unwrap();
+            s.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut hdr = [0u8; 4];
+            s.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(hdr[3], 0x03, "NeedsDomainSniff on port 2222 must sniff TLS SNI");
+            let mut l = [0u8; 1];
+            s.read_exact(&mut l).await.unwrap();
+            let mut dom = vec![0u8; l[0] as usize];
+            s.read_exact(&mut dom).await.unwrap();
+            let mut p = [0u8; 2];
+            s.read_exact(&mut p).await.unwrap();
+            let _ = sni2222_tx.send((String::from_utf8(dom).unwrap(), u16::from_be_bytes(p)));
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut got = vec![0u8; expected_2222.len()];
+            s.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, expected_2222);
+            s.write_all(b"OK2222").await.unwrap();
+        });
+        let cfg_2222 = {
+            let cfg = test_config(
+                "127.0.0.1:40001".parse().unwrap(),
+                vec![crate::router::Rule::from_raw(
+                    "PanelProxy",
+                    true,
+                    None,
+                    Some("panel.2222.example"),
+                    Some("2222"),
+                    Action::Proxy(1),
+                )],
+            );
+            cfg.proxy_nodes.write().unwrap().insert(
+                1,
+                ProxyNodeEntry {
+                    id: 1,
+                    name: "MockSocks".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: domain_2222_socks_addr.to_string(),
+                    username: None,
+                    client: ProxyNode::Socks5(Socks5Client::new(domain_2222_socks_addr.to_string())),
+                },
+            );
+            Arc::new(cfg)
+        };
+        let (mut app_2222, disp_2222) = tokio::io::duplex(4096);
+        let h_2222 = tokio::spawn(async move {
+            dispatch_transparent_stream(
+                cfg_2222,
+                disp_2222,
+                "127.0.0.1:50504".parse().unwrap(),
+                "93.184.216.99:2222".parse().unwrap(),
+                None,
+                true,
+            )
+            .await
+        });
+        app_2222.write_all(&hello_2222).await.unwrap();
+        let mut ack_2222 = [0u8; 6];
+        app_2222.read_exact(&mut ack_2222).await.unwrap();
+        assert_eq!(&ack_2222, b"OK2222");
+        assert_eq!(sni2222_rx.await.unwrap(), ("panel.2222.example".to_string(), 2222));
+        drop(app_2222);
+        h_2222.await.unwrap().unwrap();
+        srv_2222.await.unwrap();
 
         // 3. 任意非常见 HTTPS 端口（如 18443）在 DevProxy 下仍能在 25ms 机会式窗口内秒提 TLS SNI 并传权威域名给代理
         let custom_tls_ep = SocketAddr::new("93.184.216.97".parse().unwrap(), 18443);
@@ -2196,7 +2369,8 @@ mod tests {
         app_t.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"OK18443");
         assert_eq!(sni_rx.await.unwrap(), ("custom-port.example".to_string(), 18443));
-        assert!(!is_learned_server_first_endpoint((custom_tls_ep.ip(), custom_tls_ep.port())));
+        assert!(!should_skip_opportunistic_sniff((custom_tls_ep.ip(), custom_tls_ep.port())));
+        clear_server_first_endpoint_cache();
         drop(app_t);
         h_t.await.unwrap().unwrap();
         srv_t.await.unwrap();

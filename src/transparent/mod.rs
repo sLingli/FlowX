@@ -1459,6 +1459,7 @@ impl TransparentManager {
         drop(rt.network_handle);
         drop(rt.dns_inspect_handle);
         self.stats.active_flows.store(0, Ordering::Relaxed);
+        crate::interceptor::dispatcher::clear_server_first_endpoint_cache();
 
         if let Err(e) = flush_dns_cache() {
             warn!(error = %e, "Failed to flush Windows DNS cache while stopping transparent mode");
