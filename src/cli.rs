@@ -23,6 +23,7 @@ const DEFAULT_API_ADDR: &str = "127.0.0.1:40080";
 const DEFAULT_SELF_PORTS: [u16; 3] = [40001, 40080, 1053];
 const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const API_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const API_ELEVATE_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CLI_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CLI_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -70,9 +71,14 @@ struct ParsedCliInvocation {
 fn is_subcommand_bool_flag(name: &str) -> bool {
     matches!(
         name,
-        "enable"
+        "all"
+            | "enable"
             | "disable"
+            | "clear-user"
             | "clear-password"
+            | "clear-apps"
+            | "clear-targets"
+            | "clear-ports"
             | "hijack-dns"
             | "no-hijack-dns"
             | "block-quic"
@@ -108,6 +114,8 @@ fn is_known_subcommand_value_flag(name: &str) -> bool {
             | "process"
             | "proc"
             | "dll-path"
+            | "filter"
+            | "search"
     )
 }
 
@@ -554,18 +562,19 @@ SUBCOMMANDS:
   transparent enable | disable
   transparent config [--hijack-dns | --no-hijack-dns] [--block-quic | --no-block-quic] [--dll-path <PATH> | --clear-dll-path]
   transparent doctor
-      Inspect WinDivert driver diagnostics, enable/disable system-level transparent proxying, or configure DNS/QUIC options.
+  transparent elevate
+      Inspect WinDivert driver diagnostics, enable/disable/elevate transparent proxying, or configure DNS/QUIC/DLL options.
 
   node list
   node add --name <NAME> --addr <HOST:PORT> [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U>] [--pass <P>]
-  node update <ID> [--name <NAME>] [--addr <HOST:PORT>] [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U>] [--pass <P> | --clear-password]
+  node update <ID> [--name <NAME>] [--addr <HOST:PORT>] [--protocol <SOCKS5|HTTP|SOCKS4>] [--user <U> | --clear-user] [--pass <P> | --clear-password]
   node remove <ID>
-  node ping <ID>
-      Manage proxy nodes (persists to XML automatically; syncs with live daemon when running).
+  node ping <ID> | --all
+      Manage and probe proxy nodes (persists to XML automatically; syncs with live daemon when running).
 
-  rule list
+  rule list [--search <TEXT>]
   rule add --name <NAME> --action <Direct|Block|Proxy[:NODE_ID]> [--node <NODE_ID>] [--apps <GLOB>] [--targets <HOSTS>] [--ports <PORTS>]
-  rule update <ID_OR_INDEX> [--name <NAME>] [--action <Direct|Block|Proxy[:NODE_ID]>] [--node <NODE_ID>] [--apps <GLOB>] [--targets <HOSTS>] [--ports <PORTS>] [--enable | --disable]
+  rule update <ID_OR_INDEX> [--name <NAME>] [--action <Direct|Block|Proxy[:NODE_ID]>] [--node <NODE_ID>] [--apps <GLOB> | --clear-apps] [--targets <HOSTS> | --clear-targets] [--ports <PORTS> | --clear-ports] [--enable | --disable]
   rule toggle <ID_OR_INDEX> [--enable | --disable]
   rule move <ID_OR_INDEX> <up|down|top|bottom>
   rule remove <ID_OR_INDEX>
@@ -577,9 +586,9 @@ SUBCOMMANDS:
   sim --target <HOST[:PORT]> [--app <PROCESS_NAME_OR_PATH>] [--port <PORT>]
       Dry-run route evaluation and print the matched rule, action, and per-rule skip reasons.
 
-  conn list
+  conn list [--filter <ALL|PROXY|DIRECT|BLOCK>] [--search <TEXT>]
   conn kill <ID>
-      Inspect or terminate live active connections (requires running FlowX daemon).
+      Inspect, filter, or terminate live active connections (requires running FlowX daemon).
 
 GLOBAL FLAGS:
   --config <PATH>   Path to XML configuration file (default: flowx.xml or $FLOWX_CONFIG)
@@ -1075,17 +1084,46 @@ async fn api_request_raw_with_timeouts(
     Ok((status_code, json_val))
 }
 
+async fn api_request_strict_with_io_timeout(
+    api_addr: &str,
+    locale: Locale,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    io_timeout: Duration,
+) -> Result<(u16, Value)> {
+    match api_request_raw_with_timeouts(
+        api_addr,
+        locale,
+        method,
+        path,
+        body,
+        API_CONNECT_TIMEOUT,
+        io_timeout,
+    )
+    .await
+    {
+        Ok(res) => Ok(res),
+        Err(ApiTransportError::ConnectionRefused(msg)) => Err(anyhow!("{}", msg)),
+        Err(ApiTransportError::Other(e)) => Err(e),
+    }
+}
+
 async fn api_request_strict(
     api_addr: &str,
     method: &str,
     path: &str,
     body: Option<&Value>,
 ) -> Result<(u16, Value)> {
-    match api_request_raw(api_addr, Locale::from_env(), method, path, body).await {
-        Ok(res) => Ok(res),
-        Err(ApiTransportError::ConnectionRefused(msg)) => Err(anyhow!("{}", msg)),
-        Err(ApiTransportError::Other(e)) => Err(e),
-    }
+    api_request_strict_with_io_timeout(
+        api_addr,
+        Locale::from_env(),
+        method,
+        path,
+        body,
+        API_IO_TIMEOUT,
+    )
+    .await
 }
 
 async fn api_request_or_offline(
@@ -1340,12 +1378,12 @@ fn canonical_flag_group(flag: &str) -> &str {
     match flag {
         "server" | "addr" => "addr",
         "proto" | "protocol" => "protocol",
-        "username" | "user" => "user",
-        "password" | "pass" => "pass",
+        "username" | "user" | "clear-user" => "user",
+        "password" | "pass" | "clear-password" => "pass",
         "node-id" | "node" => "node",
-        "app" | "apps" | "process" | "proc" => "apps",
-        "target" | "targets" | "host" => "targets",
-        "port" | "ports" => "ports",
+        "app" | "apps" | "process" | "proc" | "clear-apps" => "apps",
+        "target" | "targets" | "host" | "clear-targets" => "targets",
+        "port" | "ports" | "clear-ports" => "ports",
         "dir" | "direction" => "dir",
         "hijack-dns" | "no-hijack-dns" => "hijack-dns",
         "block-quic" | "no-block-quic" => "block-quic",
@@ -1949,6 +1987,42 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
             }
             Ok(())
         }
+        "elevate" => {
+            if opts.offline {
+                bail!(
+                    "`flowx transparent elevate` requires a running FlowX daemon and cannot be used with --offline"
+                );
+            }
+            let _ = parse_flags_with_spec(
+                tail,
+                ArgSpec {
+                    cmd_label: "flowx transparent elevate",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
+            let (st, val) = api_request_strict_with_io_timeout(
+                &opts.api_addr,
+                opts.locale,
+                "POST",
+                "/api/transparent/elevate",
+                Some(&json!({})),
+                API_ELEVATE_IO_TIMEOUT,
+            )
+            .await?;
+            let res_val = ensure_api_ok(st, val)?;
+            if opts.json_output {
+                println!("{}", serde_json::to_string_pretty(&res_val)?);
+            } else {
+                println!(
+                    "Elevation accepted (relaunching={}). The elevated daemon will replace this instance cleanly.",
+                    res_val["relaunching"].as_bool().unwrap_or(true)
+                );
+            }
+            Ok(())
+        }
         other => bail!("Unknown `flowx transparent` subcommand '{}'", other),
     }
 }
@@ -2073,7 +2147,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                         "id", "name", "addr", "server", "protocol", "proto", "user", "username",
                         "pass", "password",
                     ],
-                    bool_flags: &["clear-password"],
+                    bool_flags: &["clear-user", "clear-password"],
                     min_pos: 0,
                     max_pos: 1,
                 },
@@ -2097,12 +2171,15 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 .get("protocol")
                 .or_else(|| flags.get("proto"))
                 .cloned();
-            let (username, clear_username) =
+            let (username, clear_username) = if flags.contains_key("clear-user") {
+                (None, Some(true))
+            } else {
                 match flags.get("user").or_else(|| flags.get("username")) {
                     Some(u) if u.trim().is_empty() => (None, Some(true)),
                     Some(u) => (Some(u.clone()), None),
                     None => (None, None),
-                };
+                }
+            };
             let clear_password = clear_password_flag.then_some(true);
             let keep_password = if clear_password_flag {
                 Some(false)
@@ -2212,13 +2289,19 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 ArgSpec {
                     cmd_label: "flowx node ping",
                     value_flags: &["id"],
-                    bool_flags: &[],
+                    bool_flags: &["all"],
                     min_pos: 0,
                     max_pos: 1,
                 },
             )?;
+            if flags.contains_key("all") {
+                if !pos.is_empty() || flags.contains_key("id") {
+                    bail!("Cannot specify both --all and a node <ID> for `flowx node ping`");
+                }
+                return ping_all_nodes(opts).await;
+            }
             let id_str =
-                resolve_id_arg(&pos, &flags, "Missing node <ID> for `flowx node ping`")?;
+                resolve_id_arg(&pos, &flags, "Missing node <ID> or --all for `flowx node ping`")?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
             let res_val = if let Some((st, val)) = api_request_or_offline(
@@ -2274,6 +2357,148 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
     }
 }
 
+async fn ping_all_nodes(opts: &GlobalCliOpts) -> Result<()> {
+    let (online, nodes): (bool, Vec<(u32, String, String, String)>) =
+        if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/nodes", None).await? {
+            let list: Vec<ProxyNodeView> = serde_json::from_value(ensure_api_ok(st, val)?)?;
+            (
+                true,
+                list.into_iter()
+                    .map(|n| (n.id, n.name, n.protocol, n.server_addr))
+                    .collect(),
+            )
+        } else {
+            let rt = load_offline_runtime_readonly(&opts.config_path)?;
+            let guard = rt.nodes.read().unwrap_or_else(|e| e.into_inner());
+            let mut list: Vec<_> = guard
+                .values()
+                .map(|n| {
+                    (
+                        n.id,
+                        n.name.clone(),
+                        n.protocol.clone(),
+                        n.server_addr.clone(),
+                    )
+                })
+                .collect();
+            list.sort_by_key(|(id, _, _, _)| *id);
+            (false, list)
+        };
+
+    let mut handles = Vec::with_capacity(nodes.len());
+    for (id, name, protocol, server_addr) in nodes {
+        let api_addr = opts.api_addr.clone();
+        let locale = opts.locale;
+        handles.push(tokio::spawn(async move {
+            let ping_val = if online {
+                match api_request_raw(
+                    &api_addr,
+                    locale,
+                    "POST",
+                    "/api/nodes/ping",
+                    Some(&json!({ "id": id })),
+                )
+                .await
+                {
+                    Ok((st, val)) if (200..300).contains(&st) => val,
+                    Ok((st, val)) => json!({
+                        "ok": false,
+                        "latency_ms": 0,
+                        "message": val["error"]
+                            .as_str()
+                            .unwrap_or(&format!("HTTP {}", st))
+                            .to_string(),
+                        "detail": val.get("code").cloned().unwrap_or(Value::Null),
+                    }),
+                    Err(ApiTransportError::ConnectionRefused(msg)) => {
+                        return Err(anyhow!("{}", msg));
+                    }
+                    Err(ApiTransportError::Other(e)) => {
+                        return Err(e);
+                    }
+                }
+            } else {
+                let (ok, latency_ms, message, detail) =
+                    ping_address(&server_addr, &DEFAULT_SELF_PORTS, locale).await;
+                serde_json::to_value(PingResponse {
+                    ok,
+                    latency_ms,
+                    message,
+                    detail,
+                })?
+            };
+            let mut entry = json!({
+                "id": id,
+                "name": name,
+                "protocol": protocol,
+                "server_addr": server_addr,
+                "ok": ping_val["ok"].as_bool().unwrap_or(false),
+                "latency_ms": ping_val["latency_ms"].as_u64().unwrap_or(0),
+                "message": ping_val["message"].as_str().unwrap_or("").to_string(),
+            });
+            if let Some(detail) = ping_val.get("detail").filter(|d| !d.is_null())
+                && let Some(obj) = entry.as_object_mut()
+            {
+                obj.insert("detail".to_string(), detail.clone());
+            }
+            Ok(entry)
+        }));
+    }
+
+    let mut results = Vec::with_capacity(handles.len());
+    for h in handles {
+        let item = h.await.context("Ping task failed")??;
+        results.push(item);
+    }
+
+    let total = results.len();
+    let reachable = results
+        .iter()
+        .filter(|r| r["ok"].as_bool().unwrap_or(false))
+        .count();
+    let unreachable = total.saturating_sub(reachable);
+    let summary = json!({
+        "ok": unreachable == 0,
+        "total": total,
+        "reachable": reachable,
+        "unreachable": unreachable,
+        "results": results,
+    });
+
+    if opts.json_output {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else if total == 0 {
+        println!("No proxy nodes configured.");
+    } else {
+        for r in summary["results"].as_array().into_iter().flatten() {
+            let id = r["id"].as_u64().unwrap_or(0);
+            let name = r["name"].as_str().unwrap_or("-");
+            if r["ok"].as_bool().unwrap_or(false) {
+                println!(
+                    "Node #{:<4} {:<18} reachable: {} ms",
+                    id,
+                    name,
+                    r["latency_ms"].as_u64().unwrap_or(0)
+                );
+            } else {
+                println!(
+                    "Node #{:<4} {:<18} unreachable: {}",
+                    id,
+                    name,
+                    r["message"].as_str().unwrap_or("failed")
+                );
+            }
+        }
+        println!("Ping all complete: {}/{} reachable.", reachable, total);
+    }
+
+    let _ = std::io::stdout().flush();
+    if unreachable > 0 {
+        return Err(anyhow::Error::new(SilentExitError { code: 1 }));
+    }
+    Ok(())
+}
+
 async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
     let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("list");
     let tail = if opts.rest.len() > 2 {
@@ -2284,16 +2509,20 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
 
     match sub {
         "list" | "ls" => {
-            let _ = parse_flags_with_spec(
+            let (_, flags) = parse_flags_with_spec(
                 tail,
                 ArgSpec {
                     cmd_label: "flowx rule list",
-                    value_flags: &[],
+                    value_flags: &["search"],
                     bool_flags: &[],
                     min_pos: 0,
                     max_pos: 0,
                 },
             )?;
+            let search_lower = flags
+                .get("search")
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty());
             let list: Vec<RuleView> =
                 if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/rules", None).await?
                 {
@@ -2303,12 +2532,33 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     rt.engine.list_rules_view_with_locale(opts.locale)
                 };
 
+            let indexed: Vec<(usize, RuleView)> = list
+                .into_iter()
+                .enumerate()
+                .filter(|(_, r)| match search_lower.as_deref() {
+                    Some(kw) => {
+                        let hay = format!(
+                            "{} {} {} {} {}",
+                            r.name, r.apps, r.targets, r.ports, r.action
+                        )
+                        .to_lowercase();
+                        hay.contains(kw)
+                    }
+                    None => true,
+                })
+                .collect();
+
             if opts.json_output {
-                println!("{}", serde_json::to_string_pretty(&list)?);
-            } else if list.is_empty() {
-                println!("No routing rules configured.");
+                let filtered: Vec<&RuleView> = indexed.iter().map(|(_, r)| r).collect();
+                println!("{}", serde_json::to_string_pretty(&filtered)?);
+            } else if indexed.is_empty() {
+                if search_lower.is_some() {
+                    println!("No matching routing rules.");
+                } else {
+                    println!("No routing rules configured.");
+                }
             } else {
-                for (idx, r) in list.iter().enumerate() {
+                for (idx, r) in indexed {
                     let state_str = if r.enabled { "ON " } else { "OFF" };
                     let apps = if r.apps.is_empty() { "*" } else { &r.apps };
                     let targets = if r.targets.is_empty() { "*" } else { &r.targets };
@@ -2404,7 +2654,13 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                         "id", "name", "action", "node", "node-id", "apps", "app", "targets",
                         "target", "ports", "port",
                     ],
-                    bool_flags: &["enable", "disable"],
+                    bool_flags: &[
+                        "enable",
+                        "disable",
+                        "clear-apps",
+                        "clear-targets",
+                        "clear-ports",
+                    ],
                     min_pos: 0,
                     max_pos: 1,
                 },
@@ -2441,12 +2697,24 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 None => (None, explicit_node),
             };
             let name = flags.get("name").cloned();
-            let apps = flags.get("apps").or_else(|| flags.get("app")).cloned();
-            let targets = flags
-                .get("targets")
-                .or_else(|| flags.get("target"))
-                .cloned();
-            let ports = flags.get("ports").or_else(|| flags.get("port")).cloned();
+            let apps = if flags.contains_key("clear-apps") {
+                Some(String::new())
+            } else {
+                flags.get("apps").or_else(|| flags.get("app")).cloned()
+            };
+            let targets = if flags.contains_key("clear-targets") {
+                Some(String::new())
+            } else {
+                flags
+                    .get("targets")
+                    .or_else(|| flags.get("target"))
+                    .cloned()
+            };
+            let ports = if flags.contains_key("clear-ports") {
+                Some(String::new())
+            } else {
+                flags.get("ports").or_else(|| flags.get("port")).cloned()
+            };
 
             let (resolved_id, res_val) = match load_rule_backend(opts).await? {
                 RuleBackend::Online { rules } => {
@@ -2877,36 +3145,65 @@ async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
 
     match sub {
         "list" | "ls" => {
-            let _ = parse_flags_with_spec(
+            let (_, flags) = parse_flags_with_spec(
                 tail,
                 ArgSpec {
                     cmd_label: "flowx conn list",
-                    value_flags: &[],
+                    value_flags: &["filter", "search"],
                     bool_flags: &[],
                     min_pos: 0,
                     max_pos: 0,
                 },
             )?;
+            let action_filter = match flags.get("filter") {
+                Some(raw) => {
+                    let upper = raw.trim().to_ascii_uppercase();
+                    if !matches!(upper.as_str(), "ALL" | "PROXY" | "DIRECT" | "BLOCK") {
+                        bail!(
+                            "Invalid --filter '{}'; expected ALL, PROXY, DIRECT, or BLOCK",
+                            raw
+                        );
+                    }
+                    upper
+                }
+                None => "ALL".to_string(),
+            };
+            let search_lower = flags
+                .get("search")
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty());
+
             let (st, val) =
                 api_request_strict(&opts.api_addr, "GET", "/api/connections", None).await?;
             let v = ensure_api_ok(st, val)?;
+            let filtered: Vec<Value> = v
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|c| conn_matches_filter(c, &action_filter, search_lower.as_deref()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
             if opts.json_output {
-                println!("{}", serde_json::to_string_pretty(&v)?);
-            } else if let Some(arr) = v.as_array() {
-                if arr.is_empty() {
-                    println!("No active connections.");
+                println!("{}", serde_json::to_string_pretty(&filtered)?);
+            } else if filtered.is_empty() {
+                if action_filter != "ALL" || search_lower.is_some() {
+                    println!("No matching active connections.");
                 } else {
-                    for c in arr {
-                        println!(
-                            "#{:<5} {:<18} (pid={:<6}) -> {:<26} [{}] {}",
-                            c["id"].as_u64().unwrap_or(0),
-                            c["process_name"].as_str().unwrap_or("-"),
-                            c["pid"].as_u64().unwrap_or(0),
-                            c["target"].as_str().unwrap_or("-"),
-                            c["rule_name"].as_str().unwrap_or("-"),
-                            c["action"].as_str().unwrap_or("-")
-                        );
-                    }
+                    println!("No active connections.");
+                }
+            } else {
+                for c in &filtered {
+                    println!(
+                        "#{:<5} {:<18} (pid={:<6}) -> {:<26} [{}] {}",
+                        c["id"].as_u64().unwrap_or(0),
+                        c["process_name"].as_str().unwrap_or("-"),
+                        c["pid"].as_u64().unwrap_or(0),
+                        c["target"].as_str().unwrap_or("-"),
+                        c["rule_name"].as_str().unwrap_or("-"),
+                        c["action"].as_str().unwrap_or("-")
+                    );
                 }
             }
             Ok(())
@@ -2947,6 +3244,38 @@ async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
         }
         other => bail!("Unknown `flowx conn` subcommand '{}'", other),
     }
+}
+
+fn conn_matches_filter(conn: &Value, action_filter: &str, search_lower: Option<&str>) -> bool {
+    let act = conn["action_type"]
+        .as_str()
+        .or_else(|| conn["action"].as_str())
+        .unwrap_or("");
+    let action_ok = match action_filter {
+        "ALL" => true,
+        "PROXY" => act.contains("Proxy") || act.contains("Chain"),
+        "DIRECT" => act.contains("Direct"),
+        "BLOCK" => act.contains("Block"),
+        _ => true,
+    };
+    if !action_ok {
+        return false;
+    }
+    if let Some(kw) = search_lower {
+        let hay = format!(
+            "{} {} {} {} {}",
+            conn["process_name"].as_str().unwrap_or(""),
+            conn["process_path"].as_str().unwrap_or(""),
+            conn["target"].as_str().unwrap_or(""),
+            conn["rule_name"].as_str().unwrap_or(""),
+            conn["action"].as_str().unwrap_or(""),
+        )
+        .to_lowercase();
+        if !hay.contains(kw) {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -4300,5 +4629,380 @@ mod tests {
             build_transparent_doctor_report("OFFLINE", &online_no_cfg, "./local-cli.xml");
         assert_eq!(offline_report["ready"], true);
         assert_eq!(offline_report["config_path"], "./local-cli.xml");
+    }
+
+    #[tokio::test]
+    async fn test_cli_transparent_elevate_node_clear_user_and_ping_all() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 1. `transparent elevate --offline` fails cleanly
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--offline".into(),
+                "--json".into(),
+                "transparent".into(),
+                "elevate".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        // 2. `transparent elevate` online sends POST /api/transparent/elevate and handles 200 & 409
+        let elev_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let elev_addr = elev_listener.local_addr().unwrap().to_string();
+        let elev_srv = tokio::spawn(async move {
+            for (status, body) in [
+                ("200 OK", r#"{"ok":true,"relaunching":true}"#),
+                (
+                    "409 Conflict",
+                    r#"{"code":"ERR_TRANSPARENT_ALREADY_ELEVATED","error":"Already Administrator"}"#,
+                ),
+            ] {
+                let (mut sock, _) = elev_listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                assert!(
+                    req.starts_with("POST /api/transparent/elevate "),
+                    "unexpected elevate request: {req}"
+                );
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            elev_addr.clone(),
+            "--json".into(),
+            "transparent".into(),
+            "elevate".into(),
+        ])
+        .await
+        .unwrap();
+        let err_409 = run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            elev_addr,
+            "--json".into(),
+            "transparent".into(),
+            "elevate".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert_eq!(
+            format_cli_error_json(&err_409)["code"],
+            "ERR_TRANSPARENT_ALREADY_ELEVATED"
+        );
+        elev_srv.await.unwrap();
+
+        // 3. Offline & online `node update --clear-user` + conflict rejection + `node ping --all`
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_cli_parity_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&cfg_path);
+        let cfg_str = cfg_path.to_string_lossy().to_string();
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "node".into(),
+            "add".into(),
+            "--name".into(),
+            "AuthNode".into(),
+            "--addr".into(),
+            "10.0.0.5:1080".into(),
+            "--user".into(),
+            "alice".into(),
+            "--pass".into(),
+            "pw".into(),
+        ])
+        .await
+        .unwrap();
+
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--config".into(),
+                cfg_str.clone(),
+                "--offline".into(),
+                "node".into(),
+                "update".into(),
+                "102".into(),
+                "--user".into(),
+                "bob".into(),
+                "--clear-user".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "node".into(),
+            "update".into(),
+            "102".into(),
+            "--clear-user".into(),
+        ])
+        .await
+        .unwrap();
+        let store = ConfigStore::new(&cfg_path);
+        let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
+        assert_eq!(rt.proxy_nodes.get(&102).unwrap().username, None);
+        assert_eq!(
+            rt.proxy_nodes.get(&102).unwrap().client.auth_credentials(),
+            (None, None)
+        );
+        let _ = std::fs::remove_file(&cfg_path);
+
+        // `node ping --all` conflicts with positional ID
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--offline".into(),
+                "node".into(),
+                "ping".into(),
+                "--all".into(),
+                "101".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        // Online `node ping --all`: all ok -> Ok(()), partial failure -> SilentExitError
+        let mock_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = mock_listener.local_addr().unwrap().to_string();
+        let mock_srv = tokio::spawn(async move {
+            let mut ping_count = 0usize;
+            for _ in 0..6 {
+                let (mut sock, _) = mock_listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.starts_with("GET /api/nodes ") {
+                    r#"[{"id":101,"name":"N1","protocol":"SOCKS5","server_addr":"127.0.0.1:10808","auth_configured":false},{"id":102,"name":"N2","protocol":"HTTP","server_addr":"127.0.0.1:10809","auth_configured":false}]"#
+                } else {
+                    ping_count += 1;
+                    // Batch 1 (ping_count 1..=2): both ok; Batch 2 (ping_count 3..=4): one fails
+                    if ping_count <= 3 {
+                        r#"{"ok":true,"latency_ms":4,"message":"ok"}"#
+                    } else {
+                        r#"{"ok":false,"latency_ms":0,"message":"refused"}"#
+                    }
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            mock_addr.clone(),
+            "--json".into(),
+            "node".into(),
+            "ping".into(),
+            "--all".into(),
+        ])
+        .await
+        .unwrap();
+        let batch2_err = run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            mock_addr,
+            "--json".into(),
+            "node".into(),
+            "ping".into(),
+            "--all".into(),
+        ])
+        .await
+        .unwrap_err();
+        assert!(batch2_err.downcast_ref::<SilentExitError>().is_some());
+        mock_srv.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cli_rule_clear_filters_and_conn_list_filters() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_cli_rule_clr_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&cfg_path);
+        let cfg_str = cfg_path.to_string_lossy().to_string();
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "rule".into(),
+            "add".into(),
+            "--name".into(),
+            "ScopedRule".into(),
+            "--apps".into(),
+            "curl.exe".into(),
+            "--targets".into(),
+            "example.com".into(),
+            "--ports".into(),
+            "443".into(),
+            "--action".into(),
+            "Direct".into(),
+        ])
+        .await
+        .unwrap();
+
+        for (set_flag, set_val, clear_flag) in [
+            ("--apps", "git.exe", "--clear-apps"),
+            ("--targets", "github.com", "--clear-targets"),
+            ("--ports", "80", "--clear-ports"),
+        ] {
+            assert!(
+                run_cli(&[
+                    "flowx".into(),
+                    "--config".into(),
+                    cfg_str.clone(),
+                    "--offline".into(),
+                    "rule".into(),
+                    "update".into(),
+                    "1".into(),
+                    set_flag.into(),
+                    set_val.into(),
+                    clear_flag.into(),
+                ])
+                .await
+                .is_err()
+            );
+        }
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "rule".into(),
+            "update".into(),
+            "1".into(),
+            "--clear-apps".into(),
+            "--clear-targets".into(),
+            "--clear-ports".into(),
+        ])
+        .await
+        .unwrap();
+        let store = ConfigStore::new(&cfg_path);
+        let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
+        assert_eq!(rt.rules[0].apps_raw, "");
+        assert_eq!(rt.rules[0].targets_raw, "");
+        assert_eq!(rt.rules[0].ports_raw, "");
+
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "rule".into(),
+            "list".into(),
+            "--search".into(),
+            "scoped".into(),
+        ])
+        .await
+        .unwrap();
+        let _ = std::fs::remove_file(&cfg_path);
+
+        // `conn list` invalid filter validation and filtering helper
+        assert!(
+            run_cli(&[
+                "flowx".into(),
+                "--api".into(),
+                "127.0.0.1:40080".into(),
+                "conn".into(),
+                "list".into(),
+                "--filter".into(),
+                "INVALID".into(),
+            ])
+            .await
+            .is_err()
+        );
+
+        let sample_proxy = json!({
+            "id": 1,
+            "process_name": "chrome.exe",
+            "process_path": "C:\\Program Files\\Google\\Chrome\\chrome.exe",
+            "target": "api.github.com:443",
+            "rule_name": "DevProxy",
+            "action": "Proxy (#101)",
+            "action_type": "Proxy",
+        });
+        let sample_direct = json!({
+            "id": 2,
+            "process_name": "curl.exe",
+            "process_path": "C:\\Windows\\System32\\curl.exe",
+            "target": "localhost:8080",
+            "rule_name": "LocalBypass",
+            "action": "Direct",
+            "action_type": "Direct",
+        });
+        assert!(conn_matches_filter(&sample_proxy, "PROXY", Some("github")));
+        assert!(!conn_matches_filter(&sample_direct, "PROXY", None));
+        assert!(conn_matches_filter(&sample_direct, "DIRECT", Some("curl")));
+        assert!(!conn_matches_filter(&sample_proxy, "BLOCK", None));
+
+        let conn_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let conn_addr = conn_listener.local_addr().unwrap().to_string();
+        let conn_srv = tokio::spawn(async move {
+            let (mut sock, _) = conn_listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await.unwrap();
+            let body = r#"[{"id":1,"process_name":"chrome.exe","process_path":"C:\\chrome.exe","pid":10,"target":"github.com:443","rule_name":"DevProxy","action":"Proxy (#101)","action_type":"Proxy","duration_secs":1,"uploaded_bytes":0,"downloaded_bytes":0,"upload_bytes_per_sec":0,"download_bytes_per_sec":0}]"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        run_cli(&[
+            "flowx".into(),
+            "--api".into(),
+            conn_addr,
+            "--json".into(),
+            "conn".into(),
+            "list".into(),
+            "--filter".into(),
+            "proxy".into(),
+            "--search".into(),
+            "chrome".into(),
+        ])
+        .await
+        .unwrap();
+        conn_srv.await.unwrap();
     }
 }

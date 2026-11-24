@@ -1,0 +1,4 @@
+interface:
+  display_name: "FlowX"
+  short_description: "Windows process-level proxy routing and WinDivert diagnostics"
+  default_prompt: "Use $flowx to configure FlowX rules, nodes, and WinDivert transparent proxying."
