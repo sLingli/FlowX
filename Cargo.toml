@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "FlowX - Modern Windows Transparent Proxy & Process Routing Engine"
+repository = "https://github.com/sLingli/FlowX"
+homepage = "https://github.com/sLingli/FlowX"
+readme = "README.md"
 
 [dependencies]
 # 异步运行时与网络 I/O

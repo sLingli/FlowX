@@ -23,20 +23,61 @@
 | 本地 DNS 服务 | `127.0.0.1:1053` | 分配 `198.18.0.0/15` Fake-IP（阻断 AAAA/SVCB/HTTPS 防泄漏，上游 `223.5.5.5:53`） |
 | 控制台与 API | `http://127.0.0.1:40080` | 仅限本地回环同源访问的 Web 管理面板与 JSON 接口 |
 
-## 快速开始
+## 安装与快速开始
+
+### 方式一：下载预编译 Release（推荐 Windows 用户，免装 Rust）
+
+1. 前往 [GitHub Releases](https://github.com/sLingli/FlowX/releases) 下载对应压缩包：
+   - **`flowx-<version>-windows-x64.zip`（完整版，开箱即用）**：包含 `flowx.exe`、配对的 `driver/WinDivert.dll` + `WinDivert64.sys`（已含官方许可证声明）、配置模板及 `skills/flowx/`。
+   - **`flowx-<version>-windows-x64-lite.zip`（轻量版，纯 MIT）**：仅包含单文件 `flowx.exe` 与配置模板，适合仅使用 `127.0.0.1:40001` 混合代理（无需管理员权限或 WinDivert 驱动）。
+2. 解压后直接在目录中运行：
+
+```powershell
+# 启动守护引擎与 Web 控制台（首次运行若无 flowx.xml 会按默认模板生成）
+.\flowx.exe
+
+# 指定自定义配置文件，或临时覆写本次启动的透明代理开关（不改写磁盘 persisted enabled）
+.\flowx.exe --config my-profile.xml
+.\flowx.exe --transparent
+.\flowx.exe --no-transparent
+```
+
+### 方式二：通过 Rust / Cargo 从源码安装或运行
+
+要求已安装 Rust 1.85+（`edition = "2024"`）：
 
 ```bash
-# 运行后台守护引擎（首次运行若无配置文件会自动创建 flowx.xml）
+# 直接安装到 Cargo bin（PATH 中即可直接运行 `flowx`）
+cargo install --git https://github.com/sLingli/FlowX
+
+# 或克隆仓库本地编译 / 运行
+git clone https://github.com/sLingli/FlowX.git
+cd FlowX
+cargo build --release
+.\target\release\flowx.exe
+
+# 也可直接源码运行或跑全量单元测试
 cargo run
-
-# 指定自定义配置文件启动守护引擎，或临时覆写透明代理启动开关（不改写磁盘 persisted enabled）
-cargo run -- --config my-profile.xml
-cargo run -- --transparent
-cargo run -- --no-transparent
-
-# 运行全部单元测试
 cargo test
 ```
+
+> 若使用源码构建并需要系统级透明代理，请将 WinDivert 2.2 的 `WinDivert.dll` 与 `WinDivert64.sys` 放入 `flowx.exe` 同级（或同级 `driver\`）目录，详见下方说明。
+
+### 方式三：安装 AI Agent Skill / 一句话让 Agent 自动安装
+
+FlowX 内置了完整可控全量功能按钮与规则调试的 AI 技能包 [`skills/flowx/SKILL.md`](skills/flowx/SKILL.md)：
+
+```bash
+# 使用 Agent Skills CLI 安装（推荐，兼容 Claude Code / Cursor / Codex 等）
+npx skills add sLingli/FlowX
+```
+
+如果你习惯直接让 AI Agent（Claude Code、Cursor、Codex、Antigravity 等）一步安装并配置好环境，可以直接复制下面这段话发给它：
+
+> 请帮我安装并启动 FlowX（`https://github.com/sLingli/FlowX`）：
+> 1. 优先从 GitHub Releases 下载最新完整版 `flowx-*-windows-x64.zip` 解压到本地常用目录（若暂无可用 Release 或需源码构建，则 `git clone https://github.com/sLingli/FlowX.git` 并 `cargo build --release`，再从 WinDivert 官方 Release 下载配对 `WinDivert.dll` + `WinDivert64.sys` 放入同级 `driver/`）；
+> 2. 将仓库中的 `skills/flowx/` 安装到你当前客户端对应的 skills 目录；
+> 3. 启动 `flowx`，执行 `flowx status --json` 与 `flowx transparent doctor --json` 向我汇报端口、节点和透明代理就绪状态（如需管理员权限开启透明代理，请提示我确认 UAC 或调用 `flowx transparent elevate --json`，不要绕过权限检查）。
 
 启动后在浏览器打开 `http://127.0.0.1:40080` 即可查看实时吞吐图表、活动连接、开关系统级透明代理、新增/编辑/测速代理节点、调整分流规则与默认兜底策略，或使用内置「路由规则命中模拟器」干跑测试规则。
 
@@ -59,20 +100,23 @@ Windows 下支持通过 WinDivert 2.2 实现无需逐一配置应用代理的系
 # 查看运行状态与统计概览
 flowx status
 
-# 查看活跃连接或按 ID 断开指定连接（失败返回退出码 1）
-flowx conn list
+# 查看/筛选活跃连接或按 ID 断开指定连接（失败返回退出码 1）
+flowx conn list [--filter ALL|PROXY|DIRECT|BLOCK] [--search <TEXT>]
 flowx conn kill 12
 
-# 代理节点增删改查与测速（不可达返回退出码 1）
+# 代理节点增删改查与测速（不可达返回退出码 1；--clear-user/--clear-password 可清空凭据）
 flowx node list
 flowx node add --name "HK-Socks" --addr "127.0.0.1:10808" --protocol SOCKS5
 flowx node update 101 --name "HK-Main" --addr "127.0.0.1:10809"
+flowx node update 101 --clear-user --clear-password
 flowx node ping 101
+flowx node ping --all
 
-# 分流规则增删改查、启停与优先级排序
-flowx rule list
+# 分流规则增删改查、启停与优先级排序（--clear-apps/--clear-targets/--clear-ports 可清空条件）
+flowx rule list [--search <TEXT>]
 flowx rule add --name "GitProxy" --apps "git.exe" --targets "*.github.com" --ports "22; 443" --action Proxy:101
 flowx rule update 2 --targets "*.github.com; *.githubusercontent.com"
+flowx rule update 2 --clear-ports
 flowx rule toggle 2 --enable
 flowx rule move 2 top
 
@@ -83,11 +127,12 @@ flowx default Proxy:101
 # 干跑模拟流量命中哪条规则并输出逐条匹配轨迹
 flowx sim --app "git.exe" --target "api.github.com:443"
 
-# Windows 透明代理状态、诊断与配置管理（均支持 --api / $FLOWX_API 在线查询与 --offline 离线修改）
+# Windows 透明代理状态、诊断、配置管理与在线提权重启（均支持 --api / $FLOWX_API；除 elevate 外均支持 --offline）
 flowx transparent status
 flowx transparent doctor --json
 flowx transparent enable
 flowx transparent disable
+flowx transparent elevate --json
 flowx transparent config --hijack-dns --block-quic --dll-path "C:\tools\WinDivert.dll"
 flowx transparent config --clear-dll-path
 ```

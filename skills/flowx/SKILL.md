@@ -20,7 +20,7 @@ FlowX 是基于 Rust 的 Windows 进程级透明网络代理与分流引擎，�
 - **混合代理入站**：`127.0.0.1:40001`（无需管理员权限即可使用）
 - **本地 Fake-IP DNS**：`127.0.0.1:1053`（分配 `198.18.0.0/15`，阻断 AAAA/SVCB/HTTPS 防泄漏）
 - **Web 控制台与 HTTP API**：`http://127.0.0.1:40080`
-- **配置文件**：`.\flowx.xml`（可通过 `--config <路径>` 或 `$env:FLOWX_CONFIG` 指定；参考模板为 [flowx.example.xml](../../flowx.example.xml)）
+- **配置文件**：`.\flowx.xml`（可通过 `--config <路径>` 或 `$env:FLOWX_CONFIG` 指定；参考模板为 [references/flowx.example.xml](references/flowx.example.xml)）
 
 > **PowerShell 引号提醒**：`--apps`、`--targets`、`--ports` 中包含分号 `;` 时**必须使用引号包裹**（如 `--targets "*.github.com; *.npmjs.org"`），避免 PowerShell 将 `;` 解析为命令分隔符。
 
@@ -31,7 +31,7 @@ FlowX 是基于 Rust 的 Windows 进程级透明网络代理与分流引擎，�
 当用户要求“让某个程序 / 域名走代理、直连或阻断”或排查不生效问题时，严格按以下 5 步执行：
 
 1. **探测真实进程名（先查后写，绝不盲猜）**
-   - Windows 应用常拆分为多个可执行文件（例如同时存在 `Reasonix.exe` 与 `reasonix-desktop.exe`，或衍生 `msedgewebview2.exe` / `helper` 子进程）。
+   - Windows 应用常拆分为多个可执行文件（例如同时存在 `Cursor.exe` 与 `msedgewebview2.exe` / `helper` / `node.exe` 子进程）。
    - 先用 PowerShell 查询运行中进程或安装目录，确认完整进程名：
      ```powershell
      Get-Process | Where-Object { $_.ProcessName -match "关键词" } | Select-Object ProcessName, Path
@@ -100,7 +100,7 @@ flowx conn kill 42 --json
 
 ## 四、 规则语法要点
 
-- **`apps`**：分号 `;` 分隔，忽略大小写，`/` 与 `\` 自动归一化，支持 `*` 与 `?` 通配（如 `*reasonix*.exe`、`C:\Apps\*\client.exe`）。
+- **`apps`**：分号 `;` 分隔，忽略大小写，`/` 与 `\` 自动归一化，支持 `*` 与 `?` 通配（如 `*cursor*.exe`、`C:\Apps\*\client.exe`）。
   - 省略 `.exe` 的简写（如 `git`、`C:\Tools\curl`）可匹配 `.exe` 进程；`*.exe` / `*.*` 等纯通配后缀仅匹配显式带 `.exe` 的进程。
   - 含路径分隔符时 `*` 不跨越目录层级；不含分隔符时仅匹配进程文件名；留空匹配所有进程。
 - **`targets`**：分号 `;` 分隔域名、IPv4/IPv6 或 CIDR；前缀通配 `*.example.com` 同时匹配根域 `example.com` 与所有子域；支持展开 `%ComputerName%`（及别名 `%HOSTNAME%`）。
