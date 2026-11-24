@@ -165,13 +165,9 @@ impl Rule {
             return true;
         }
         let has_target_constraint = self.target_domains.is_some() || self.target_subnets.is_some();
-        if has_target_constraint
+        has_target_constraint
             && self.target_domains.as_ref().is_none_or(Vec::is_empty)
             && self.target_subnets.as_ref().is_none_or(Vec::is_empty)
-        {
-            return true;
-        }
-        false
     }
 
     /// 仅评估启用状态与应用进程约束（供端口无关的 DNS 预判与通用匹配复用）

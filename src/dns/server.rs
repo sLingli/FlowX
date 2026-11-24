@@ -843,19 +843,12 @@ pub(crate) async fn resolve_via_upstream_dns_with_options(
 }
 
 fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
-    if matches!(
+    matches!(
         err.kind(),
         std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::WouldBlock
             | std::io::ErrorKind::Interrupted
-    ) {
-        return true;
-    }
-    if err.raw_os_error() == Some(10040) {
-        // WSAEMSGSIZE: UDP datagram truncated by socket receive buffer
-        return true;
-    }
-    false
+    ) || err.raw_os_error() == Some(10040) // WSAEMSGSIZE: UDP datagram truncated by socket receive buffer
 }
 
 enum ForwardQueryOutcome {

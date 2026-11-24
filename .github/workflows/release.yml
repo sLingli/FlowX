@@ -63,10 +63,11 @@ jobs:
       - name: Cache Cargo dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify Clippy and unit tests before release
-        run: |
-          cargo clippy --all-targets --locked -- -D warnings
-          cargo test --locked
+      - name: Verify Clippy before release
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Verify unit tests before release
+        run: cargo test --locked
 
       - name: Build release binary
         run: cargo build --release --locked
