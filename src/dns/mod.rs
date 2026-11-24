@@ -337,6 +337,10 @@ impl FakeIpPool {
         self
     }
 
+    pub(crate) fn self_ports(&self) -> &[u16] {
+        &self.self_ports
+    }
+
     /// 为指定域名分配或复用一个 Fake-IP（采用 Double-Checked Locking 消除 TOCTOU 竞态）
     ///
     /// 命中已有映射时会滑动续期 TTL，保证仍在被查询的活跃域名不会因固定 TTL 到期而被回收重分配。
@@ -554,19 +558,12 @@ impl FakeIpPool {
             let before_count = state.ip_to_domain.len();
             state.ip_to_domain.retain(|_, entry| entry.expire > now);
             state.domain_to_ip.retain(|_, (_, expire)| *expire > now);
-            while let Some(&Reverse((exp, seq, ip_raw))) = state.expiry_heap.peek() {
-                if exp > now {
-                    break;
-                }
+            while state
+                .expiry_heap
+                .peek()
+                .is_some_and(|Reverse((exp, _, _))| *exp <= now)
+            {
                 state.expiry_heap.pop();
-                let ip = Ipv4Addr::from(ip_raw);
-                if state
-                    .ip_to_domain
-                    .get(&ip)
-                    .is_some_and(|entry| entry.seq == seq && entry.expire <= now)
-                {
-                    state.ip_to_domain.remove(&ip);
-                }
             }
             if state.expiry_heap.len() > state.ip_to_domain.len().saturating_mul(4).max(256) {
                 state.rebuild_expiry_heap();

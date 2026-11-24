@@ -329,33 +329,43 @@ impl DirectOutbound {
                                 .await
                                 .with_context(|| match &last_err {
                                     Some((primary_dns, primary_err)) => format!(
-                                        "Upstream DNS resolution failed for direct target {} (primary {}: {:#})",
-                                        domain, primary_dns, primary_err
+                                        "Upstream DNS resolution failed for direct target {} via fallback {} (primary {}: {:#})",
+                                        domain, canonical_upstream, primary_dns, primary_err
                                     ),
                                     None => format!(
-                                        "Upstream DNS resolution failed for direct target {}",
-                                        domain
+                                        "Upstream DNS resolution failed for direct target {} via {}",
+                                        domain, canonical_upstream
                                     ),
                                 })?
-                            } else if let Some((_, err)) = last_err {
+                            } else if let Some((srv, err)) = last_err {
                                 return Err(err).with_context(|| {
                                     format!(
-                                        "Upstream DNS resolution failed for direct target {}",
-                                        domain
+                                        "Upstream DNS resolution failed for direct target {} (last server: {}, fallback {} skipped due to timeout)",
+                                        domain, srv, canonical_upstream
                                     )
                                 });
                             } else {
-                                bail!("Upstream DNS resolution timed out for direct target {}", domain);
+                                bail!(
+                                    "Upstream DNS resolution timed out for direct target {} (candidates: {:?}, fallback: {})",
+                                    domain,
+                                    orig_candidates,
+                                    canonical_upstream
+                                );
                             }
-                        } else if let Some((_, err)) = last_err {
+                        } else if let Some((srv, err)) = last_err {
                             return Err(err).with_context(|| {
                                 format!(
-                                    "Upstream DNS resolution failed for direct target {}",
-                                    domain
+                                    "Upstream DNS resolution failed for direct target {} (server: {})",
+                                    domain, srv
                                 )
                             });
                         } else {
-                            bail!("Upstream DNS resolution failed for direct target {}", domain);
+                            bail!(
+                                "Upstream DNS resolution failed for direct target {} (candidates: {:?}, fallback: {})",
+                                domain,
+                                orig_candidates,
+                                canonical_upstream
+                            );
                         }
                     };
 

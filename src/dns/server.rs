@@ -639,6 +639,14 @@ async fn forward_upstream_udp(
                     e
                 );
             }
+            Ok(Err(e)) if is_transient_udp_recv_error(&e) => {
+                debug!(
+                    "[DNS Engine] Transient upstream UDP receive error from {} ignored: {}",
+                    upstream_dns, e
+                );
+                tokio::task::yield_now().await;
+                continue;
+            }
             Ok(Err(e)) => {
                 debug!("[DNS Engine] Upstream UDP receive error: {}", e);
                 bail!("Upstream DNS {} UDP receive error: {}", upstream_dns, e);
@@ -725,7 +733,11 @@ pub(crate) async fn resolve_via_upstream_dns_with_options(
 
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
-        bail!("Upstream DNS resolution timed out for {}", domain);
+        bail!(
+            "Upstream DNS resolution timed out for {} (server: {})",
+            domain,
+            upstream_dns
+        );
     }
 
     let tx_a = csprng_u16();
@@ -817,9 +829,17 @@ pub(crate) async fn resolve_via_upstream_dns_with_options(
         return Err(err);
     }
     if !got_response {
-        bail!("Upstream DNS resolution timed out for {}", domain);
+        bail!(
+            "Upstream DNS resolution timed out for {} (server: {})",
+            domain,
+            upstream_dns
+        );
     }
-    bail!("No usable IP records returned by upstream DNS for {}", domain)
+    bail!(
+        "No usable IP records returned by upstream DNS {} for {}",
+        upstream_dns,
+        domain
+    )
 }
 
 fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
@@ -1029,7 +1049,7 @@ impl DnsServer {
         let canon = canonicalize_socket_addr_preserving_scope(orig_dst);
         let dst_ip = canon.ip();
         let bind_ip = self.bind_addr.ip().to_canonical();
-        let points_to_self = canon.port() == self.bind_addr.port()
+        let points_to_self_bind = canon.port() == self.bind_addr.port()
             && self.bind_addr.port() != 0
             && (dst_ip == bind_ip
                 || (bind_ip.is_unspecified()
@@ -1037,29 +1057,12 @@ impl DnsServer {
                         dst_ip,
                         &crate::outbound::local_interface_ips(),
                     )));
-        let unusable = match canon {
-            SocketAddr::V4(v4) => {
-                let ip4 = v4.ip();
-                ip4.is_unspecified()
-                    || ip4.is_broadcast()
-                    || ip4.is_multicast()
-                    || ip4.is_link_local()
-            }
-            SocketAddr::V6(v6) => {
-                let ip6 = v6.ip();
-                ip6.is_unspecified()
-                    || ip6.is_multicast()
-                    || (ip6.is_unicast_link_local() && v6.scope_id() == 0)
-            }
-        };
-        if canon.port() == 0
-            || unusable
-            || self.pool.is_fake_ip_addr(dst_ip)
-            || points_to_self
-        {
-            (self.upstream_dns, false)
-        } else {
-            (canon, true)
+        if points_to_self_bind {
+            return (self.upstream_dns, false);
+        }
+        match super::sanitize_upstream_dns_addr(canon, Some(&self.pool), self.pool.self_ports()) {
+            Some(clean) => (clean, true),
+            None => (self.upstream_dns, false),
         }
     }
 
@@ -2115,9 +2118,9 @@ mod tests {
             "Windows WSAECONNRESET must not be misreported as timeout, got: {msg}"
         );
 
-        // 4. P1-3: InspectDns 在 preserved_orig == false（端口 0 / 未指定 / 自指）时必须返回 None，绝不暗中改道至 self.upstream_dns；
-        //    同时 resolve_transparent_upstream 保留带 scope_id 的 fe80::1
-        let pool = Arc::new(FakeIpPool::new_default());
+        // 4. P1-3 & P3-3c: InspectDns 在 preserved_orig == false（端口 0 / 未指定 / 自指 DNS 端口或任意 FlowX 自服务端口）时必须返回 None，
+        //    绝不暗中改道至 self.upstream_dns；同时 resolve_transparent_upstream 保留带 scope_id 的 fe80::1
+        let pool = Arc::new(FakeIpPool::new_default().with_self_ports(vec![1053, 40001, 40080]));
         let srv = DnsServer::new(
             "0.0.0.0:1053".parse().unwrap(),
             Arc::clone(&pool),
@@ -2129,7 +2132,16 @@ mod tests {
             "0.0.0.0:53".parse::<SocketAddr>().unwrap(),
             "8.8.8.8:0".parse::<SocketAddr>().unwrap(),
             "127.0.0.1:1053".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:40001".parse::<SocketAddr>().unwrap(),
+            "127.0.0.1:40080".parse::<SocketAddr>().unwrap(),
+            "[::1]:40001".parse::<SocketAddr>().unwrap(),
+            "[::ffff:127.0.0.1]:40080".parse::<SocketAddr>().unwrap(),
         ] {
+            let (fallback, preserved) = srv.resolve_transparent_upstream(bad_orig);
+            assert!(
+                !preserved && fallback == blackhole_addr,
+                "resolve_transparent_upstream must reject {bad_orig}"
+            );
             assert!(
                 srv.process_transparent_inspect_query_bytes(&q_test, bad_orig)
                     .await

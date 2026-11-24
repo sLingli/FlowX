@@ -519,6 +519,36 @@ pub struct ConfigStore {
     save_lock: Mutex<()>,
 }
 
+struct ConfigFileLock {
+    file: std::fs::File,
+}
+
+impl Drop for ConfigFileLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn is_retryable_windows_rename_error(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(5 | 32 | 33))
+        || err.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+fn rename_with_windows_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    const RETRY_DELAYS_MS: [u64; 5] = [10, 25, 50, 100, 150];
+    let mut attempt = 0usize;
+    loop {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt < RETRY_DELAYS_MS.len() && is_retryable_windows_rename_error(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[attempt]));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 impl ConfigStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
@@ -529,6 +559,48 @@ impl ConfigStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn lock_file_path(&self) -> PathBuf {
+        let parent_dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("flowx.xml");
+        let lock_name = format!(".{}.lock", file_name);
+        match parent_dir {
+            Some(parent) => parent.join(lock_name),
+            None => PathBuf::from(lock_name),
+        }
+    }
+
+    fn acquire_cross_process_lock(&self) -> Result<ConfigFileLock> {
+        let parent_dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+        if let Some(parent) = parent_dir {
+            std::fs::create_dir_all(parent)?;
+        }
+        let lock_path = self.lock_file_path();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!(
+                    "Failed to open configuration lock file: {}",
+                    lock_path.display()
+                )
+            })?;
+        file.lock().with_context(|| {
+            format!(
+                "Failed to acquire cross-process lock for configuration file: {}",
+                lock_path.display()
+            )
+        })?;
+        Ok(ConfigFileLock { file })
     }
 
     #[cfg(test)]
@@ -571,6 +643,7 @@ impl ConfigStore {
             return Ok((runtime, false));
         }
         let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_lock = self.acquire_cross_process_lock()?;
         if let Some(runtime) = self.read_existing_opt(self_ports)? {
             return Ok((runtime, false));
         }
@@ -608,6 +681,7 @@ impl ConfigStore {
     /// 串行加锁后将已构建的配置快照原子写入磁盘（适合在 `tokio::task::spawn_blocking` 中调用）
     pub fn save_profile(&self, cfg: &ProfileConfig) -> Result<()> {
         let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _file_lock = self.acquire_cross_process_lock()?;
         self.write_config_atomic(cfg)
     }
 
@@ -673,7 +747,7 @@ impl ConfigStore {
             return Err(e);
         }
 
-        if let Err(e) = std::fs::rename(&tmp_path, &self.path) {
+        if let Err(e) = rename_with_windows_retry(&tmp_path, &self.path) {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e).with_context(|| {
                 format!(
@@ -1081,6 +1155,50 @@ mod tests {
         }
         assert_eq!(created_count, 1);
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(store.lock_file_path());
+    }
+
+    #[test]
+    fn test_config_store_cross_instance_file_lock_serializes_concurrent_saves() {
+        let tmp = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_xproc_lock_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let lock_path = ConfigStore::new(&tmp).lock_file_path();
+        let _ = std::fs::remove_file(&lock_path);
+
+        let mut handles = Vec::new();
+        for worker in 0..4usize {
+            let path_clone = tmp.clone();
+            handles.push(std::thread::spawn(move || {
+                // Separate ConfigStore instance per thread exercises the OS LockFileEx lock
+                // rather than sharing an in-process Mutex.
+                let store = ConfigStore::new(&path_clone);
+                for round in 0..8usize {
+                    let mut cfg = ProfileConfig::default_profile();
+                    cfg.transparent_proxy = Some(TransparentProxyItem {
+                        enabled: (worker + round).is_multiple_of(2),
+                        hijack_dns: true,
+                        block_quic_for_proxied: true,
+                        dll_path: None,
+                    });
+                    store.save_profile(&cfg).expect("cross-instance save must succeed");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let loaded = ConfigStore::new(&tmp).load_existing(&[]).unwrap();
+        assert!(loaded.rules.iter().any(|r| r.name == "LocalBypass"));
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&lock_path);
     }
 
     #[test]
