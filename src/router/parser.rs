@@ -201,17 +201,25 @@ fn is_safe_hostname_literal(host: &str) -> bool {
         })
 }
 
-/// 仅对单个已按 `;` 拆分后的 token 展开 `%ComputerName%` 占位符。
+/// 仅对单个已按 `;` 拆分后的 token 展开 `%ComputerName%`（及历史兼容别名 `%HOSTNAME%`）占位符。
 /// 返回 `Some((expanded, used_placeholder))` 表示可安全编译；
 /// 返回 `None` 表示包含占位符但本机主机名含有分隔符/通配符/CIDR 等危险字符，已安全跳过。
 fn expand_hostname_in_token(token: &str, resolved_host: Option<&str>) -> Option<(String, bool)> {
     let has_computername = contains_ascii_ignore_case(token, b"%computername%");
-    if !has_computername {
+    let has_hostname = contains_ascii_ignore_case(token, b"%hostname%");
+    if !has_computername && !has_hostname {
         return Some((token.to_string(), false));
     }
 
     let safe_host = resolved_host.filter(|h| is_safe_hostname_literal(h))?;
-    let out = replace_ascii_placeholder_ignore_case(token, "%computername%", safe_host);
+    let mut out = if has_computername {
+        replace_ascii_placeholder_ignore_case(token, "%computername%", safe_host)
+    } else {
+        token.to_string()
+    };
+    if has_hostname {
+        out = replace_ascii_placeholder_ignore_case(&out, "%hostname%", safe_host);
+    }
     Some((out, true))
 }
 
@@ -228,9 +236,10 @@ fn parse_targets_with_hostname(
     let mut subnets = Vec::new();
     // 严格先按 `;` 拆分 token，再在单 token 内安全替换主机名占位符，杜绝主机名夹带 `;` 或引号发生目标注入
     let tokens = split_quoted_tokens(trimmed_raw, ';');
-    let has_placeholder = tokens
-        .iter()
-        .any(|t| contains_ascii_ignore_case(t, b"%computername%"));
+    let has_placeholder = tokens.iter().any(|t| {
+        contains_ascii_ignore_case(t, b"%computername%")
+            || contains_ascii_ignore_case(t, b"%hostname%")
+    });
     let resolved_host = if has_placeholder {
         Some(
             resolved_host_override
@@ -259,7 +268,9 @@ fn parse_targets_with_hostname(
 
         if used_placeholder {
             // 经过主机名占位符展开的条目绝不允许再按 CIDR/IP 解析，且若原本就是裸占位符则仅构造成 Exact 域名匹配器
-            if unquoted.eq_ignore_ascii_case("%computername%") {
+            if unquoted.eq_ignore_ascii_case("%computername%")
+                || unquoted.eq_ignore_ascii_case("%hostname%")
+            {
                 let norm = trimmed.trim_end_matches('.').to_ascii_lowercase();
                 if !norm.is_empty() {
                     domain_patterns.push(DomainMatcher::Exact(norm));
@@ -421,9 +432,9 @@ mod tests {
         let expected_host = resolve_local_hostname();
         assert!(!expected_host.is_empty());
 
-        // 正常安全主机名可按大小写无关展开且构造成 Exact 域名匹配器
+        // 正常安全主机名可按大小写无关展开（含历史兼容别名 %HOSTNAME%）且构造成 is_host_local() == true 的 Exact 域名匹配器
         let (domains, subnets) = parse_targets_with_hostname(
-            "localhost; %ComputerName%; *.Local",
+            "localhost; %ComputerName%; *.Local; %HOSTNAME%",
             Some("my-workstation"),
         );
         let domains = domains.unwrap();
@@ -431,12 +442,19 @@ mod tests {
         assert!(domains.iter().any(|d| d.matches("localhost")));
         assert!(domains.iter().any(|d| d.matches("my-workstation")));
         assert!(domains.iter().any(|d| d.matches("nas.local")));
+        assert!(!domains.iter().any(|d| d.matches("%hostname%")));
         assert!(!domains.iter().any(|d| d.matches("notlocal")));
         assert!(!domains.iter().any(|d| d.matches("evil.com")));
 
+        // 仅含 %HOSTNAME% 的存量规则展开后必须被识别为本机域名，不会对公网 IP 误触发 NeedsDomainSniff
+        let (legacy_domains, _) = parse_targets_with_hostname("%HOSTNAME%", Some("my-workstation"));
+        let legacy_domains = legacy_domains.unwrap();
+        assert_eq!(legacy_domains.len(), 1);
+        assert!(legacy_domains[0].is_host_local("my-workstation"));
+
         // P1-4 回归 1：主机名注入分号与通配符绝不可拆分注入 `*.evil.com`
         let (inj_domains, inj_subnets) = parse_targets_with_hostname(
-            "127.0.0.1; %ComputerName%",
+            "127.0.0.1; %ComputerName%; %HostName%",
             Some("pc;*.evil.com"),
         );
         assert!(inj_subnets.is_some());
