@@ -1525,10 +1525,21 @@ async fn handle_api_request(
         }
         ("GET", "/api/transparent/status") => {
             let status_view = transparent_status_or_fallback(transparent_manager.as_deref());
+            let mut body_val =
+                serde_json::to_value(&status_view).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = body_val.as_object_mut() {
+                obj.insert(
+                    "config_path".to_string(),
+                    config_store
+                        .as_ref()
+                        .map(|s| serde_json::Value::String(s.path().display().to_string()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
             (
                 "200 OK",
                 "application/json; charset=utf-8",
-                serde_json_to_string(&status_view),
+                serde_json_to_string(&body_val),
             )
         }
         ("POST", "/api/transparent/toggle") => {
@@ -2788,7 +2799,7 @@ async fn handle_transparent_config(
     }
 
     if let Some(ref raw_path) = req.dll_path
-        && (raw_path.chars().any(|c| c.is_control()) || raw_path.len() > 4096)
+        && !crate::transparent::is_valid_custom_dll_path_input(raw_path)
     {
         return (
             "400 Bad Request",
@@ -5167,7 +5178,7 @@ mod tests {
             .with_self_ports(vec![40001, 40080, 1053])
             .with_config_store(Arc::clone(&store))
             .with_transparent_manager(Arc::clone(&t_mgr))
-            .with_persist_timeout(Duration::from_millis(200));
+            .with_persist_timeout(Duration::from_millis(500));
         let listener = srv.bind().await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
@@ -5192,10 +5203,14 @@ mod tests {
         assert!(status_resp.contains(r#""enabled":false"#));
         assert!(status_resp.contains(r#""hijack_dns":true"#));
 
-        // 2. PUT /api/transparent/config rejects control chars & conflicting clear_dll_path
+        // 2. PUT /api/transparent/config rejects control chars, untrusted/relative/UNC/non-WinDivert paths & conflicting clear_dll_path
         for bad_body in [
             r#"{"dll_path":"C:\\bad\npath\\WinDivert.dll"}"#,
             r#"{"dll_path":"C:\\ok\\WinDivert.dll","clear_dll_path":true}"#,
+            r#"{"dll_path":"WinDivert.dll"}"#,
+            r#"{"dll_path":"..\\evil\\WinDivert.dll"}"#,
+            r#"{"dll_path":"\\\\fileserver\\share\\WinDivert.dll"}"#,
+            r#"{"dll_path":"C:\\tools\\evil.dll"}"#,
         ] {
             let bad_resp = raw_http(
                 addr,
@@ -5268,8 +5283,7 @@ mod tests {
         )
         .await;
         assert!(
-            toggle_resp.starts_with("HTTP/1.1 409 Conflict")
-                || toggle_resp.starts_with("HTTP/1.1 400 Bad Request"),
+            toggle_resp.starts_with("HTTP/1.1 409 Conflict"),
             "toggle fail: {toggle_resp}"
         );
         assert!(!t_mgr.settings().enabled);

@@ -79,6 +79,18 @@ struct TransparentStatsCounters {
     quic_blocked_total: AtomicU64,
 }
 
+/// 校验用户输入的自定义 WinDivert DLL 路径：
+/// - 拒绝控制字符或超过 4096 字节的输入；
+/// - 允许空/空白（语义上等同于清除自定义路径、恢复自动探测）；
+/// - 非空时必须通过 `resolve_candidate_dll_path`（本机绝对路径、无 `..`/UNC、目录或 `WinDivert.dll`）。
+pub(crate) fn is_valid_custom_dll_path_input(raw: &str) -> bool {
+    if raw.chars().any(char::is_control) || raw.len() > 4096 {
+        return false;
+    }
+    let trimmed = raw.trim();
+    trimmed.is_empty() || windivert_ffi::resolve_candidate_dll_path(trimmed).is_some()
+}
+
 /// 基于给定静态配置构建驱动探测快照（供 CLI 离线查询与测试降级复用）
 pub fn probe_status(cfg: &TransparentSettings) -> TransparentRuntimeStatus {
     let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());

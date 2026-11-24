@@ -12,18 +12,19 @@ FlowX 采用分层解耦的设计，包含入站接管与进程追踪、核心�
 flowchart TD
     subgraph AppLayer ["应用层"]
         A1["业务进程 (curl.exe / node.exe / chrome.exe)"]
-        A2["本地 DNS 查询方"]
+        A2["本地 DNS 查询方 / 系统 DNS (svchost.exe)"]
     end
 
-    subgraph InterceptionLayer ["入站与进程识别层"]
+    subgraph InterceptionLayer ["入站、透明拦截与进程识别层"]
         MixedInbound["混合协议入站 (src/inbound/mod.rs · 127.0.0.1:40001)"]
-        ProcessTracker["TCP 四元组进程追踪器 (src/interceptor/process.rs)"]
+        TransparentEngine["WinDivert + smoltcp 透明代理引擎 (src/transparent/)"]
+        ProcessTracker["TCP/UDP 四元组进程追踪器 (src/interceptor/process.rs)"]
     end
 
     subgraph CoreEngine ["FlowX 核心路由与协议引擎"]
         Dispatcher["流分发调度中心 (src/interceptor/dispatcher.rs)"]
         FakeIpEngine["Fake-IP 分配池与双向映射 (src/dns/mod.rs · 198.18.0.0/15)"]
-        DnsServer["本地 DNS 服务 (src/dns/server.rs · 127.0.0.1:1053)"]
+        DnsServer["本地与透明 DNS 引擎 (src/dns/server.rs · 127.0.0.1:1053)"]
         RouterEngine["多维规则匹配引擎 (src/router/mod.rs)"]
         OutboundMgr["出站协议与代理链 (src/outbound/)"]
     end
@@ -41,13 +42,19 @@ flowchart TD
     end
 
     A1 -->|"SOCKS5 / SOCKS4a / HTTP"| MixedInbound
-    A2 -->|"UDP 53"| DnsServer
+    A1 -->|"出站 TCP / UDP-443 (WinDivert 透明接管)"| TransparentEngine
+    A2 -->|"UDP 53 (显式或透明劫持/被动观测)"| TransparentEngine
+    A2 -->|"UDP 53 (直连本地 DNS)"| DnsServer
+    TransparentEngine -->|"smoltcp 虚拟 TCP 流"| Dispatcher
+    TransparentEngine -->|"透明 DNS 查询 / real_ip 观测"| DnsServer
     DnsServer --> FakeIpEngine
     MixedInbound --> Dispatcher
-    ProcessTracker -.->|"Windows: GetExtendedTcpTable 四元组"| Dispatcher
+    ProcessTracker -.->|"Windows: GetExtendedTcpTable / GetExtendedUdpTable"| Dispatcher
+    ProcessTracker -.->|"UDP/TCP PID 兜底查询"| TransparentEngine
     Dispatcher --> FakeIpEngine
     Dispatcher --> RouterEngine
     Dispatcher --> OutboundMgr
+    OutboundMgr -.->|"BypassPortRegistry 源端口豁免"| TransparentEngine
     OutboundMgr --> ProxyNode
     OutboundMgr --> TargetHost
     ProxyNode --> TargetHost
@@ -77,12 +84,12 @@ flowchart TD
 - **Fake-IP 多 DNS 隔离与独立真实 IP 反查缓存**：`FakeIpPool` 为 `198.18.0.0/15` 维护 `BinaryHeap` $O(\log N)$ 淘汰与每域名多 `orig_dns` 列表（最多 4 个、私网/VPN DNS 优先、读锁快路径防双 DNS 写锁抖动，过期条目绝不复活陈旧 `orig_dns`）；被动 `real_ip -> domain` 缓存使用独立 `RwLock` + $O(\log N)$ 过期堆与读锁先窥探 GC，冲突 IP 退化为 `Ambiguous` 并在冲突窗口结束后自然恢复单域归属。
 
 ### 2.4 多维规则路由引擎 (`src/router/mod.rs`, `src/router/parser.rs`)
-- **多维条件与 Fail-Closed 保护**：支持应用程序名/路径 Glob 通配符（分号分隔，省略 `.exe` 的简写可匹配 Windows `.exe` 进程）、目标域名通配与 IPv4/IPv6 CIDR 网段、离散端口与端口范围（如 `80; 443; 8000-8080`）；`%ComputerName%` 在按 `;` 拆词后解析并拦截元字符注入；非法/空白条件生成的 Fail-Closed 空匹配集规则（`Some(vec![])`）在路由与 DNS 预判中均被严格跳过。
+- **多维条件与 Fail-Closed 保护**：支持应用程序名/路径 Glob 通配符（分号分隔，省略 `.exe` 的简写可匹配 Windows `.exe` 进程）、目标域名通配与 IPv4/IPv6 CIDR 网段、离散端口与端口范围（如 `80; 443; 8000-8080`）；`%ComputerName%` 与兼容别名 `%HOSTNAME%` 在按 `;` 拆词后解析并拦截元字符注入；非法/空白条件生成的 Fail-Closed 空匹配集规则（`Some(vec![])`）在路由与 DNS 预判中均被严格跳过。
 - **私有后缀隔离与设计边界**：`is_non_hijackable_local_qname` 保护本机/`localhost`/`.local` (mDNS)/`.arpa`/单标签名；`is_implicit_private_qname` 保护 `.lan`/`.localdomain`/`.home`/`.corp`/`.internal`/`.intranet`/`.ts.net` 不被通配代理规则在 DNS 阶段隐式劫持（显式命中这些后缀的规则仍可生效）。若其解析出的私网/VPN IP（如 `10.0.0.0/8`、`172.16.0.0/12`、`100.64.0.0/10`）未列入 `LocalBypass`，TCP 阶段通配代理规则仍会按 SNI 代理，需按需在规则中添加对应网段或后缀直连规则。
 - **动作与动态管理**：支持 `Direct`、`Block`、`Proxy(node_id)` 与 `Chain(chain_id)`；采用自顶向下 First-Match Wins 求值与 CoW 更新，支持在线/离线增删改、启停、排序与干跑路由模拟器 (`simulate`)。
 
 ### 2.5 Windows WinDivert 系统级透明代理引擎 (`src/transparent/`)
-- **三句柄分层捕获**：Windows 管理员权限下动态加载受信任绝对路径成对的 `WinDivert.dll` / `WinDivert64.sys`，同时打开：(1) `SOCKET` 层 `SNIFF | RECV_ONLY` 句柄维护分片 `SocketPidTable` 与 TCP 关闭旁路失效；(2) 出站 `NETWORK` 层句柄按规则分流 TCP / UDP-53 / UDP-443 QUIC / Fake-IP UDP 与 IPv4/IPv6 分片；(3) 独立入站 `NETWORK` 层内联同步观测句柄（`inbound and !loopback and !impostor and (udp.SrcPort == 53 or fragment)`，`flags = 0`）先将 `InspectDns` 应答中的 `real_ip -> domain` 落盘后再无条件原样重注入 OS（出站原包直接 `emit_passthrough`，消除 DNS 应答与 TCP SYN 竞态，同时完整保留 OS 原生接口、VPN 绑定、分片/超 `4096B` EDNS0 与 `fe80::` `scope_id`）。
+- **三句柄分层捕获**：Windows 管理员权限下动态加载受信任绝对路径成对的 `WinDivert.dll` / `WinDivert64.sys`，同时打开：(1) `SOCKET` 层 `SNIFF | RECV_ONLY` 句柄维护分片 `SocketPidTable` 与 TCP 关闭旁路失效；(2) 出站 `NETWORK` 层句柄按规则分流 TCP / UDP-53 / UDP-443 QUIC / Fake-IP UDP 与 IPv4/IPv6 分片；(3) 独立入站 `NETWORK` 层内联同步观测句柄（`inbound and !loopback and !impostor and udp.SrcPort == 53`，`flags = 0`，未设 `WINDIVERT_FLAG_FRAGMENTS` 由 WinDivert 内核自动重组完整入站 IP 包）先将 `InspectDns` 应答中的 `real_ip -> domain` 落盘后再无条件原样重注入 OS（出站原包直接 `emit_passthrough`，消除 DNS 应答与 TCP SYN 竞态，同时完整保留 OS 原生接口、VPN 绑定、超 `4096B` EDNS0 与 `fe80::` `scope_id`）。
 - **有界 IPv4/IPv6 分片重组与卸载兼容 (`fragment.rs`, `dns_hijack.rs`, `netstack.rs`)**：先校验合法性/重叠后再执行容量驱逐，严格按 RFC 6946 隔离 IPv6 原子分片，完整支持 `0/43/51/60/135(Mobility)/139(HIP)/140(SHIM6)` 最多 8 层 IPv6 扩展头、post-Fragment 非 TCP/UDP (`58/50/59`) 逐片透传，以及 Windows NDIS LSO / UDP `length == 0` 卸载报文解析。
 - **用户态 TCP 协议栈与权威首包嗅探 (`netstack.rs`, `sniffer.rs`, `bypass.rs`)**：单所有权 `smoltcp` 引擎负责四元组劫持、半关闭与非优雅取消/断链槽位回收（`poll_shutdown` 仅在写缓冲排空且发 FIN 后置位 `graceful_shutdown`）；`BypassPortRegistry` 按 TCP/UDP 与 IPv4/IPv6 四表隔离登记 FlowX 自身出站源端口并保证 socket 先于守卫析构；`sniffer.rs` 支持跨多条 TLS Record 拆分的 `ClientHello` SNI 与 HTTP `Host` 严格主机名嗅探，在 `NeedsDomainSniff` 及 `Immediate(Proxy | Chain)`（覆盖 `8444`/`9443`/`2083`/`3000` 等非标准端口，豁免已知服务端先发端口）下优先提取权威域名，且异步确定 `Immediate(Direct | Block)` 后绝不被 SYN 期过期嗅探标记拖慢。
 - **UAC 平滑提权与配置隔离**：`POST /api/transparent/elevate` 使用独立无锁原子闸门并在 `spawn_blocking` 内持有 `ElevateFlagResetGuard` 与 `shutdown_tx`（与 `Ctrl+C` 的 `503 ERR_SERVER_SHUTTING_DOWN` 明确区分），通过 `ShellExecuteW("runas")` 以 `--transparent --replace-pid <old_pid>` 接管端口；`--transparent` / `--no-transparent` 仅覆写本次运行时状态，不污染磁盘 `<TransparentProxy enabled="...">`；`flowx transparent status | enable | disable | config | doctor` 均统一遵循 `--api` / `$FLOWX_API` / `--offline` 语义。

@@ -27,7 +27,7 @@ FlowX 是一套基于 Rust 构建的 Windows 进程级透明网络代理与分�
 `flowx` 子命令执行严格参数校验与确定性路由（未知参数如 `--targe` 或多余位置参数会直接报错退出）：
 - **在线模式（Online）**：连接运行中守护进程的 HTTP API（支持 `PATCH` 原子部分更新），内存状态与 `flowx.xml` 实时同步；
 - **显式离线模式（`--offline`）**：直接安全校验并原子读写 `--config` / `$FLOWX_CONFIG` 指定的 XML 文件（未设置或为空白时回落至 `./flowx.xml`），不尝试连接守护进程（`conn` 命令除外，其要求在线守护进程）；只读命令缺失配置文件时直接报错而不新建文件，变更命令在参数/规则校验失败时同样不会在磁盘提前生成 `flowx.xml`；CLI 支持 `--` 选项终止符分隔位置参数，并按 `FLOWX_LANG` → `LC_ALL` → `LC_MESSAGES` → `LANG`（默认英文）自适应本地化语言与 `Accept-Language`；
-- **默认地址离线回退**：仅当未显式指定 `--api` / `$FLOWX_API` 且连接默认本地 `127.0.0.1:40080` 收到 `ConnectionRefused` 时，`status` / `node` / `rule` / `default` / `sim` 才会安全回退离线 XML；若超时、HTTP 返回错误或自定义 `--api` 失败，CLI 会直接报错，避免配置分脑。
+- **默认地址离线回退**：仅当未显式指定 `--api` / `$FLOWX_API` 且连接默认本地 `127.0.0.1:40080` 收到 `ConnectionRefused` 时，`status` / `transparent` / `node` / `rule` / `default` / `sim` 才会安全回退离线 XML；若超时、HTTP 返回错误或自定义 `--api` 失败，CLI 会直接报错，避免配置分脑。
 
 ### 1. 状态与默认兜底策略
 ```bash

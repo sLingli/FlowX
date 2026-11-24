@@ -1634,6 +1634,79 @@ fn print_transparent_status(st: &Value, mode_label: &str) {
     }
 }
 
+fn build_transparent_doctor_report(
+    mode_label: &str,
+    st_val: &Value,
+    local_config_path: &str,
+) -> Value {
+    let elevated = st_val["elevated"].as_bool().unwrap_or(false);
+    let running = st_val["running"].as_bool().unwrap_or(false);
+    let dll_found = st_val["dll_found"].as_bool().unwrap_or(false);
+    let sys_found = st_val["sys_found"].as_bool().unwrap_or(false);
+    let dll_path = st_val["dll_path"].as_str().map(str::to_string);
+    let sys_path = st_val["sys_path"].as_str().map(str::to_string);
+    let configured_dll_path = st_val["configured_dll_path"].as_str().map(str::to_string);
+    let searched_dirs: Vec<String> = st_val["searched_dirs"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let config_enabled = st_val["enabled"].as_bool().unwrap_or(false);
+    let hijack_dns = st_val["hijack_dns"].as_bool().unwrap_or(true);
+    let block_quic = st_val["block_quic_for_proxied"].as_bool().unwrap_or(true);
+    let last_error = st_val["last_error"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let mut issues: Vec<String> = Vec::new();
+    if !elevated {
+        issues.push(
+            "Target FlowX instance lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
+        );
+    }
+    if !dll_found || !sys_found {
+        issues.push(format!(
+            "Missing WinDivert binaries (dll_found={}, sys_found={}); place WinDivert.dll and WinDivert64.sys next to flowx.exe or set --dll-path. Searched: {:?}",
+            dll_found, sys_found, searched_dirs
+        ));
+    }
+    if let Some(ref err) = last_error {
+        issues.push(format!("Last runtime error: {}", err));
+    }
+    let ready = elevated && dll_found && sys_found && last_error.is_none();
+    let config_path: Option<String> = if mode_label == "ONLINE" {
+        st_val["config_path"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    } else {
+        Some(local_config_path.to_string())
+    };
+    json!({
+        "mode": mode_label,
+        "ready": ready,
+        "running": running,
+        "config_path": config_path,
+        "supported": true,
+        "elevated": elevated,
+        "dll_found": dll_found,
+        "sys_found": sys_found,
+        "dll_path": dll_path,
+        "sys_path": sys_path,
+        "configured_dll_path": configured_dll_path,
+        "searched_dirs": searched_dirs,
+        "config_enabled": config_enabled,
+        "hijack_dns": hijack_dns,
+        "block_quic_for_proxied": block_quic,
+        "last_error": last_error,
+        "issues": issues,
+    })
+}
+
 async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
     let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("status");
     let tail = if opts.rest.len() > 2 {
@@ -1745,9 +1818,17 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
             let clear_dll_path = flags.contains_key("clear-dll-path");
             let dll_path = flags.get("dll-path").cloned();
             if let Some(ref raw_path) = dll_path
-                && (raw_path.chars().any(|c| c.is_control()) || raw_path.len() > 4096)
+                && !crate::transparent::is_valid_custom_dll_path_input(raw_path)
             {
-                bail!("Invalid --dll-path: contains control characters or exceeds 4096 bytes");
+                let msg = crate::i18n::t(opts.locale, "error.transparent_invalid_dll_path");
+                return Err(anyhow::Error::new(ApiHttpError::from_value(
+                    400,
+                    json!({
+                        "code": "ERR_TRANSPARENT_INVALID_DLL_PATH",
+                        "error": msg,
+                    }),
+                    true,
+                )));
             }
 
             let mut payload = serde_json::Map::new();
@@ -1820,64 +1901,22 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 };
                 ("OFFLINE", serde_json::to_value(probe_status(&settings))?)
             };
-            let elevated = st_val["elevated"].as_bool().unwrap_or(false);
-            let running = st_val["running"].as_bool().unwrap_or(false);
-            let dll_found = st_val["dll_found"].as_bool().unwrap_or(false);
-            let sys_found = st_val["sys_found"].as_bool().unwrap_or(false);
-            let dll_path = st_val["dll_path"].as_str().map(str::to_string);
-            let sys_path = st_val["sys_path"].as_str().map(str::to_string);
-            let configured_dll_path = st_val["configured_dll_path"].as_str().map(str::to_string);
-            let searched_dirs: Vec<String> = st_val["searched_dirs"]
+            let report = build_transparent_doctor_report(mode_label, &st_val, &opts.config_path);
+            let ready = report["ready"].as_bool().unwrap_or(false);
+            let running = report["running"].as_bool().unwrap_or(false);
+            let elevated = report["elevated"].as_bool().unwrap_or(false);
+            let dll_found = report["dll_found"].as_bool().unwrap_or(false);
+            let sys_found = report["sys_found"].as_bool().unwrap_or(false);
+            let dll_path = report["dll_path"].as_str();
+            let sys_path = report["sys_path"].as_str();
+            let searched_dirs: Vec<&str> = report["searched_dirs"]
                 .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
-            let config_enabled = st_val["enabled"].as_bool().unwrap_or(false);
-            let hijack_dns = st_val["hijack_dns"].as_bool().unwrap_or(true);
-            let block_quic = st_val["block_quic_for_proxied"].as_bool().unwrap_or(true);
-            let last_error = st_val["last_error"]
-                .as_str()
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-
-            let mut issues: Vec<String> = Vec::new();
-            if !elevated {
-                issues.push(
-                    "Target FlowX instance lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
-                );
-            }
-            if !dll_found || !sys_found {
-                issues.push(format!(
-                    "Missing WinDivert binaries (dll_found={}, sys_found={}); place WinDivert.dll and WinDivert64.sys next to flowx.exe or set --dll-path. Searched: {:?}",
-                    dll_found, sys_found, searched_dirs
-                ));
-            }
-            if let Some(ref err) = last_error {
-                issues.push(format!("Last runtime error: {}", err));
-            }
-            let ready = elevated && dll_found && sys_found;
-            let report = json!({
-                "mode": mode_label,
-                "ready": ready,
-                "running": running,
-                "config_path": opts.config_path,
-                "supported": true,
-                "elevated": elevated,
-                "dll_found": dll_found,
-                "sys_found": sys_found,
-                "dll_path": dll_path,
-                "sys_path": sys_path,
-                "configured_dll_path": configured_dll_path,
-                "searched_dirs": searched_dirs,
-                "config_enabled": config_enabled,
-                "hijack_dns": hijack_dns,
-                "block_quic_for_proxied": block_quic,
-                "last_error": last_error,
-                "issues": issues,
-            });
+            let issues: Vec<&str> = report["issues"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -1885,15 +1924,18 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 println!("  Ready:         {}", ready);
                 println!("  Running:       {}", running);
                 println!("  Elevated:      {}", elevated);
+                if let Some(cp) = report["config_path"].as_str() {
+                    println!("  Config Path:   {}", cp);
+                }
                 println!(
                     "  WinDivert DLL: found={} ({})",
                     dll_found,
-                    dll_path.as_deref().unwrap_or("-")
+                    dll_path.unwrap_or("-")
                 );
                 println!(
                     "  WinDivert SYS: found={} ({})",
                     sys_found,
-                    sys_path.as_deref().unwrap_or("-")
+                    sys_path.unwrap_or("-")
                 );
                 println!("  Search Dirs:   {:?}", searched_dirs);
                 if issues.is_empty() {
@@ -4168,5 +4210,95 @@ mod tests {
             req_line.starts_with("GET /api/transparent/status "),
             "expected GET /api/transparent/status, got: {req_line}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cli_transparent_dll_path_validation_and_doctor_report_semantics() {
+        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
+            "flowx_cli_tp_val_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg_str = cfg_path.display().to_string();
+
+        // 1. Invalid --dll-path emits structured ERR_TRANSPARENT_INVALID_DLL_PATH matching API
+        for bad_path in [
+            "WinDivert.dll",
+            r".\driver\WinDivert.dll",
+            r"..\evil\WinDivert.dll",
+            r"\\fileserver\share\WinDivert.dll",
+            r"C:\tools\evil.dll",
+            "C:\\bad\npath\\WinDivert.dll",
+        ] {
+            let err = run_cli(&[
+                "flowx".into(),
+                "--config".into(),
+                cfg_str.clone(),
+                "--offline".into(),
+                "--json".into(),
+                "transparent".into(),
+                "config".into(),
+                "--dll-path".into(),
+                bad_path.into(),
+            ])
+            .await
+            .expect_err(&format!("expected invalid --dll-path rejection for {bad_path:?}"));
+            let err_json = format_cli_error_json(&err);
+            assert_eq!(
+                err_json["code"], "ERR_TRANSPARENT_INVALID_DLL_PATH",
+                "unexpected CLI JSON error for {bad_path:?}: {err_json}"
+            );
+        }
+        assert!(!cfg_path.exists());
+
+        // 2. doctor ready must be false when last_error is present
+        let err_status = json!({
+            "elevated": true,
+            "running": false,
+            "dll_found": true,
+            "sys_found": true,
+            "dll_path": r"C:\FlowX\WinDivert.dll",
+            "sys_path": r"C:\FlowX\WinDivert64.sys",
+            "searched_dirs": [r"C:\FlowX"],
+            "enabled": true,
+            "hijack_dns": true,
+            "block_quic_for_proxied": true,
+            "configured_dll_path": null,
+            "last_error": "WinDivert driver signature check failed",
+            "config_path": r"D:\Daemon\prod.xml",
+        });
+        let online_err_report =
+            build_transparent_doctor_report("ONLINE", &err_status, "./local-cli.xml");
+        assert_eq!(online_err_report["ready"], false);
+        assert_eq!(online_err_report["config_path"], r"D:\Daemon\prod.xml");
+        assert!(online_err_report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("signature check failed")));
+
+        // 3. Online doctor without server config_path reports null instead of local CLI config path
+        let online_no_cfg = json!({
+            "elevated": true,
+            "running": true,
+            "dll_found": true,
+            "sys_found": true,
+            "searched_dirs": [r"C:\FlowX"],
+            "enabled": true,
+            "last_error": null,
+        });
+        let online_report =
+            build_transparent_doctor_report("ONLINE", &online_no_cfg, "./local-cli.xml");
+        assert_eq!(online_report["ready"], true);
+        assert!(online_report["config_path"].is_null());
+
+        // 4. Offline doctor reports local CLI config path
+        let offline_report =
+            build_transparent_doctor_report("OFFLINE", &online_no_cfg, "./local-cli.xml");
+        assert_eq!(offline_report["ready"], true);
+        assert_eq!(offline_report["config_path"], "./local-cli.xml");
     }
 }
