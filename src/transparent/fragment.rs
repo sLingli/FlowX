@@ -7,6 +7,7 @@ use crate::transparent::netstack::{EmittedIpPacket, PacketInterfaceMeta};
 
 const MAX_FRAGMENT_GROUPS: usize = 1024;
 const MAX_CHUNKS_PER_GROUP: usize = 64;
+const MAX_BYTES_PER_GROUP: usize = 256 * 1024;
 const MAX_TOTAL_FRAGMENT_BYTES: usize = 4 * 1024 * 1024;
 const FRAGMENT_TTL: Duration = Duration::from_secs(10);
 
@@ -134,6 +135,7 @@ enum FragmentParse {
 
 struct StoredChunk {
     payload: Vec<u8>,
+    more_fragments: bool,
     raw_packet: EmittedIpPacket,
 }
 
@@ -358,7 +360,7 @@ impl FragmentTracker {
                 }
 
                 let incoming_cost = frag_payload.len() + raw.len();
-                if incoming_cost > MAX_TOTAL_FRAGMENT_BYTES {
+                if incoming_cost > MAX_BYTES_PER_GROUP || incoming_cost > MAX_TOTAL_FRAGMENT_BYTES {
                     self.remove_group(&key);
                     return FragmentOutcome::Drop;
                 }
@@ -385,7 +387,9 @@ impl FragmentTracker {
                     }
 
                     if let Some(existing) = existing_group.chunks.get(&frag_offset) {
-                        if existing.payload.as_slice() == frag_payload {
+                        if existing.payload.as_slice() == frag_payload
+                            && existing.more_fragments == more_fragments
+                        {
                             return FragmentOutcome::Pending;
                         }
                         self.remove_group(&key);
@@ -405,7 +409,10 @@ impl FragmentTracker {
                         self.remove_group(&key);
                         return FragmentOutcome::Drop;
                     }
-                    if existing_group.chunks.len() >= MAX_CHUNKS_PER_GROUP {
+                    if existing_group.chunks.len() >= MAX_CHUNKS_PER_GROUP
+                        || existing_group.bytes_used.saturating_add(incoming_cost)
+                            > MAX_BYTES_PER_GROUP
+                    {
                         self.remove_group(&key);
                         return FragmentOutcome::Drop;
                     }
@@ -441,6 +448,7 @@ impl FragmentTracker {
 
                 let stored = StoredChunk {
                     payload: frag_payload.to_vec(),
+                    more_fragments,
                     raw_packet: EmittedIpPacket {
                         data: raw.to_vec(),
                         meta,
@@ -1301,5 +1309,35 @@ mod tests {
             cap_tracker.ingest_at(t0 + Duration::from_secs(1), &finish_first, meta4, None),
             FragmentOutcome::Reassembled { .. }
         ));
+
+        // 5. 同偏移重复分片若 more_fragments 标志冲突（MF=1 vs MF=0），必须直接丢弃整组
+        let mut mf_tracker = FragmentTracker::new();
+        let frag_mf1 = make_ipv4_packet(
+            [10, 0, 9, 9],
+            [93, 184, 216, 34],
+            IP_PROTO_UDP,
+            0x7777,
+            8,
+            true,
+            &[0xAAu8; 8],
+        );
+        let frag_mf0_conflict = make_ipv4_packet(
+            [10, 0, 9, 9],
+            [93, 184, 216, 34],
+            IP_PROTO_UDP,
+            0x7777,
+            8,
+            false,
+            &[0xAAu8; 8],
+        );
+        assert!(matches!(
+            mf_tracker.ingest(&frag_mf1, meta4, None),
+            FragmentOutcome::Pending
+        ));
+        assert!(matches!(
+            mf_tracker.ingest(&frag_mf0_conflict, meta4, None),
+            FragmentOutcome::Drop
+        ));
+        assert_eq!(mf_tracker.active_group_count(), 0);
     }
 }

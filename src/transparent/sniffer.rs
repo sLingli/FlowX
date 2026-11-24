@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const MAX_SNIFF_BYTES: usize = 8192;
+const MAX_SNIFF_BYTES: usize = 32_768;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniffOutcome {
@@ -13,9 +13,10 @@ pub struct SniffOutcome {
 
 /// 按 RFC 1035 / RFC 1123 / RFC 6066 严格校验嗅探到的域名：
 /// 排除标准与非规范数字 IPv4（`127.1` / `0177.0.0.1` / `0x7f000001` / `2130706433`）、IPv6 字面量、
-/// 空标签（前导点/连续点）、下划线、超 63 字节标签以及以 `-` 开头或结尾的标签。
+/// 任意首尾空白（含 Unicode `\u{00a0}`）、空标签（前导点/连续点/多尾点如 `example.com..`）、下划线、
+/// 超 63 字节标签以及以 `-` 开头或结尾的标签。
 pub fn is_valid_sniffed_host(host: &str) -> bool {
-    let trimmed = host.trim().trim_end_matches('.');
+    let trimmed = host.strip_suffix('.').unwrap_or(host);
     if trimmed.is_empty() || trimmed.len() > 253 {
         return false;
     }
@@ -142,7 +143,8 @@ fn looks_like_http_request(buf: &[u8]) -> bool {
 
 fn parse_http_host_value(raw_val: &str) -> Option<String> {
     let val = raw_val.trim_matches(|c| c == ' ' || c == '\t');
-    if val.is_empty() || val.bytes().any(|b| b <= 0x20 || b == 0x7F) {
+    // 严格仅允许可见 ASCII（0x21..=0x7E），彻底拦截控制字符、内部空格及 Unicode 空白（如 \u{00a0}）
+    if val.is_empty() || !val.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
         return None;
     }
     if val.starts_with('[') {
@@ -150,8 +152,8 @@ fn parse_http_host_value(raw_val: &str) -> Option<String> {
         return None;
     }
     let host_part = if let Some((h, p)) = val.split_once(':') {
-        // 严格要求冒号右侧为合法十进制端口号 (1..=65535)，杜绝未加方括号的 IPv6（如 dead:beef::1）或畸形端口串被截断误判
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+        // 严格要求冒号右侧为无前导零的合法十进制端口号 (1..=65535)，杜绝未加方括号的 IPv6（如 dead:beef::1）、`:080` 或畸形端口串
+        if p.is_empty() || p.starts_with('0') || !p.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
         let port = p.parse::<u16>().ok()?;
@@ -162,12 +164,20 @@ fn parse_http_host_value(raw_val: &str) -> Option<String> {
     } else {
         val
     };
-    let normalized = host_part.trim_end_matches('.').to_ascii_lowercase();
-    is_valid_sniffed_host(&normalized).then_some(normalized)
+    if !is_valid_sniffed_host(host_part) {
+        return None;
+    }
+    Some(
+        host_part
+            .strip_suffix('.')
+            .unwrap_or(host_part)
+            .to_ascii_lowercase(),
+    )
 }
 
 fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
-    // 扫描完整请求头直至空行（\r\n\r\n），校验端口合法性、拒绝 obs-fold 续行与重复 Host 冲突
+    // 扫描请求头直至空行（\r\n\r\n），校验端口合法性、拒绝行内孤立 \r、obs-fold 续行与重复 Host 冲突；
+    // 若超大 Cookie/Authorization 请求头超出 MAX_SNIFF_BYTES 且已合法唯一捕获到 Host，则按已校验结果返回
     let mut start = 0usize;
     let mut is_request_line = true;
     let mut header_end = false;
@@ -179,6 +189,11 @@ fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
             .strip_suffix(b"\r")
             .unwrap_or(&buf[start..line_end]);
         start = line_end + 1;
+
+        // 拒绝任何行内孤立 \r（防止 CR/LF 拆分走私）
+        if line.contains(&b'\r') {
+            return SniffProbe::NotMatchable;
+        }
 
         if is_request_line {
             is_request_line = false;
@@ -210,13 +225,11 @@ fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
         }
     }
 
-    if header_end {
+    if header_end || buf.len() >= MAX_SNIFF_BYTES {
         match found_host {
             Some(host) => SniffProbe::Found(host),
             None => SniffProbe::NotMatchable,
         }
-    } else if buf.len() >= MAX_SNIFF_BYTES {
-        SniffProbe::NotMatchable
     } else {
         SniffProbe::NeedMore
     }
@@ -349,11 +362,10 @@ fn parse_tls_client_hello_sni(buf: &[u8]) -> SniffProbe {
                     }
                     if name_type == 0x00
                         && let Ok(s) = std::str::from_utf8(&ext_data[pos..pos + name_len])
+                        && is_valid_sniffed_host(s)
                     {
-                        let normalized = s.trim().trim_end_matches('.').to_ascii_lowercase();
-                        if is_valid_sniffed_host(&normalized) {
-                            return SniffProbe::Found(normalized);
-                        }
+                        let normalized = s.strip_suffix('.').unwrap_or(s).to_ascii_lowercase();
+                        return SniffProbe::Found(normalized);
                     }
                     pos += name_len;
                 }
@@ -475,6 +487,11 @@ mod tests {
         for invalid in [
             "",
             ".example.com",
+            "example.com..",
+            " example.com",
+            "example.com ",
+            "\u{00a0}example.com",
+            "example.com\u{00a0}",
             "a..b.com",
             "bad_host.example",
             "-leading.example",
@@ -579,8 +596,12 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: dead:beef::1\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: example.com:notaport\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: example.com:0\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com:080\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: example.com:99999\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: example.com:\r\n\r\n".as_slice(),
+            b"GET / HTTP/1.1\r\nHost: example.com..\r\n\r\n".as_slice(),
+            "GET / HTTP/1.1\r\nHost: \u{00a0}example.com\r\n\r\n".as_bytes(),
+            b"GET / HTTP/1.1\r\nHost: good.example\r\nX-Bare: a\rb\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: good.example\r\nHost: evil.example\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: good.example\r\nHost: good.example\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: good.example\r\n .continued.example\r\n\r\n".as_slice(),
@@ -615,5 +636,26 @@ mod tests {
         assert_eq!(out_ok.host.as_deref(), Some("service.example.com"));
         assert!(!out_ok.timed_out);
         assert_eq!(out_ok.buffered, good_req);
+
+        // 超长 Cookie 请求头（超过 8192B 与超过 MAX_SNIFF_BYTES）已合法解析到 Host 时仍应返回捕获到的 Host
+        let huge_cookie = "c".repeat(MAX_SNIFF_BYTES + 2048);
+        let huge_req = format!(
+            "GET /sso HTTP/1.1\r\nHost: huge-cookie.example\r\nCookie: tok={huge_cookie}\r\n\r\n"
+        );
+        let (mut c_huge, mut s_huge) = tokio::io::duplex(MAX_SNIFF_BYTES + 4096);
+        let req_bytes = huge_req.into_bytes();
+        let write_bytes = req_bytes.clone();
+        let w = tokio::spawn(async move {
+            let _ = c_huge.write_all(&write_bytes).await;
+        });
+        let out_huge = peek_host_prefix(&mut s_huge, Duration::from_millis(300))
+            .await
+            .unwrap();
+        assert_eq!(out_huge.host.as_deref(), Some("huge-cookie.example"));
+        assert!(!out_huge.timed_out);
+        assert_eq!(out_huge.buffered.len(), MAX_SNIFF_BYTES);
+        assert_eq!(out_huge.buffered.as_slice(), &req_bytes[..MAX_SNIFF_BYTES]);
+        drop(s_huge);
+        let _ = w.await;
     }
 }
