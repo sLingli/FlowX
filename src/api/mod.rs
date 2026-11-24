@@ -2635,12 +2635,6 @@ fn map_transparent_apply_error(
             "ERR_TRANSPARENT_MISSING_DRIVER",
             "error.transparent_missing_driver",
         )
-    } else if raw_err.starts_with("ERR_TRANSPARENT_UNSUPPORTED_OS:") {
-        (
-            "400 Bad Request",
-            "ERR_TRANSPARENT_UNSUPPORTED_OS",
-            "error.transparent_unsupported_os",
-        )
     } else {
         (
             "500 Internal Server Error",
@@ -2894,13 +2888,7 @@ async fn handle_transparent_elevate_after_gate(
         }
         Ok(Err(e)) => {
             let msg = e.to_string();
-            let (status, code, key) = if msg.contains("ERR_TRANSPARENT_UNSUPPORTED_OS") {
-                (
-                    "400 Bad Request",
-                    "ERR_TRANSPARENT_UNSUPPORTED_OS",
-                    "error.transparent_unsupported_os",
-                )
-            } else if msg.contains("ERR_TRANSPARENT_UAC_CANCELLED") {
+            let (status, code, key) = if msg.contains("ERR_TRANSPARENT_UAC_CANCELLED") {
                 (
                     "409 Conflict",
                     "ERR_TRANSPARENT_UAC_CANCELLED",

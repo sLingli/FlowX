@@ -107,15 +107,6 @@ impl DomainMatcher {
     }
 }
 
-/// 规则主干至少包含一个具体（非纯通配符）文件名字符时，才在规则编译期补充无 `.exe` 变体，
-/// 避免 `*.exe` / `/usr/bin/*.exe` 退化为 `*` 或 `/usr/bin/*` 全匹配。
-fn has_concrete_filename_chars(stem_after_slash: &str) -> bool {
-    !stem_after_slash.is_empty()
-        && stem_after_slash
-            .chars()
-            .any(|c| !matches!(c, '*' | '?' | '[' | ']' | '.'))
-}
-
 /// 解析以分号分隔的应用程序路径/通配符（支持引号与 Fail-Closed 约束模式）
 pub fn parse_applications(raw: &str) -> Option<Vec<AppMatcher>> {
     let trimmed_raw = raw.trim();
@@ -134,25 +125,12 @@ pub fn parse_applications(raw: &str) -> Option<Vec<AppMatcher>> {
         // 统一转换为小写并处理路径分隔符为 '/'
         let normalized = trimmed.to_lowercase().replace('\\', "/");
         let is_path = normalized.contains('/');
-        let wrap = |pat: Pattern| {
-            if is_path {
+        if let Ok(pat) = Pattern::new(&normalized) {
+            matchers.push(if is_path {
                 AppMatcher::Path(pat)
             } else {
                 AppMatcher::Name(pat)
-            }
-        };
-
-        if let Ok(pat) = Pattern::new(&normalized) {
-            matchers.push(wrap(pat));
-        }
-
-        if let Some(stem) = normalized.strip_suffix(".exe") {
-            let file_stem = stem.rsplit('/').next().unwrap_or(stem);
-            if has_concrete_filename_chars(file_stem)
-                && let Ok(stem_pat) = Pattern::new(stem)
-            {
-                matchers.push(wrap(stem_pat));
-            }
+            });
         }
     }
 
@@ -192,24 +170,12 @@ fn replace_ascii_placeholder_ignore_case(input: &str, placeholder: &str, value: 
     }
 }
 
-/// 解析当前主机名（兼容 Windows `COMPUTERNAME`、Unix `HOSTNAME` 以及 Linux `/proc/sys/kernel/hostname` 与 `/etc/hostname`）
+/// 解析当前 Windows 主机名（读取 `COMPUTERNAME` 环境变量，缺省回退 `"localhost"`）
 pub fn resolve_local_hostname() -> String {
-    for var in ["COMPUTERNAME", "HOSTNAME"] {
-        if let Ok(val) = std::env::var(var) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
-        if let Ok(content) = std::fs::read_to_string(path)
-            && let Some(first_line) = content.lines().next()
-        {
-            let trimmed = first_line.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
+    if let Ok(val) = std::env::var("COMPUTERNAME") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
     }
     "localhost".to_string()
@@ -235,25 +201,17 @@ fn is_safe_hostname_literal(host: &str) -> bool {
         })
 }
 
-/// 仅对单个已按 `;` 拆分后的 token 展开主机名占位符。
-/// 返回 `Ok(Some((expanded, used_placeholder)))` 表示可安全编译；
-/// 返回 `Ok(None)` 表示包含占位符但本机主机名含有分隔符/通配符/CIDR 等危险字符，已安全跳过。
+/// 仅对单个已按 `;` 拆分后的 token 展开 `%ComputerName%` 占位符。
+/// 返回 `Some((expanded, used_placeholder))` 表示可安全编译；
+/// 返回 `None` 表示包含占位符但本机主机名含有分隔符/通配符/CIDR 等危险字符，已安全跳过。
 fn expand_hostname_in_token(token: &str, resolved_host: Option<&str>) -> Option<(String, bool)> {
     let has_computername = contains_ascii_ignore_case(token, b"%computername%");
-    let has_hostname = contains_ascii_ignore_case(token, b"%hostname%");
-    if !has_computername && !has_hostname {
+    if !has_computername {
         return Some((token.to_string(), false));
     }
 
     let safe_host = resolved_host.filter(|h| is_safe_hostname_literal(h))?;
-    let mut out = if has_computername {
-        replace_ascii_placeholder_ignore_case(token, "%computername%", safe_host)
-    } else {
-        token.to_string()
-    };
-    if has_hostname {
-        out = replace_ascii_placeholder_ignore_case(&out, "%hostname%", safe_host);
-    }
+    let out = replace_ascii_placeholder_ignore_case(token, "%computername%", safe_host);
     Some((out, true))
 }
 
@@ -270,10 +228,9 @@ fn parse_targets_with_hostname(
     let mut subnets = Vec::new();
     // 严格先按 `;` 拆分 token，再在单 token 内安全替换主机名占位符，杜绝主机名夹带 `;` 或引号发生目标注入
     let tokens = split_quoted_tokens(trimmed_raw, ';');
-    let has_placeholder = tokens.iter().any(|t| {
-        contains_ascii_ignore_case(t, b"%computername%")
-            || contains_ascii_ignore_case(t, b"%hostname%")
-    });
+    let has_placeholder = tokens
+        .iter()
+        .any(|t| contains_ascii_ignore_case(t, b"%computername%"));
     let resolved_host = if has_placeholder {
         Some(
             resolved_host_override
@@ -302,9 +259,7 @@ fn parse_targets_with_hostname(
 
         if used_placeholder {
             // 经过主机名占位符展开的条目绝不允许再按 CIDR/IP 解析，且若原本就是裸占位符则仅构造成 Exact 域名匹配器
-            if unquoted.eq_ignore_ascii_case("%computername%")
-                || unquoted.eq_ignore_ascii_case("%hostname%")
-            {
+            if unquoted.eq_ignore_ascii_case("%computername%") {
                 let norm = trimmed.trim_end_matches('.').to_ascii_lowercase();
                 if !norm.is_empty() {
                     domain_patterns.push(DomainMatcher::Exact(norm));
@@ -445,21 +400,20 @@ mod tests {
     #[test]
     fn test_parse_applications() {
         let pats = parse_applications(r#"node.exe; *chrome*.exe; "C:\Program Files\App\app.exe""#).unwrap();
-        // node.exe(+node), *chrome*.exe(+*chrome*), c:/program files/app/app.exe(+c:/program files/app/app)
-        assert_eq!(pats.len(), 6);
+        assert_eq!(pats.len(), 3);
         assert!(pats[0].matches(&["node.exe"], &[]));
-        assert!(pats[1].matches(&["node"], &[]));
-        assert!(pats[2].matches(&["google-chrome.exe"], &[]));
-        assert!(pats[3].matches(&["google-chrome"], &[]));
-        assert!(!pats[3].matches(&["curl"], &["/opt/google-chrome/curl"]));
-        assert!(pats[4].matches(&[], &["c:/program files/app/app.exe"]));
-        assert!(pats[5].matches(&[], &["c:/program files/app/app"]));
+        assert!(!pats[0].matches(&["node"], &[]));
+        assert!(pats[1].matches(&["google-chrome.exe"], &[]));
+        assert!(!pats[1].matches(&["curl.exe"], &["c:/tools/google-chrome/curl.exe"]));
+        assert!(pats[2].matches(&[], &["c:/program files/app/app.exe"]));
 
-        // `*.exe` 与 `/usr/bin/*.exe` 绝不可降级为 `*` 或 `/usr/bin/*`
-        let wild_exe = parse_applications("*.exe; /usr/bin/*.exe").unwrap();
+        // `*.exe` 与 `C:\Tools\*.exe` 仅匹配实际带 `.exe` 后缀的进程
+        let wild_exe = parse_applications(r"*.exe; C:\Tools\*.exe").unwrap();
         assert_eq!(wild_exe.len(), 2);
-        assert!(!wild_exe.iter().any(|m| m.matches(&["curl"], &["/usr/bin/curl"])));
+        assert!(!wild_exe.iter().any(|m| m.matches(&["System"], &["System"])));
         assert!(wild_exe.iter().any(|m| m.matches(&["curl.exe"], &[])));
+        assert!(wild_exe.iter().any(|m| m.matches(&[], &["c:/tools/curl.exe"])));
+        assert!(!wild_exe.iter().any(|m| m.matches(&[], &["c:/tools/sub/curl.exe"])));
     }
 
     #[test]
@@ -469,7 +423,7 @@ mod tests {
 
         // 正常安全主机名可按大小写无关展开且构造成 Exact 域名匹配器
         let (domains, subnets) = parse_targets_with_hostname(
-            "localhost; %ComputerName%; *.Local; %HOSTNAME%",
+            "localhost; %ComputerName%; *.Local",
             Some("my-workstation"),
         );
         let domains = domains.unwrap();
@@ -482,7 +436,7 @@ mod tests {
 
         // P1-4 回归 1：主机名注入分号与通配符绝不可拆分注入 `*.evil.com`
         let (inj_domains, inj_subnets) = parse_targets_with_hostname(
-            "127.0.0.1; %ComputerName%; %HostName%",
+            "127.0.0.1; %ComputerName%",
             Some("pc;*.evil.com"),
         );
         assert!(inj_subnets.is_some());

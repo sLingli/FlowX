@@ -249,8 +249,6 @@ pub fn is_shared_system_dns_process(
     name.eq_ignore_ascii_case("svchost.exe")
         || name.eq_ignore_ascii_case("svchost")
         || name.eq_ignore_ascii_case("dnscache")
-        || name.eq_ignore_ascii_case("systemd-resolved")
-        || name.eq_ignore_ascii_case("mdnsresponder")
 }
 
 /// 从原始 IP 数据包中解析出的轻量 UDP 视图（兼容 IPv4 与 IPv6，自动剔除分片报文）

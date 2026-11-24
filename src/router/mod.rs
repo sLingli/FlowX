@@ -1160,8 +1160,8 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_platform_exe_suffix_matching() {
-        // Windows 风格规则 (.exe) 应命中 Linux 无后缀进程
+    fn test_windows_exe_suffix_and_path_matching() {
+        // 显式 `.exe` 规则精确匹配 Windows 进程
         let win_rule = Rule::from_raw(
             "WinStyle",
             true,
@@ -1171,9 +1171,9 @@ mod tests {
             Action::Proxy(101),
         );
         for (name, path) in [
-            ("node", "/usr/bin/node"),
-            ("google-chrome", "/opt/google/chrome/google-chrome"),
-            ("git", "/usr/bin/git"),
+            ("node.exe", r"C:\Program Files\nodejs\node.exe"),
+            ("google-chrome.exe", r"C:\Program Files\Google\Chrome\Application\google-chrome.exe"),
+            ("git.exe", r"C:\Program Files\Git\cmd\git.exe"),
         ] {
             let ctx = RouteContext {
                 process_path: Some(path),
@@ -1185,26 +1185,26 @@ mod tests {
             assert!(win_rule.check_match(&ctx).is_ok(), "{name} should match .exe rule");
         }
 
-        // 目录包含 `git` 但进程名不是 `git` 的 `/home/git/curl` 不应被 `*git*.exe` 跨 `/` 误命中
+        // 目录包含 `git` 但进程名不是 `git` 的 `C:\Users\git\curl.exe` 不应被 `*git*.exe` 跨目录误命中
         let ctx_dir_collision = RouteContext {
-            process_path: Some("/home/git/curl"),
-            process_name: Some("curl"),
+            process_path: Some(r"C:\Users\git\curl.exe"),
+            process_name: Some("curl.exe"),
             target_host: Some("example.com"),
             target_ip: None,
             target_port: 443,
         };
         assert_eq!(win_rule.check_match(&ctx_dir_collision), Err("app_mismatch"));
 
-        // `*.exe` 与 `*.*` 绝不命中无扩展名的 Linux/macOS 进程或未知进程 None
+        // `*.exe` 与 `*.*` 绝不命中无扩展名的 System 进程或未知进程 None
         let ext_rule = Rule::from_raw("ExeAndExt", true, Some("*.exe; *.*"), None, None, Action::Block);
-        let ctx_linux_no_ext = RouteContext {
-            process_path: Some("/usr/bin/curl"),
-            process_name: Some("curl"),
+        let ctx_system_no_ext = RouteContext {
+            process_path: Some("System"),
+            process_name: Some("System"),
             target_host: Some("example.com"),
             target_ip: None,
             target_port: 443,
         };
-        assert_eq!(ext_rule.check_match(&ctx_linux_no_ext), Err("app_mismatch"));
+        assert_eq!(ext_rule.check_match(&ctx_system_no_ext), Err("app_mismatch"));
         let ctx_unknown_none = RouteContext {
             process_path: None,
             process_name: None,
@@ -1214,11 +1214,11 @@ mod tests {
         };
         assert_eq!(ext_rule.check_match(&ctx_unknown_none), Err("app_mismatch"));
 
-        // Linux 风格规则 (无后缀) 应命中 Windows .exe 进程，且路径规则同样双向兼容与字面 `/` 隔离
-        let linux_rule = Rule::from_raw(
-            "LinuxStyle",
+        // 省略 `.exe` 的简写规则可匹配 Windows `.exe` 进程，且路径规则严格隔离目录层级
+        let short_rule = Rule::from_raw(
+            "ShortNameStyle",
             true,
-            Some("curl; /usr/bin/wget; /home/*/app"),
+            Some(r"curl; C:\Tools\wget; C:\Users\*\app"),
             None,
             None,
             Action::Direct,
@@ -1230,34 +1230,34 @@ mod tests {
             target_ip: None,
             target_port: 443,
         };
-        assert!(linux_rule.check_match(&ctx_win).is_ok());
+        assert!(short_rule.check_match(&ctx_win).is_ok());
         let ctx_wget = RouteContext {
-            process_path: Some("/usr/bin/wget"),
-            process_name: Some("wget"),
+            process_path: Some(r"C:\Tools\wget.exe"),
+            process_name: Some("wget.exe"),
             target_host: Some("example.com"),
             target_ip: None,
             target_port: 80,
         };
-        assert!(linux_rule.check_match(&ctx_wget).is_ok());
+        assert!(short_rule.check_match(&ctx_wget).is_ok());
         let ctx_nested_path = RouteContext {
-            process_path: Some("/home/user/sub/app"),
-            process_name: Some("app"),
+            process_path: Some(r"C:\Users\dev\sub\app.exe"),
+            process_name: Some("app.exe"),
             target_host: Some("example.com"),
             target_ip: None,
             target_port: 80,
         };
-        assert_eq!(linux_rule.check_match(&ctx_nested_path), Err("app_mismatch"));
+        assert_eq!(short_rule.check_match(&ctx_nested_path), Err("app_mismatch"));
 
         // 不相关进程不应误命中
         let ctx_other = RouteContext {
-            process_path: Some("/usr/bin/python3"),
-            process_name: Some("python3"),
+            process_path: Some(r"C:\Python312\python.exe"),
+            process_name: Some("python.exe"),
             target_host: Some("example.com"),
             target_ip: None,
             target_port: 443,
         };
         assert_eq!(win_rule.check_match(&ctx_other), Err("app_mismatch"));
-        assert_eq!(linux_rule.check_match(&ctx_other), Err("app_mismatch"));
+        assert_eq!(short_rule.check_match(&ctx_other), Err("app_mismatch"));
     }
 
     #[test]
@@ -1301,7 +1301,7 @@ mod tests {
 
         // Unrelated app on 443 cannot match ChromeSniProxy -> Immediate(Direct default)
         assert_eq!(
-            engine.needs_domain_for_routing(Some("/usr/bin/ssh"), Some("ssh"), Some(public_ip), 443),
+            engine.needs_domain_for_routing(Some(r"C:\Windows\System32\OpenSSH\ssh.exe"), Some("ssh.exe"), Some(public_ip), 443),
             DomainNeedDecision::Immediate(Action::Direct)
         );
     }

@@ -373,11 +373,10 @@ pub(crate) fn is_trusted_local_absolute_path(path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
     }
-    let mut has_disk_prefix = !cfg!(windows);
+    let mut has_disk_prefix = false;
     for comp in path.components() {
         match comp {
             std::path::Component::ParentDir | std::path::Component::CurDir => return false,
-            #[cfg(windows)]
             std::path::Component::Prefix(prefix) => {
                 use std::path::Prefix;
                 match prefix.kind() {

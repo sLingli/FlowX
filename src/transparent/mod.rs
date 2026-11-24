@@ -2,26 +2,19 @@ pub mod dns_hijack;
 pub mod fragment;
 pub mod netstack;
 pub mod sniffer;
-
-#[cfg(windows)]
 pub mod pid_table;
-#[cfg(windows)]
 pub mod windivert_ffi;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-#[cfg(windows)]
 use std::thread::JoinHandle;
 
 use serde::{Deserialize, Serialize};
-#[cfg(windows)]
 use tracing::{debug, info, warn};
 
 use crate::dns::server::DnsServer;
-use crate::interceptor::dispatcher::DispatcherConfig;
-#[cfg(windows)]
-use crate::interceptor::dispatcher::dispatch_transparent_stream;
+use crate::interceptor::dispatcher::{dispatch_transparent_stream, DispatcherConfig};
 
 /// 透明代理配置（持久化至 `<TransparentProxy>`）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,31 +81,18 @@ struct TransparentStatsCounters {
 
 /// 基于给定静态配置构建驱动探测快照（供 CLI 离线查询与测试降级复用）
 pub fn probe_status(cfg: &TransparentSettings) -> TransparentRuntimeStatus {
-    #[cfg(windows)]
-    let (dll_found, sys_found, dll_path, sys_path, searched_dirs) = {
-        let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
-        (
-            avail.dll_found,
-            avail.sys_found,
-            avail.dll_path,
-            avail.sys_path,
-            avail.searched_dirs,
-        )
-    };
-    #[cfg(not(windows))]
-    let (dll_found, sys_found, dll_path, sys_path, searched_dirs) =
-        (false, false, None, None, Vec::new());
+    let avail = windivert_ffi::locate_windivert_files(cfg.dll_path.as_deref());
 
     TransparentRuntimeStatus {
-        supported: cfg!(windows),
+        supported: true,
         enabled: cfg.enabled,
         running: false,
         elevated: is_process_elevated(),
-        dll_found,
-        sys_found,
-        dll_path,
-        sys_path,
-        searched_dirs,
+        dll_found: avail.dll_found,
+        sys_found: avail.sys_found,
+        dll_path: avail.dll_path,
+        sys_path: avail.sys_path,
+        searched_dirs: avail.searched_dirs,
         driver_version: None,
         active_flows: 0,
         tcp_intercepted_total: 0,
@@ -127,45 +107,37 @@ pub fn probe_status(cfg: &TransparentSettings) -> TransparentRuntimeStatus {
     }
 }
 
-/// 检测当前进程是否拥有 Windows 管理员提升令牌（非 Windows 返回 `false`）
+/// 检测当前进程是否拥有 Windows 管理员提升令牌
 pub fn is_process_elevated() -> bool {
-    #[cfg(windows)]
-    {
-        use std::ffi::c_void;
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows_sys::Win32::Security::{
-            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-        };
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-        unsafe {
-            let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0
-                || token.is_null()
-            {
-                return false;
-            }
-            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
-            let mut ret_len = 0u32;
-            let ok = GetTokenInformation(
-                token,
-                TokenElevation,
-                (&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>(),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut ret_len,
-            );
-            CloseHandle(token);
-            ok != 0 && elevation.TokenIsElevated != 0
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0
+            || token.is_null()
+        {
+            return false;
         }
-    }
-    #[cfg(not(windows))]
-    {
-        false
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast::<c_void>(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
     }
 }
 
 /// 仅从 Windows `System32` 目录加载系统 DLL（避免高权限下被 CWD / 应用目录 / `PATH` 劫持）
-#[cfg(windows)]
 unsafe fn load_system32_library(dll_name: &str) -> io::Result<windows_sys::Win32::Foundation::HMODULE> {
     use windows_sys::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 
@@ -187,7 +159,6 @@ unsafe fn load_system32_library(dll_name: &str) -> io::Result<windows_sys::Win32
 }
 
 /// 解析通过 Windows API `GetSystemDirectoryW` 确认的本地可信 `System32\<exe_name>` 路径，拒绝可变环境变量、CWD 与 UNC 回退
-#[cfg(windows)]
 fn get_trusted_system32_dir() -> io::Result<std::path::PathBuf> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -214,7 +185,6 @@ fn get_trusted_system32_dir() -> io::Result<std::path::PathBuf> {
     )))
 }
 
-#[cfg(windows)]
 fn resolve_system32_executable(exe_name: &str) -> io::Result<std::path::PathBuf> {
     let sys_dir = get_trusted_system32_dir()?;
     if !windivert_ffi::is_trusted_local_absolute_path(&sys_dir) {
@@ -235,48 +205,41 @@ fn resolve_system32_executable(exe_name: &str) -> io::Result<std::path::PathBuf>
 
 /// 刷新 Windows 系统 DNS 缓存，确保切入/退出透明模式时清理陈旧解析记录及 Fake-IP 残留
 pub fn flush_dns_cache() -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use std::ffi::CString;
-        use windows_sys::Win32::Foundation::FreeLibrary;
-        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    use std::ffi::CString;
+    use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 
-        type FnDnsFlushResolverCache = unsafe extern "system" fn() -> i32;
-        if let Ok(module) = unsafe { load_system32_library("dnsapi.dll") } {
-            let sym = CString::new("DnsFlushResolverCache").unwrap();
-            let proc = unsafe { GetProcAddress(module, sym.as_ptr() as *const u8) };
-            let flushed = if let Some(ptr) = proc {
-                let func: FnDnsFlushResolverCache =
-                    unsafe { std::mem::transmute_copy(&ptr) };
-                unsafe { func() != 0 }
-            } else {
-                false
-            };
-            unsafe {
-                FreeLibrary(module);
-            }
-            if flushed {
-                return Ok(());
-            }
-        }
-
-        // 后备方案：仅从 %SystemRoot%\System32\ipconfig.exe 静默执行（禁止裸名走 PATH / CWD）
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let ipconfig_path = resolve_system32_executable("ipconfig.exe")?;
-        let status = std::process::Command::new(ipconfig_path)
-            .arg("/flushdns")
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()?;
-        if status.success() {
-            Ok(())
+    type FnDnsFlushResolverCache = unsafe extern "system" fn() -> i32;
+    if let Ok(module) = unsafe { load_system32_library("dnsapi.dll") } {
+        let sym = CString::new("DnsFlushResolverCache").unwrap();
+        let proc = unsafe { GetProcAddress(module, sym.as_ptr() as *const u8) };
+        let flushed = if let Some(ptr) = proc {
+            let func: FnDnsFlushResolverCache =
+                unsafe { std::mem::transmute_copy(&ptr) };
+            unsafe { func() != 0 }
         } else {
-            Err(io::Error::other("Failed to flush Windows DNS cache"))
+            false
+        };
+        unsafe {
+            FreeLibrary(module);
+        }
+        if flushed {
+            return Ok(());
         }
     }
-    #[cfg(not(windows))]
-    {
+
+    // 后备方案：仅从 %SystemRoot%\System32\ipconfig.exe 静默执行（禁止裸名走 PATH / CWD）
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let ipconfig_path = resolve_system32_executable("ipconfig.exe")?;
+    let status = std::process::Command::new(ipconfig_path)
+        .arg("/flushdns")
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()?;
+    if status.success() {
         Ok(())
+    } else {
+        Err(io::Error::other("Failed to flush Windows DNS cache"))
     }
 }
 
@@ -364,108 +327,96 @@ pub fn build_elevated_relaunch_args(
 
 /// 触发 Windows UAC 提权以 `--transparent --replace-pid <当前PID>` 重启 FlowX，由新实例平滑接管配置与端口
 pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{FreeLibrary, HINSTANCE, HWND};
-        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows_sys::Win32::Foundation::{FreeLibrary, HINSTANCE, HWND};
+    use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-        if is_process_elevated() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "Process is already running with Administrator privileges",
-            ));
-        }
+    if is_process_elevated() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Process is already running with Administrator privileges",
+        ));
+    }
 
-        type ShellExecuteWFn = unsafe extern "system" fn(
-            hwnd: HWND,
-            lp_operation: *const u16,
-            lp_file: *const u16,
-            lp_parameters: *const u16,
-            lp_directory: *const u16,
-            n_show_cmd: i32,
-        ) -> HINSTANCE;
+    type ShellExecuteWFn = unsafe extern "system" fn(
+        hwnd: HWND,
+        lp_operation: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show_cmd: i32,
+    ) -> HINSTANCE;
 
-        // 按需仅从 System32 延迟加载 shell32.dll，避免无头环境启动失败或 CWD/PATH DLL 劫持
-        let shell32_mod = unsafe { load_system32_library("shell32.dll") }.map_err(|os_err| {
-            io::Error::new(
-                os_err.kind(),
-                format!("Failed to load shell32.dll from System32 for UAC elevation: {os_err}"),
-            )
-        })?;
+    // 按需仅从 System32 延迟加载 shell32.dll，避免无头环境启动失败或 CWD/PATH DLL 劫持
+    let shell32_mod = unsafe { load_system32_library("shell32.dll") }.map_err(|os_err| {
+        io::Error::new(
+            os_err.kind(),
+            format!("Failed to load shell32.dll from System32 for UAC elevation: {os_err}"),
+        )
+    })?;
 
-        let proc_ptr = unsafe { GetProcAddress(shell32_mod, c"ShellExecuteW".as_ptr().cast()) };
-        let Some(proc_fn) = proc_ptr else {
-            let os_err = io::Error::last_os_error();
-            unsafe {
-                FreeLibrary(shell32_mod);
-            }
-            return Err(io::Error::new(
-                os_err.kind(),
-                format!("Failed to resolve ShellExecuteW from shell32.dll: {os_err}"),
-            ));
-        };
-        let shell_execute_w: ShellExecuteWFn = unsafe { std::mem::transmute(proc_fn) };
-
-        let exe_path = std::env::current_exe().inspect_err(|_| unsafe {
-            FreeLibrary(shell32_mod);
-        })?;
-        let cwd = std::env::current_dir().ok();
-        let raw_args: Vec<String> = std::env::args().collect();
-        let params = build_elevated_relaunch_args(&raw_args, std::process::id(), extra_args);
-
-        let verb_w: Vec<u16> = "runas\0".encode_utf16().collect();
-        let exe_w: Vec<u16> = exe_path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
-        let cwd_w: Option<Vec<u16>> = cwd.map(|p| {
-            p.to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect()
-        });
-
-        let ret = unsafe {
-            shell_execute_w(
-                std::ptr::null_mut(),
-                verb_w.as_ptr(),
-                exe_w.as_ptr(),
-                params_w.as_ptr(),
-                cwd_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-                SW_SHOWNORMAL,
-            )
-        };
+    let proc_ptr = unsafe { GetProcAddress(shell32_mod, c"ShellExecuteW".as_ptr().cast()) };
+    let Some(proc_fn) = proc_ptr else {
+        let os_err = io::Error::last_os_error();
         unsafe {
             FreeLibrary(shell32_mod);
         }
-        let code = ret as isize;
-        if code <= 32 {
-            let msg = match code {
-                5 | 1223 => "ERR_TRANSPARENT_UAC_CANCELLED: Administrator elevation prompt was cancelled or denied.",
-                2 | 3 => "Failed to locate executable path while requesting elevation.",
-                _ => "ShellExecuteW(runas) failed to launch elevated FlowX instance.",
-            };
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{msg} (ShellExecute code {code})"),
-            ));
-        }
-        Ok(())
+        return Err(io::Error::new(
+            os_err.kind(),
+            format!("Failed to resolve ShellExecuteW from shell32.dll: {os_err}"),
+        ));
+    };
+    let shell_execute_w: ShellExecuteWFn = unsafe { std::mem::transmute(proc_fn) };
+
+    let exe_path = std::env::current_exe().inspect_err(|_| unsafe {
+        FreeLibrary(shell32_mod);
+    })?;
+    let cwd = std::env::current_dir().ok();
+    let raw_args: Vec<String> = std::env::args().collect();
+    let params = build_elevated_relaunch_args(&raw_args, std::process::id(), extra_args);
+
+    let verb_w: Vec<u16> = "runas\0".encode_utf16().collect();
+    let exe_w: Vec<u16> = exe_path
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let params_w: Vec<u16> = params.encode_utf16().chain(std::iter::once(0)).collect();
+    let cwd_w: Option<Vec<u16>> = cwd.map(|p| {
+        p.to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+
+    let ret = unsafe {
+        shell_execute_w(
+            std::ptr::null_mut(),
+            verb_w.as_ptr(),
+            exe_w.as_ptr(),
+            params_w.as_ptr(),
+            cwd_w.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+            SW_SHOWNORMAL,
+        )
+    };
+    unsafe {
+        FreeLibrary(shell32_mod);
     }
-    #[cfg(not(windows))]
-    {
-        let _ = extra_args;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "ERR_TRANSPARENT_UNSUPPORTED_OS: Elevated WinDivert relaunch is only supported on Windows.",
-        ))
+    let code = ret as isize;
+    if code <= 32 {
+        let msg = match code {
+            5 | 1223 => "ERR_TRANSPARENT_UAC_CANCELLED: Administrator elevation prompt was cancelled or denied.",
+            2 | 3 => "Failed to locate executable path while requesting elevation.",
+            _ => "ShellExecuteW(runas) failed to launch elevated FlowX instance.",
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{msg} (ShellExecute code {code})"),
+        ));
     }
+    Ok(())
 }
 
-#[cfg(windows)]
 fn resolve_outbound_pid(
     table: &pid_table::SocketPidTable,
     protocol: u8,
@@ -494,7 +445,6 @@ fn resolve_outbound_pid(
     }
 }
 
-#[cfg(windows)]
 fn shutdown_and_join_runtime(
     stop_flag: &AtomicBool,
     signal: &netstack::NetstackSignal,
@@ -520,7 +470,6 @@ fn shutdown_and_join_runtime(
 }
 
 /// 启动期原子回滚守卫：若任意子线程创建失败或发生 panic，确保已启动线程与 WinDivert 句柄全部回收
-#[cfg(windows)]
 struct PartialRuntimeGuard {
     armed: bool,
     stop_flag: Arc<AtomicBool>,
@@ -532,7 +481,6 @@ struct PartialRuntimeGuard {
     dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
-#[cfg(windows)]
 impl Drop for PartialRuntimeGuard {
     fn drop(&mut self) {
         if !self.armed {
@@ -551,7 +499,6 @@ impl Drop for PartialRuntimeGuard {
     }
 }
 
-#[cfg(windows)]
 struct ActiveRuntime {
     stop_flag: Arc<AtomicBool>,
     signal: Arc<netstack::NetstackSignal>,
@@ -564,14 +511,10 @@ struct ActiveRuntime {
 }
 
 /// WinDivert NETWORK 层收包初始缓冲区（128 KiB > WINDIVERT_MTU_MAX 65575）与 LSO/巨包动态扩容上限（4 MiB）
-#[cfg(any(windows, test))]
 pub(crate) const INITIAL_NET_RX_BUF_LEN: usize = 131_072;
-#[cfg(any(windows, test))]
 pub(crate) const MAX_NET_RX_BUF_LEN: usize = 4 * 1024 * 1024;
-#[cfg(windows)]
 const WINDOWS_ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 
-#[cfg(any(windows, test))]
 #[inline]
 pub(crate) fn next_net_rx_buf_len(current: usize) -> Option<usize> {
     if current >= MAX_NET_RX_BUF_LEN {
@@ -581,7 +524,6 @@ pub(crate) fn next_net_rx_buf_len(current: usize) -> Option<usize> {
 }
 
 /// WinDivert NETWORK 层过滤表达式：捕获全部出站非自环 TCP、UDP/53 DNS、UDP/443 QUIC、发往 Fake-IP (`198.18.0.0/15`) 的任意 UDP 以及全部 IPv4/IPv6 分片
-#[cfg(any(windows, test))]
 pub(crate) fn windivert_network_filter() -> &'static str {
     "outbound and !loopback and !impostor and (tcp or udp.DstPort == 53 or udp.DstPort == 443 or (udp and ip and ip.DstAddr >= 198.18.0.0 and ip.DstAddr <= 198.19.255.255) or fragment)"
 }
@@ -589,12 +531,10 @@ pub(crate) fn windivert_network_filter() -> &'static str {
 /// WinDivert NETWORK 层入站 `InspectDns` 同步观测过滤表达式（配合 `DNS_INSPECT_LAYER_FLAGS = 0` 内联拦截-重注入）：
 /// 捕获入站 UDP/53 应答与入站 IP 分片（覆盖大包 DNSSEC / EDNS0），先同步落盘 `real_ip -> domain` 后再无条件原样重注入 OS，
 /// 彻底消除高并发下「入站 DNS 应答 vs 业务进程 TCP SYN」竞态且绝不丢弃或篡改任何入站报文
-#[cfg(any(windows, test))]
 pub(crate) fn windivert_dns_inspect_inbound_filter() -> &'static str {
     "inbound and !loopback and !impostor and (udp.SrcPort == 53 or fragment)"
 }
 
-#[cfg(windows)]
 struct NetRxContext {
     stop_flag: Arc<AtomicBool>,
     net_h: Arc<windivert_ffi::WinDivertHandle>,
@@ -610,7 +550,6 @@ struct NetRxContext {
     dns_abort_handles: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
-#[cfg(windows)]
 impl NetRxContext {
     fn emit_passthrough(&self, raw: &[u8], addr: &windivert_ffi::WinDivertAddress, fallback_fragments: Option<&[netstack::EmittedIpPacket]>) {
         if let Some(frags) = fallback_fragments {
@@ -788,9 +727,7 @@ impl NetRxContext {
 
 /// 透明代理全生命周期管理器：负责 WinDivert 驱动加载、双层截获线程调度、错误诊断与 Drop 安全回收
 pub struct TransparentManager {
-    #[cfg_attr(not(windows), allow(dead_code))]
     dispatcher_config: Arc<DispatcherConfig>,
-    #[cfg_attr(not(windows), allow(dead_code))]
     dns_server: Arc<DnsServer>,
     settings: Mutex<TransparentSettings>,
     persisted_enabled: AtomicBool,
@@ -799,7 +736,6 @@ pub struct TransparentManager {
     stats: Arc<TransparentStatsCounters>,
     last_error: Mutex<Option<String>>,
     lifecycle_lock: Mutex<()>,
-    #[cfg(windows)]
     runtime: Mutex<Option<ActiveRuntime>>,
 }
 
@@ -837,7 +773,6 @@ impl TransparentManager {
             stats: Arc::new(TransparentStatsCounters::default()),
             last_error: Mutex::new(None),
             lifecycle_lock: Mutex::new(()),
-            #[cfg(windows)]
             runtime: Mutex::new(None),
         })
     }
@@ -861,17 +796,10 @@ impl TransparentManager {
     }
 
     pub fn is_running(&self) -> bool {
-        #[cfg(windows)]
-        {
-            self.runtime
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_some()
-        }
-        #[cfg(not(windows))]
-        {
-            false
-        }
+        self.runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
 
     pub fn status(&self) -> TransparentRuntimeStatus {
@@ -882,7 +810,6 @@ impl TransparentManager {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
-        #[cfg(windows)]
         let (running, driver_version) = {
             let guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             (
@@ -890,8 +817,6 @@ impl TransparentManager {
                 guard.as_ref().and_then(|rt| rt.driver_version.clone()),
             )
         };
-        #[cfg(not(windows))]
-        let (running, driver_version) = (false, None);
 
         let mut st = probe_status(&cfg);
         st.running = running;
@@ -1026,22 +951,6 @@ impl TransparentManager {
         msg
     }
 
-    #[cfg(not(windows))]
-    fn start_locked(
-        &self,
-        _rt_handle: &tokio::runtime::Handle,
-        _cfg: &TransparentSettings,
-    ) -> Result<(), String> {
-        Err(self.set_error(
-            "ERR_TRANSPARENT_UNSUPPORTED_OS: WinDivert transparent proxy is only supported on Windows."
-                .to_string(),
-        ))
-    }
-
-    #[cfg(not(windows))]
-    fn stop_locked(&self) {}
-
-    #[cfg(windows)]
     fn start_locked(
         &self,
         rt_handle: &tokio::runtime::Handle,
@@ -1531,7 +1440,6 @@ impl TransparentManager {
         Ok(())
     }
 
-    #[cfg(windows)]
     fn stop_locked(&self) {
         let rt_opt = self.runtime.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(rt) = rt_opt else {
@@ -1652,7 +1560,7 @@ mod tests {
         );
 
         let st = mgr.status();
-        assert_eq!(st.supported, cfg!(windows));
+        assert!(st.supported);
         assert!(!st.running);
         assert!(!st.dll_found);
         assert!(!st.sys_found);
@@ -1686,7 +1594,6 @@ mod tests {
         assert!(mgr.status().last_error.is_none());
     }
 
-    #[cfg(windows)]
     #[test]
     fn test_system32_dll_and_exe_loaders_resolve_system32() {
         use windows_sys::Win32::Foundation::FreeLibrary;

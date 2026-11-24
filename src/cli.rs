@@ -1609,8 +1609,7 @@ fn print_transparent_status(st: &Value, mode_label: &str) {
         st["configured_dll_path"].as_str().unwrap_or("<auto>"),
     );
     println!(
-        "WinDivert:      supported={} dll_found={} sys_found={} driver_ver={}",
-        st["supported"].as_bool().unwrap_or(false),
+        "WinDivert:      dll_found={} sys_found={} driver_ver={}",
         st["dll_found"].as_bool().unwrap_or(false),
         st["sys_found"].as_bool().unwrap_or(false),
         st["driver_version"].as_str().unwrap_or("-"),
@@ -1821,7 +1820,6 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 };
                 ("OFFLINE", serde_json::to_value(probe_status(&settings))?)
             };
-            let supported = st_val["supported"].as_bool().unwrap_or(false);
             let elevated = st_val["elevated"].as_bool().unwrap_or(false);
             let running = st_val["running"].as_bool().unwrap_or(false);
             let dll_found = st_val["dll_found"].as_bool().unwrap_or(false);
@@ -1846,11 +1844,6 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 .map(str::to_string);
 
             let mut issues: Vec<String> = Vec::new();
-            if !supported {
-                issues.push(
-                    "WinDivert transparent proxy is only supported on Windows hosts.".to_string(),
-                );
-            }
             if !elevated {
                 issues.push(
                     "Target FlowX instance lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
@@ -1865,13 +1858,13 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
             if let Some(ref err) = last_error {
                 issues.push(format!("Last runtime error: {}", err));
             }
-            let ready = supported && elevated && dll_found && sys_found;
+            let ready = elevated && dll_found && sys_found;
             let report = json!({
                 "mode": mode_label,
                 "ready": ready,
                 "running": running,
                 "config_path": opts.config_path,
-                "supported": supported,
+                "supported": true,
                 "elevated": elevated,
                 "dll_found": dll_found,
                 "sys_found": sys_found,
@@ -1891,7 +1884,6 @@ async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 println!("Transparent Proxy Doctor [{}]:", mode_label);
                 println!("  Ready:         {}", ready);
                 println!("  Running:       {}", running);
-                println!("  Windows Host:  {}", supported);
                 println!("  Elevated:      {}", elevated);
                 println!(
                     "  WinDivert DLL: found={} ({})",
