@@ -249,20 +249,19 @@ async fn main() -> anyhow::Result<()> {
                 _ = interval.tick() => {
                     let pool_task = Arc::clone(&pool_gc);
                     let tracker_task = Arc::clone(&tracker_gc);
-                    if let Ok((cleaned_ips, cleaned_pids, cleaned_neg)) =
+                    if let Ok((cleaned_ips, cleaned_pids)) =
                         tokio::task::spawn_blocking(move || {
                             let cleaned_ips = pool_task.cleanup_expired();
-                            let (cleaned_pids, cleaned_neg) = tracker_task.cleanup_expired();
-                            (cleaned_ips, cleaned_pids, cleaned_neg)
+                            let cleaned_pids = tracker_task.cleanup_expired();
+                            (cleaned_ips, cleaned_pids)
                         })
                         .await
-                        && (cleaned_ips > 0 || cleaned_pids > 0 || cleaned_neg > 0)
+                        && (cleaned_ips > 0 || cleaned_pids > 0)
                     {
                         tracing::debug!(
-                            "[GC] Periodic expired entry collection: Fake-IP={}, PID={}, NegPID={}",
+                            "[GC] Periodic expired entry collection: Fake-IP={}, PID={}",
                             cleaned_ips,
-                            cleaned_pids,
-                            cleaned_neg
+                            cleaned_pids
                         );
                     }
                 }

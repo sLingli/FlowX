@@ -1,10 +1,7 @@
 use std::collections::HashMap;
 use std::hash::Hash;
-#[cfg(any(windows, target_os = "macos", test))]
 use std::mem::size_of;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-#[cfg(any(windows, target_os = "linux", test))]
-use std::net::{SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -12,8 +9,6 @@ use tokio::sync::Semaphore;
 
 /// PID 正向缓存最大条目数（防无界增长与 O(N^2) 全表扫描）
 const MAX_PID_CACHE: usize = 1024;
-/// 跨用户/权限受限 PID 负缓存最大条目数
-const MAX_NEG_PID_CACHE: usize = 1024;
 /// 周期性插入时清理过期条目的最小间隔
 const CACHE_SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// 并发执行阻塞式进程反查的最大任务数
@@ -22,8 +17,6 @@ const LOOKUP_SEMAPHORE_PERMITS: usize = 8;
 const LOOKUP_SEMAPHORE_TIMEOUT: Duration = Duration::from_millis(200);
 /// PID 正向缓存默认有效期
 const DEFAULT_PID_TTL: Duration = Duration::from_secs(10);
-/// 不可访问 PID (`EACCES`/`EPERM`) 负缓存默认有效期
-const DEFAULT_NEG_PID_TTL: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
@@ -72,15 +65,6 @@ impl<K: Eq + Hash + Copy, V: Clone> BoundedCache<K, V> {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", test))]
-    fn contains_active(&self, key: &K, now: Instant) -> bool {
-        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        guard
-            .entries
-            .get(key)
-            .is_some_and(|slot| slot.expires_at > now)
-    }
-
     fn get_cloned(&self, key: &K, now: Instant) -> Option<V> {
         let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
         guard
@@ -88,17 +72,6 @@ impl<K: Eq + Hash + Copy, V: Clone> BoundedCache<K, V> {
             .get(key)
             .filter(|slot| slot.expires_at > now)
             .map(|slot| slot.value.clone())
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos", test))]
-    fn active_keys(&self, now: Instant) -> Vec<K> {
-        let guard = self.state.read().unwrap_or_else(|e| e.into_inner());
-        guard
-            .entries
-            .iter()
-            .filter(|(_, slot)| slot.expires_at > now)
-            .map(|(k, _)| *k)
-            .collect()
     }
 
     fn remove(&self, key: &K) {
@@ -157,29 +130,17 @@ impl<K: Eq + Hash + Copy, V: Clone> BoundedCache<K, V> {
 
 pub struct ProcessTracker {
     pid_cache: BoundedCache<u32, PidCacheEntry>,
-    neg_pid_cache: BoundedCache<u32, ()>,
     lookup_semaphore: Arc<Semaphore>,
 }
 
 impl ProcessTracker {
     pub fn new() -> Self {
-        Self::with_config(
-            DEFAULT_PID_TTL,
-            DEFAULT_NEG_PID_TTL,
-            MAX_PID_CACHE,
-            MAX_NEG_PID_CACHE,
-        )
+        Self::with_config(DEFAULT_PID_TTL, MAX_PID_CACHE)
     }
 
-    fn with_config(
-        pid_ttl: Duration,
-        neg_ttl: Duration,
-        max_pid_entries: usize,
-        max_neg_entries: usize,
-    ) -> Self {
+    fn with_config(pid_ttl: Duration, max_pid_entries: usize) -> Self {
         Self {
             pid_cache: BoundedCache::new(pid_ttl, max_pid_entries),
-            neg_pid_cache: BoundedCache::new(neg_ttl, max_neg_entries),
             lookup_semaphore: Arc::new(Semaphore::new(LOOKUP_SEMAPHORE_PERMITS)),
         }
     }
@@ -231,25 +192,7 @@ impl ProcessTracker {
     /// 若进程在反查窗口内已退出或不可访问则返回 `None`（绝不缓存未知占位）。
     pub fn find_by_connection(&self, client: SocketAddr, server: SocketAddr) -> Option<ProcessInfo> {
         let now = Instant::now();
-
-        #[cfg(target_os = "linux")]
-        let pid = {
-            let hint_pids = self.pid_cache.active_keys(now);
-            get_pid_by_connection_with_hints(client, server, &hint_pids, &self.neg_pid_cache, now)?
-        };
-
-        #[cfg(target_os = "macos")]
-        let pid = {
-            let hint_pids = self.pid_cache.active_keys(now);
-            get_pid_by_connection_with_hints(client, server, &hint_pids, &self.neg_pid_cache, now)?
-        };
-
-        #[cfg(windows)]
         let pid = get_pid_by_connection(client, server)?;
-
-        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-        let pid = get_pid_by_connection(client, server)?;
-
         self.resolve_pid_with(
             pid,
             now,
@@ -312,12 +255,9 @@ impl ProcessTracker {
         .flatten()
     }
 
-    /// 清理过期的 PID 正/负缓存项，返回 `(pid_cleaned, neg_cleaned)`
-    pub fn cleanup_expired(&self) -> (usize, usize) {
-        let now = Instant::now();
-        let cleaned_pids = self.pid_cache.cleanup_expired(now);
-        let cleaned_neg = self.neg_pid_cache.cleanup_expired(now);
-        (cleaned_pids, cleaned_neg)
+    /// 清理过期的 PID 缓存项，返回清理数量
+    pub fn cleanup_expired(&self) -> usize {
+        self.pid_cache.cleanup_expired(Instant::now())
     }
 }
 
@@ -328,14 +268,7 @@ impl Default for ProcessTracker {
 }
 
 fn is_system_pid(pid: u32) -> bool {
-    #[cfg(windows)]
-    {
-        pid == 0 || pid == 4
-    }
-    #[cfg(not(windows))]
-    {
-        pid == 0
-    }
+    pid == 0 || pid == 4
 }
 
 fn extract_process_name(path: &str) -> String {
@@ -347,7 +280,6 @@ fn extract_process_name(path: &str) -> String {
         .to_string()
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
 fn normalize_ipv4_pair(client: SocketAddr, server: SocketAddr) -> Option<(SocketAddrV4, SocketAddrV4)> {
     let to_v4 = |addr: SocketAddr| -> Option<SocketAddrV4> {
         match addr {
@@ -358,7 +290,6 @@ fn normalize_ipv4_pair(client: SocketAddr, server: SocketAddr) -> Option<(Socket
     Some((to_v4(client)?, to_v4(server)?))
 }
 
-#[cfg(any(windows, target_os = "linux", test))]
 fn normalize_ipv6_pair(client: SocketAddr, server: SocketAddr) -> Option<(SocketAddrV6, SocketAddrV6)> {
     let to_v6 = |addr: SocketAddr| -> SocketAddrV6 {
         match addr {
@@ -369,7 +300,6 @@ fn normalize_ipv6_pair(client: SocketAddr, server: SocketAddr) -> Option<(Socket
     Some((to_v6(client), to_v6(server)))
 }
 
-#[cfg(any(windows, test))]
 fn find_in_tcp_table_bytes<Row: Copy, F>(
     raw_bytes: &[u8],
     actual_size: usize,
@@ -403,7 +333,6 @@ where
     None
 }
 
-#[cfg(windows)]
 fn query_ip_helper_owner_pid_table<Row: Copy, Fetch, Match>(
     table_offset: usize,
     mut fetch_fn: Fetch,
@@ -452,7 +381,6 @@ where
     None
 }
 
-#[cfg(windows)]
 fn query_extended_tcp_table<Row: Copy, F>(
     af: u32,
     table_offset: usize,
@@ -474,7 +402,6 @@ where
     )
 }
 
-#[cfg(windows)]
 fn query_extended_udp_table<Row: Copy, F>(
     af: u32,
     table_offset: usize,
@@ -496,7 +423,6 @@ where
     )
 }
 
-#[cfg(windows)]
 fn query_windows_tcp_v4(client_v4: SocketAddrV4, server_v4: SocketAddrV4) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
@@ -520,7 +446,6 @@ fn query_windows_tcp_v4(client_v4: SocketAddrV4, server_v4: SocketAddrV4) -> Opt
     })
 }
 
-#[cfg(windows)]
 fn query_windows_tcp_v6(client_v6: SocketAddrV6, server_v6: SocketAddrV6) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
@@ -544,7 +469,6 @@ fn query_windows_tcp_v6(client_v6: SocketAddrV6, server_v6: SocketAddrV6) -> Opt
     })
 }
 
-#[cfg(windows)]
 fn get_pid_by_connection(client: SocketAddr, server: SocketAddr) -> Option<u32> {
     match (client, server) {
         (SocketAddr::V4(client_v4), SocketAddr::V4(server_v4)) => {
@@ -579,7 +503,6 @@ fn get_pid_by_connection(client: SocketAddr, server: SocketAddr) -> Option<u32> 
     }
 }
 
-#[cfg(windows)]
 fn query_windows_udp_v4(target_ip: Option<Ipv4Addr>, target_port: u16) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID,
@@ -605,7 +528,6 @@ fn query_windows_udp_v4(target_ip: Option<Ipv4Addr>, target_port: u16) -> Option
     exact.or(wild_pid)
 }
 
-#[cfg(windows)]
 fn query_windows_udp_v6(target_ip: Option<Ipv6Addr>, target_port: u16) -> Option<u32> {
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
@@ -631,7 +553,6 @@ fn query_windows_udp_v6(target_ip: Option<Ipv6Addr>, target_port: u16) -> Option
     exact.or(wild_pid)
 }
 
-#[cfg(windows)]
 fn get_pid_by_udp_endpoint(local: SocketAddr) -> Option<u32> {
     match local.ip().to_canonical() {
         std::net::IpAddr::V4(v4) => query_windows_udp_v4(Some(v4), local.port())
@@ -646,25 +567,15 @@ pub fn lookup_outbound_socket_pid(
     local: SocketAddr,
     remote: SocketAddr,
 ) -> Option<u32> {
-    #[cfg(windows)]
-    {
-        match protocol {
-            6 => get_pid_by_connection(local, remote).filter(|&p| p != 0),
-            17 => get_pid_by_udp_endpoint(local).filter(|&p| p != 0),
-            _ => None,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (protocol, local, remote);
-        None
+    match protocol {
+        6 => get_pid_by_connection(local, remote).filter(|&p| p != 0),
+        17 => get_pid_by_udp_endpoint(local).filter(|&p| p != 0),
+        _ => None,
     }
 }
 
-#[cfg(windows)]
 struct HandleGuard(windows_sys::Win32::Foundation::HANDLE);
 
-#[cfg(windows)]
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -675,7 +586,6 @@ impl Drop for HandleGuard {
     }
 }
 
-#[cfg(windows)]
 fn query_windows_process_creation_time(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u128> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::GetProcessTimes;
@@ -694,7 +604,6 @@ fn query_windows_process_creation_time(handle: windows_sys::Win32::Foundation::H
     Some(((creation.dwHighDateTime as u128) << 32) | (creation.dwLowDateTime as u128))
 }
 
-#[cfg(windows)]
 fn get_process_start_time(pid: u32) -> Option<u128> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
@@ -709,7 +618,6 @@ fn get_process_start_time(pid: u32) -> Option<u128> {
     query_windows_process_creation_time(handle)
 }
 
-#[cfg(windows)]
 fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
     use windows_sys::Win32::System::Threading::{
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -748,930 +656,6 @@ fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
     None
 }
 
-#[cfg(target_os = "linux")]
-fn get_pid_by_connection_with_hints(
-    client: SocketAddr,
-    server: SocketAddr,
-    hint_pids: &[u32],
-    neg_cache: &BoundedCache<u32, ()>,
-    now: Instant,
-) -> Option<u32> {
-    let (inode, sock_uid) = find_socket_inode_linux(client, server)?;
-    find_pid_by_socket_inode_linux(inode, sock_uid, hint_pids, neg_cache, now)
-}
-
-#[cfg(target_os = "linux")]
-fn find_socket_inode_linux(client: SocketAddr, server: SocketAddr) -> Option<(u64, Option<u32>)> {
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let try_tcp4 = |c_v4: SocketAddrV4, s_v4: SocketAddrV4| -> Option<(u64, Option<u32>)> {
-        let file = File::open("/proc/net/tcp").ok()?;
-        find_socket_meta_in_proc_tcp_reader(BufReader::new(file), c_v4, s_v4)
-    };
-    let try_tcp6 = |c_v6: SocketAddrV6, s_v6: SocketAddrV6| -> Option<(u64, Option<u32>)> {
-        let file = File::open("/proc/net/tcp6").ok()?;
-        find_socket_meta_in_proc_tcp6_reader(BufReader::new(file), c_v6, s_v6)
-    };
-
-    match (client, server) {
-        (SocketAddr::V4(c_v4), SocketAddr::V4(s_v4)) => {
-            if let Some(meta) = try_tcp4(c_v4, s_v4) {
-                return Some(meta);
-            }
-            if let Some((c_v6, s_v6)) = normalize_ipv6_pair(client, server) {
-                return try_tcp6(c_v6, s_v6);
-            }
-            None
-        }
-        (SocketAddr::V6(c_v6), SocketAddr::V6(s_v6)) => {
-            if let Some(meta) = try_tcp6(c_v6, s_v6) {
-                return Some(meta);
-            }
-            if let Some((c_v4, s_v4)) = normalize_ipv4_pair(client, server) {
-                return try_tcp4(c_v4, s_v4);
-            }
-            None
-        }
-        _ => {
-            if let Some((c_v4, s_v4)) = normalize_ipv4_pair(client, server)
-                && let Some(meta) = try_tcp4(c_v4, s_v4)
-            {
-                return Some(meta);
-            }
-            if let Some((c_v6, s_v6)) = normalize_ipv6_pair(client, server) {
-                return try_tcp6(c_v6, s_v6);
-            }
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-enum PidFdProbe {
-    Matched,
-    NoMatch,
-    PermissionDenied,
-}
-
-#[cfg(target_os = "linux")]
-fn proc_pid_owns_socket_inode(pid: u32, inode: u64) -> PidFdProbe {
-    let fd_dir = format!("/proc/{}/fd", pid);
-    let entries = match std::fs::read_dir(fd_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            return PidFdProbe::PermissionDenied;
-        }
-        Err(_) => return PidFdProbe::NoMatch,
-    };
-    for entry in entries.flatten() {
-        if let Ok(target) = std::fs::read_link(entry.path())
-            && let Some(target_str) = target.to_str()
-            && matches_socket_inode(target_str, inode)
-        {
-            return PidFdProbe::Matched;
-        }
-    }
-    PidFdProbe::NoMatch
-}
-
-#[cfg(target_os = "linux")]
-fn find_pid_by_socket_inode_linux(
-    inode: u64,
-    sock_uid: Option<u32>,
-    hint_pids: &[u32],
-    neg_cache: &BoundedCache<u32, ()>,
-    now: Instant,
-) -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-
-    let probe_pid = |pid: u32| -> bool {
-        if neg_cache.contains_active(&pid, now) {
-            return false;
-        }
-        match proc_pid_owns_socket_inode(pid, inode) {
-            PidFdProbe::Matched => true,
-            PidFdProbe::PermissionDenied => {
-                neg_cache.insert(pid, (), now);
-                false
-            }
-            PidFdProbe::NoMatch => false,
-        }
-    };
-
-    // 1. 快路径：优先探测最近活跃进程
-    for &pid in hint_pids {
-        if probe_pid(pid) {
-            return Some(pid);
-        }
-    }
-
-    // 2. 慢路径：遍历 /proc 下纯数字 PID 目录，若已解析出套接字 UID 则先探测同 UID 进程
-    let entries = std::fs::read_dir("/proc").ok()?;
-    let mut deferred_pids: Vec<u32> = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if name_str.is_empty() || !name_str.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(pid) = name_str.parse::<u32>() else {
-            continue;
-        };
-        if hint_pids.contains(&pid) || neg_cache.contains_active(&pid, now) {
-            continue;
-        }
-        if let Some(target_uid) = sock_uid {
-            let dir_uid = entry.metadata().ok().map(|m| m.uid());
-            if dir_uid != Some(target_uid) {
-                deferred_pids.push(pid);
-                continue;
-            }
-        }
-        if probe_pid(pid) {
-            return Some(pid);
-        }
-    }
-
-    // 3. 回退：兼容跨 UID fd 继承/传递或 setuid 服务场景
-    for pid in deferred_pids {
-        if probe_pid(pid) {
-            return Some(pid);
-        }
-    }
-    None
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_u64(raw: &str) -> Option<u64> {
-    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    raw.parse::<u64>().ok()
-}
-
-/// 解析 `/proc/net/tcp` 单列十六进制 `HHHHHHHH:PPPP` 地址（IP 按主机字节序编码，端口按大端编码）
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_net_ipv4_addr(raw: &str) -> Option<(Ipv4Addr, u16)> {
-    let (ip_hex, port_hex) = raw.split_once(':')?;
-    if ip_hex.len() != 8
-        || port_hex.len() != 4
-        || !ip_hex.bytes().all(|b| b.is_ascii_hexdigit())
-        || !port_hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let ip_host = u32::from_str_radix(ip_hex, 16).ok()?;
-    let port = u16::from_str_radix(port_hex, 16).ok()?;
-    Some((Ipv4Addr::from(ip_host.to_ne_bytes()), port))
-}
-
-/// 解析 `/proc/net/tcp6` 单列十六进制 `32位Hex:PPPP` 地址（4 个 32-bit 字均按主机字节序编码）
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_net_ipv6_addr(raw: &str) -> Option<(Ipv6Addr, u16)> {
-    let (ip_hex, port_hex) = raw.split_once(':')?;
-    if ip_hex.len() != 32
-        || port_hex.len() != 4
-        || !ip_hex.bytes().all(|b| b.is_ascii_hexdigit())
-        || !port_hex.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    let port = u16::from_str_radix(port_hex, 16).ok()?;
-    let mut octets = [0u8; 16];
-    for i in 0..4 {
-        let word_hex = &ip_hex[i * 8..(i + 1) * 8];
-        let word = u32::from_str_radix(word_hex, 16).ok()?;
-        octets[i * 4..(i + 1) * 4].copy_from_slice(&word.to_ne_bytes());
-    }
-    Some((Ipv6Addr::from(octets), port))
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_u32(s: &str) -> Option<u32> {
-    parse_proc_u64(s).and_then(|v| u32::try_from(v).ok())
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn find_socket_meta_in_proc_reader<R, A, P>(
-    mut reader: R,
-    target_local: (A, u16),
-    target_rem: (A, u16),
-    parse_addr: P,
-) -> Option<(u64, Option<u32>)>
-where
-    R: std::io::BufRead,
-    A: PartialEq,
-    P: Fn(&str) -> Option<(A, u16)>,
-{
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let read = reader.read_line(&mut line).ok()?;
-        if read == 0 {
-            break;
-        }
-        let mut cols = line.split_ascii_whitespace();
-        let Some(_sl) = cols.next() else {
-            continue;
-        };
-        let Some(local_raw) = cols.next() else {
-            continue;
-        };
-        let Some(rem_raw) = cols.next() else {
-            continue;
-        };
-        if parse_addr(local_raw).as_ref() != Some(&target_local)
-            || parse_addr(rem_raw).as_ref() != Some(&target_rem)
-        {
-            continue;
-        }
-        // 列布局: sl(0) local(1) rem(2) st(3) queue(4) tr(5) retrnsmt(6) uid(7) timeout(8) inode(9)
-        let uid = cols.nth(4).and_then(parse_proc_u32);
-        if let Some(inode_str) = cols.nth(1)
-            && let Some(inode) = parse_proc_u64(inode_str)
-            && inode > 0
-        {
-            return Some((inode, uid));
-        }
-    }
-    None
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn find_socket_meta_in_proc_tcp_reader<R: std::io::BufRead>(
-    reader: R,
-    client: SocketAddrV4,
-    server: SocketAddrV4,
-) -> Option<(u64, Option<u32>)> {
-    find_socket_meta_in_proc_reader(
-        reader,
-        (*client.ip(), client.port()),
-        (*server.ip(), server.port()),
-        parse_proc_net_ipv4_addr,
-    )
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn find_socket_meta_in_proc_tcp6_reader<R: std::io::BufRead>(
-    reader: R,
-    client: SocketAddrV6,
-    server: SocketAddrV6,
-) -> Option<(u64, Option<u32>)> {
-    find_socket_meta_in_proc_reader(
-        reader,
-        (*client.ip(), client.port()),
-        (*server.ip(), server.port()),
-        parse_proc_net_ipv6_addr,
-    )
-}
-
-#[cfg(test)]
-fn find_socket_inode_in_proc_tcp_reader<R: std::io::BufRead>(
-    reader: R,
-    client: SocketAddrV4,
-    server: SocketAddrV4,
-) -> Option<u64> {
-    find_socket_meta_in_proc_tcp_reader(reader, client, server).map(|(inode, _)| inode)
-}
-
-#[cfg(test)]
-fn find_socket_inode_in_proc_tcp6_reader<R: std::io::BufRead>(
-    reader: R,
-    client: SocketAddrV6,
-    server: SocketAddrV6,
-) -> Option<u64> {
-    find_socket_meta_in_proc_tcp6_reader(reader, client, server).map(|(inode, _)| inode)
-}
-
-/// 在 `/proc/net/tcp` 文本中按完整四元组 (`local == client && remote == server`) 查找套接字 inode
-#[cfg(test)]
-fn find_socket_inode_in_proc_tcp(
-    content: &str,
-    client: SocketAddrV4,
-    server: SocketAddrV4,
-) -> Option<u64> {
-    find_socket_inode_in_proc_tcp_reader(std::io::Cursor::new(content), client, server)
-}
-
-/// 在 `/proc/net/tcp6` 文本中按完整四元组 (`local == client && remote == server`) 查找套接字 inode
-#[cfg(test)]
-fn find_socket_inode_in_proc_tcp6(
-    content: &str,
-    client: SocketAddrV6,
-    server: SocketAddrV6,
-) -> Option<u64> {
-    find_socket_inode_in_proc_tcp6_reader(std::io::Cursor::new(content), client, server)
-}
-
-/// 判断 `/proc/<pid>/fd/*` 符号链接目标是否指向指定套接字 inode（兼容 `socket:[inode]` 与 `[0000]:inode`）
-#[cfg(any(target_os = "linux", test))]
-fn matches_socket_inode(link_target: &str, inode: u64) -> bool {
-    if let Some(rest) = link_target.strip_prefix("socket:[")
-        && let Some(num_str) = rest.strip_suffix(']')
-    {
-        return parse_proc_u64(num_str) == Some(inode);
-    }
-    if let Some(rest) = link_target.strip_prefix("[0000]:") {
-        return parse_proc_u64(rest) == Some(inode);
-    }
-    false
-}
-
-/// 解析 `/proc/<pid>/stat` 的第 22 字段 (`starttime`)，在最后一个 `')'` 之后切分以免疫含空格/括号的进程名
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_stat_starttime(stat_content: &str) -> Option<u128> {
-    let close_paren = stat_content.rfind(')')?;
-    let after_comm = stat_content.get(close_paren + 1..)?;
-    // `after_comm` 首个空白分隔列为第 3 字段 (`state`)，索引 19 即为第 22 字段 (`starttime`)
-    let starttime_str = after_comm.split_ascii_whitespace().nth(19)?;
-    parse_proc_u64(starttime_str).map(u128::from)
-}
-
-#[cfg(target_os = "linux")]
-fn get_process_start_time(pid: u32) -> Option<u128> {
-    if pid == 0 {
-        return Some(0);
-    }
-    let stat_path = format!("/proc/{}/stat", pid);
-    let content = std::fs::read_to_string(stat_path).ok()?;
-    parse_proc_stat_starttime(&content)
-}
-
-/// 清理 `/proc/<pid>/exe` 软链读取结果（剥离 Linux 内核对已覆盖二进制附加的 `" (deleted)"` 后缀）
-#[cfg(any(target_os = "linux", test))]
-fn clean_proc_exe_path(raw: &str) -> String {
-    let trimmed = raw.trim_end_matches(['\r', '\n']);
-    trimmed
-        .strip_suffix(" (deleted)")
-        .unwrap_or(trimmed)
-        .to_string()
-}
-
-/// 规范化 `/proc/<pid>/cmdline` 的首个参数，剥离 ASCII 控制字符并截断前导空白
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_cmdline_argv0(bytes: &[u8]) -> Option<String> {
-    let first_arg = bytes.split(|&b| b == 0).next().unwrap_or(bytes);
-    let sanitized: String = String::from_utf8_lossy(first_arg)
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
-    let trimmed = sanitized.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-/// 清理 `/proc/<pid>/comm` 进程短名中的目录分隔符与控制字符，避免破坏进程名提取与日志安全
-#[cfg(any(target_os = "linux", test))]
-fn sanitize_proc_comm_fallback(raw: &str) -> Option<String> {
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control())
-        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
-    if pid == 0 {
-        return Some(("kernel".to_string(), Some(0)));
-    }
-
-    let start_time = get_process_start_time(pid);
-
-    // 1. 优先读取 /proc/<pid>/exe 符号链接以获得真实可执行文件绝对路径
-    let exe_link = format!("/proc/{}/exe", pid);
-    if let Ok(path_buf) = std::fs::read_link(&exe_link) {
-        let cleaned = clean_proc_exe_path(&path_buf.to_string_lossy());
-        if !cleaned.is_empty() {
-            return Some((cleaned, start_time));
-        }
-    }
-
-    // 2. 回退：受限读取 /proc/<pid>/cmdline 的前 4096 字节并取 argv[0]
-    let cmdline_path = format!("/proc/{}/cmdline", pid);
-    if let Ok(file) = std::fs::File::open(&cmdline_path) {
-        use std::io::Read;
-        let mut bytes = Vec::with_capacity(256);
-        if file.take(4096).read_to_end(&mut bytes).is_ok()
-            && let Some(arg0) = parse_proc_cmdline_argv0(&bytes)
-        {
-            return Some((arg0, start_time));
-        }
-    }
-
-    // 3. 回退：读取并清洗 /proc/<pid>/comm 进程短名
-    let comm_path = format!("/proc/{}/comm", pid);
-    if let Ok(comm) = std::fs::read_to_string(&comm_path)
-        && let Some(cleaned) = sanitize_proc_comm_fallback(&comm)
-    {
-        return Some((cleaned, start_time));
-    }
-
-    None
-}
-
-// =========================================================================
-// macOS XNU libproc (`<sys/proc_info.h>`) 结构布局与套接字/进程反查
-// =========================================================================
-
-#[cfg(any(target_os = "macos", test))]
-mod macos_proc_info {
-    use super::*;
-    use std::net::IpAddr;
-
-    pub const SOCKINFO_IN: i32 = 1;
-    pub const SOCKINFO_TCP: i32 = 2;
-    pub const INI_IPV4: u8 = 0x1;
-    pub const INI_IPV6: u8 = 0x2;
-    #[cfg(target_os = "macos")]
-    pub const PROC_ALL_PIDS: u32 = 1;
-    #[cfg(target_os = "macos")]
-    pub const PROC_PIDFDSOCKETINFO: i32 = 3;
-    const SOCK_MAXADDRLEN: usize = 255;
-    const IF_NAMESIZE: usize = 16;
-    const MAX_KCTL_NAME: usize = 96;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct ProcFileInfo {
-        pub fi_openflags: u32,
-        pub fi_status: u32,
-        pub fi_offset: i64,
-        pub fi_type: i32,
-        pub fi_guardflags: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct VinfoStat {
-        pub vst_dev: u32,
-        pub vst_mode: u16,
-        pub vst_nlink: u16,
-        pub vst_ino: u64,
-        pub vst_uid: u32,
-        pub vst_gid: u32,
-        pub vst_atime: i64,
-        pub vst_atimensec: i64,
-        pub vst_mtime: i64,
-        pub vst_mtimensec: i64,
-        pub vst_ctime: i64,
-        pub vst_ctimensec: i64,
-        pub vst_birthtime: i64,
-        pub vst_birthtimensec: i64,
-        pub vst_size: i64,
-        pub vst_blocks: i64,
-        pub vst_blksize: i32,
-        pub vst_flags: u32,
-        pub vst_gen: u32,
-        pub vst_rdev: u32,
-        pub vst_qspare: [i64; 2],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct SockBufInfo {
-        pub sbi_cc: u32,
-        pub sbi_hiwat: u32,
-        pub sbi_mbcnt: u32,
-        pub sbi_mbmax: u32,
-        pub sbi_lowat: u32,
-        pub sbi_flags: i16,
-        pub sbi_timeo: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct In4In6Addr {
-        pub i46a_pad32: [u32; 3],
-        pub i46a_addr4: [u8; 4],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub union InAddrUnion {
-        pub ina_46: In4In6Addr,
-        pub ina_6: [u8; 16],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct InSockV4 {
-        pub in4_tos: u8,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct InSockV6 {
-        pub in6_hlim: u8,
-        pub in6_cksum: i32,
-        pub in6_ifindex: u16,
-        pub in6_hops: i16,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct InSockInfo {
-        pub insi_fport: i32,
-        pub insi_lport: i32,
-        pub insi_gencnt: u64,
-        pub insi_flags: u32,
-        pub insi_flow: u32,
-        pub insi_vflag: u8,
-        pub insi_ip_ttl: u8,
-        pub rfu_1: u32,
-        pub insi_faddr: InAddrUnion,
-        pub insi_laddr: InAddrUnion,
-        pub insi_v4: InSockV4,
-        pub insi_v6: InSockV6,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct TcpSockInfo {
-        pub tcpsi_ini: InSockInfo,
-        pub tcpsi_state: i32,
-        pub tcpsi_timer: [i32; 4],
-        pub tcpsi_mss: i32,
-        pub tcpsi_flags: u32,
-        pub rfu_1: u32,
-        pub tcpsi_tp: u64,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct UnSockInfo {
-        pub unsi_conn_so: u64,
-        pub unsi_conn_pcb: u64,
-        pub unsi_addr: [u8; SOCK_MAXADDRLEN],
-        pub unsi_caddr: [u8; SOCK_MAXADDRLEN],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct NdrvInfo {
-        pub ndrvsi_if_family: u32,
-        pub ndrvsi_if_unit: u32,
-        pub ndrvsi_if_name: [u8; IF_NAMESIZE],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct KernEventInfo {
-        pub kesi_vendor_code_filter: u32,
-        pub kesi_class_filter: u32,
-        pub kesi_subclass_filter: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct KernCtlInfo {
-        pub kcsi_id: u32,
-        pub kcsi_reg_unit: u32,
-        pub kcsi_flags: u32,
-        pub kcsi_recvbufsize: u32,
-        pub kcsi_sendbufsize: u32,
-        pub kcsi_unit: u32,
-        pub kcsi_name: [u8; MAX_KCTL_NAME],
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct VsockSockInfo {
-        pub local_cid: u32,
-        pub local_port: u32,
-        pub remote_cid: u32,
-        pub remote_port: u32,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub union SocketProtoUnion {
-        pub pri_in: InSockInfo,
-        pub pri_tcp: TcpSockInfo,
-        pub pri_un: UnSockInfo,
-        pub pri_ndrv: NdrvInfo,
-        pub pri_kern_event: KernEventInfo,
-        pub pri_kern_ctl: KernCtlInfo,
-        pub pri_vsock: VsockSockInfo,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct SocketInfo {
-        pub soi_stat: VinfoStat,
-        pub soi_so: u64,
-        pub soi_pcb: u64,
-        pub soi_type: i32,
-        pub soi_protocol: i32,
-        pub soi_family: i32,
-        pub soi_options: i16,
-        pub soi_linger: i16,
-        pub soi_state: i16,
-        pub soi_qlen: i16,
-        pub soi_incqlen: i16,
-        pub soi_qlimit: i16,
-        pub soi_timeo: i16,
-        pub soi_error: u16,
-        pub soi_oobmark: u32,
-        pub soi_rcv: SockBufInfo,
-        pub soi_snd: SockBufInfo,
-        pub soi_kind: i32,
-        pub rfu_1: u32,
-        pub soi_proto: SocketProtoUnion,
-    }
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    pub struct SocketFdInfo {
-        pub pfi: ProcFileInfo,
-        pub psi: SocketInfo,
-    }
-
-    fn canonical_ip(ip: IpAddr) -> IpAddr {
-        match ip {
-            IpAddr::V6(v6) => v6
-                .to_ipv4_mapped()
-                .map(IpAddr::V4)
-                .unwrap_or(IpAddr::V6(v6)),
-            v4 => v4,
-        }
-    }
-
-    pub fn matches_macos_socket_info(
-        info: &SocketFdInfo,
-        client: SocketAddr,
-        server: SocketAddr,
-        tcp_proto: i32,
-    ) -> bool {
-        let psi = &info.psi;
-        if psi.soi_kind != SOCKINFO_TCP && !(psi.soi_kind == SOCKINFO_IN && psi.soi_protocol == tcp_proto) {
-            return false;
-        }
-        // SAFETY: `soi_kind` 已验证为 TCP/IN，对应联合体首字段均等价为 `InSockInfo`。
-        let ini = unsafe { &psi.soi_proto.pri_tcp.tcpsi_ini };
-        let local_port = u16::from_be((ini.insi_lport & 0xffff) as u16);
-        let remote_port = u16::from_be((ini.insi_fport & 0xffff) as u16);
-        if local_port != client.port() || remote_port != server.port() {
-            return false;
-        }
-
-        let target_local = canonical_ip(client.ip());
-        let target_remote = canonical_ip(server.ip());
-
-        if ini.insi_vflag & INI_IPV4 != 0 {
-            let local_ip = IpAddr::V4(Ipv4Addr::from(unsafe { ini.insi_laddr.ina_46.i46a_addr4 }));
-            let remote_ip = IpAddr::V4(Ipv4Addr::from(unsafe { ini.insi_faddr.ina_46.i46a_addr4 }));
-            if local_ip == target_local && remote_ip == target_remote {
-                return true;
-            }
-        }
-
-        if ini.insi_vflag & INI_IPV6 != 0 {
-            let local_ip = canonical_ip(IpAddr::V6(Ipv6Addr::from(unsafe { ini.insi_laddr.ina_6 })));
-            let remote_ip = canonical_ip(IpAddr::V6(Ipv6Addr::from(unsafe { ini.insi_faddr.ina_6 })));
-            if local_ip == target_local && remote_ip == target_remote {
-                return true;
-            }
-        }
-
-        false
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_pid_owns_socket(
-    pid: u32,
-    client: SocketAddr,
-    server: SocketAddr,
-    neg_cache: &BoundedCache<u32, ()>,
-    now: Instant,
-) -> bool {
-    use macos_proc_info::{matches_macos_socket_info, SocketFdInfo, PROC_PIDFDSOCKETINFO};
-
-    if pid == 0 || neg_cache.contains_active(&pid, now) {
-        return false;
-    }
-
-    let check_pidinfo = |ret: libc::c_int| -> bool {
-        if ret < 0 {
-            if let Some(errno) = std::io::Error::last_os_error().raw_os_error()
-                && (errno == libc::EPERM || errno == libc::EACCES)
-            {
-                neg_cache.insert(pid, (), now);
-            }
-            return false;
-        }
-        ret > 0
-    };
-
-    let c_pid = pid as libc::c_int;
-    let buf_bytes = unsafe { libc::proc_pidinfo(c_pid, libc::PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-    if !check_pidinfo(buf_bytes) {
-        return false;
-    }
-
-    let elem_size = size_of::<libc::proc_fdinfo>();
-    let capacity = (buf_bytes as usize / elem_size).saturating_add(16);
-    let mut fds: Vec<libc::proc_fdinfo> = vec![unsafe { std::mem::zeroed() }; capacity];
-    let actual_bytes = unsafe {
-        libc::proc_pidinfo(
-            c_pid,
-            libc::PROC_PIDLISTFDS,
-            0,
-            fds.as_mut_ptr().cast(),
-            (fds.len() * elem_size) as libc::c_int,
-        )
-    };
-    if !check_pidinfo(actual_bytes) {
-        return false;
-    }
-
-    let fd_count = (actual_bytes as usize / elem_size).min(fds.len());
-    let sock_fd_size = size_of::<SocketFdInfo>() as libc::c_int;
-
-    for fd in &fds[..fd_count] {
-        if fd.proc_fdtype != libc::PROX_FDTYPE_SOCKET as u32 {
-            continue;
-        }
-        let mut sock_info: SocketFdInfo = unsafe { std::mem::zeroed() };
-        let got = unsafe {
-            libc::proc_pidfdinfo(
-                c_pid,
-                fd.proc_fd,
-                PROC_PIDFDSOCKETINFO,
-                (&mut sock_info as *mut SocketFdInfo).cast(),
-                sock_fd_size,
-            )
-        };
-        if got == sock_fd_size
-            && matches_macos_socket_info(&sock_info, client, server, libc::IPPROTO_TCP)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "macos")]
-fn get_pid_by_connection_with_hints(
-    client: SocketAddr,
-    server: SocketAddr,
-    hint_pids: &[u32],
-    neg_cache: &BoundedCache<u32, ()>,
-    now: Instant,
-) -> Option<u32> {
-    for &pid in hint_pids {
-        if macos_pid_owns_socket(pid, client, server, neg_cache, now) {
-            return Some(pid);
-        }
-    }
-
-    let need_bytes = unsafe {
-        libc::proc_listpids(macos_proc_info::PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0)
-    };
-    if need_bytes <= 0 {
-        return None;
-    }
-
-    let count = (need_bytes as usize / size_of::<libc::c_int>()).saturating_add(64);
-    let mut pids: Vec<libc::c_int> = vec![0; count];
-    let got_bytes = unsafe {
-        libc::proc_listpids(
-            macos_proc_info::PROC_ALL_PIDS,
-            0,
-            pids.as_mut_ptr().cast(),
-            (pids.len() * size_of::<libc::c_int>()) as libc::c_int,
-        )
-    };
-    if got_bytes <= 0 {
-        return None;
-    }
-
-    let actual_count = (got_bytes as usize / size_of::<libc::c_int>()).min(pids.len());
-    for &raw_pid in &pids[..actual_count] {
-        if raw_pid <= 0 {
-            continue;
-        }
-        let pid = raw_pid as u32;
-        if hint_pids.contains(&pid) {
-            continue;
-        }
-        if macos_pid_owns_socket(pid, client, server, neg_cache, now) {
-            return Some(pid);
-        }
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn macos_read_bsdinfo(pid: u32) -> Option<libc::proc_bsdinfo> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let expected = size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    let ret = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            (&mut info as *mut libc::proc_bsdinfo).cast(),
-            expected,
-        )
-    };
-    if ret == expected {
-        Some(info)
-    } else {
-        None
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn macos_cstr_array_to_string(bytes: &[libc::c_char]) -> Option<String> {
-    let u8_bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), bytes.len()) };
-    let nul_pos = u8_bytes.iter().position(|&b| b == 0).unwrap_or(u8_bytes.len());
-    let s = String::from_utf8_lossy(&u8_bytes[..nul_pos]).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn get_process_start_time(pid: u32) -> Option<u128> {
-    if pid == 0 {
-        return Some(0);
-    }
-    let info = macos_read_bsdinfo(pid)?;
-    Some((info.pbi_start_tvsec as u128) * 1_000_000 + (info.pbi_start_tvusec as u128))
-}
-
-#[cfg(target_os = "macos")]
-fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
-    if pid == 0 {
-        return Some(("kernel".to_string(), Some(0)));
-    }
-
-    let bsd = macos_read_bsdinfo(pid);
-    let start_time = bsd
-        .as_ref()
-        .map(|b| (b.pbi_start_tvsec as u128) * 1_000_000 + (b.pbi_start_tvusec as u128));
-
-    let mut path_buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
-    let ret = unsafe {
-        libc::proc_pidpath(
-            pid as libc::c_int,
-            path_buf.as_mut_ptr().cast(),
-            path_buf.len() as u32,
-        )
-    };
-    if ret > 0 && (ret as usize) <= path_buf.len() {
-        let path = String::from_utf8_lossy(&path_buf[..ret as usize])
-            .trim()
-            .to_string();
-        if !path.is_empty() {
-            return Some((path, start_time));
-        }
-    }
-
-    if let Some(info) = bsd {
-        if let Some(name) = macos_cstr_array_to_string(&info.pbi_name) {
-            return Some((name, start_time));
-        }
-        if let Some(comm) = macos_cstr_array_to_string(&info.pbi_comm) {
-            return Some((comm, start_time));
-        }
-    }
-
-    None
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn get_pid_by_connection(_client: SocketAddr, _server: SocketAddr) -> Option<u32> {
-    None
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn get_process_start_time(_pid: u32) -> Option<u128> {
-    None
-}
-
-#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn get_process_identity(_pid: u32) -> Option<(String, Option<u128>)> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1683,10 +667,9 @@ mod tests {
         let client: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let server: SocketAddr = "127.0.0.1:2".parse().unwrap();
         assert!(tracker.find_by_connection(client, server).is_none());
-        assert_eq!(tracker.cleanup_expired(), (0, 0));
+        assert_eq!(tracker.cleanup_expired(), 0);
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_find_own_process_by_connection() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1702,7 +685,6 @@ mod tests {
         assert_eq!(info.pid, std::process::id());
     }
 
-    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_find_own_process_by_ipv6_connection() {
         let Ok(listener) = std::net::TcpListener::bind("[::1]:0") else {
@@ -1788,106 +770,6 @@ mod tests {
     }
 
     #[test]
-    fn test_linux_proc_net_tcp_and_tcp6_parsers_hardened() {
-        let c_ip = Ipv4Addr::new(127, 0, 0, 1);
-        let s_ip = Ipv4Addr::new(127, 0, 0, 1);
-        let c_port = 54321u16;
-        let s_port = 40001u16;
-
-        let c_hex = format!("{:08X}:{:04X}", u32::from_ne_bytes(c_ip.octets()), c_port);
-        let s_hex = format!("{:08X}:{:04X}", u32::from_ne_bytes(s_ip.octets()), s_port);
-
-        let sample_tcp = format!(
-            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-               0: {s_hex} 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 41001 1 0000000000000000 100 0 0 10 0\n\
-               1: {c_hex} {s_hex} 01 00000000:00000000 00:00000000 00000000  1000        0 +987654 1 0000000000000000 20 4 30 10 -1\n\
-               2: {c_hex} {s_hex} 01 00000000:00000000 00:00000000 00000000  1000        0 987654 1 0000000000000000 20 4 30 10 -1\n"
-        );
-
-        let client_v4 = SocketAddrV4::new(c_ip, c_port);
-        let server_v4 = SocketAddrV4::new(s_ip, s_port);
-        assert_eq!(
-            find_socket_inode_in_proc_tcp(&sample_tcp, client_v4, server_v4),
-            Some(987654)
-        );
-        assert_eq!(
-            find_socket_inode_in_proc_tcp(&sample_tcp, SocketAddrV4::new(c_ip, 12345), server_v4),
-            None
-        );
-
-        let v6_ip: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
-        let oct = v6_ip.octets();
-        let w0 = u32::from_ne_bytes([oct[0], oct[1], oct[2], oct[3]]);
-        let w1 = u32::from_ne_bytes([oct[4], oct[5], oct[6], oct[7]]);
-        let w2 = u32::from_ne_bytes([oct[8], oct[9], oct[10], oct[11]]);
-        let w3 = u32::from_ne_bytes([oct[12], oct[13], oct[14], oct[15]]);
-        let c6_hex = format!("{:08X}{:08X}{:08X}{:08X}:{:04X}", w0, w1, w2, w3, c_port);
-        let s6_hex = format!("{:08X}{:08X}{:08X}{:08X}:{:04X}", w0, w1, w2, w3, s_port);
-
-        let sample_tcp6 = format!(
-            "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
-               0: {c6_hex} {s6_hex} 01 00000000:00000000 00:00000000 00000000  1000        0 556677 1 0000000000000000 20 4 30 10 -1\n"
-        );
-        let client_v6 = SocketAddrV6::new(v6_ip, c_port, 0, 0);
-        let server_v6 = SocketAddrV6::new(v6_ip, s_port, 0, 0);
-        assert_eq!(
-            find_socket_inode_in_proc_tcp6(&sample_tcp6, client_v6, server_v6),
-            Some(556677)
-        );
-
-        // P0-2: 32 字节非 ASCII 多字节 UTF-8 与前导 `+` 必须被拒绝且不触发切片 Panic
-        let utf8_32bytes = "0000000é00000000000000000000000:0050";
-        assert_eq!(utf8_32bytes.split_once(':').unwrap().0.len(), 32);
-        assert!(parse_proc_net_ipv6_addr(utf8_32bytes).is_none());
-        assert!(parse_proc_net_ipv6_addr("+0000000000000000000000000000001:0050").is_none());
-        assert!(parse_proc_net_ipv4_addr("+7F00001:0050").is_none());
-        assert!(parse_proc_net_ipv4_addr("0100007F:+050").is_none());
-        assert!(!matches_socket_inode("socket:[+987654]", 987654));
-        assert!(!matches_socket_inode("[0000]:+987654", 987654));
-
-        assert!(matches_socket_inode("socket:[987654]", 987654));
-        assert!(matches_socket_inode("[0000]:987654", 987654));
-        assert!(!matches_socket_inode("socket:[987655]", 987654));
-        assert!(!matches_socket_inode("pipe:[987654]", 987654));
-        assert_eq!(
-            clean_proc_exe_path("/usr/bin/curl (deleted)\n"),
-            "/usr/bin/curl"
-        );
-        assert_eq!(clean_proc_exe_path("/usr/bin/git"), "/usr/bin/git");
-        assert_eq!(
-            find_socket_meta_in_proc_tcp_reader(std::io::Cursor::new(&sample_tcp), client_v4, server_v4),
-            Some((987654, Some(1000)))
-        );
-        assert_eq!(
-            parse_proc_cmdline_argv0(b"/usr/bin/curl\n--silent\0https://example.com\0"),
-            Some("/usr/bin/curl--silent".to_string())
-        );
-        assert_eq!(parse_proc_cmdline_argv0(b"\0--flag"), None);
-        assert_eq!(
-            sanitize_proc_comm_fallback("../../ev\x1bil/app\n"),
-            Some(".._.._evil_app".to_string())
-        );
-        assert_eq!(
-            sanitize_proc_comm_fallback("..\\..\\ev\x1bil\\app\r\n"),
-            Some(".._.._evil_app".to_string())
-        );
-        assert_eq!(sanitize_proc_comm_fallback("\x00\n\t "), None);
-    }
-
-    #[test]
-    fn test_parse_proc_stat_starttime() {
-        let stat = "1234 (my )Weird( app ) S 1 1234 1234 0 -1 4194304 100 0 0 0 5 1 0 0 20 0 1 0 987654321 1024 10 0 0";
-        assert_eq!(parse_proc_stat_starttime(stat), Some(987654321));
-        assert_eq!(parse_proc_stat_starttime("1234 (bad) S 1 2"), None);
-        assert_eq!(
-            parse_proc_stat_starttime(
-                "1234 (plus) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 +999"
-            ),
-            None
-        );
-    }
-
-    #[test]
     fn test_pid_cache_start_time_invalidation_and_no_unknown_cache() {
         let tracker = ProcessTracker::new();
         let t0 = Instant::now();
@@ -1946,93 +828,30 @@ mod tests {
 
     #[test]
     fn test_bounded_cache_capacity_and_expiry() {
-        let tracker = ProcessTracker::with_config(
-            Duration::from_millis(40),
-            Duration::from_millis(40),
-            3,
-            3,
-        );
+        let tracker = ProcessTracker::with_config(Duration::from_millis(40), 3);
         let t0 = Instant::now();
 
         for i in 1..=5u32 {
             let entry = PidCacheEntry {
                 info: ProcessInfo {
                     pid: i,
-                    path: format!("/usr/bin/p{}", i),
-                    name: format!("p{}", i),
+                    path: format!("C:\\Apps\\p{}.exe", i),
+                    name: format!("p{}.exe", i),
                 },
                 start_time: Some(i as u128),
             };
             tracker.pid_cache.insert(i, entry, t0 + Duration::from_millis(i as u64));
-            tracker.neg_pid_cache.insert(i, (), t0 + Duration::from_millis(i as u64));
         }
 
         // 受 MAX 容量=3 约束，最老的条目 (1, 2) 应已被逐出，保留最新 (3, 4, 5)
         assert_eq!(tracker.pid_cache.state.read().unwrap().entries.len(), 3);
-        assert_eq!(tracker.neg_pid_cache.state.read().unwrap().entries.len(), 3);
         assert!(tracker.pid_cache.get_cloned(&1, t0).is_none());
         assert!(tracker.pid_cache.get_cloned(&5, t0).is_some());
-        assert!(tracker.neg_pid_cache.contains_active(&5, t0));
-        assert_eq!(tracker.pid_cache.active_keys(t0).len(), 3);
 
         std::thread::sleep(Duration::from_millis(60));
-        let (cleaned_pids, cleaned_neg) = tracker.cleanup_expired();
+        let cleaned_pids = tracker.cleanup_expired();
         assert_eq!(cleaned_pids, 3);
-        assert_eq!(cleaned_neg, 3);
-        assert_eq!(tracker.cleanup_expired(), (0, 0));
-    }
-
-    #[test]
-    fn test_macos_socket_fdinfo_layout_and_matching() {
-        use macos_proc_info::{matches_macos_socket_info, SocketFdInfo, INI_IPV4, INI_IPV6, SOCKINFO_TCP};
-
-        assert_eq!(size_of::<SocketFdInfo>(), 792);
-        assert_eq!(std::mem::align_of::<SocketFdInfo>(), 8);
-
-        let mut info: SocketFdInfo = unsafe { std::mem::zeroed() };
-        info.psi.soi_kind = SOCKINFO_TCP;
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_vflag = INI_IPV4;
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_lport = u16::to_be(51234) as i32;
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_fport = u16::to_be(40081) as i32;
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_laddr.ina_46.i46a_addr4 = [127, 0, 0, 1];
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_faddr.ina_46.i46a_addr4 = [127, 0, 0, 1];
-        assert!(matches_macos_socket_info(
-            &info,
-            "127.0.0.1:51234".parse().unwrap(),
-            "127.0.0.1:40081".parse().unwrap(),
-            6
-        ));
-        assert!(matches_macos_socket_info(
-            &info,
-            "[::ffff:127.0.0.1]:51234".parse().unwrap(),
-            "[::ffff:127.0.0.1]:40081".parse().unwrap(),
-            6
-        ));
-
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_vflag = INI_IPV6;
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_laddr.ina_6 = Ipv6Addr::LOCALHOST.octets();
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_faddr.ina_6 = Ipv6Addr::LOCALHOST.octets();
-        assert!(matches_macos_socket_info(
-            &info,
-            "[::1]:51234".parse().unwrap(),
-            "[::1]:40081".parse().unwrap(),
-            6
-        ));
-
-        // Dual-stack INI_IPV4 | INI_IPV6 socket with IPv6 addresses must NOT early-return false on INI_IPV4 mismatch
-        info.psi.soi_proto.pri_tcp.tcpsi_ini.insi_vflag = INI_IPV4 | INI_IPV6;
-        assert!(matches_macos_socket_info(
-            &info,
-            "[::1]:51234".parse().unwrap(),
-            "[::1]:40081".parse().unwrap(),
-            6
-        ));
-        assert!(!matches_macos_socket_info(
-            &info,
-            "[::1]:51235".parse().unwrap(),
-            "[::1]:40081".parse().unwrap(),
-            6
-        ));
+        assert_eq!(tracker.cleanup_expired(), 0);
     }
 
     #[tokio::test]
@@ -2052,7 +871,6 @@ mod tests {
         assert_eq!(async_info.path, sync_info.path);
     }
 
-    #[cfg(windows)]
     #[test]
     fn test_lookup_outbound_socket_pid_udp_and_tcp_fallback() {
         let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
