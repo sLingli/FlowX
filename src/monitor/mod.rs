@@ -217,6 +217,16 @@ impl ConnectionManager {
         }
     }
 
+    /// 向当前所有活跃连接广播终止通知（用于提权交接或控制台强制关闭时快速释放滞留会话）
+    pub fn kill_all_connections(&self) -> usize {
+        let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
+        for conn in conns.values() {
+            conn.cancelled.store(true, Ordering::Release);
+            conn.cancel_notify.notify_waiters();
+        }
+        conns.len()
+    }
+
     /// O(1) 获取当前活跃连接数，供优雅停机排空阶段零开销轮询
     pub fn active_count(&self) -> usize {
         self.connections
