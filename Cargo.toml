@@ -2,7 +2,7 @@
 name = "flowx"
 version = "0.1.0"
 edition = "2024"
-description = "FlowX - Modern Transparent Proxy & Process Routing Engine"
+description = "FlowX - Modern Windows Transparent Proxy & Process Routing Engine"
 
 [dependencies]
 # 异步运行时与网络 I/O
@@ -28,8 +28,7 @@ glob = "0.3"
 smoltcp = { version = "0.14.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"] }
 etherparse = "0.21.0"
 
-# Windows 原生网络/进程 API 交互（仅在 Windows 目标平台编译）
-[target.'cfg(windows)'.dependencies]
+# Windows 原生网络/进程 API 交互
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
@@ -42,6 +41,3 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging"
 ] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

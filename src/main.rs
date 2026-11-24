@@ -1,3 +1,6 @@
+#[cfg(not(windows))]
+compile_error!("FlowX only supports Windows.");
+
 pub mod api;
 pub mod cli;
 pub mod config;
@@ -272,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     info!("[Ready] Web console ready at: http://127.0.0.1:40080");
-    info!("[Ready] Press Ctrl+C (or send SIGTERM) to stop FlowX core");
+    info!("[Ready] Press Ctrl+C to stop FlowX core");
 
     // 8. 同时等待 OS 停机信号、内部停机通知（如提权交接）与核心任务异常退出
     let mut main_shutdown_rx = shutdown_rx.clone();
@@ -322,62 +325,36 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn wait_for_pid_exit(pid: u32, timeout: Duration) {
-    #[cfg(windows)]
-    {
-        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        let _ = tokio::task::spawn_blocking(move || {
-            use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
-            use windows_sys::Win32::System::Threading::{
-                OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-            };
+    let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+    let _ = tokio::task::spawn_blocking(move || {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        };
 
-            let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
-            if handle.is_null() {
-                return;
-            }
-            let wait_res = unsafe { WaitForSingleObject(handle, timeout_ms) };
-            unsafe {
-                CloseHandle(handle);
-            }
-            if wait_res == WAIT_TIMEOUT {
-                warn!(
-                    "[Startup] Timed out waiting for PID {} to exit; continuing port bind attempt",
-                    pid
-                );
-            }
-        })
-        .await;
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (pid, timeout);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if handle.is_null() {
+            return;
+        }
+        let wait_res = unsafe { WaitForSingleObject(handle, timeout_ms) };
+        unsafe {
+            CloseHandle(handle);
+        }
+        if wait_res == WAIT_TIMEOUT {
+            warn!(
+                "[Startup] Timed out waiting for PID {} to exit; continuing port bind attempt",
+                pid
+            );
+        }
+    })
+    .await;
 }
 
 async fn wait_for_shutdown_signal() -> anyhow::Result<&'static str> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut sigterm = signal(SignalKind::terminate())
-            .context("Failed to register SIGTERM signal handler")?;
-        tokio::select! {
-            res = tokio::signal::ctrl_c() => {
-                res.context("Failed to listen for SIGINT (Ctrl+C)")?;
-                Ok("SIGINT (Ctrl+C)")
-            }
-            Some(()) = sigterm.recv() => {
-                Ok("SIGTERM")
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .context("Failed to listen for Ctrl+C shutdown signal")?;
-        Ok("Ctrl+C")
-    }
+    tokio::signal::ctrl_c()
+        .await
+        .context("Failed to listen for Ctrl+C shutdown signal")?;
+    Ok("Ctrl+C")
 }
 
 const REPLACE_PID_WAIT_TIMEOUT: Duration = Duration::from_secs(20);

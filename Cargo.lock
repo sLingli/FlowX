@@ -103,7 +103,6 @@ dependencies = [
  "etherparse",
  "glob",
  "ipnet",
- "libc",
  "quick-xml",
  "serde",
  "serde_json",
