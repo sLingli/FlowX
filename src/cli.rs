@@ -1670,6 +1670,11 @@ fn print_transparent_status(st: &Value, mode_label: &str) {
     if let Some(err) = st["last_error"].as_str().filter(|s| !s.is_empty()) {
         println!("Last Error:     {}", err);
     }
+    if st["low_integrity"].as_bool().unwrap_or(false) {
+        println!(
+            "Integrity Warn: Low Mandatory Integrity process detected (UAC elevation & USER32/SHELL32 blocked); move FlowX to a normal folder or run from an Administrator terminal."
+        );
+    }
 }
 
 fn build_transparent_doctor_report(
@@ -1678,6 +1683,7 @@ fn build_transparent_doctor_report(
     local_config_path: &str,
 ) -> Value {
     let elevated = st_val["elevated"].as_bool().unwrap_or(false);
+    let low_integrity = st_val["low_integrity"].as_bool().unwrap_or(false);
     let running = st_val["running"].as_bool().unwrap_or(false);
     let dll_found = st_val["dll_found"].as_bool().unwrap_or(false);
     let sys_found = st_val["sys_found"].as_bool().unwrap_or(false);
@@ -1701,6 +1707,12 @@ fn build_transparent_doctor_report(
         .map(str::to_string);
 
     let mut issues: Vec<String> = Vec::new();
+    if low_integrity {
+        issues.push(
+            "Process is running at Windows Low Mandatory Integrity Level (for example inherited from a restricted/sandboxed folder); UAC elevation and USER32/SHELL32 initialization are blocked. Copy or install FlowX into a standard directory, or launch from an Administrator terminal."
+                .to_string(),
+        );
+    }
     if !elevated {
         issues.push(
             "Target FlowX instance lacks Administrator privileges; launch an elevated shell or click 'Restart as Administrator' in Web UI.".to_string(),
@@ -1715,7 +1727,7 @@ fn build_transparent_doctor_report(
     if let Some(ref err) = last_error {
         issues.push(format!("Last runtime error: {}", err));
     }
-    let ready = elevated && dll_found && sys_found && last_error.is_none();
+    let ready = elevated && !low_integrity && dll_found && sys_found && last_error.is_none();
     let config_path: Option<String> = if mode_label == "ONLINE" {
         st_val["config_path"]
             .as_str()
@@ -1731,6 +1743,7 @@ fn build_transparent_doctor_report(
         "config_path": config_path,
         "supported": true,
         "elevated": elevated,
+        "low_integrity": low_integrity,
         "dll_found": dll_found,
         "sys_found": sys_found,
         "dll_path": dll_path,
@@ -4629,6 +4642,27 @@ mod tests {
             build_transparent_doctor_report("OFFLINE", &online_no_cfg, "./local-cli.xml");
         assert_eq!(offline_report["ready"], true);
         assert_eq!(offline_report["config_path"], "./local-cli.xml");
+
+        // 5. Low-integrity status blocks readiness and surfaces actionable issue
+        let low_il_status = json!({
+            "elevated": false,
+            "low_integrity": true,
+            "running": false,
+            "dll_found": true,
+            "sys_found": true,
+            "searched_dirs": [r"C:\FlowX"],
+            "enabled": false,
+            "last_error": null,
+        });
+        let low_il_report =
+            build_transparent_doctor_report("ONLINE", &low_il_status, "./local-cli.xml");
+        assert_eq!(low_il_report["ready"], false);
+        assert_eq!(low_il_report["low_integrity"], true);
+        assert!(low_il_report["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("Low Mandatory Integrity")));
     }
 
     #[tokio::test]

@@ -51,6 +51,7 @@ pub struct TransparentRuntimeStatus {
     pub enabled: bool,
     pub running: bool,
     pub elevated: bool,
+    pub low_integrity: bool,
     pub dll_found: bool,
     pub sys_found: bool,
     pub dll_path: Option<String>,
@@ -100,6 +101,7 @@ pub fn probe_status(cfg: &TransparentSettings) -> TransparentRuntimeStatus {
         enabled: cfg.enabled,
         running: false,
         elevated: is_process_elevated(),
+        low_integrity: is_low_integrity_process(),
         dll_found: avail.dll_found,
         sys_found: avail.sys_found,
         dll_path: avail.dll_path,
@@ -147,6 +149,75 @@ pub fn is_process_elevated() -> bool {
         CloseHandle(token);
         ok != 0 && elevation.TokenIsElevated != 0
     }
+}
+
+pub(crate) const SECURITY_MANDATORY_MEDIUM_RID: u32 = 0x2000;
+
+#[inline]
+pub(crate) fn is_low_integrity_rid(rid: u32) -> bool {
+    rid < SECURITY_MANDATORY_MEDIUM_RID
+}
+
+/// 查询当前进程令牌的 Windows 强制完整性级别 RID（如 Low=0x1000, Medium=0x2000, High=0x3000）
+pub(crate) fn process_integrity_rid() -> Option<u32> {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token.is_null() {
+            return None;
+        }
+        let mut ret_len = 0u32;
+        GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            std::ptr::null_mut(),
+            0,
+            &mut ret_len,
+        );
+        if GetLastError() != ERROR_INSUFFICIENT_BUFFER || ret_len == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; ret_len as usize];
+        let ok = GetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            buf.as_mut_ptr().cast::<c_void>(),
+            ret_len,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        if ok == 0 || (ret_len as usize) < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+            return None;
+        }
+        let label = &*(buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
+        let sid = label.Label.Sid;
+        if sid.is_null() || IsValidSid(sid) == 0 {
+            return None;
+        }
+        let count_ptr = GetSidSubAuthorityCount(sid);
+        if count_ptr.is_null() || *count_ptr == 0 {
+            return None;
+        }
+        let last_idx = u32::from(*count_ptr - 1);
+        let rid_ptr = GetSidSubAuthority(sid, last_idx);
+        if rid_ptr.is_null() {
+            return None;
+        }
+        Some(*rid_ptr)
+    }
+}
+
+/// 判断当前进程是否处于 Windows 低完整性级别（`< Medium (0x2000)`，如沙盒/受限目录继承 `Low Mandatory Level`）
+pub fn is_low_integrity_process() -> bool {
+    process_integrity_rid().is_some_and(is_low_integrity_rid)
 }
 
 /// 仅从 Windows `System32` 目录加载系统 DLL（避免高权限下被 CWD / 应用目录 / `PATH` 劫持）
@@ -337,6 +408,66 @@ pub fn build_elevated_relaunch_args(
         .join(" ")
 }
 
+struct StaComGuard {
+    ole32_mod: windows_sys::Win32::Foundation::HMODULE,
+    should_uninit: bool,
+}
+
+impl StaComGuard {
+    /// 按 ShellExecuteW 官方要求初始化线程 STA COM（COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE），并在退出作用域时配对释放
+    fn init() -> Option<Self> {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+
+        const COINIT_APARTMENTTHREADED_DISABLE_OLE1DDE: u32 = 0x2 | 0x4;
+        type CoInitializeExFn = unsafe extern "system" fn(*const c_void, u32) -> i32;
+
+        let ole32_mod = unsafe { load_system32_library("ole32.dll") }.ok()?;
+        let co_init_ptr =
+            unsafe { GetProcAddress(ole32_mod, c"CoInitializeEx".as_ptr().cast::<u8>()) };
+        let Some(co_init_fn_ptr) = co_init_ptr else {
+            unsafe {
+                FreeLibrary(ole32_mod);
+            }
+            return None;
+        };
+        let co_initialize_ex: CoInitializeExFn = unsafe { std::mem::transmute(co_init_fn_ptr) };
+        let hr = unsafe {
+            co_initialize_ex(std::ptr::null(), COINIT_APARTMENTTHREADED_DISABLE_OLE1DDE)
+        };
+        // S_OK (0) 或 S_FALSE (1) 需要配对 CoUninitialize；RPC_E_CHANGED_MODE 等则不调用
+        let should_uninit = hr == 0 || hr == 1;
+        Some(Self {
+            ole32_mod,
+            should_uninit,
+        })
+    }
+}
+
+impl Drop for StaComGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::FreeLibrary;
+        use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+
+        type CoUninitializeFn = unsafe extern "system" fn();
+
+        if self.should_uninit {
+            let co_uninit_ptr =
+                unsafe { GetProcAddress(self.ole32_mod, c"CoUninitialize".as_ptr().cast::<u8>()) };
+            if let Some(ptr) = co_uninit_ptr {
+                let co_uninitialize: CoUninitializeFn = unsafe { std::mem::transmute(ptr) };
+                unsafe {
+                    co_uninitialize();
+                }
+            }
+        }
+        unsafe {
+            FreeLibrary(self.ole32_mod);
+        }
+    }
+}
+
 /// 触发 Windows UAC 提权以 `--transparent --replace-pid <当前PID>` 重启 FlowX，由新实例平滑接管配置与端口
 pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{FreeLibrary, HINSTANCE, HWND};
@@ -349,6 +480,16 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
             "Process is already running with Administrator privileges",
         ));
     }
+
+    if is_low_integrity_process() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "ERR_TRANSPARENT_LOW_INTEGRITY: Current process is running at Windows Low Mandatory Integrity Level (for example when launched from a restricted or sandboxed directory); Windows blocks in-process UAC elevation and USER32/SHELL32 initialization. Move or install FlowX into a standard directory, or start FlowX from an Administrator terminal.",
+        ));
+    }
+
+    // 初始化 STA COM（ShellExecuteW 在 Tokio blocking 工作线程上默认无 COM 套间），保持到 ShellExecuteW 与 FreeLibrary 完成
+    let _com_guard = StaComGuard::init();
 
     type ShellExecuteWFn = unsafe extern "system" fn(
         hwnd: HWND,
@@ -1644,6 +1785,47 @@ mod tests {
             FreeLibrary(dnsapi);
         }
 
+        let rid = process_integrity_rid().expect("TokenIntegrityLevel should be queryable");
+        if !is_low_integrity_rid(rid) {
+            use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
+
+            let ole32 = unsafe { load_system32_library("ole32.dll") }
+                .expect("ole32.dll should load cleanly from System32 at Medium+ integrity");
+            assert!(!ole32.is_null());
+            unsafe {
+                FreeLibrary(ole32);
+            }
+
+            {
+                let com_guard = StaComGuard::init();
+                assert!(
+                    com_guard.is_some(),
+                    "StaComGuard should initialize COM cleanly via System32 ole32.dll"
+                );
+            }
+
+            let shell32 = unsafe { load_system32_library("shell32.dll") }
+                .expect("shell32.dll should load cleanly from System32 at Medium+ integrity");
+            assert!(!shell32.is_null());
+            let shell_exec =
+                unsafe { GetProcAddress(shell32, c"ShellExecuteW".as_ptr().cast::<u8>()) };
+            assert!(
+                shell_exec.is_some(),
+                "ShellExecuteW should resolve in System32 shell32.dll"
+            );
+            unsafe {
+                FreeLibrary(shell32);
+            }
+        } else {
+            assert!(is_low_integrity_process());
+            let err = relaunch_elevated_with_replace_pid(&[])
+                .expect_err("Low integrity process must reject in-process UAC cleanly");
+            assert!(
+                err.to_string().contains("ERR_TRANSPARENT_LOW_INTEGRITY:"),
+                "unexpected Low integrity error: {err}"
+            );
+        }
+
         let ipconfig = resolve_system32_executable("ipconfig.exe")
             .expect("ipconfig.exe should resolve inside SystemRoot\\System32");
         assert!(ipconfig.is_absolute());
@@ -1656,6 +1838,16 @@ mod tests {
             "unexpected ipconfig dir: {}",
             ipconfig.display()
         );
+    }
+
+    #[test]
+    fn test_low_integrity_rid_thresholds() {
+        assert!(is_low_integrity_rid(0x0000)); // Untrusted
+        assert!(is_low_integrity_rid(0x1000)); // Low
+        assert!(is_low_integrity_rid(0x1FFF));
+        assert!(!is_low_integrity_rid(SECURITY_MANDATORY_MEDIUM_RID));
+        assert!(!is_low_integrity_rid(0x3000)); // High
+        assert!(!is_low_integrity_rid(0x4000)); // System
     }
 
     #[test]

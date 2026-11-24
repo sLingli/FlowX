@@ -1070,6 +1070,7 @@ async fn handle_api_request(
             &mut trigger_elevated_shutdown,
         )
         .await;
+        let (status, body) = finalize_elevate_response_and_log(locale, status, body);
         finish_api_response_and_maybe_shutdown(
             &mut stream,
             status,
@@ -2620,6 +2621,49 @@ pub(crate) fn handle_simulate_route_with_pool(
     };
 
     ("200 OK", ct, serde_json_to_string(&resp))
+}
+
+fn finalize_elevate_response_and_log(
+    locale: Locale,
+    status: &'static str,
+    body: String,
+) -> (&'static str, String) {
+    if status.starts_with("200") {
+        return (status, body);
+    }
+
+    let (out_status, out_body) = if status == "500 Internal Server Error" {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(detail) = val.get("detail").and_then(|v| v.as_str()) {
+                if detail.starts_with("ERR_TRANSPARENT_LOW_INTEGRITY:") {
+                    (
+                        "409 Conflict",
+                        serde_json::json!({
+                            "error": t(locale, "error.transparent_low_integrity"),
+                            "code": "ERR_TRANSPARENT_LOW_INTEGRITY",
+                            "detail": detail,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (status, body)
+                }
+            } else {
+                (status, body)
+            }
+        } else {
+            (status, body)
+        }
+    } else {
+        (status, body)
+    };
+
+    tracing::warn!(
+        "[API] POST /api/transparent/elevate failed ({}): {}",
+        out_status,
+        out_body
+    );
+    (out_status, out_body)
 }
 
 fn transparent_status_or_fallback(mgr: Option<&TransparentManager>) -> TransparentRuntimeStatus {
@@ -5886,5 +5930,44 @@ mod tests {
             resp.starts_with("HTTP/1.1 200 OK") && resp.contains(r#""relaunching":true"#),
             "expected complete 200 OK elevate response after run() drained, got: {resp}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_elevate_low_integrity_error_maps_to_409_conflict_with_detail() {
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, re, nodes)
+            .with_shutdown_sender(shutdown_tx)
+            .with_elevate_runner(Arc::new(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "ERR_TRANSPARENT_LOW_INTEGRITY: blocked at Low IL",
+                ))
+            }));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let mut rx_srv = shutdown_rx.clone();
+        let server_task = tokio::spawn(async move {
+            tokio::select! {
+                res = srv.run(listener, rx_srv.clone()) => res,
+                _ = rx_srv.changed() => Ok(()),
+            }
+        });
+
+        let req = format!(
+            "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept-Language: zh-CN\r\nContent-Length: 0\r\n\r\n"
+        );
+        let resp = raw_http(addr, &req).await;
+        assert!(resp.starts_with("HTTP/1.1 409 Conflict"), "resp: {resp}");
+        assert!(resp.contains("ERR_TRANSPARENT_LOW_INTEGRITY"), "resp: {resp}");
+        assert!(resp.contains("blocked at Low IL"), "resp: {resp}");
+        assert!(!*shutdown_rx.borrow());
+
+        server_task.abort();
+        let _ = server_task.await;
     }
 }

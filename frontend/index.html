@@ -3132,6 +3132,7 @@
         tp_stat_dns: '劫持 DNS 包',
         tp_stat_blocked: '阻断 RST/QUIC',
         tp_msg_need_admin: '当前以标准用户权限运行。开启系统级透明代理需点击「以管理员重启并开启」并通过 UAC 授权',
+        tp_msg_low_integrity: '当前 FlowX 运行在 Windows 低完整性级别（通常因所在目录继承了沙盒/低完整性标签）。Windows 禁止低完整性进程初始化图形会话或发起 UAC 提权，请将程序移至普通目录或从管理员终端启动。',
         tp_msg_missing_driver: '未检测到完整驱动文件：请将 WinDivert.dll 与 WinDivert64.sys 置于程序同级目录或配置路径。已搜索目录：{dirs}',
         tp_msg_elevating: '正在等待 Windows UAC 管理员授权并重启 FlowX 实例',
         tp_msg_elevated_timeout: '等待提权实例重新上线超时：若已取消 UAC，可点击按钮重试',
@@ -3150,6 +3151,7 @@
         tp_err_open_network: '打开 WinDivert NETWORK 层句柄失败',
         tp_err_uac_cancelled: '管理员 UAC 提权授权已取消或被拒绝',
         tp_err_elevate_in_progress: '管理员提权重启正在进行中',
+        tp_err_low_integrity: '当前进程处于 Windows 低完整性级别（受限/沙盒目录），系统禁止应用内 UAC 提权，请将程序移至普通目录或以管理员终端启动',
         tp_err_already_elevated: '当前进程已具备管理员权限',
         tp_err_elevate_failed: '触发管理员提权重启失败',
         tp_err_invalid_dll_path: 'WinDivert DLL 路径无效或包含非法字符',
@@ -3433,6 +3435,7 @@
         tp_stat_dns: 'DNS hijacked',
         tp_stat_blocked: 'RST / QUIC',
         tp_msg_need_admin: 'Running without Administrator privileges. Choose Restart as Administrator and approve UAC to capture system traffic',
+        tp_msg_low_integrity: 'FlowX is running at Windows Low Integrity Level (typically inherited from a sandboxed/restricted directory). Windows blocks in-process UAC elevation and USER32/SHELL32 initialization; move FlowX to a standard directory or run from an Administrator terminal.',
         tp_msg_missing_driver: 'WinDivert binaries missing: place WinDivert.dll and WinDivert64.sys next to flowx.exe or set a custom DLL path. Searched: {dirs}',
         tp_msg_elevating: 'Waiting for Windows UAC confirmation and elevated FlowX instance restart',
         tp_msg_elevated_timeout: 'Timed out waiting for elevated FlowX to reconnect; retry if UAC was cancelled',
@@ -3451,6 +3454,7 @@
         tp_err_open_network: 'Failed to open WinDivert NETWORK layer handle',
         tp_err_uac_cancelled: 'Administrator UAC elevation prompt was cancelled or denied',
         tp_err_elevate_in_progress: 'Administrator elevation relaunch is already in progress',
+        tp_err_low_integrity: 'Process is running at Windows Low Integrity Level (restricted/sandboxed directory); move FlowX to a standard directory or launch from an Administrator terminal',
         tp_err_already_elevated: 'FlowX is already running with Administrator privileges',
         tp_err_elevate_failed: 'Failed to launch elevated FlowX instance',
         tp_err_invalid_dll_path: 'Invalid WinDivert DLL path or illegal characters',
@@ -4159,6 +4163,7 @@
       const enabled = Boolean(d.enabled);
       const running = Boolean(d.running);
       const elevated = Boolean(d.elevated);
+      const lowIntegrity = Boolean(d.low_integrity);
       const dllFound = Boolean(d.dll_found);
       const sysFound = Boolean(d.sys_found);
 
@@ -4244,6 +4249,11 @@
         alertBox.setAttribute('role', 'alert');
         alertText.textContent = formatTransparentError(d.last_error);
         alertBox.style.display = 'flex';
+      } else if (!elevated && lowIntegrity) {
+        alertBox.className = 'tp-alert error';
+        alertBox.setAttribute('role', 'alert');
+        alertText.textContent = t('tp_msg_low_integrity');
+        alertBox.style.display = 'flex';
       } else if (tp && !elevated) {
         alertText.textContent = t('tp_msg_need_admin');
         alertBox.style.display = 'flex';
@@ -4262,6 +4272,7 @@
         ['ERR_TRANSPARENT_OPEN_NETWORK_LAYER:', 'tp_err_open_network'],
         ['ERR_TRANSPARENT_UAC_CANCELLED:', 'tp_err_uac_cancelled'],
         ['ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:', 'tp_err_elevate_in_progress'],
+        ['ERR_TRANSPARENT_LOW_INTEGRITY:', 'tp_err_low_integrity'],
         ['ERR_TRANSPARENT_ALREADY_ELEVATED:', 'tp_err_already_elevated'],
         ['ERR_TRANSPARENT_ELEVATE_FAILED:', 'tp_err_elevate_failed'],
         ['ERR_TRANSPARENT_INVALID_DLL_PATH:', 'tp_err_invalid_dll_path'],
@@ -4272,7 +4283,7 @@
           const localized = t(key);
           const detail = msg.slice(prefix.length).trim();
           // 英文错误仅附加简短诊断明细（如底层 Win32 错误码），常规文案直接使用当前界面语言
-          if (state.lang === 'zh-CN' && (prefix === 'ERR_TRANSPARENT_REQUIRES_ADMIN:' || prefix === 'ERR_TRANSPARENT_UAC_CANCELLED:' || prefix === 'ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:' || prefix === 'ERR_TRANSPARENT_ALREADY_ELEVATED:')) {
+          if (state.lang === 'zh-CN' && (prefix === 'ERR_TRANSPARENT_REQUIRES_ADMIN:' || prefix === 'ERR_TRANSPARENT_UAC_CANCELLED:' || prefix === 'ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:' || prefix === 'ERR_TRANSPARENT_LOW_INTEGRITY:' || prefix === 'ERR_TRANSPARENT_ALREADY_ELEVATED:')) {
             return localized;
           }
           return detail ? `${localized} (${detail})` : localized;
@@ -4398,7 +4409,11 @@
         }, 30000);
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
-          showToast(data.error || t('toast_tp_elevate_fail'), 'error');
+          const errDetail = data.detail ? formatTransparentError(data.detail) : '';
+          const errMsg = (data.detail && errDetail !== data.detail)
+            ? errDetail
+            : (data.error ? (errDetail ? `${data.error}: ${errDetail}` : data.error) : t('toast_tp_elevate_fail'));
+          showToast(errMsg, 'error');
           return;
         }
 
