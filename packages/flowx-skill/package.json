@@ -1,0 +1,43 @@
+{
+  "name": "@slingli/flowx-skill",
+  "version": "0.1.0",
+  "description": "AI Agent Skill for FlowX — Windows process-level transparent proxy, routing rule debugging, and CLI control",
+  "keywords": [
+    "flowx",
+    "agent-skill",
+    "ai-agent",
+    "windivert",
+    "proxy",
+    "windows"
+  ],
+  "homepage": "https://github.com/sLingli/FlowX#readme",
+  "bugs": {
+    "url": "https://github.com/sLingli/FlowX/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sLingli/FlowX.git",
+    "directory": "skills/flowx"
+  },
+  "license": "MIT",
+  "author": "sLingli <YS111165542@outlook.com>",
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "flowx-skill": "bin/install.js"
+  },
+  "files": [
+    "bin",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "node scripts/sync.js"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

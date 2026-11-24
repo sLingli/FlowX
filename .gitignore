@@ -4,3 +4,8 @@
 .*flowx*.tmp*
 .*.xml.lock
 /driver
+/packages/*/LICENSE
+/packages/*/*.tgz
+/packages/flowx-skill/skills
+/packages/flowx/flowx.example.xml
+/packages/flowx/native

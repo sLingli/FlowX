@@ -1,0 +1,50 @@
+{
+  "name": "@slingli/flowx",
+  "version": "0.1.0",
+  "description": "FlowX — Windows process-level transparent proxy, mixed inbound & routing engine CLI + embedded Web UI",
+  "keywords": [
+    "flowx",
+    "proxy",
+    "windivert",
+    "socks5",
+    "windows",
+    "transparent-proxy",
+    "cli"
+  ],
+  "homepage": "https://github.com/sLingli/FlowX#readme",
+  "bugs": {
+    "url": "https://github.com/sLingli/FlowX/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sLingli/FlowX.git"
+  },
+  "license": "MIT",
+  "author": "sLingli <YS111165542@outlook.com>",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "bin": {
+    "flowx": "bin/flowx.js"
+  },
+  "files": [
+    "bin",
+    "native",
+    "flowx.example.xml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "prepack": "node scripts/sync.js"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
+}

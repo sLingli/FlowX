@@ -47,7 +47,7 @@ FlowX 是基于 Rust 的 Windows 进程级透明网络代理与分流引擎，�
    - 若前方存在更宽泛规则，用 `flowx rule move <ID> <up|down|top|bottom>` 调整优先级，保持 `#1 LocalBypass` 始终在首位防回环。
 5. **干跑模拟与实机生效确认**
    - 对目标进程和域名执行 `flowx sim --app <进程路径或名称> --target <域名或IP:端口> --json`，核对 `matched_rule_name`、`action` 与 `trace`。
-   - 若 `system.transparent.running` 为 `false`，立即执行 `flowx transparent doctor --json` 定位原因（缺管理员权限或缺少 `flowx.exe` 同级 / `driver\` 下的 `WinDivert.dll` + `WinDivert64.sys`）。需提权重启守护进程时，在用户知情确认后可执行 `flowx transparent elevate --json`（会触发系统 UAC 弹窗），或暂将应用代理指向混合入站 `127.0.0.1:40001`。
+   - 若 `system.transparent.running` 为 `false`，立即执行 `flowx transparent doctor --json` 定位原因（缺管理员权限或缺少 `flowx.exe` 同级 / `driver\` 下的 `WinDivert.dll` + `WinDivert64.sys`）。若通过 npm 包（`@slingli/flowx`）安装且仅缺驱动，可先运行 `flowx setup-driver` 自动下载校验安装驱动；需提权重启守护进程时，在用户知情确认后可执行 `flowx transparent elevate --json`（会触发系统 UAC 弹窗），或暂将应用代理指向混合入站 `127.0.0.1:40001`。
 
 ---
 

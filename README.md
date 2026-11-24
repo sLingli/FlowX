@@ -25,7 +25,22 @@
 
 ## 安装与快速开始
 
-### 方式一：下载预编译 Release（推荐 Windows 用户，免装 Rust）
+### 方式一：通过 npm 一行安装 Windows CLI（推荐，免装 Rust）
+
+适合本机已有 Node.js（`>= 18`）的 Windows x64 用户：
+
+```powershell
+# 全局安装 FlowX CLI 与内嵌 Web 控制台（开箱即用 127.0.0.1:40001 混合入站与 40080 控制台）
+npm install -g @slingli/flowx
+
+# 启动引擎与 Web 控制台
+flowx
+
+# （可选）若要开启 WinDivert 系统级透明代理，自动下载并校验官方驱动放入同级 driver\ 目录
+flowx setup-driver
+```
+
+### 方式二：下载 GitHub Releases 预编译压缩包（免装 Node 与 Rust）
 
 1. 前往 [GitHub Releases](https://github.com/sLingli/FlowX/releases) 下载对应压缩包：
    - **`flowx-<version>-windows-x64.zip`（完整版，开箱即用）**：包含 `flowx.exe`、配对的 `driver/WinDivert.dll` + `WinDivert64.sys`（已含官方许可证声明）、配置模板及 `skills/flowx/`。
@@ -42,7 +57,7 @@
 .\flowx.exe --no-transparent
 ```
 
-### 方式二：通过 Rust / Cargo 从源码安装或运行
+### 方式三：通过 Rust / Cargo 从源码安装或运行
 
 要求已安装 Rust 1.85+（`edition = "2024"`）：
 
@@ -63,20 +78,23 @@ cargo test
 
 > 若使用源码构建并需要系统级透明代理，请将 WinDivert 2.2 的 `WinDivert.dll` 与 `WinDivert64.sys` 放入 `flowx.exe` 同级（或同级 `driver\`）目录，详见下方说明。
 
-### 方式三：安装 AI Agent Skill / 一句话让 Agent 自动安装
+### 方式四：安装 AI Agent Skill / 一句话让 Agent 自动安装
 
-FlowX 内置了完整可控全量功能按钮与规则调试的 AI 技能包 [`skills/flowx/SKILL.md`](skills/flowx/SKILL.md)：
+FlowX 将 Skill（[`@slingli/flowx-skill`](https://www.npmjs.com/package/@slingli/flowx-skill)）与 CLI 程序（[`@slingli/flowx`](https://www.npmjs.com/package/@slingli/flowx)）拆分为独立包发布，支持通过 npm 或 GitHub 安装：
 
 ```bash
-# 使用 Agent Skills CLI 安装（推荐，兼容 Claude Code / Cursor / Codex 等）
+# 方式 A：通过 npm 包一键安装到本机 Agent 技能目录（支持 Claude Code / Codex / Cursor / Antigravity / .agents）
+npx @slingli/flowx-skill
+
+# 方式 B：或使用 Agent Skills CLI 直接从 GitHub 仓库拉取
 npx skills add sLingli/FlowX
 ```
 
 如果你习惯直接让 AI Agent（Claude Code、Cursor、Codex、Antigravity 等）一步安装并配置好环境，可以直接复制下面这段话发给它：
 
 > 请帮我安装并启动 FlowX（`https://github.com/sLingli/FlowX`）：
-> 1. 优先从 GitHub Releases 下载最新完整版 `flowx-*-windows-x64.zip` 解压到本地常用目录（若暂无可用 Release 或需源码构建，则 `git clone https://github.com/sLingli/FlowX.git` 并 `cargo build --release`，再从 WinDivert 官方 Release 下载配对 `WinDivert.dll` + `WinDivert64.sys` 放入同级 `driver/`）；
-> 2. 将仓库中的 `skills/flowx/` 安装到你当前客户端对应的 skills 目录；
+> 1. 优先运行 `npm install -g @slingli/flowx` 安装 CLI 与 Web 控制台；如需要使用系统级透明代理，运行 `flowx setup-driver` 自动下载并校验 WinDivert 驱动（若无 Node.js，则改从 GitHub Releases 下载最新 `flowx-*-windows-x64.zip` 解压，或源码 `cargo build --release`）；
+> 2. 运行 `npx @slingli/flowx-skill`（或将仓库 `skills/flowx/` 复制进你的 skills 目录）完成技能安装；
 > 3. 启动 `flowx`，执行 `flowx status --json` 与 `flowx transparent doctor --json` 向我汇报端口、节点和透明代理就绪状态（如需管理员权限开启透明代理，请提示我确认 UAC 或调用 `flowx transparent elevate --json`，不要绕过权限检查）。
 
 启动后在浏览器打开 `http://127.0.0.1:40080` 即可查看实时吞吐图表、活动连接、开关系统级透明代理、新增/编辑/测速代理节点、调整分流规则与默认兜底策略，或使用内置「路由规则命中模拟器」干跑测试规则。
