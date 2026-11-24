@@ -123,9 +123,9 @@ mod entry {
             Err(err) => cli::emit_cli_error_and_exit(&err, wants_json),
         };
 
-        // 1. 初始化标准结构化日志
+        // 1. 初始化标准结构化日志（支持通过 FLOWX_LOG / RUST_LOG 调整日志级别，默认 INFO）
         let subscriber = FmtSubscriber::builder()
-            .with_max_level(Level::INFO)
+            .with_max_level(resolve_log_level())
             .finish();
         tracing::subscriber::set_global_default(subscriber)?;
 
@@ -527,9 +527,42 @@ mod entry {
         }
     }
 
+    fn parse_log_level(raw: Option<&str>) -> Level {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("trace") => Level::TRACE,
+            Some("debug") => Level::DEBUG,
+            Some("warn" | "warning") => Level::WARN,
+            Some("error") => Level::ERROR,
+            _ => Level::INFO,
+        }
+    }
+
+    fn resolve_log_level() -> Level {
+        let raw = std::env::var("FLOWX_LOG")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                std::env::var("RUST_LOG")
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            });
+        parse_log_level(raw.as_deref())
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn test_parse_log_level() {
+            assert_eq!(parse_log_level(None), Level::INFO);
+            assert_eq!(parse_log_level(Some("")), Level::INFO);
+            assert_eq!(parse_log_level(Some("debug")), Level::DEBUG);
+            assert_eq!(parse_log_level(Some(" DEBUG ")), Level::DEBUG);
+            assert_eq!(parse_log_level(Some("trace")), Level::TRACE);
+            assert_eq!(parse_log_level(Some("warning")), Level::WARN);
+            assert_eq!(parse_log_level(Some("error")), Level::ERROR);
+        }
 
         #[tokio::test]
         async fn test_internal_watch_shutdown_exits_cleanly_while_unexpected_task_exit_errors() {

@@ -1424,9 +1424,9 @@ impl TransparentManager {
                                 )
                                 .await
                                 {
-                                    debug!(
+                                    warn!(
                                         orig_dst = %flow.orig_dst,
-                                        error = %e,
+                                        error = %format!("{e:#}"),
                                         "Transparent TCP stream finished with error"
                                     );
                                 }

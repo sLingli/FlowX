@@ -1,4 +1,5 @@
 /target
 /flowx.xml
 .*flowx*.tmp*
+.*.xml.lock
 /driver

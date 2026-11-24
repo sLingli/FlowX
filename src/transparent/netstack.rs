@@ -1363,8 +1363,14 @@ impl NetstackEngine {
                     );
                     remove_session = true;
                 } else {
-                    // B. 检测远端（本地应用）是否已发送正常 FIN
-                    if !sock.may_recv() && !sock.can_recv() && !inner.socket_eof_to_app {
+                    // B. 检测远端（本地应用）是否已发送正常 FIN：
+                    //    smoltcp 的 may_recv() 在三次握手尚未完成的 SynReceived 态也返回 false，
+                    //    必须要求 session.ever_established 为真才判定远端已发送 FIN，避免首包即误判 EOF。
+                    if session.ever_established
+                        && !sock.may_recv()
+                        && !sock.can_recv()
+                        && !inner.socket_eof_to_app
+                    {
                         inner.socket_eof_to_app = true;
                         if wake_read.is_none() {
                             wake_read = inner.read_waker.take();
@@ -2980,6 +2986,71 @@ mod tests {
         assert!(
             tx_out.iter().any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst)),
             "ungraceful abort after cancelled poll_shutdown should emit RST"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_netstack_pump_during_syn_received_does_not_trigger_premature_eof() {
+        let signal = Arc::new(NetstackSignal::new());
+        let mut engine = NetstackEngine::new(Arc::clone(&signal));
+        let meta = PacketInterfaceMeta {
+            if_idx: 1,
+            sub_if_idx: 0,
+            loopback: false,
+            is_ipv6: false,
+            bitfield: 0,
+        };
+        let client_ip = [10, 0, 0, 2];
+        let server_ip = [172, 66, 147, 243];
+        let mut accepted = Vec::new();
+        let mut tx_out = Vec::new();
+
+        // 1. 收到 SYN 后进入 SynReceived，并模拟 actor 主循环紧接着调用 engine.pump()
+        let syn = build_syn(client_ip, 52020, server_ip, 443, 1000);
+        assert!(matches!(
+            engine.ingest_outbound_tcp(syn, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            TcpIngestOutcome::Intercepted
+        ));
+        let syn_ack = parse_tcp_packet(&tx_out[0].data).unwrap();
+        assert!(syn_ack.syn && syn_ack.ack);
+        tx_out.clear();
+
+        engine.pump(&mut tx_out);
+
+        // 2. 在客户端 ACK 与首个载荷到达前，AsyncRead 必须处于 Pending，绝不能因 SynReceived 返回 Ok(0) EOF
+        let mut flow = accepted.pop().unwrap();
+        let mut buf = [0u8; 64];
+        let early_read = tokio::time::timeout(Duration::from_millis(20), flow.stream.read(&mut buf)).await;
+        assert!(
+            early_read.is_err(),
+            "read() during SynReceived must stay Pending rather than returning premature EOF"
+        );
+
+        // 3. 客户端发来 ACK + 首批 TLS 数据后，流必须继续可读且不会在后续读完当前载荷后误判 EOF
+        let ack_data = build_ack(
+            client_ip,
+            52020,
+            server_ip,
+            443,
+            1001,
+            syn_ack.seq.wrapping_add(1),
+            false,
+            b"\x16\x03\x01\x00\x05hello",
+        );
+        assert!(matches!(
+            engine.ingest_outbound_tcp(ack_data, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            TcpIngestOutcome::Intercepted
+        ));
+        let n = tokio::time::timeout(Duration::from_millis(100), flow.stream.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"\x16\x03\x01\x00\x05hello");
+
+        let second_read = tokio::time::timeout(Duration::from_millis(20), flow.stream.read(&mut buf)).await;
+        assert!(
+            second_read.is_err(),
+            "read() after consuming first flight without FIN must remain Pending"
         );
     }
 }
