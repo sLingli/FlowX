@@ -268,7 +268,7 @@ impl Default for ProcessTracker {
 }
 
 fn is_system_pid(pid: u32) -> bool {
-    pid == 0 || pid == 4
+    pid == 4
 }
 
 fn extract_process_name(path: &str) -> String {
@@ -431,6 +431,9 @@ fn query_windows_tcp_v4(client_v4: SocketAddrV4, server_v4: SocketAddrV4) -> Opt
 
     let table_offset = std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table);
     query_extended_tcp_table::<MIB_TCPROW_OWNER_PID, _>(AF_INET as u32, table_offset, |row| {
+        if row.dwOwningPid == 0 {
+            return None;
+        }
         let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
         let remote_port = u16::from_be((row.dwRemotePort & 0xffff) as u16);
         if local_port != client_v4.port() || remote_port != server_v4.port() {
@@ -454,6 +457,9 @@ fn query_windows_tcp_v6(client_v6: SocketAddrV6, server_v6: SocketAddrV6) -> Opt
 
     let table_offset = std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table);
     query_extended_tcp_table::<MIB_TCP6ROW_OWNER_PID, _>(AF_INET6 as u32, table_offset, |row| {
+        if row.dwOwningPid == 0 {
+            return None;
+        }
         let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
         let remote_port = u16::from_be((row.dwRemotePort & 0xffff) as u16);
         if local_port != client_v6.port() || remote_port != server_v6.port() {
@@ -556,7 +562,7 @@ fn query_windows_udp_v6(target_ip: Option<Ipv6Addr>, target_port: u16) -> Option
 fn get_pid_by_udp_endpoint(local: SocketAddr) -> Option<u32> {
     match local.ip().to_canonical() {
         std::net::IpAddr::V4(v4) => query_windows_udp_v4(Some(v4), local.port())
-            .or_else(|| query_windows_udp_v6(None, local.port())),
+            .or_else(|| query_windows_udp_v6(Some(v4.to_ipv6_mapped()), local.port())),
         std::net::IpAddr::V6(v6) => query_windows_udp_v6(Some(v6), local.port()),
     }
 }
@@ -607,7 +613,10 @@ fn query_windows_process_creation_time(handle: windows_sys::Win32::Foundation::H
 fn get_process_start_time(pid: u32) -> Option<u128> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
-    if pid == 0 || pid == 4 {
+    if pid == 0 {
+        return None;
+    }
+    if pid == 4 {
         return Some(0);
     }
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
@@ -623,7 +632,10 @@ fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
         OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
-    if pid == 0 || pid == 4 {
+    if pid == 0 {
+        return None;
+    }
+    if pid == 4 {
         return Some(("System".to_string(), Some(0)));
     }
 
@@ -885,5 +897,21 @@ mod tests {
         let client_local = client.local_addr().unwrap();
         let tcp_pid = lookup_outbound_socket_pid(6, client_local, server_addr);
         assert_eq!(tcp_pid, Some(std::process::id()));
+
+        // PID 0 (Idle/TIME_WAIT 无归属槽位) 绝不可被误判为 Windows System 内核进程（仅 PID 4 为 System）
+        let tracker = ProcessTracker::new();
+        assert!(tracker.resolve_pid(0).is_none());
+        let sys_info = tracker.resolve_pid(4).expect("PID 4 should resolve to System");
+        assert_eq!(sys_info.name, "System");
+
+        // 双栈 IPv6 UDP 套接字（显式绑定 ::ffff:127.0.0.1 或 [::]）按 IPv4 地址查询也应命中本进程 PID
+        if let Ok(v6_sock) = std::net::UdpSocket::bind("[::]:0") {
+            let v6_port = v6_sock.local_addr().unwrap().port();
+            let v4_lookup = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), v6_port);
+            assert_eq!(
+                lookup_outbound_socket_pid(17, v4_lookup, "1.1.1.1:53".parse().unwrap()),
+                Some(std::process::id())
+            );
+        }
     }
 }

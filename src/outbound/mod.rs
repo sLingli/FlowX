@@ -161,16 +161,19 @@ pub(crate) fn is_loopback_domain(host: &str) -> bool {
         || (bytes.len() > 10 && bytes[bytes.len() - 10..].eq_ignore_ascii_case(b".localhost"))
 }
 
-/// 枚举本机网络接口上的所有 IP 地址（用于防 DNS 重绑定直连本机开放端口）
+/// 枚举本机在线网络接口上处于 Preferred 状态的单播 IP 地址（用于防 DNS 重绑定直连本机开放端口）
 pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+        IpDadStatePreferred, AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
     };
 
+    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
     let mut ips = Vec::new();
     let mut buf_len: u32 = 16 * 1024;
     let mut buf: Vec<u64> = Vec::new();
@@ -180,7 +183,7 @@ pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
         let ret = unsafe {
             GetAdaptersAddresses(
                 AF_UNSPEC as u32,
-                0,
+                flags,
                 std::ptr::null(),
                 buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
                 &mut buf_len,
@@ -189,8 +192,16 @@ pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
         if ret == 0 {
             let mut adapter_ptr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
             while !adapter_ptr.is_null() {
+                if unsafe { (*adapter_ptr).OperStatus } != IfOperStatusUp {
+                    adapter_ptr = unsafe { (*adapter_ptr).Next };
+                    continue;
+                }
                 let mut unicast_ptr = unsafe { (*adapter_ptr).FirstUnicastAddress };
                 while !unicast_ptr.is_null() {
+                    if unsafe { (*unicast_ptr).DadState } != IpDadStatePreferred {
+                        unicast_ptr = unsafe { (*unicast_ptr).Next };
+                        continue;
+                    }
                     let sock_addr = unsafe { (*unicast_ptr).Address };
                     if !sock_addr.lpSockaddr.is_null() && sock_addr.iSockaddrLength > 0 {
                         let family = unsafe { (*sock_addr.lpSockaddr).sa_family };
