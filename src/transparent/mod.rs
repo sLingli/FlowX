@@ -459,13 +459,39 @@ fn shutdown_and_join_runtime(
     signal.close();
     let _ = socket_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
     let _ = network_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
-    let _ = dns_inspect_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
+    // 先仅关闭入站 DNS 观测句柄的 Recv 方向，确保线程把已在驱动队列中截获的应答全部原样 send 重注入 OS 后自然退出
+    let _ = dns_inspect_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Recv);
     for th in threads {
         let _ = th.join();
     }
+    let _ = dns_inspect_handle.shutdown(windivert_ffi::WinDivertShutdownMode::Both);
     let mut handles = dns_abort_handles.lock().unwrap_or_else(|e| e.into_inner());
     for h in handles.drain(..) {
         h.abort();
+    }
+}
+
+/// 在打开 WinDivert 句柄前提前激活出站旁路注册标志，若建句柄阶段失败则自动复位（消除启动瞬间 TOCTOU 窗口）
+struct TransparentActiveStartupGuard {
+    armed: bool,
+}
+
+impl TransparentActiveStartupGuard {
+    fn activate() -> Self {
+        crate::outbound::bypass::set_transparent_active(true);
+        Self { armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TransparentActiveStartupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::outbound::bypass::set_transparent_active(false);
+        }
     }
 }
 
@@ -529,10 +555,10 @@ pub(crate) fn windivert_network_filter() -> &'static str {
 }
 
 /// WinDivert NETWORK 层入站 `InspectDns` 同步观测过滤表达式（配合 `DNS_INSPECT_LAYER_FLAGS = 0` 内联拦截-重注入）：
-/// 捕获入站 UDP/53 应答与入站 IP 分片（覆盖大包 DNSSEC / EDNS0），先同步落盘 `real_ip -> domain` 后再无条件原样重注入 OS，
-/// 彻底消除高并发下「入站 DNS 应答 vs 业务进程 TCP SYN」竞态且绝不丢弃或篡改任何入站报文
+/// WinDivert 2.2 在未设置 `WINDIVERT_FLAG_FRAGMENTS` 时默认在内核完成入站分片重组后交付完整 UDP/53 报文（覆盖大包 DNSSEC / EDNS0），
+/// 同步落盘 `real_ip -> domain` 后再无条件原样重注入 OS，消除高并发下「入站 DNS 应答 vs 业务进程 TCP SYN」竞态且绝不触碰非 DNS 入站分片
 pub(crate) fn windivert_dns_inspect_inbound_filter() -> &'static str {
-    "inbound and !loopback and !impostor and (udp.SrcPort == 53 or fragment)"
+    "inbound and !loopback and !impostor and udp.SrcPort == 53"
 }
 
 struct NetRxContext {
@@ -986,6 +1012,9 @@ impl TransparentManager {
             ))
         })?;
 
+        // 在打开 WinDivert 句柄前即置位 transparent_active，消除并发出站连接/UDP DNS 跳过 BypassPortRegistry 登记的 TOCTOU 窗口
+        let mut active_startup_guard = TransparentActiveStartupGuard::activate();
+
         let socket_filter =
             "(tcp or udp) and (event == BIND or event == CONNECT or event == LISTEN or event == ACCEPT or event == CLOSE)";
         let socket_handle = Arc::new(
@@ -1074,7 +1103,8 @@ impl TransparentManager {
             threads: Vec::with_capacity(4),
             dns_abort_handles: Arc::clone(&dns_abort_handles),
         };
-        crate::outbound::bypass::set_transparent_active(true);
+        // PartialRuntimeGuard 接管失败回滚时复位 transparent_active 的职责
+        active_startup_guard.disarm();
 
         // 1. SOCKET 层监听线程：高速维护 (proto, local_ip, local_port) -> PID，并推送 TCP 关闭事件失效旁路缓存
         {
@@ -1231,8 +1261,8 @@ impl TransparentManager {
             startup_guard.threads.push(handle);
         }
 
-        // 2b. 入站同步 DNS 应答观测线程（内联拦截-落盘-重注入）：覆盖未分片 UDP/53 与分片大包 EDNS0/DNSSEC，
-        //     先同步学习 real_ip -> domain 再无条件原样重注入 OS，消除与后续 TCP SYN 的竞态且零丢包
+        // 2b. 入站同步 DNS 应答观测线程（内联拦截-落盘-重注入）：依赖 WinDivert 2.2 flags=0 原生重组覆盖大包 EDNS0/DNSSEC，
+        //     先同步学习 real_ip -> domain 再无条件原样重注入 OS；停机时仅关闭 Recv 方向直至排空全部排队应答再退出
         {
             let stop = Arc::clone(&stop_flag);
             let sniff_h = Arc::clone(&dns_inspect_handle);
@@ -1242,14 +1272,11 @@ impl TransparentManager {
                 .name("flowx-windivert-dns-sniff".to_string())
                 .spawn(move || {
                     let mut buf = vec![0u8; INITIAL_NET_RX_BUF_LEN];
-                    let mut inbound_fragments = fragment::FragmentTracker::new();
-                    while !stop.load(Ordering::Acquire) {
+                    loop {
                         let (len, addr) = match sniff_h.recv(&mut buf) {
                             Ok(res) => res,
                             Err(e) => {
-                                if stop.load(Ordering::Acquire)
-                                    || matches!(e.raw_os_error(), Some(6 | 232 | 995))
-                                {
+                                if matches!(e.raw_os_error(), Some(6 | 232 | 995)) {
                                     break;
                                 }
                                 if e.raw_os_error() == Some(WINDOWS_ERROR_INSUFFICIENT_BUFFER)
@@ -1257,6 +1284,9 @@ impl TransparentManager {
                                 {
                                     buf.resize(next_len, 0);
                                     continue;
+                                }
+                                if stop.load(Ordering::Acquire) {
+                                    break;
                                 }
                                 debug!(error = %e, "WinDivert inbound DNS observer recv transient error");
                                 std::thread::yield_now();
@@ -1267,23 +1297,19 @@ impl TransparentManager {
                             continue;
                         }
                         let raw = &buf[..len];
-                        let net_data = addr.network();
-                        let frag_meta = netstack::PacketInterfaceMeta {
-                            if_idx: net_data.if_idx,
-                            sub_if_idx: net_data.sub_if_idx,
-                            loopback: addr.loopback(),
-                            is_ipv6: addr.ipv6(),
-                            bitfield: addr.raw_bitfield(),
-                        };
                         let _ = dns_hijack::observe_inbound_dns_packet_for_inspect(
                             raw,
-                            frag_meta,
-                            &mut inbound_fragments,
                             &inspect_tbl,
                             &fake_ip_pool,
                         );
-                        // 无论是否命中观测表或是否分片，都在观测完成后无条件原样重注入 OS
-                        let _ = sniff_h.send(raw, &addr);
+                        // 无论是否命中观测表，都在观测完成后无条件原样重注入 OS，并记录重注入异常
+                        if let Err(e) = sniff_h.send(raw, &addr) {
+                            warn!(
+                                error = %e,
+                                packet_len = raw.len(),
+                                "Failed to reinject observed inbound DNS response packet"
+                            );
+                        }
                     }
                 })
                 .map_err(|e| self.set_error(format!("Failed to spawn inbound DNS observer thread: {e}")))?;
@@ -1632,7 +1658,7 @@ mod tests {
         let inbound_f = windivert_dns_inspect_inbound_filter();
         assert!(inbound_f.contains("inbound"));
         assert!(inbound_f.contains("udp.SrcPort == 53"));
-        assert!(inbound_f.contains("or fragment"));
+        assert!(!inbound_f.contains("or fragment"));
     }
 
     #[test]
