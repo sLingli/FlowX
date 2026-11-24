@@ -110,3 +110,7 @@ curl -x http://127.0.0.1:40001 https://example.com
 启动时优先加载 `--config` 参数或 `FLOWX_CONFIG` 环境变量指定的路径（`FLOWX_CONFIG` 为空白字符串时回退默认 `./flowx.xml`）。通过 Web 控制台对代理节点或分流规则进行的增删、启停和排序更改，都会自动原子写回该 XML 文件（含旧版孤立 `<Username>` 降级配置在下次变更回写后自动清理）。
 
 更多架构细节与模块设计请参见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+## 开源协议
+
+本项目主体源码与内嵌控制台及 AI Skill 基于 [MIT License](LICENSE) 开源。启用系统级透明代理时按需搭配使用的第三方 `WinDivert` 驱动二进制遵循其上游开源协议（LGPLv3 / GPLv2）。

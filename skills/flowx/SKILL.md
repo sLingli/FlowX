@@ -1,6 +1,7 @@
 ---
 name: flowx
 description: Configure, diagnose, and manage the FlowX Windows process-level transparent proxy and routing engine (WinDivert + mixed inbound). Use when the user asks to route an application, domain, IP/CIDR, or port through a proxy/direct/block rule (like Proxifier), inspect active connections or traffic stats, test rule matching (dry-run sim), switch default actions, or troubleshoot FlowX transparent mode, WinDivert drivers, and proxy nodes.
+license: MIT
 ---
 
 # FlowX Windows 进程级代理与分流控制指南
