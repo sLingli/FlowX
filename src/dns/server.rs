@@ -294,36 +294,19 @@ fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
 pub(crate) fn csprng_u16() -> u16 {
     let mut bytes = [0u8; 2];
 
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Security::Cryptography::{
-            BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-        };
-        let status = unsafe {
-            BCryptGenRandom(
-                std::ptr::null_mut(),
-                bytes.as_mut_ptr(),
-                bytes.len() as u32,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        };
-        if status == 0 {
-            return u16::from_be_bytes(bytes);
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::sync::OnceLock;
-        static URANDOM: OnceLock<Option<std::fs::File>> = OnceLock::new();
-        if let Some(mut f) = URANDOM
-            .get_or_init(|| std::fs::File::open("/dev/urandom").ok())
-            .as_ref()
-            && f.read_exact(&mut bytes).is_ok()
-        {
-            return u16::from_be_bytes(bytes);
-        }
+    use windows_sys::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status == 0 {
+        return u16::from_be_bytes(bytes);
     }
 
     use std::collections::hash_map::RandomState;
@@ -848,13 +831,8 @@ fn is_transient_udp_recv_error(err: &std::io::Error) -> bool {
     ) {
         return true;
     }
-    #[cfg(windows)]
     if err.raw_os_error() == Some(10040) {
         // WSAEMSGSIZE: UDP datagram truncated by socket receive buffer
-        return true;
-    }
-    #[cfg(unix)]
-    if err.raw_os_error() == Some(libc::EMSGSIZE) {
         return true;
     }
     false
@@ -1548,10 +1526,7 @@ mod tests {
         assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::ConnectionReset)));
         assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::WouldBlock)));
         assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::Interrupted)));
-        #[cfg(windows)]
         assert!(is_transient_udp_recv_error(&Error::from_raw_os_error(10040)));
-        #[cfg(unix)]
-        assert!(is_transient_udp_recv_error(&Error::from_raw_os_error(libc::EMSGSIZE)));
         assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::PermissionDenied)));
         assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::InvalidInput)));
     }
@@ -2134,8 +2109,7 @@ mod tests {
         .unwrap_err();
         let msg = format!("{reset_err:#}");
         assert!(!msg.is_empty());
-        // Windows 立即触发 ConnectionReset，其它平台可能超时；Windows 下不得误报为 timed out
-        #[cfg(windows)]
+        // Windows 立即触发 ConnectionReset，不得误报为 timed out
         assert!(
             msg.contains("connection reset") || msg.contains("unreachable"),
             "Windows WSAECONNRESET must not be misreported as timeout, got: {msg}"

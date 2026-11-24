@@ -654,23 +654,12 @@ impl ConfigStore {
 
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
 
         let mut file = opts
             .open(&tmp_path)
             .with_context(|| format!("Failed to create temporary configuration file: {}", tmp_path.display()))?;
 
         let write_result: Result<()> = (|| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .context("Failed to restrict temporary configuration file permissions to 0600")?;
-            }
             file.write_all(xml.as_bytes())
                 .with_context(|| format!("Failed to write temporary configuration file: {}", tmp_path.display()))?;
             file.sync_all()
@@ -692,34 +681,6 @@ impl ConfigStore {
                     self.path.display()
                 )
             });
-        }
-
-        #[cfg(unix)]
-        {
-            let dir_to_sync = parent_dir.unwrap_or_else(|| Path::new("."));
-            match std::fs::File::open(dir_to_sync) {
-                Ok(dir_file) => match dir_file.sync_all() {
-                    Ok(()) => {}
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
-                        ) => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("Failed to fsync configuration directory: {}", dir_to_sync.display())
-                        });
-                    }
-                },
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!(
-                            "Failed to open configuration directory for sync: {}",
-                            dir_to_sync.display()
-                        )
-                    });
-                }
-            }
         }
 
         Ok(())

@@ -163,104 +163,69 @@ pub(crate) fn is_loopback_domain(host: &str) -> bool {
 
 /// 枚举本机网络接口上的所有 IP 地址（用于防 DNS 重绑定直连本机开放端口）
 pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
-        use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
-        };
-        use windows_sys::Win32::Networking::WinSock::{
-            AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
-        };
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
 
-        let mut ips = Vec::new();
-        let mut buf_len: u32 = 16 * 1024;
-        let mut buf: Vec<u64> = Vec::new();
+    let mut ips = Vec::new();
+    let mut buf_len: u32 = 16 * 1024;
+    let mut buf: Vec<u64> = Vec::new();
 
-        for _ in 0..4 {
-            buf.resize((buf_len as usize).div_ceil(std::mem::size_of::<u64>()), 0);
-            let ret = unsafe {
-                GetAdaptersAddresses(
-                    AF_UNSPEC as u32,
-                    0,
-                    std::ptr::null(),
-                    buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
-                    &mut buf_len,
-                )
-            };
-            if ret == 0 {
-                let mut adapter_ptr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
-                while !adapter_ptr.is_null() {
-                    let mut unicast_ptr = unsafe { (*adapter_ptr).FirstUnicastAddress };
-                    while !unicast_ptr.is_null() {
-                        let sock_addr = unsafe { (*unicast_ptr).Address };
-                        if !sock_addr.lpSockaddr.is_null() && sock_addr.iSockaddrLength > 0 {
-                            let family = unsafe { (*sock_addr.lpSockaddr).sa_family };
-                            if family == AF_INET
-                                && sock_addr.iSockaddrLength as usize
-                                    >= std::mem::size_of::<SOCKADDR_IN>()
-                            {
-                                let sin = unsafe {
-                                    (sock_addr.lpSockaddr as *const SOCKADDR_IN).read_unaligned()
-                                };
-                                let addr = u32::from_be(unsafe { sin.sin_addr.S_un.S_addr });
-                                ips.push(IpAddr::V4(Ipv4Addr::from(addr)));
-                            } else if family == AF_INET6
-                                && sock_addr.iSockaddrLength as usize
-                                    >= std::mem::size_of::<SOCKADDR_IN6>()
-                            {
-                                let sin6 = unsafe {
-                                    (sock_addr.lpSockaddr as *const SOCKADDR_IN6).read_unaligned()
-                                };
-                                let bytes = unsafe { sin6.sin6_addr.u.Byte };
-                                ips.push(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
-                            }
+    for _ in 0..4 {
+        buf.resize((buf_len as usize).div_ceil(std::mem::size_of::<u64>()), 0);
+        let ret = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                0,
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut buf_len,
+            )
+        };
+        if ret == 0 {
+            let mut adapter_ptr = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+            while !adapter_ptr.is_null() {
+                let mut unicast_ptr = unsafe { (*adapter_ptr).FirstUnicastAddress };
+                while !unicast_ptr.is_null() {
+                    let sock_addr = unsafe { (*unicast_ptr).Address };
+                    if !sock_addr.lpSockaddr.is_null() && sock_addr.iSockaddrLength > 0 {
+                        let family = unsafe { (*sock_addr.lpSockaddr).sa_family };
+                        if family == AF_INET
+                            && sock_addr.iSockaddrLength as usize
+                                >= std::mem::size_of::<SOCKADDR_IN>()
+                        {
+                            let sin = unsafe {
+                                (sock_addr.lpSockaddr as *const SOCKADDR_IN).read_unaligned()
+                            };
+                            let addr = u32::from_be(unsafe { sin.sin_addr.S_un.S_addr });
+                            ips.push(IpAddr::V4(Ipv4Addr::from(addr)));
+                        } else if family == AF_INET6
+                            && sock_addr.iSockaddrLength as usize
+                                >= std::mem::size_of::<SOCKADDR_IN6>()
+                        {
+                            let sin6 = unsafe {
+                                (sock_addr.lpSockaddr as *const SOCKADDR_IN6).read_unaligned()
+                            };
+                            let bytes = unsafe { sin6.sin6_addr.u.Byte };
+                            ips.push(IpAddr::V6(std::net::Ipv6Addr::from(bytes)));
                         }
-                        unicast_ptr = unsafe { (*unicast_ptr).Next };
                     }
-                    adapter_ptr = unsafe { (*adapter_ptr).Next };
+                    unicast_ptr = unsafe { (*unicast_ptr).Next };
                 }
-                return ips;
-            } else if ret == ERROR_BUFFER_OVERFLOW && buf_len > 0 {
-                continue;
-            } else {
-                break;
+                adapter_ptr = unsafe { (*adapter_ptr).Next };
             }
-        }
-        ips
-    }
-
-    #[cfg(unix)]
-    {
-        let mut ips = Vec::new();
-        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-        if unsafe { libc::getifaddrs(&mut ifap) } != 0 || ifap.is_null() {
             return ips;
+        } else if ret == ERROR_BUFFER_OVERFLOW && buf_len > 0 {
+            continue;
+        } else {
+            break;
         }
-        let mut cur = ifap;
-        while !cur.is_null() {
-            let addr_ptr = unsafe { (*cur).ifa_addr };
-            if !addr_ptr.is_null() {
-                let family = unsafe { (*addr_ptr).sa_family } as i32;
-                if family == libc::AF_INET {
-                    let sin = unsafe { (addr_ptr as *const libc::sockaddr_in).read_unaligned() };
-                    let addr = u32::from_be(sin.sin_addr.s_addr);
-                    ips.push(IpAddr::V4(Ipv4Addr::from(addr)));
-                } else if family == libc::AF_INET6 {
-                    let sin6 = unsafe { (addr_ptr as *const libc::sockaddr_in6).read_unaligned() };
-                    ips.push(IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
-                }
-            }
-            cur = unsafe { (*cur).ifa_next };
-        }
-        unsafe { libc::freeifaddrs(ifap) };
-        ips
     }
-
-    #[cfg(not(any(windows, unix)))]
-    {
-        Vec::new()
-    }
+    ips
 }
 
 pub(crate) fn is_local_or_loopback_ip(ip: IpAddr, local_ips: &[IpAddr]) -> bool {
