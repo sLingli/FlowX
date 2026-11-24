@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Windows Rust Build & Test
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy linter
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Run unit tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: CLI offline smoke test
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\target\release\flowx.exe --version
+          .\target\release\flowx.exe --help | Out-Null
+          $statusJson = .\target\release\flowx.exe --config flowx.example.xml --offline status --json
+          $status = $statusJson | ConvertFrom-Json
+          if ($status.mode -ne 'offline') { throw "Unexpected status mode: $($status.mode)" }
+          $simJson = .\target\release\flowx.exe --config flowx.example.xml --offline sim --app git.exe --target api.github.com:443 --json
+          $sim = $simJson | ConvertFrom-Json
+          if ($sim.action -notmatch 'Proxy') { throw "Unexpected sim action: $($sim.action)" }
+          $docJson = .\target\release\flowx.exe --config flowx.example.xml --offline transparent doctor --json
+          $null = $docJson | ConvertFrom-Json
+
+  validate-skill:
+    name: Validate AI Agent Skill
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate skills/flowx structure and frontmatter
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+
+          skill_dir = pathlib.Path("skills/flowx")
+          skill_md = skill_dir / "SKILL.md"
+          raw = skill_md.read_bytes()
+          if b"\r\n" in raw:
+              sys.exit("SKILL.md must use LF line endings (found CRLF)")
+
+          text = raw.decode("utf-8")
+          m = re.match(r"^---\n(.*?)\n---\n", text, re.DOTALL)
+          if not m:
+              sys.exit("SKILL.md is missing valid LF YAML frontmatter")
+
+          fields = {}
+          for line in m.group(1).splitlines():
+              if not line.strip() or line.lstrip().startswith("#"):
+                  continue
+              if ":" not in line:
+                  sys.exit(f"Invalid frontmatter line: {line}")
+              k, v = line.split(":", 1)
+              fields[k.strip()] = v.strip().strip('"').strip("'")
+
+          allowed = {"name", "description", "license", "allowed-tools", "metadata"}
+          extra = set(fields) - allowed
+          if extra:
+              sys.exit(f"Unexpected frontmatter keys: {sorted(extra)}")
+          if fields.get("name") != "flowx":
+              sys.exit(f"Expected name 'flowx', got {fields.get('name')!r}")
+          desc = fields.get("description", "")
+          if not desc or len(desc) > 1024 or "<" in desc or ">" in desc:
+              sys.exit("Invalid SKILL.md description")
+
+          required_files = [
+              skill_dir / "references" / "api-and-auth-semantics.md",
+              skill_dir / "agents" / "openai.yaml",
+          ]
+          for req in required_files:
+              if not req.is_file():
+                  sys.exit(f"Missing required skill file: {req}")
+
+          openai_yaml = (skill_dir / "agents" / "openai.yaml").read_text(encoding="utf-8")
+          for key in ("display_name:", "short_description:", "default_prompt:"):
+              if key not in openai_yaml:
+                  sys.exit(f"Missing {key} in agents/openai.yaml")
+
+          print("Skill validation passed cleanly.")
+          PY

@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  WINDIVERT_VERSION: "2.2.2"
+  WINDIVERT_URL: "https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip"
+  WINDIVERT_SHA256: "63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15"
+
+jobs:
+  release:
+    name: Build & Package Windows Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve version and validate tag
+        shell: pwsh
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cargoToml = Get-Content Cargo.toml -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw "Failed to parse version from Cargo.toml"
+          }
+          $crateVersion = $Matches[1]
+
+          if ($env:REF_TYPE -eq 'tag') {
+            $tag = $env:REF_NAME
+            $tagNoV = $tag -replace '^v', ''
+            $tagBase = ($tagNoV -split '-', 2)[0]
+            if ($tagBase -ne $crateVersion) {
+              throw "Tag '$tag' does not match Cargo.toml version '$crateVersion'"
+            }
+            $releaseVersion = $tagNoV
+            $isPre = ($tagNoV -match '-').ToString().ToLowerInvariant()
+          } else {
+            $releaseVersion = "$crateVersion-ci.$($env:GITHUB_RUN_NUMBER)"
+            $isPre = "true"
+          }
+
+          "VERSION=$releaseVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "IS_PRERELEASE=$isPre" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Packaging FlowX version $releaseVersion (prerelease=$isPre)"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify Clippy and unit tests before release
+        run: |
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Download and verify official WinDivert driver
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tmpDir = Join-Path $env:RUNNER_TEMP "windivert"
+          New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
+          $zipPath = Join-Path $tmpDir "WinDivert-$($env:WINDIVERT_VERSION)-A.zip"
+
+          Invoke-WebRequest -Uri $env:WINDIVERT_URL -OutFile $zipPath -UseBasicParsing
+          $actualHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:WINDIVERT_SHA256.ToLowerInvariant()) {
+            throw "WinDivert SHA-256 mismatch! Expected $($env:WINDIVERT_SHA256), got $actualHash"
+          }
+
+          $extractDir = Join-Path $tmpDir "extracted"
+          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
+
+          $dllFile = Get-ChildItem -Path $extractDir -Recurse -File -Filter "WinDivert.dll" |
+            Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
+          $sysFile = Get-ChildItem -Path $extractDir -Recurse -File -Filter "WinDivert64.sys" |
+            Where-Object { $_.Directory.Name -eq "x64" } | Select-Object -First 1
+          $licenseFile = Get-ChildItem -Path $extractDir -Recurse -File -Filter "LICENSE*" |
+            Select-Object -First 1
+
+          if (-not $dllFile -or -not $sysFile -or -not $licenseFile) {
+            throw "Missing required WinDivert x64 files or LICENSE inside archive"
+          }
+
+          "WD_DLL=$($dllFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WD_SYS=$($sysFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "WD_LICENSE=$($licenseFile.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Assemble release archives and SHA256SUMS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = $env:VERSION
+          $stage = Join-Path $env:RUNNER_TEMP "stage"
+          $dist = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Force -Path $stage, $dist | Out-Null
+
+          # 1. Full Windows bundle (binary + WinDivert driver + skill + docs)
+          $fullRoot = Join-Path $stage "full"
+          New-Item -ItemType Directory -Force -Path (Join-Path $fullRoot "driver") | Out-Null
+          Copy-Item .\target\release\flowx.exe $fullRoot
+          Copy-Item .\flowx.example.xml, .\README.md, .\LICENSE $fullRoot
+          Copy-Item $env:WD_DLL (Join-Path $fullRoot "driver\WinDivert.dll")
+          Copy-Item $env:WD_SYS (Join-Path $fullRoot "driver\WinDivert64.sys")
+          Copy-Item $env:WD_LICENSE (Join-Path $fullRoot "driver\LICENSE-WinDivert.txt")
+          Copy-Item .\skills (Join-Path $fullRoot "skills") -Recurse
+          $fullZip = Join-Path $dist "flowx-$ver-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $fullRoot "*") -DestinationPath $fullZip -Force
+
+          # 2. Lite Windows bundle (pure MIT binary without third-party driver)
+          $liteRoot = Join-Path $stage "lite"
+          New-Item -ItemType Directory -Force -Path $liteRoot | Out-Null
+          Copy-Item .\target\release\flowx.exe $liteRoot
+          Copy-Item .\flowx.example.xml, .\README.md, .\LICENSE $liteRoot
+          $liteZip = Join-Path $dist "flowx-$ver-windows-x64-lite.zip"
+          Compress-Archive -Path (Join-Path $liteRoot "*") -DestinationPath $liteZip -Force
+
+          # 3. Standalone AI Agent Skill bundle
+          $skillRoot = Join-Path $stage "skill"
+          New-Item -ItemType Directory -Force -Path $skillRoot | Out-Null
+          Copy-Item .\skills (Join-Path $skillRoot "skills") -Recurse
+          Copy-Item .\LICENSE $skillRoot
+          $skillZip = Join-Path $dist "flowx-skill-$ver.zip"
+          Compress-Archive -Path (Join-Path $skillRoot "*") -DestinationPath $skillZip -Force
+
+          # Generate SHA256SUMS.txt
+          $checksumLines = Get-ChildItem -Path $dist -Filter "*.zip" | Sort-Object Name | ForEach-Object {
+            $h = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $($_.Name)"
+          }
+          $checksumLines | Set-Content -Path (Join-Path $dist "SHA256SUMS.txt") -Encoding ascii
+          Get-Content (Join-Path $dist "SHA256SUMS.txt")
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: flowx-release-${{ env.VERSION }}
+          path: dist/*
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt

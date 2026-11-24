@@ -1,4 +1,5 @@
 /target
+/dist
 /flowx.xml
 .*flowx*.tmp*
 .*.xml.lock
