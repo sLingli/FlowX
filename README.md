@@ -1,20 +1,18 @@
 <div align="center">
   <img src="icon.svg" alt="FlowX" width="120" height="120">
   <h1>FlowX</h1>
-  <p><strong>基于 Rust 异步运行时（Tokio）构建的跨平台进程级透明代理与分流引擎</strong></p>
-  <p>Windows / Linux / macOS · 混合协议入站 · WinDivert 系统级透明接管 · Fake-IP / 被动观测 DNS · XML 配置持久化 · 单文件 Web 控制台</p>
+  <p><strong>基于 Rust 异步运行时（Tokio）构建的 Windows 进程级透明代理与分流引擎</strong></p>
+  <p>Windows 原生 · 混合协议入站 · WinDivert 系统级透明接管 · Fake-IP / 同步观测 DNS · XML 配置持久化 · 单文件 Web 控制台</p>
 </div>
 
-## 平台支持
+## 平台要求
 
 | 平台 | 进程四元组追踪 | 透明代理 | 停机信号 |
 |---|---|---|---|
 | Windows | `GetExtendedTcpTable` + WinDivert `SOCKET` 层 + `QueryFullProcessImageNameW` | 支持（WinDivert 2.2 + `smoltcp` 用户态 TCP/IP 栈） | `Ctrl+C` |
-| Linux | `/proc/net/tcp[6]` → socket inode → `/proc/<pid>/fd` → `/proc/<pid>/exe` | 本地混合入站模式 | `SIGINT` / `SIGTERM`（兼容 `systemctl stop`） |
-| macOS | `libproc` (`proc_listpids` / `PROC_PIDFDSOCKETINFO` / `PROC_PIDTBSDINFO`，兼容双栈 `INI_IPV4 \| INI_IPV6`) | 本地混合入站模式 | `SIGINT` / `SIGTERM`（兼容 `launchd`） |
 
-- **Unix 权限**：默认端口（`1053` / `40001` / `40080`）均大于 1024，普通用户即可运行，且在 Unix 下写回 `flowx.xml` 时强制使用 `0600` 私有文件权限；普通用户仅能反查同用户下发起的进程连接，Linux 跨用户识别可通过 `sudo` 或授予 `CAP_SYS_PTRACE` + `CAP_DAC_READ_SEARCH` 能力（`sudo setcap cap_sys_ptrace,cap_dac_read_search+ep ./flowx`），macOS 跨用户进程反查需以 `sudo` 运行。
-- **规则跨平台互通与安全限制**：应用程序规则中的 `.exe` 后缀双向兼容，`git.exe` 可匹配 Linux / macOS 下的 `git`，`git` 也可匹配 Windows 下的 `git.exe`；`%ComputerName%` / `%HOSTNAME%` 在拆词之后解析并过滤 `;` / 通配符 / CIDR 等元字符，防止主机名注入。
+- **运行环境**：FlowX 仅面向 Windows 平台构建与运行；显式本地混合入站模式普通用户即可运行，系统级透明代理需以管理员权限启动（支持 Web 控制台一键 UAC 提权平滑接管端口）。
+- **规则匹配与安全限制**：应用程序规则支持进程名与 Windows 路径 Glob 通配（省略 `.exe` 的简写如 `git` 也可匹配 `git.exe`）；`%ComputerName%` 在按 `;` 拆词之后解析并过滤 `;` / 通配符 / CIDR 等元字符，防止主机名注入。
 - **代理认证与节点安全**：`HTTP` 与 `SOCKS5` 节点强制要求用户名与密码成对配置（清空密码会同步清除用户名；`HTTP` 用户名禁止包含冒号 `:`；历史 XML 若遗留孤立 `<Username>` 无 `<Password>`，启动时会自动告警并降级清空用户名以免阻断启动），`SOCKS4` 仅支持可选 `UserID`（禁止携带密码）。节点名称、用户名与密码均禁止控制字符与超长（>255 字节）输入；节点地址禁止指向 Fake-IP（`198.18.0.0/15` / `[::ffff:198.18.0.x]`）或本机/回环中的 FlowX 自身服务端口，并支持通过上游 DNS `A + AAAA` 对称解析纯 IPv6 域名节点进行连通性测速（Ping）与实际出站拨号。
 
 ## 默认监听端口
@@ -49,7 +47,7 @@ Windows 下支持通过 WinDivert 2.2 实现无需逐一配置应用代理的系
 1. **驱动准备**：从 WinDivert 官方发行包获取同版本 `WinDivert.dll` 与 `WinDivert64.sys`，将两者放置于 `flowx.exe` 同级目录（或通过 Web 控制台 / `flowx transparent config --dll-path <绝对路径>` / `<TransparentProxy><DllPath>` 指定同目录成对文件）。
 2. **权限要求**：开启透明接管需要管理员权限。可直接以管理员终端启动 `flowx --transparent`，或在普通用户启动后于 Web 控制台点击「以管理员重启并开启」通过 UAC 自动平滑交接端口（`--replace-pid`）。
 3. **DNS 与域名路由边界**：
-   - **选择性 Fake-IP 与纯被动观测 (`InspectDns`)**：仅对命中域名/代理规则的独立进程分配 Fake-IP（保留原始分域 DNS 及 IPv6 `fe80::` 接口 `scope_id`，支持多 DNS 并存且权威 `NXDOMAIN` 不泄露至公网 DNS）；对共享系统 DNS 解析器（如 `svchost.exe` `Dnscache`）采用原包直通 + 独立入站 `SNIFF | RECV_ONLY` 旁路观测学习 `real_ip -> domain`，绝不吞包或影响 VPN/多网卡/EDNS0 响应。
+   - **选择性 Fake-IP 与同步观测 (`InspectDns`)**：仅对命中域名/代理规则的独立进程分配 Fake-IP（保留原始分域 DNS 及 IPv6 `fe80::` 接口 `scope_id`，支持多 DNS 并存且权威 `NXDOMAIN` 不泄露至公网 DNS）；对共享系统 DNS 解析器（如 `svchost.exe` `Dnscache`）采用出站原包直通 + 独立入站内联同步观测学习 `real_ip -> domain` 后再无条件原样重注入 OS，消除高并发下 DNS 应答与 TCP SYN 竞态，绝不丢弃或篡改 VPN/多网卡/EDNS0 响应。
    - **TLS SNI / HTTP Host 首包嗅探**：命中代理规则时，除明确服务端先发协议端口（如 `21/22/23/25/110/143/587/3306/5900`）外，在标准与非标准端口（如 `443`、`8444`、`9443`、`2083`、`3000`）均优先执行支持多 Record `ClientHello` 的权威 SNI/Host 嗅探，并将权威域名提交给远端代理。
    - **内网/VPN 私有后缀边界说明**：`.lan`、`.localdomain`、`.home`、`.corp`、`.internal`、`.intranet`、`.ts.net` 等私有后缀在 **DNS 阶段** 不会被 `DevProxy` 等无域名通配规则或全局默认代理隐式劫持（用户显式编写匹配这些后缀的规则仍可生效）；但请注意，若这些域名解析到的真实 IP（如企业内网 `10.0.0.0/8`、`172.16.0.0/12` 或 Tailscale CGNAT `100.64.0.0/10`）不在默认 `LocalBypass` 的 `192.168.0.0/16` 范围内，**TCP 阶段** 命中 `DevProxy`（如 `chrome.exe -> Proxy`）的连接仍会通过 TLS SNI 送往代理节点。如需对这些内网/VPN 网段或后缀直连，请将其补充到 `LocalBypass`（例如追加 `10.0.0.0/8; 172.16.0.0/12; 100.64.0.0/10; *.ts.net; *.corp`）。
 
@@ -105,7 +103,7 @@ curl -x socks5h://127.0.0.1:40001 https://example.com
 curl -x http://127.0.0.1:40001 https://example.com
 ```
 
-在控制台中可以看到发起进程（Windows 下为 `curl.exe`，Linux 下为 `curl`）、PID、目标域名、命中的规则及实时速率。
+在控制台中可以看到发起进程（如 `curl.exe`）、PID、目标域名、命中的规则及实时速率。
 
 ## 配置文件 (`flowx.xml`)
 

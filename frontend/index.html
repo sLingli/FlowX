@@ -2326,7 +2326,7 @@
           </button>
           <div>
             <h1 class="page-title" id="view-title" tabindex="-1">Overview</h1>
-            <p class="page-subtitle" id="view-subtitle">Mixed Inbound · Process Tracking (Windows / Linux / macOS) · Fake-IP DNS</p>
+            <p class="page-subtitle" id="view-subtitle">Mixed Inbound · Windows Process Tracking · Fake-IP DNS</p>
           </div>
         </div>
         <div class="topbar-right">
@@ -2797,7 +2797,7 @@
       </div>
       <div class="form-group">
         <label class="form-label" for="rule-apps" data-i18n="form_rule_apps">Application filter (semicolon-separated, wildcards supported)</label>
-        <div class="form-hint" id="rule-apps-hint" style="margin-top:0; margin-bottom:6px;" data-i18n="form_rule_apps_hint">Leave empty for all processes; .exe matches both Windows and Unix</div>
+        <div class="form-hint" id="rule-apps-hint" style="margin-top:0; margin-bottom:6px;" data-i18n="form_rule_apps_hint">Leave empty for all processes; supports process names (with or without .exe) and Windows paths</div>
         <input type="text" class="form-input mono" id="rule-apps" aria-describedby="rule-apps-hint" data-i18n-placeholder="form_rule_apps_ph" placeholder="chrome.exe; *edge*.exe; node.exe" autocomplete="off">
       </div>
       <div class="form-group">
@@ -2873,7 +2873,7 @@
         sidebar_config: '配置文件',
 
         topbar_title_dashboard: '实时概览',
-        topbar_sub_dashboard: '混合入站 · 跨平台进程追踪 (Windows / Linux / macOS) · Fake-IP DNS',
+        topbar_sub_dashboard: '混合入站 · Windows 进程追踪 · Fake-IP DNS',
         topbar_title_connections: '活跃连接',
         topbar_sub_connections: '实时追踪本地进程出站会话、规则命中与流量统计',
         topbar_title_proxies: '代理节点',
@@ -3045,7 +3045,7 @@
         form_rule_name_ph: 'BrowserProxy',
         form_rule_apps: '应用程序筛选（分号分隔，支持通配符）',
         form_rule_apps_ph: 'chrome.exe; *edge*.exe; node.exe',
-        form_rule_apps_hint: '留空匹配全部进程；.exe 后缀跨平台互通（git.exe 可匹配 Linux 下的 git）',
+        form_rule_apps_hint: '留空匹配全部进程；支持进程名（可省略 .exe）或 Windows 路径通配',
         form_rule_targets: '目标地址筛选（域名 / IP / CIDR，分号分隔）',
         form_rule_targets_ph: '*.github.com; 1.1.1.1/32; localhost',
         form_rule_targets_hint: '留空匹配全部目标地址',
@@ -3112,7 +3112,6 @@
         tp_status_running: '运行中',
         tp_status_disabled: '已关闭',
         tp_status_pending: '待就绪',
-        tp_status_unsupported: '仅支持 Windows',
         tp_admin_yes: '管理员',
         tp_admin_no: '标准用户',
         tp_opt_dns_title: '选择性 DNS 劫持 (UDP/53)',
@@ -3132,7 +3131,6 @@
         tp_stat_pass: '直连放行包',
         tp_stat_dns: '劫持 DNS 包',
         tp_stat_blocked: '阻断 RST/QUIC',
-        tp_msg_unsupported: '当前宿主机非 Windows 系统，WinDivert 透明代理不可用（本地混合入站仍正常运行）',
         tp_msg_need_admin: '当前以标准用户权限运行。开启系统级透明代理需点击「以管理员重启并开启」并通过 UAC 授权',
         tp_msg_missing_driver: '未检测到完整驱动文件：请将 WinDivert.dll 与 WinDivert64.sys 置于程序同级目录或配置路径。已搜索目录：{dirs}',
         tp_msg_elevating: '正在等待 Windows UAC 管理员授权并重启 FlowX 实例',
@@ -3147,7 +3145,6 @@
         toast_tp_elevate_fail: '提权重启失败',
         tp_err_requires_admin: '开启系统级透明代理需要管理员权限',
         tp_err_missing_driver: '未找到 WinDivert.dll 或 WinDivert64.sys 驱动文件',
-        tp_err_unsupported_os: '当前操作系统不支持 WinDivert 透明代理（仅支持 Windows）',
         tp_err_load_failed: '加载 WinDivert.dll 失败',
         tp_err_open_socket: '打开 WinDivert SOCKET 层句柄失败',
         tp_err_open_network: '打开 WinDivert NETWORK 层句柄失败',
@@ -3177,7 +3174,7 @@
         sidebar_config: 'Profile',
 
         topbar_title_dashboard: 'Overview',
-        topbar_sub_dashboard: 'Mixed Inbound · Process Tracking (Windows / Linux / macOS) · Fake-IP DNS',
+        topbar_sub_dashboard: 'Mixed Inbound · Windows Process Tracking · Fake-IP DNS',
         topbar_title_connections: 'Active connections',
         topbar_sub_connections: 'Real-time outbound session tracking, rule matching and throughput',
         topbar_title_proxies: 'Proxy nodes',
@@ -3349,7 +3346,7 @@
         form_rule_name_ph: 'BrowserProxy',
         form_rule_apps: 'Application filter (semicolon-separated, wildcards supported)',
         form_rule_apps_ph: 'chrome.exe; *edge*.exe; node.exe',
-        form_rule_apps_hint: 'Leave empty for all processes; .exe matches both Windows and Unix',
+        form_rule_apps_hint: 'Leave empty for all processes; supports process names (with or without .exe) and Windows paths',
         form_rule_targets: 'Target address filter (Domain / IP / CIDR, semicolon-separated)',
         form_rule_targets_ph: '*.github.com; 1.1.1.1/32; localhost',
         form_rule_targets_hint: 'Leave empty to match all target destinations',
@@ -3416,7 +3413,6 @@
         tp_status_running: 'Running',
         tp_status_disabled: 'Disabled',
         tp_status_pending: 'Standby',
-        tp_status_unsupported: 'Windows only',
         tp_admin_yes: 'Administrator',
         tp_admin_no: 'Standard user',
         tp_opt_dns_title: 'Selective DNS interception (UDP/53)',
@@ -3436,7 +3432,6 @@
         tp_stat_pass: 'Passthrough',
         tp_stat_dns: 'DNS hijacked',
         tp_stat_blocked: 'RST / QUIC',
-        tp_msg_unsupported: 'WinDivert transparent proxying is only supported on Windows (local mixed inbound remains active)',
         tp_msg_need_admin: 'Running without Administrator privileges. Choose Restart as Administrator and approve UAC to capture system traffic',
         tp_msg_missing_driver: 'WinDivert binaries missing: place WinDivert.dll and WinDivert64.sys next to flowx.exe or set a custom DLL path. Searched: {dirs}',
         tp_msg_elevating: 'Waiting for Windows UAC confirmation and elevated FlowX instance restart',
@@ -3451,7 +3446,6 @@
         toast_tp_elevate_fail: 'Administrator elevation failed',
         tp_err_requires_admin: 'Administrator privileges are required to enable transparent proxy',
         tp_err_missing_driver: 'WinDivert.dll or WinDivert64.sys binaries were not found',
-        tp_err_unsupported_os: 'WinDivert transparent proxy is only supported on Windows',
         tp_err_load_failed: 'Failed to load WinDivert.dll',
         tp_err_open_socket: 'Failed to open WinDivert SOCKET layer handle',
         tp_err_open_network: 'Failed to open WinDivert NETWORK layer handle',
@@ -4162,7 +4156,6 @@
       const card = document.getElementById('tp-card');
       if (!card) return;
       const d = tp || {};
-      const supported = Boolean(d.supported);
       const enabled = Boolean(d.enabled);
       const running = Boolean(d.running);
       const elevated = Boolean(d.elevated);
@@ -4170,9 +4163,7 @@
       const sysFound = Boolean(d.sys_found);
 
       const statusBadge = document.getElementById('tp-status-badge');
-      if (!supported) {
-        setStatusChip(statusBadge, '', t('tp_status_unsupported'));
-      } else if (running) {
+      if (running) {
         setStatusChip(statusBadge, 'live', t('tp_status_running'));
       } else if (enabled) {
         setStatusChip(statusBadge, 'warn', t('tp_status_pending'));
@@ -4188,7 +4179,7 @@
       }
 
       const elevateBtn = document.getElementById('btn-tp-elevate');
-      elevateBtn.style.display = supported && !elevated ? 'inline-flex' : 'none';
+      elevateBtn.style.display = !elevated ? 'inline-flex' : 'none';
 
       const masterEl = document.getElementById('tp-toggle-switch');
       const dnsEl = document.getElementById('tp-hijack-dns');
@@ -4205,7 +4196,7 @@
           dllInput.value = d.configured_dll_path || '';
         }
       }
-      const locked = state.tpBusy || state.tpElevating || !supported;
+      const locked = state.tpBusy || state.tpElevating;
       elevateBtn.disabled = locked;
       masterEl.disabled = locked;
       dnsEl.disabled = locked;
@@ -4242,9 +4233,6 @@
         alertBox.className = 'tp-alert info';
         alertText.textContent = t('tp_msg_elevating');
         alertBox.style.display = 'flex';
-      } else if (tp && !supported) {
-        alertText.textContent = t('tp_msg_unsupported');
-        alertBox.style.display = 'flex';
       } else if (tp && (!dllFound || !sysFound)) {
         alertBox.className = 'tp-alert error';
         alertBox.setAttribute('role', 'alert');
@@ -4269,7 +4257,6 @@
       const map = [
         ['ERR_TRANSPARENT_REQUIRES_ADMIN:', 'tp_err_requires_admin'],
         ['ERR_TRANSPARENT_MISSING_DRIVER:', 'tp_err_missing_driver'],
-        ['ERR_TRANSPARENT_UNSUPPORTED_OS:', 'tp_err_unsupported_os'],
         ['ERR_TRANSPARENT_LOAD_FAILED:', 'tp_err_load_failed'],
         ['ERR_TRANSPARENT_OPEN_SOCKET_LAYER:', 'tp_err_open_socket'],
         ['ERR_TRANSPARENT_OPEN_NETWORK_LAYER:', 'tp_err_open_network'],
@@ -4285,7 +4272,7 @@
           const localized = t(key);
           const detail = msg.slice(prefix.length).trim();
           // 英文错误仅附加简短诊断明细（如底层 Win32 错误码），常规文案直接使用当前界面语言
-          if (state.lang === 'zh-CN' && (prefix === 'ERR_TRANSPARENT_REQUIRES_ADMIN:' || prefix === 'ERR_TRANSPARENT_UNSUPPORTED_OS:' || prefix === 'ERR_TRANSPARENT_UAC_CANCELLED:' || prefix === 'ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:' || prefix === 'ERR_TRANSPARENT_ALREADY_ELEVATED:')) {
+          if (state.lang === 'zh-CN' && (prefix === 'ERR_TRANSPARENT_REQUIRES_ADMIN:' || prefix === 'ERR_TRANSPARENT_UAC_CANCELLED:' || prefix === 'ERR_TRANSPARENT_ELEVATE_IN_PROGRESS:' || prefix === 'ERR_TRANSPARENT_ALREADY_ELEVATED:')) {
             return localized;
           }
           return detail ? `${localized} (${detail})` : localized;
