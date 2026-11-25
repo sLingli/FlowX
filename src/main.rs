@@ -1,29 +1,6 @@
 #[cfg(not(windows))]
 compile_error!("FlowX only supports Windows.");
 
-#[cfg(windows)]
-pub mod api;
-#[cfg(windows)]
-pub mod cli;
-#[cfg(windows)]
-pub mod config;
-#[cfg(windows)]
-pub mod dns;
-#[cfg(windows)]
-pub mod i18n;
-#[cfg(windows)]
-pub mod inbound;
-#[cfg(windows)]
-pub mod interceptor;
-#[cfg(windows)]
-pub mod monitor;
-#[cfg(windows)]
-pub mod outbound;
-#[cfg(windows)]
-pub mod router;
-#[cfg(windows)]
-pub mod transparent;
-
 #[cfg(not(windows))]
 fn main() {}
 
@@ -43,16 +20,16 @@ mod entry {
     use tracing::{info, warn, Level};
     use tracing_subscriber::FmtSubscriber;
 
-    use crate::api::{ApiServer, SystemRuntimeContext};
-    use crate::cli;
-    use crate::config::ConfigStore;
-    use crate::dns::server::DnsServer;
-    use crate::dns::FakeIpPool;
-    use crate::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
-    use crate::interceptor::process::ProcessTracker;
-    use crate::monitor::{ConnectionManager, InFlightTracker};
-    use crate::router::RuleEngine;
-    use crate::transparent::TransparentManager;
+    use flowx::api::{ApiServer, SystemRuntimeContext};
+    use flowx::cli;
+    use flowx::config::ConfigStore;
+    use flowx::dns::server::DnsServer;
+    use flowx::dns::FakeIpPool;
+    use flowx::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
+    use flowx::interceptor::process::ProcessTracker;
+    use flowx::monitor::{ConnectionManager, InFlightTracker};
+    use flowx::router::RuleEngine;
+    use flowx::transparent::TransparentManager;
 
     pub(super) const REPLACE_PID_WAIT_TIMEOUT: Duration = Duration::from_secs(20);
     const NORMAL_DRAIN_WAIT: Duration = Duration::from_secs(10);

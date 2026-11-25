@@ -1159,7 +1159,7 @@ async fn handle_api_request(
     let (mut status, mut content_type, mut body) = match (method, path) {
         ("OPTIONS", _) => ("204 No Content", "text/plain", String::new()),
         ("GET", "/") | ("GET", "/dashboard") => {
-            let html = include_str!("../../frontend/index.html");
+            let html = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/frontend/index.html"));
             ("200 OK", "text/html; charset=utf-8", html.to_string())
         }
         ("GET", "/api/health") => (
