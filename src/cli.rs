@@ -7,13 +7,14 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::api::{
-    handle_add_node, handle_add_rule, handle_patch_node, handle_patch_rule,
-    handle_set_default_action, handle_simulate_route, ping_address, proxy_node_view,
-    AddNodeRequest, AddRuleRequest, PatchNodeRequest, PatchRuleRequest, PingResponse,
+use crate::config::ConfigStore;
+use crate::control::node::{add_node, list_nodes, patch_node, ping_address};
+use crate::control::routing::{set_default_action, simulate_route};
+use crate::control::rule::{add_rule, patch_rule};
+use crate::control::{
+    AddNodeRequest, AddRuleRequest, ControlError, PatchNodeRequest, PatchRuleRequest, PingResponse,
     ProxyNodeView, SetDefaultActionRequest, SimulateRouteRequest,
 };
-use crate::config::ConfigStore;
 use crate::i18n::Locale;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::router::{format_action_desc, Action, RuleEngine, RuleView};
@@ -1286,21 +1287,12 @@ fn ensure_api_ok(status: u16, val: Value) -> Result<Value> {
     }
 }
 
-fn ensure_offline_handler_ok(status_line: &str, body: &str) -> Result<Value> {
-    let val: Value =
-        serde_json::from_str(body).unwrap_or_else(|_| json!({ "raw": body, "error": body }));
-    let status = status_line
-        .split_whitespace()
-        .next()
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(500);
-    if (200..300).contains(&status) {
-        Ok(val)
-    } else {
-        Err(anyhow::Error::new(ApiHttpError::from_value(
-            status, val, true,
-        )))
-    }
+fn control_err_to_cli(err: ControlError, locale: Locale) -> anyhow::Error {
+    anyhow::Error::new(ApiHttpError::from_value(
+        err.kind.status_code(),
+        err.to_localized_value(locale),
+        true,
+    ))
 }
 
 struct OfflineRuntime {
@@ -2067,10 +2059,7 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     serde_json::from_value(v)?
                 } else {
                     let rt = load_offline_runtime_readonly(&opts.config_path)?;
-                    let guard = rt.nodes.read().unwrap_or_else(|e| e.into_inner());
-                    let mut v: Vec<ProxyNodeView> = guard.values().map(proxy_node_view).collect();
-                    v.sort_by_key(|n| n.id);
-                    v
+                    list_nodes(&rt.nodes)
                 };
 
             if opts.json_output {
@@ -2134,10 +2123,10 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 let rt = load_offline_runtime(&opts.config_path)?;
                 let req: AddNodeRequest = serde_json::from_value(payload)?;
-                let (st, _, body) = handle_add_node(req, &rt.nodes, &DEFAULT_SELF_PORTS, opts.locale);
-                let val = ensure_offline_handler_ok(st, &body)?;
+                let new_id = add_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 rt.save()?;
-                val
+                json!({ "ok": true, "id": new_id })
             };
 
             if opts.json_output {
@@ -2219,11 +2208,10 @@ async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 let rt = load_offline_runtime(&opts.config_path)?;
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
-                let (st, _, body) =
-                    handle_patch_node(req, &rt.nodes, &DEFAULT_SELF_PORTS, opts.locale);
-                let val = ensure_offline_handler_ok(st, &body)?;
+                let updated_id = patch_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 rt.save()?;
-                val
+                json!({ "ok": true, "id": updated_id })
             };
 
             if opts.json_output {
@@ -2641,10 +2629,10 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             } else {
                 let rt = load_offline_runtime(&opts.config_path)?;
                 let req: AddRuleRequest = serde_json::from_value(payload)?;
-                let (st, _, body) = handle_add_rule(req, &rt.engine, &rt.nodes, opts.locale);
-                let val = ensure_offline_handler_ok(st, &body)?;
+                let new_id = add_rule(req, &rt.engine, &rt.nodes)
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 rt.save()?;
-                val
+                json!({ "ok": true, "id": new_id })
             };
 
             if opts.json_output {
@@ -2766,10 +2754,10 @@ async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                         "enabled": enabled,
                     });
                     let req: PatchRuleRequest = serde_json::from_value(payload)?;
-                    let (st, _, body) = handle_patch_rule(req, &rt.engine, &rt.nodes, opts.locale);
-                    let val = ensure_offline_handler_ok(st, &body)?;
+                    let updated_id = patch_rule(req, &rt.engine, &rt.nodes)
+                        .map_err(|e| control_err_to_cli(e, opts.locale))?;
                     rt.save()?;
-                    (resolved_id, val)
+                    (resolved_id, json!({ "ok": true, "id": updated_id }))
                 }
             };
 
@@ -3011,10 +2999,10 @@ async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         } else {
             let rt = load_offline_runtime(&opts.config_path)?;
             let req: SetDefaultActionRequest = serde_json::from_value(payload)?;
-            let (st, _, body) = handle_set_default_action(req, &rt.engine, &rt.nodes, opts.locale);
-            let val = ensure_offline_handler_ok(st, &body)?;
+            let resp = set_default_action(req, &rt.engine, &rt.nodes, opts.locale)
+                .map_err(|e| control_err_to_cli(e, opts.locale))?;
             rt.save()?;
-            val
+            serde_json::to_value(resp)?
         };
 
         if opts.json_output {
@@ -3114,8 +3102,9 @@ async fn cmd_sim(opts: &GlobalCliOpts) -> Result<()> {
     } else {
         let rt = load_offline_runtime_readonly(&opts.config_path)?;
         let req: SimulateRouteRequest = serde_json::from_value(payload)?;
-        let (st, _, body) = handle_simulate_route(req, &rt.engine, opts.locale);
-        ensure_offline_handler_ok(st, &body)?
+        let resp = simulate_route(req, &rt.engine, opts.locale)
+            .map_err(|e| control_err_to_cli(e, opts.locale))?;
+        serde_json::to_value(resp)?
     };
 
     if opts.json_output {

@@ -4,26 +4,38 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Mutex, Semaphore};
 use tracing::{error, info};
 
 use crate::config::ConfigStore;
-use crate::dns::FakeIpPool;
+use crate::control::node::{
+    add_node, delete_node, list_nodes, patch_node, ping_address_with_context, update_node,
+};
+use crate::control::routing::{build_system_info, set_default_action, simulate_route_with_pool};
+use crate::control::rule::{
+    add_rule, delete_rule, move_rule, patch_rule, toggle_rule, update_rule,
+};
+use crate::control::transparent::{
+    apply_transparent_config_fields, classify_transparent_apply_error,
+    classify_transparent_elevate_error, transparent_status_or_fallback,
+};
+use crate::control::ControlError;
 use crate::i18n::{json_error, t, Locale};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::monitor::{ConnectionManager, InFlightTracker};
-use crate::outbound::chain::{parse_target_addr, ProxyNode};
-use crate::outbound::http::HttpConnectClient;
-use crate::outbound::socks4::Socks4Client;
-use crate::outbound::socks5::Socks5Client;
-use crate::outbound::TargetAddr;
-use crate::router::{Action, Rule, RuleEngine};
+use crate::router::{Action, RuleEngine};
 use crate::transparent::{
-    probe_status, relaunch_elevated_with_replace_pid, TransparentManager,
-    TransparentRuntimeStatus, TransparentSettings,
+    relaunch_elevated_with_replace_pid, TransparentManager, TransparentSettings,
+};
+
+pub use crate::control::{
+    AddNodeRequest, AddRuleRequest, DefaultActionResponse, MoveRuleRequest, PatchNodeRequest,
+    PatchRuleRequest, PingNodeRequest, PingResponse, ProxyNodeView, SetDefaultActionRequest,
+    SimulateRouteRequest, SimulateRouteResponse, SystemInfoResponse, SystemRuntimeContext,
+    ToggleRuleRequest, TransparentConfigRequest, TransparentToggleRequest, UpdateNodeRequest,
+    UpdateRuleRequest,
 };
 
 const API_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,203 +44,19 @@ const MAX_REQUEST_SIZE: usize = 1024 * 1024; // 1MB 上限防 DoS
 const MAX_API_CONCURRENCY: usize = 128;
 const MAX_MUTATION_CONCURRENCY: usize = 16;
 const MAX_PING_CONCURRENCY: usize = 16;
+const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 #[cfg(test)]
 pub(crate) type ElevateRunner = Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>;
 #[cfg(not(test))]
 type ElevateRunner = ();
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProxyNodeView {
-    pub id: u32,
-    pub name: String,
-    pub protocol: String,
-    pub server_addr: String,
-    pub auth_configured: bool,
-    #[serde(default)]
-    pub password_configured: bool,
-    pub username: Option<String>,
-}
-
-pub(crate) fn proxy_node_view(n: &ProxyNodeEntry) -> ProxyNodeView {
-    ProxyNodeView {
-        id: n.id,
-        name: n.name.clone(),
-        protocol: n.protocol.clone(),
-        server_addr: n.server_addr.clone(),
-        auth_configured: n.is_auth_configured(),
-        password_configured: n.client.auth_credentials().1.is_some(),
-        username: n.username.clone(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AddNodeRequest {
-    pub name: String,
-    pub protocol: String,
-    pub server_addr: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateNodeRequest {
-    pub id: u32,
-    pub name: String,
-    pub protocol: String,
-    pub server_addr: String,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub keep_password: Option<bool>,
-    pub clear_password: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PatchNodeRequest {
-    pub id: u32,
-    pub name: Option<String>,
-    pub protocol: Option<String>,
-    pub server_addr: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub keep_password: Option<bool>,
-    pub clear_password: Option<bool>,
-    pub clear_username: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PingNodeRequest {
-    pub id: u32,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PingResponse {
-    pub ok: bool,
-    pub latency_ms: u64,
-    pub message: String,
-    /// 底层错误的原始信息（不本地化，仅供排障，前端不应直接展示）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AddRuleRequest {
-    pub name: String,
-    pub apps: Option<String>,
-    pub targets: Option<String>,
-    pub ports: Option<String>,
-    pub action: String, // "Direct", "Block", "Proxy"
-    pub node_id: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct UpdateRuleRequest {
-    pub id: u64,
-    pub name: String,
-    pub apps: Option<String>,
-    pub targets: Option<String>,
-    pub ports: Option<String>,
-    pub action: String, // "Direct", "Block", "Proxy"
-    pub node_id: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PatchRuleRequest {
-    pub id: u64,
-    pub name: Option<String>,
-    pub apps: Option<String>,
-    pub targets: Option<String>,
-    pub ports: Option<String>,
-    pub action: Option<String>,
-    pub node_id: Option<u32>,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SetDefaultActionRequest {
-    pub action: String, // "Direct", "Block", "Proxy"
-    pub node_id: Option<u32>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SimulateRouteRequest {
-    pub process: Option<String>,
-    pub target: String,
-    pub port: Option<u16>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulateRouteResponse {
-    pub matched_rule_id: Option<u64>,
-    pub matched_rule_name: String,
-    pub is_default: bool,
-    pub action: String,
-    pub action_type: String,
-    pub node_id: Option<u32>,
-    pub process_name: Option<String>,
-    pub process_path: Option<String>,
-    pub target_host: Option<String>,
-    pub target_ip: Option<String>,
-    pub target_port: u16,
-    pub trace: Vec<crate::router::RuleTraceStep>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ToggleRuleRequest {
-    pub id: u64,
-    pub enabled: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MoveRuleRequest {
-    pub id: u64,
-    pub direction: String, // "up" | "down" | "top" | "bottom"
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TransparentToggleRequest {
-    pub enabled: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TransparentConfigRequest {
-    pub hijack_dns: Option<bool>,
-    pub block_quic_for_proxied: Option<bool>,
-    pub dll_path: Option<String>,
-    pub clear_dll_path: Option<bool>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SystemRuntimeContext {
-    pub inbound_addr: SocketAddr,
-    pub dns_addr: SocketAddr,
-    pub upstream_dns: SocketAddr,
-    pub api_addr: SocketAddr,
-    pub fake_ip_pool: Arc<FakeIpPool>,
-    /// 本地 Fake-IP DNS 服务是否拦截 `AAAA`/`SVCB`/`HTTPS` 防泄漏（仅作用于本地 DNS 入站）
-    pub block_ipv6: bool,
-    pub started_at: Instant,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SystemInfoResponse {
-    pub version: &'static str,
-    pub inbound_addr: String,
-    pub inbound_protocols: Vec<&'static str>,
-    pub dns_addr: String,
-    pub upstream_dns: String,
-    pub api_addr: String,
-    pub config_path: String,
-    pub fake_ip_cidr: &'static str,
-    pub fake_ip_count: usize,
-    pub uptime_secs: u64,
-    pub default_action: String,
-    pub default_action_type: String,
-    pub default_node_id: Option<u32>,
-    pub nodes_count: usize,
-    pub rules_count: usize,
-    pub enabled_rules_count: usize,
-    pub transparent: TransparentRuntimeStatus,
+fn control_error_to_http(err: ControlError, locale: Locale) -> (&'static str, &'static str, String) {
+    (
+        err.kind.http_status_line(),
+        JSON_CONTENT_TYPE,
+        err.to_localized_json(locale),
+    )
 }
 
 pub struct ApiServer {
@@ -1216,52 +1044,50 @@ async fn handle_api_request(
             }
         }
         ("GET", "/api/nodes") => {
-            let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-            let mut list: Vec<ProxyNodeView> = nodes_guard.values().map(proxy_node_view).collect();
-            list.sort_by_key(|n| n.id);
-            ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&list))
+            let list = list_nodes(&proxy_nodes);
+            ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&list))
         }
         ("POST", "/api/nodes") => match serde_json::from_str::<AddNodeRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_NODE_BODY", "error.invalid_node_body"),
             ),
-            Ok(req) => {
-                let res = handle_add_node(req, &proxy_nodes, &self_ports, locale);
-                if res.0 == "200 OK" {
+            Ok(req) => match add_node(req, &proxy_nodes, &self_ports) {
+                Ok(new_id) => {
                     should_persist = true;
+                    ("200 OK", JSON_CONTENT_TYPE, format!(r#"{{"ok":true,"id":{}}}"#, new_id))
                 }
-                res
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("PUT", "/api/nodes") => match serde_json::from_str::<UpdateNodeRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_NODE_BODY", "error.invalid_node_body"),
             ),
-            Ok(req) => {
-                let res = handle_update_node(req, &proxy_nodes, &self_ports, locale);
-                if res.0 == "200 OK" {
+            Ok(req) => match update_node(req, &proxy_nodes, &self_ports) {
+                Ok(id) => {
                     should_persist = true;
+                    ("200 OK", JSON_CONTENT_TYPE, format!(r#"{{"ok":true,"id":{}}}"#, id))
                 }
-                res
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("PATCH", "/api/nodes") => match serde_json::from_str::<PatchNodeRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_NODE_BODY", "error.invalid_node_body"),
             ),
-            Ok(req) => {
-                let res = handle_patch_node(req, &proxy_nodes, &self_ports, locale);
-                if res.0 == "200 OK" {
+            Ok(req) => match patch_node(req, &proxy_nodes, &self_ports) {
+                Ok(id) => {
                     should_persist = true;
+                    ("200 OK", JSON_CONTENT_TYPE, format!(r#"{{"ok":true,"id":{}}}"#, id))
                 }
-                res
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("DELETE", "/api/nodes") => {
             let id: Option<u32> = parse_query_param(query, "id")
@@ -1273,39 +1099,17 @@ async fn handle_api_request(
                         .and_then(|n| u32::try_from(n).ok())
                 });
             if let Some(node_id) = id {
-                // 级联防呆检查：若当前有任何路由规则或默认兜底动作指向该代理节点，禁止删除
-                let rules = rule_engine.current_rules();
-                let current_default = rule_engine.default_action();
-                let is_referenced = rules.iter().any(|r| match &r.action {
-                    Action::Proxy(pid) => *pid == node_id,
-                    _ => false,
-                }) || matches!(current_default, Action::Proxy(pid) if pid == node_id);
-                if is_referenced {
-                    (
-                        "409 Conflict",
-                        "application/json; charset=utf-8",
-                        json_error(locale, "ERR_NODE_IN_USE", "error.node_in_use"),
-                    )
-                } else {
-                    let removed = {
-                        let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-                        nodes_guard.remove(&node_id).is_some()
-                    };
-                    if removed {
+                match delete_node(node_id, &proxy_nodes, &rule_engine) {
+                    Ok(()) => {
                         should_persist = true;
-                        ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
-                    } else {
-                        (
-                            "404 Not Found",
-                            "application/json; charset=utf-8",
-                            json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
-                        )
+                        ("200 OK", JSON_CONTENT_TYPE, r#"{"ok":true}"#.to_string())
                     }
+                    Err(err) => control_error_to_http(err, locale),
                 }
             } else {
                 (
                     "400 Bad Request",
-                    "application/json; charset=utf-8",
+                    JSON_CONTENT_TYPE,
                     json_error(locale, "ERR_MISSING_NODE_ID", "error.missing_node_id"),
                 )
             }
@@ -1336,165 +1140,147 @@ async fn handle_api_request(
                         message: msg,
                         detail,
                     };
-                    ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&ping_res))
+                    ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&ping_res))
                 } else {
                     (
                         "404 Not Found",
-                        "application/json; charset=utf-8",
+                        JSON_CONTENT_TYPE,
                         json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
                     )
                 }
             } else {
                 (
                     "400 Bad Request",
-                    "application/json; charset=utf-8",
+                    JSON_CONTENT_TYPE,
                     json_error(locale, "ERR_MISSING_NODE_ID", "error.missing_node_id"),
                 )
             }
         }
         ("GET", "/api/rules") => {
             let list = rule_engine.list_rules_view_with_locale(locale);
-            ("200 OK", "application/json; charset=utf-8", serde_json_to_string(&list))
+            ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&list))
         }
         ("POST", "/api/rules") => match serde_json::from_str::<AddRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_RULE_BODY", "error.invalid_rule_body"),
             ),
-            Ok(req) => {
-                let res = handle_add_rule(req, &rule_engine, &proxy_nodes, locale);
-                if res.0 == "200 OK" {
+            Ok(req) => match add_rule(req, &rule_engine, &proxy_nodes) {
+                Ok(id) => {
                     should_persist = true;
+                    ("200 OK", JSON_CONTENT_TYPE, format!(r#"{{"ok":true,"id":{}}}"#, id))
                 }
-                res
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("PUT", "/api/rules") => match serde_json::from_str::<UpdateRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_RULE_BODY", "error.invalid_rule_body"),
             ),
-            Ok(req) => {
-                let res = handle_update_rule(req, &rule_engine, &proxy_nodes, locale);
-                if res.0 == "200 OK" {
+            Ok(req) => match update_rule(req, &rule_engine, &proxy_nodes) {
+                Ok(id) => {
                     should_persist = true;
+                    ("200 OK", JSON_CONTENT_TYPE, format!(r#"{{"ok":true,"id":{}}}"#, id))
                 }
-                res
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("PATCH", "/api/rules") => match serde_json::from_str::<PatchRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_RULE_BODY", "error.invalid_rule_body"),
             ),
-            Ok(req) => {
-                let res = handle_patch_rule(req, &rule_engine, &proxy_nodes, locale);
-                if res.0 == "200 OK" {
+            Ok(req) => match patch_rule(req, &rule_engine, &proxy_nodes) {
+                Ok(id) => {
                     should_persist = true;
+                    ("200 OK", JSON_CONTENT_TYPE, format!(r#"{{"ok":true,"id":{}}}"#, id))
                 }
-                res
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("POST", "/api/rules/default") => {
             match serde_json::from_str::<SetDefaultActionRequest>(req_body) {
                 Err(_) => (
                     "400 Bad Request",
-                    "application/json; charset=utf-8",
+                    JSON_CONTENT_TYPE,
                     json_error(
                         locale,
                         "ERR_INVALID_DEFAULT_ACTION_BODY",
                         "error.invalid_default_action_body",
                     ),
                 ),
-                Ok(req) => {
-                    let res = handle_set_default_action(req, &rule_engine, &proxy_nodes, locale);
-                    if res.0 == "200 OK" {
+                Ok(req) => match set_default_action(req, &rule_engine, &proxy_nodes, locale) {
+                    Ok(resp) => {
                         should_persist = true;
+                        ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&resp))
                     }
-                    res
-                }
+                    Err(err) => control_error_to_http(err, locale),
+                },
             }
         }
         ("POST", "/api/rules/simulate") => {
             match serde_json::from_str::<SimulateRouteRequest>(req_body) {
                 Err(_) => (
                     "400 Bad Request",
-                    "application/json; charset=utf-8",
+                    JSON_CONTENT_TYPE,
                     json_error(
                         locale,
                         "ERR_INVALID_SIMULATE_BODY",
                         "error.invalid_simulate_body",
                     ),
                 ),
-                Ok(req) => handle_simulate_route_with_pool(
+                Ok(req) => match simulate_route_with_pool(
                     req,
                     &rule_engine,
                     runtime_context.as_deref().map(|c| c.fake_ip_pool.as_ref()),
                     locale,
-                ),
+                ) {
+                    Ok(resp) => ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&resp)),
+                    Err(err) => control_error_to_http(err, locale),
+                },
             }
         }
         ("POST", "/api/rules/toggle") => match serde_json::from_str::<ToggleRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_TOGGLE_BODY", "error.invalid_toggle_body"),
             ),
-            Ok(req) => match rule_engine.toggle_rule(req.id, req.enabled) {
-                Some(enabled) => {
+            Ok(req) => match toggle_rule(req, &rule_engine) {
+                Ok(enabled) => {
                     should_persist = true;
                     (
                         "200 OK",
-                        "application/json; charset=utf-8",
+                        JSON_CONTENT_TYPE,
                         format!(r#"{{"ok":true,"enabled":{}}}"#, enabled),
                     )
                 }
-                None => (
-                    "404 Not Found",
-                    "application/json; charset=utf-8",
-                    json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
-                ),
+                Err(err) => control_error_to_http(err, locale),
             },
         },
         ("POST", "/api/rules/move") => match serde_json::from_str::<MoveRuleRequest>(req_body) {
             Err(_) => (
                 "400 Bad Request",
-                "application/json; charset=utf-8",
+                JSON_CONTENT_TYPE,
                 json_error(locale, "ERR_INVALID_MOVE_BODY", "error.invalid_move_body"),
             ),
-            Ok(req) => {
-                if !matches!(
-                    req.direction.trim().to_ascii_lowercase().as_str(),
-                    "up" | "down" | "top" | "bottom"
-                ) {
-                    (
-                        "400 Bad Request",
-                        "application/json; charset=utf-8",
-                        json_error(locale, "ERR_INVALID_MOVE_DIR", "error.invalid_move_direction"),
-                    )
-                } else {
-                    match rule_engine.move_rule(req.id, &req.direction) {
-                        Some(changed) => {
-                            if changed {
-                                should_persist = true;
-                            }
-                            (
-                                "200 OK",
-                                "application/json; charset=utf-8",
-                                format!(r#"{{"ok":true,"moved":{}}}"#, changed),
-                            )
-                        }
-                        None => (
-                            "404 Not Found",
-                            "application/json; charset=utf-8",
-                            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
-                        ),
+            Ok(req) => match move_rule(req, &rule_engine) {
+                Ok(changed) => {
+                    if changed {
+                        should_persist = true;
                     }
+                    (
+                        "200 OK",
+                        JSON_CONTENT_TYPE,
+                        format!(r#"{{"ok":true,"moved":{}}}"#, changed),
+                    )
                 }
-            }
+                Err(err) => control_error_to_http(err, locale),
+            },
         },
         ("DELETE", "/api/rules") => {
             let id: Option<u64> = parse_query_param(query, "id")
@@ -1505,21 +1291,17 @@ async fn handle_api_request(
                         .and_then(|v| v.get("id").and_then(|i| i.as_u64()))
                 });
             if let Some(rule_id) = id {
-                let ok = rule_engine.delete_rule(rule_id);
-                if ok {
-                    should_persist = true;
-                    ("200 OK", "application/json; charset=utf-8", r#"{"ok":true}"#.to_string())
-                } else {
-                    (
-                        "404 Not Found",
-                        "application/json; charset=utf-8",
-                        json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
-                    )
+                match delete_rule(rule_id, &rule_engine) {
+                    Ok(()) => {
+                        should_persist = true;
+                        ("200 OK", JSON_CONTENT_TYPE, r#"{"ok":true}"#.to_string())
+                    }
+                    Err(err) => control_error_to_http(err, locale),
                 }
             } else {
                 (
                     "400 Bad Request",
-                    "application/json; charset=utf-8",
+                    JSON_CONTENT_TYPE,
                     json_error(locale, "ERR_MISSING_RULE_ID", "error.missing_rule_id"),
                 )
             }
@@ -1704,925 +1486,6 @@ async fn finish_api_response_and_maybe_shutdown(
     send_res
 }
 
-#[allow(clippy::type_complexity)]
-fn validate_node_base(
-    name_raw: &str,
-    protocol_raw: &str,
-    server_addr_raw: &str,
-    username_raw: Option<String>,
-    explicit_password: Option<String>,
-    self_ports: &[u16],
-    locale: Locale,
-) -> std::result::Result<(String, String, String, Option<String>, Option<String>), (&'static str, &'static str, String)> {
-    let ct = "application/json; charset=utf-8";
-    let name = name_raw.trim().to_string();
-    if name.is_empty() {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_NODE_NAME", "error.empty_node_name"),
-        ));
-    }
-    if crate::config::has_control_or_oversize(&name, 255) {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_NAME", "error.invalid_node_name"),
-        ));
-    }
-
-    let protocol = protocol_raw.trim().to_ascii_uppercase();
-    if !matches!(protocol.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_UNSUPPORTED_PROTOCOL", "error.unsupported_protocol"),
-        ));
-    }
-
-    let server_addr = server_addr_raw.trim().to_string();
-    let Ok(target_parsed) = parse_target_addr(&server_addr) else {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_ADDR", "error.invalid_node_addr"),
-        ));
-    };
-    if target_parsed.port() == 0 || target_parsed.host_string().is_empty() {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_NODE_PORT", "error.invalid_node_port"),
-        ));
-    }
-
-    match &target_parsed {
-        crate::outbound::TargetAddr::Ip(sa) => {
-            if let Some(violation) = crate::outbound::direct::check_direct_ips_violation(
-                &[sa.ip()],
-                sa.port(),
-                self_ports,
-                None,
-            ) {
-                let (code, key) = match violation {
-                    crate::outbound::direct::DirectIpViolation::FakeIp(_) => {
-                        ("ERR_NODE_FAKE_IP", "error.node_fake_ip")
-                    }
-                    crate::outbound::direct::DirectIpViolation::SelfLoop(_) => {
-                        ("ERR_NODE_SELF_LOOP", "error.node_self_loop")
-                    }
-                };
-                return Err(("400 Bad Request", ct, json_error(locale, code, key)));
-            }
-        }
-        crate::outbound::TargetAddr::Domain(_, port) => {
-            if target_parsed.is_loopback_or_unspecified() && self_ports.contains(port) {
-                return Err((
-                    "400 Bad Request",
-                    ct,
-                    json_error(locale, "ERR_NODE_SELF_LOOP", "error.node_self_loop"),
-                ));
-            }
-        }
-    }
-
-    let username = username_raw
-        .map(|u| u.trim().to_string())
-        .filter(|u| !u.is_empty());
-
-    if let Some(u) = &username {
-        if crate::config::has_control_or_oversize(u, 255) {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(locale, "ERR_INVALID_USERNAME", "error.invalid_username"),
-            ));
-        }
-        if protocol == "HTTP" && u.contains(':') {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(locale, "ERR_HTTP_USERNAME_COLON", "error.http_username_colon"),
-            ));
-        }
-    }
-
-    if let Some(p) = &explicit_password {
-        if crate::config::has_control_or_oversize(p, 255) {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(locale, "ERR_INVALID_PASSWORD", "error.invalid_password"),
-            ));
-        }
-        if protocol != "SOCKS4" && username.is_none() && !p.is_empty() {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_PASSWORD_WITHOUT_USERNAME",
-                    "error.password_without_username",
-                ),
-            ));
-        }
-    }
-
-    Ok((name, protocol, server_addr, username, explicit_password))
-}
-
-fn build_proxy_client(
-    protocol: &str,
-    server_addr: &str,
-    username: &Option<String>,
-    password: &Option<String>,
-) -> ProxyNode {
-    match protocol {
-        "HTTP" => {
-            let mut c = HttpConnectClient::new(server_addr);
-            if let (Some(u), Some(p)) = (username, password) {
-                c = c.with_auth(u.clone(), p.clone());
-            }
-            ProxyNode::Http(c)
-        }
-        "SOCKS4" => {
-            let mut c = Socks4Client::new(server_addr);
-            if let Some(u) = username {
-                c = c.with_user_id(u.clone());
-            }
-            ProxyNode::Socks4(c)
-        }
-        _ => {
-            let mut c = Socks5Client::new(server_addr);
-            if let (Some(u), Some(p)) = (username, password) {
-                c = c.with_auth(u.clone(), p.clone());
-            }
-            ProxyNode::Socks5(c)
-        }
-    }
-}
-
-type ApiErrorResp = (&'static str, &'static str, String);
-
-#[allow(clippy::too_many_arguments)]
-fn resolve_updated_credentials(
-    is_patch: bool,
-    protocol: &str,
-    username: Option<String>,
-    existing_username: &Option<String>,
-    existing_password: Option<String>,
-    explicit_password: Option<String>,
-    keep_password: Option<bool>,
-    clear_password: Option<bool>,
-    locale: Locale,
-) -> std::result::Result<(Option<String>, Option<String>), ApiErrorResp> {
-    let ct = "application/json; charset=utf-8";
-    let has_raw_password_field = explicit_password.is_some();
-    let explicit_empty = explicit_password.as_deref() == Some("");
-    let explicit_non_empty = explicit_password.filter(|p| !p.is_empty());
-
-    if clear_password == Some(true) && (keep_password == Some(true) || explicit_non_empty.is_some())
-    {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_CONFLICTING_PASSWORD_OPTIONS",
-                "error.conflicting_password_options",
-            ),
-        ));
-    }
-    if keep_password == Some(true) && explicit_non_empty.is_some() {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_CONFLICTING_PASSWORD_OPTIONS",
-                "error.conflicting_password_options",
-            ),
-        ));
-    }
-    if explicit_empty && (keep_password == Some(true) || clear_password == Some(false)) {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_CONFLICTING_PASSWORD_OPTIONS",
-                "error.conflicting_password_options",
-            ),
-        ));
-    }
-
-    if protocol == "SOCKS4" {
-        if has_raw_password_field || keep_password == Some(true) {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
-                    "error.socks4_password_unsupported",
-                ),
-            ));
-        }
-        return Ok((username, None));
-    }
-
-    if username.is_none() {
-        if keep_password == Some(true) && existing_password.is_some() {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_PASSWORD_WITHOUT_USERNAME",
-                    "error.password_without_username",
-                ),
-            ));
-        }
-        if clear_password == Some(false)
-            && !has_raw_password_field
-            && existing_password.is_some()
-        {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_CONFLICTING_PASSWORD_OPTIONS",
-                    "error.conflicting_password_options",
-                ),
-            ));
-        }
-        return Ok((None, None));
-    }
-
-    let clearing_password = clear_password == Some(true) || explicit_empty;
-
-    if clearing_password {
-        if username != *existing_username {
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_USERNAME_WITHOUT_PASSWORD",
-                    "error.username_without_password",
-                ),
-            ));
-        }
-        return Ok((None, None));
-    }
-
-    if let Some(p) = explicit_non_empty {
-        return Ok((username, Some(p)));
-    }
-
-    let should_keep = keep_password.unwrap_or(is_patch);
-    if should_keep {
-        if username != *existing_username {
-            if existing_password.is_some() {
-                return Err((
-                    "400 Bad Request",
-                    ct,
-                    json_error(
-                        locale,
-                        "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
-                        "error.password_required_on_user_change",
-                    ),
-                ));
-            }
-            return Err((
-                "400 Bad Request",
-                ct,
-                json_error(
-                    locale,
-                    "ERR_USERNAME_WITHOUT_PASSWORD",
-                    "error.username_without_password",
-                ),
-            ));
-        }
-        if let Some(pw) = existing_password {
-            return Ok((username, Some(pw)));
-        }
-    }
-
-    Err((
-        "400 Bad Request",
-        ct,
-        json_error(
-            locale,
-            "ERR_USERNAME_WITHOUT_PASSWORD",
-            "error.username_without_password",
-        ),
-    ))
-}
-
-pub(crate) fn handle_add_node(
-    req: AddNodeRequest,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    self_ports: &[u16],
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let (name, protocol, server_addr, username, explicit_password) = match validate_node_base(
-        &req.name,
-        &req.protocol,
-        &req.server_addr,
-        req.username,
-        req.password,
-        self_ports,
-        locale,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
-    if protocol == "SOCKS4" && explicit_password.is_some() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_SOCKS4_PASSWORD_UNSUPPORTED", "error.socks4_password_unsupported"),
-        );
-    }
-    if explicit_password.as_deref() == Some("") {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_PASSWORD", "error.empty_password"),
-        );
-    }
-    if protocol != "SOCKS4" && username.is_some() && explicit_password.is_none() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_USERNAME_WITHOUT_PASSWORD",
-                "error.username_without_password",
-            ),
-        );
-    }
-    let password = explicit_password;
-
-    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
-    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-    let new_id = nodes_guard.keys().max().copied().unwrap_or(100) + 1;
-    nodes_guard.insert(
-        new_id,
-        ProxyNodeEntry {
-            id: new_id,
-            name,
-            protocol,
-            server_addr,
-            username,
-            client,
-        },
-    );
-    ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, new_id))
-}
-
-pub(crate) fn handle_update_node(
-    req: UpdateNodeRequest,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    self_ports: &[u16],
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let (name, protocol, server_addr, username, explicit_password) = match validate_node_base(
-        &req.name,
-        &req.protocol,
-        &req.server_addr,
-        req.username,
-        req.password,
-        self_ports,
-        locale,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
-    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-    let Some(existing) = nodes_guard.get(&req.id) else {
-        return (
-            "404 Not Found",
-            ct,
-            json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
-        );
-    };
-
-    let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
-    let (username, password) = match resolve_updated_credentials(
-        false,
-        &protocol,
-        username,
-        &existing.username,
-        existing_password,
-        explicit_password,
-        req.keep_password,
-        req.clear_password,
-        locale,
-    ) {
-        Ok(creds) => creds,
-        Err(resp) => return resp,
-    };
-
-    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
-    nodes_guard.insert(
-        req.id,
-        ProxyNodeEntry {
-            id: req.id,
-            name,
-            protocol,
-            server_addr,
-            username,
-            client,
-        },
-    );
-    ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, req.id))
-}
-
-pub(crate) fn handle_patch_node(
-    req: PatchNodeRequest,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    self_ports: &[u16],
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
-    let Some(existing) = nodes_guard.get(&req.id).cloned() else {
-        return (
-            "404 Not Found",
-            ct,
-            json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
-        );
-    };
-
-    let name_raw = req.name.unwrap_or_else(|| existing.name.clone());
-    let protocol_raw = req.protocol.unwrap_or_else(|| existing.protocol.clone());
-    let server_addr_raw = req.server_addr.unwrap_or_else(|| existing.server_addr.clone());
-    if req.clear_username == Some(true)
-        && req.username.as_deref().is_some_and(|u| !u.trim().is_empty())
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_CONFLICTING_USERNAME_OPTIONS",
-                "error.conflicting_username_options",
-            ),
-        );
-    }
-    let username_raw = if req.clear_username == Some(true) {
-        None
-    } else if req.username.is_some() {
-        req.username
-    } else {
-        existing.username.clone()
-    };
-
-    let (name, protocol, server_addr, username, explicit_password) = match validate_node_base(
-        &name_raw,
-        &protocol_raw,
-        &server_addr_raw,
-        username_raw,
-        req.password,
-        self_ports,
-        locale,
-    ) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
-    let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
-    let (username, password) = match resolve_updated_credentials(
-        true,
-        &protocol,
-        username,
-        &existing.username,
-        existing_password,
-        explicit_password,
-        req.keep_password,
-        req.clear_password,
-        locale,
-    ) {
-        Ok(creds) => creds,
-        Err(resp) => return resp,
-    };
-
-    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
-    nodes_guard.insert(
-        req.id,
-        ProxyNodeEntry {
-            id: req.id,
-            name,
-            protocol,
-            server_addr,
-            username,
-            client,
-        },
-    );
-    ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, req.id))
-}
-
-fn parse_and_validate_action(
-    action_raw: &str,
-    node_id: Option<u32>,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    locale: Locale,
-) -> std::result::Result<Action, (&'static str, &'static str, String)> {
-    let ct = "application/json; charset=utf-8";
-    match action_raw.trim().to_ascii_uppercase().as_str() {
-        "DIRECT" => Ok(Action::Direct),
-        "BLOCK" => Ok(Action::Block),
-        "PROXY" => {
-            let Some(nid) = node_id else {
-                return Err((
-                    "400 Bad Request",
-                    ct,
-                    json_error(
-                        locale,
-                        "ERR_MISSING_NODE_FOR_PROXY",
-                        "error.missing_node_id_for_proxy",
-                    ),
-                ));
-            };
-            let exists = {
-                let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-                nodes_guard.contains_key(&nid)
-            };
-            if !exists {
-                return Err((
-                    "400 Bad Request",
-                    ct,
-                    json_error(locale, "ERR_NODE_NOT_FOUND", "error.node_not_found"),
-                ));
-            }
-            Ok(Action::Proxy(nid))
-        }
-        _ => Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_RULE_ACTION", "error.invalid_rule_action"),
-        )),
-    }
-}
-
-fn validate_rule_probe(
-    rule: &Rule,
-    apps_clean: Option<&str>,
-    targets_clean: Option<&str>,
-    ports_clean: Option<&str>,
-    locale: Locale,
-) -> std::result::Result<(), (&'static str, &'static str, String)> {
-    let ct = "application/json; charset=utf-8";
-    if apps_clean.is_some()
-        && rule.application_patterns.as_ref().is_some_and(Vec::is_empty)
-    {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_APP_PATTERN", "error.invalid_app_pattern"),
-        ));
-    }
-    if targets_clean.is_some()
-        && rule.target_subnets.is_none()
-        && rule.target_domains.as_ref().is_some_and(Vec::is_empty)
-    {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_TARGET_PATTERN", "error.invalid_target_pattern"),
-        ));
-    }
-    if ports_clean.is_some() && rule.ports.as_ref().is_some_and(Vec::is_empty) {
-        return Err((
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_PORT_FORMAT", "error.invalid_port_format"),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn handle_add_rule(
-    req: AddRuleRequest,
-    rule_engine: &RuleEngine,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_RULE_NAME", "error.empty_rule_name"),
-        );
-    }
-
-    let action = match parse_and_validate_action(&req.action, req.node_id, proxy_nodes, locale) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-
-    let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let targets_clean = req.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let ports_clean = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
-
-    let rule = Rule::from_raw(name, true, apps_clean, targets_clean, ports_clean, action);
-    if let Err(resp) = validate_rule_probe(&rule, apps_clean, targets_clean, ports_clean, locale) {
-        return resp;
-    }
-
-    let id = rule.id;
-    rule_engine.add_rule(rule);
-    ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, id))
-}
-
-pub(crate) fn handle_update_rule(
-    req: UpdateRuleRequest,
-    rule_engine: &RuleEngine,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let name = req.name.trim().to_string();
-    if name.is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_RULE_NAME", "error.empty_rule_name"),
-        );
-    }
-
-    let action = match parse_and_validate_action(&req.action, req.node_id, proxy_nodes, locale) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-
-    let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let targets_clean = req.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let ports_clean = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
-
-    let probe = Rule::from_raw_with_id(
-        req.id,
-        &name,
-        true,
-        apps_clean,
-        targets_clean,
-        ports_clean,
-        action.clone(),
-    );
-    if let Err(resp) = validate_rule_probe(&probe, apps_clean, targets_clean, ports_clean, locale) {
-        return resp;
-    }
-
-    match rule_engine.update_rule(req.id, name, apps_clean, targets_clean, ports_clean, action) {
-        Some(updated) => ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, updated.id)),
-        None => (
-            "404 Not Found",
-            ct,
-            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
-        ),
-    }
-}
-
-pub(crate) fn handle_patch_rule(
-    req: PatchRuleRequest,
-    rule_engine: &RuleEngine,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let Some(existing) = rule_engine.current_rules().iter().find(|r| r.id == req.id).cloned() else {
-        return (
-            "404 Not Found",
-            ct,
-            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
-        );
-    };
-
-    let name = req.name.map(|s| s.trim().to_string()).unwrap_or_else(|| existing.name.clone());
-    if name.is_empty() {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_EMPTY_RULE_NAME", "error.empty_rule_name"),
-        );
-    }
-
-    let action = if let Some(act_str) = req.action.as_deref() {
-        let effective_node_id = req.node_id.or_else(|| match existing.action {
-            Action::Proxy(id) if act_str.trim().eq_ignore_ascii_case("Proxy") => Some(id),
-            _ => None,
-        });
-        match parse_and_validate_action(act_str, effective_node_id, proxy_nodes, locale) {
-            Ok(a) => a,
-            Err(resp) => return resp,
-        }
-    } else if let Some(nid) = req.node_id {
-        if matches!(existing.action, Action::Proxy(_)) {
-            match parse_and_validate_action("Proxy", Some(nid), proxy_nodes, locale) {
-                Ok(a) => a,
-                Err(resp) => return resp,
-            }
-        } else {
-            return (
-                "400 Bad Request",
-                ct,
-                json_error(locale, "ERR_INVALID_RULE_ACTION", "error.invalid_rule_action"),
-            );
-        }
-    } else {
-        existing.action.clone()
-    };
-
-    let apps_clean_owned: Option<String> = match req.apps {
-        Some(v) => Some(v.trim().to_string()).filter(|s| !s.is_empty()),
-        None => Some(existing.apps_raw.trim().to_string()).filter(|s| !s.is_empty()),
-    };
-    let targets_clean_owned: Option<String> = match req.targets {
-        Some(v) => Some(v.trim().to_string()).filter(|s| !s.is_empty()),
-        None => Some(existing.targets_raw.trim().to_string()).filter(|s| !s.is_empty()),
-    };
-    let ports_clean_owned: Option<String> = match req.ports {
-        Some(v) => Some(v.trim().to_string()).filter(|s| !s.is_empty()),
-        None => Some(existing.ports_raw.trim().to_string()).filter(|s| !s.is_empty()),
-    };
-
-    let apps_clean = apps_clean_owned.as_deref();
-    let targets_clean = targets_clean_owned.as_deref();
-    let ports_clean = ports_clean_owned.as_deref();
-
-    let probe = Rule::from_raw_with_id(
-        req.id,
-        &name,
-        req.enabled.unwrap_or(existing.enabled),
-        apps_clean,
-        targets_clean,
-        ports_clean,
-        action.clone(),
-    );
-    if let Err(resp) = validate_rule_probe(&probe, apps_clean, targets_clean, ports_clean, locale) {
-        return resp;
-    }
-
-    match rule_engine.update_rule_with_enabled(
-        req.id,
-        name,
-        apps_clean,
-        targets_clean,
-        ports_clean,
-        action,
-        req.enabled,
-    ) {
-        Some(updated) => ("200 OK", ct, format!(r#"{{"ok":true,"id":{}}}"#, updated.id)),
-        None => (
-            "404 Not Found",
-            ct,
-            json_error(locale, "ERR_RULE_NOT_FOUND", "error.rule_not_found"),
-        ),
-    }
-}
-
-pub(crate) fn handle_set_default_action(
-    req: SetDefaultActionRequest,
-    rule_engine: &RuleEngine,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let action = match parse_and_validate_action(&req.action, req.node_id, proxy_nodes, locale) {
-        Ok(a) => a,
-        Err(resp) => return resp,
-    };
-
-    rule_engine.set_default_action(action.clone());
-    let resp = serde_json::json!({
-        "ok": true,
-        "default_action": crate::router::format_action_desc(&action, locale),
-        "default_action_type": action.type_str(),
-        "default_node_id": action.target_id(),
-    });
-    ("200 OK", ct, resp.to_string())
-}
-
-pub(crate) fn parse_simulate_target(
-    raw: &str,
-    explicit_port: Option<u16>,
-) -> Option<(String, Option<std::net::IpAddr>, u16)> {
-    if explicit_port == Some(0) {
-        return None;
-    }
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-        let port = explicit_port.unwrap_or(443);
-        return Some((ip.to_string(), Some(ip), port));
-    }
-
-    let parsed = TargetAddr::parse_authority(trimmed, Some(explicit_port.unwrap_or(443)), false).ok()?;
-    let port = explicit_port.unwrap_or_else(|| parsed.port());
-    match parsed {
-        TargetAddr::Ip(addr) => Some((addr.ip().to_string(), Some(addr.ip()), port)),
-        TargetAddr::Domain(host, _) => Some((host, None, port)),
-    }
-}
-
-pub(crate) fn handle_simulate_route(
-    req: SimulateRouteRequest,
-    rule_engine: &RuleEngine,
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    handle_simulate_route_with_pool(req, rule_engine, None, locale)
-}
-
-pub(crate) fn handle_simulate_route_with_pool(
-    req: SimulateRouteRequest,
-    rule_engine: &RuleEngine,
-    fake_ip_pool: Option<&FakeIpPool>,
-    locale: Locale,
-) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let Some((parsed_host, ip_opt, target_port)) = parse_simulate_target(&req.target, req.port) else {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(locale, "ERR_INVALID_SIMULATE_TARGET", "error.invalid_simulate_target"),
-        );
-    };
-
-    // 与真实流量调度保持完全一致：Fake-IP（含 IPv4 映射 IPv6）还原为原域名；真实 IP 字面量不设 target_host（仅传 target_ip）
-    let (target_host, target_ip) = match ip_opt {
-        Some(ip) if fake_ip_pool.is_some_and(|p| p.is_fake_ip_addr(ip)) => {
-            match fake_ip_pool.and_then(|p| p.restore_ip(ip)) {
-                Some(domain) => (Some(domain), None),
-                None => (None, Some(ip)),
-            }
-        }
-        Some(ip) => (None, Some(ip)),
-        None => (Some(parsed_host), None),
-    };
-
-    let proc_raw = req
-        .process
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let process_path = proc_raw.map(|s| s.to_string());
-    let process_name = proc_raw.map(|p| {
-        let base = p.rsplit(['/', '\\']).next().unwrap_or(p).trim();
-        if base.is_empty() {
-            p.to_string()
-        } else {
-            base.to_string()
-        }
-    });
-
-    let ctx = crate::router::RouteContext {
-        process_path: process_path.as_deref(),
-        process_name: process_name.as_deref(),
-        target_host: target_host.as_deref(),
-        target_ip,
-        target_port,
-    };
-
-    let sim = rule_engine.simulate(&ctx);
-    let matched_rule_name = if sim.is_default {
-        t(locale, "action.default_rule").to_string()
-    } else {
-        sim.matched_rule_name
-    };
-    let action_desc = crate::router::format_action_desc(&sim.action, locale);
-    let action_type = sim.action.type_str().to_string();
-    let node_id = sim.action.target_id();
-
-    let resp = SimulateRouteResponse {
-        matched_rule_id: sim.matched_rule_id,
-        matched_rule_name,
-        is_default: sim.is_default,
-        action: action_desc,
-        action_type,
-        node_id,
-        process_name,
-        process_path,
-        target_host,
-        target_ip: target_ip.map(|ip| ip.to_string()),
-        target_port,
-        trace: sim.trace,
-    };
-
-    ("200 OK", ct, serde_json_to_string(&resp))
-}
-
 fn finalize_elevate_response_and_log(
     locale: Locale,
     status: &'static str,
@@ -2666,44 +1529,11 @@ fn finalize_elevate_response_and_log(
     (out_status, out_body)
 }
 
-fn transparent_status_or_fallback(mgr: Option<&TransparentManager>) -> TransparentRuntimeStatus {
-    mgr.map_or_else(
-        || probe_status(&TransparentSettings::default()),
-        |m| m.status(),
-    )
-}
-
 fn map_transparent_apply_error(
     locale: Locale,
     raw_err: &str,
 ) -> (&'static str, &'static str, String) {
-    let ct = "application/json; charset=utf-8";
-    let (status, code, key) = if raw_err.starts_with("ERR_TRANSPARENT_REQUIRES_ADMIN:") {
-        (
-            "409 Conflict",
-            "ERR_TRANSPARENT_REQUIRES_ADMIN",
-            "error.transparent_requires_admin",
-        )
-    } else if raw_err.starts_with("ERR_TRANSPARENT_MISSING_DRIVER:") {
-        (
-            "409 Conflict",
-            "ERR_TRANSPARENT_MISSING_DRIVER",
-            "error.transparent_missing_driver",
-        )
-    } else {
-        (
-            "500 Internal Server Error",
-            "ERR_TRANSPARENT_START_FAILED",
-            "error.transparent_start_failed",
-        )
-    };
-    let payload = serde_json::json!({
-        "error": t(locale, key),
-        "code": code,
-        "detail": raw_err,
-    })
-    .to_string();
-    (status, ct, payload)
+    control_error_to_http(classify_transparent_apply_error(raw_err), locale)
 }
 
 async fn apply_transparent_and_stage(
@@ -2824,55 +1654,10 @@ async fn handle_transparent_config(
         );
     };
 
-    if req.clear_dll_path == Some(true)
-        && req
-            .dll_path
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty())
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_TRANSPARENT_INVALID_DLL_PATH",
-                "error.transparent_invalid_dll_path",
-            ),
-        );
-    }
-
-    if let Some(ref raw_path) = req.dll_path
-        && !crate::transparent::is_valid_custom_dll_path_input(raw_path)
-    {
-        return (
-            "400 Bad Request",
-            ct,
-            json_error(
-                locale,
-                "ERR_TRANSPARENT_INVALID_DLL_PATH",
-                "error.transparent_invalid_dll_path",
-            ),
-        );
-    }
-
-    let mut next = mgr.settings();
-    if let Some(v) = req.hijack_dns {
-        next.hijack_dns = v;
-    }
-    if let Some(v) = req.block_quic_for_proxied {
-        next.block_quic_for_proxied = v;
-    }
-    if req.clear_dll_path == Some(true) {
-        next.dll_path = None;
-    } else if let Some(raw_path) = req.dll_path {
-        let trimmed = raw_path.trim();
-        next.dll_path = if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        };
-    }
+    let next = match apply_transparent_config_fields(&mgr.settings(), req) {
+        Ok(next) => next,
+        Err(err) => return control_error_to_http(err, locale),
+    };
 
     apply_transparent_and_stage(
         mgr,
@@ -2941,38 +1726,7 @@ async fn handle_transparent_elevate_after_gate(
             *trigger_elevated_shutdown = true;
             ("200 OK", ct, r#"{"ok":true,"relaunching":true}"#.to_string())
         }
-        Ok(Err(e)) => {
-            let msg = e.to_string();
-            let (status, code, key) = if msg.contains("ERR_TRANSPARENT_UAC_CANCELLED") {
-                (
-                    "409 Conflict",
-                    "ERR_TRANSPARENT_UAC_CANCELLED",
-                    "error.transparent_uac_cancelled",
-                )
-            } else if e.kind() == std::io::ErrorKind::AlreadyExists {
-                (
-                    "409 Conflict",
-                    "ERR_TRANSPARENT_ALREADY_ELEVATED",
-                    "error.transparent_already_elevated",
-                )
-            } else {
-                (
-                    "500 Internal Server Error",
-                    "ERR_TRANSPARENT_ELEVATE_FAILED",
-                    "error.transparent_elevate_failed",
-                )
-            };
-            (
-                status,
-                ct,
-                serde_json::json!({
-                    "error": t(locale, key),
-                    "code": code,
-                    "detail": msg,
-                })
-                .to_string(),
-            )
-        }
+        Ok(Err(e)) => control_error_to_http(classify_transparent_elevate_error(&e), locale),
         Err(join_err) => (
             "500 Internal Server Error",
             ct,
@@ -2983,72 +1737,6 @@ async fn handle_transparent_elevate_after_gate(
             })
             .to_string(),
         ),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_system_info(
-    actual_port: u16,
-    runtime_ctx: Option<&SystemRuntimeContext>,
-    config_store: Option<&ConfigStore>,
-    transparent_manager: Option<&TransparentManager>,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-    rule_engine: &RuleEngine,
-    started_at: Instant,
-    locale: Locale,
-) -> SystemInfoResponse {
-    let nodes_count = proxy_nodes
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .len();
-    let rules = rule_engine.current_rules();
-    let rules_count = rules.len();
-    let enabled_rules_count = rules.iter().filter(|r| r.enabled).count();
-    let current_default = rule_engine.default_action();
-    let default_action = crate::router::format_action_desc(&current_default, locale);
-    let default_action_type = current_default.type_str().to_string();
-    let default_node_id = current_default.target_id();
-
-    let (inbound_addr, dns_addr, upstream_dns, api_addr, fake_ip_count, uptime_secs) =
-        match runtime_ctx {
-            Some(ctx) => (
-                ctx.inbound_addr.to_string(),
-                ctx.dns_addr.to_string(),
-                ctx.upstream_dns.to_string(),
-                ctx.api_addr.to_string(),
-                ctx.fake_ip_pool.len(),
-                ctx.started_at.elapsed().as_secs(),
-            ),
-            None => (
-                "127.0.0.1:40001".to_string(),
-                "127.0.0.1:1053".to_string(),
-                "223.5.5.5:53".to_string(),
-                format!("127.0.0.1:{}", actual_port),
-                0,
-                started_at.elapsed().as_secs(),
-            ),
-        };
-
-    SystemInfoResponse {
-        version: env!("CARGO_PKG_VERSION"),
-        inbound_addr,
-        inbound_protocols: vec!["SOCKS5", "SOCKS4a", "HTTP", "HTTP CONNECT"],
-        dns_addr,
-        upstream_dns,
-        api_addr,
-        config_path: config_store
-            .map(|s| s.path().display().to_string())
-            .unwrap_or_else(|| t(locale, "system.memory_mode").to_string()),
-        fake_ip_cidr: "198.18.0.0/15",
-        fake_ip_count,
-        uptime_secs,
-        default_action,
-        default_action_type,
-        default_node_id,
-        nodes_count,
-        rules_count,
-        enabled_rules_count,
-        transparent: transparent_status_or_fallback(transparent_manager),
     }
 }
 
@@ -3136,172 +1824,6 @@ fn localize_connection_view(conn: &mut crate::monitor::ConnectionSnapshot, local
     }
 }
 
-pub(crate) async fn ping_address(
-    addr: &str,
-    self_ports: &[u16],
-    locale: Locale,
-) -> (bool, u64, String, Option<String>) {
-    ping_address_with_context(addr, self_ports, None, None, locale).await
-}
-
-async fn ping_address_with_context(
-    addr: &str,
-    self_ports: &[u16],
-    runtime_ctx: Option<&SystemRuntimeContext>,
-    ping_semaphore: Option<&Semaphore>,
-    locale: Locale,
-) -> (bool, u64, String, Option<String>) {
-    const PING_TIMEOUT: Duration = Duration::from_millis(2000);
-    let start = Instant::now();
-
-    let _permit = if let Some(sem) = ping_semaphore {
-        match tokio::time::timeout(PING_TIMEOUT, sem.acquire()).await {
-            Ok(Ok(p)) => Some(p),
-            Ok(Err(e)) => {
-                return (
-                    false,
-                    0,
-                    t(locale, "error.ping_failed").to_string(),
-                    Some(e.to_string()),
-                );
-            }
-            Err(_) => return (false, 0, t(locale, "ping.timeout").to_string(), None),
-        }
-    } else {
-        None
-    };
-
-    let parsed = match parse_target_addr(addr) {
-        Ok(p) => p,
-        Err(e) => {
-            return (
-                false,
-                0,
-                t(locale, "error.ping_failed").to_string(),
-                Some(e.to_string()),
-            );
-        }
-    };
-
-    let default_pool;
-    let fake_pool = match runtime_ctx {
-        Some(ctx) => ctx.fake_ip_pool.as_ref(),
-        None => {
-            default_pool = FakeIpPool::new_default();
-            &default_pool
-        }
-    };
-
-    let (port, candidate_ips): (u16, Vec<std::net::IpAddr>) = match &parsed {
-        TargetAddr::Ip(sock_addr) => (sock_addr.port(), vec![sock_addr.ip()]),
-        TargetAddr::Domain(domain, port) => {
-            if crate::outbound::is_loopback_domain(domain) {
-                (
-                    *port,
-                    vec![
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-                    ],
-                )
-            } else {
-                let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
-                if remaining.is_zero() {
-                    return (false, 0, t(locale, "ping.timeout").to_string(), None);
-                }
-                let upstream_dns = runtime_ctx
-                    .map(|c| c.upstream_dns)
-                    .unwrap_or_else(|| "223.5.5.5:53".parse().unwrap());
-                // block_ipv6 仅用于本地 Fake-IP DNS 防泄漏；在线节点 Ping 与 DirectOutbound 统一允许 A + AAAA 解析与拨号
-                match crate::dns::server::resolve_via_upstream_dns(
-                    domain,
-                    upstream_dns,
-                    Some(fake_pool),
-                    remaining,
-                )
-                .await
-                {
-                    Ok(ips) => (*port, ips),
-                    Err(e) => {
-                        return (
-                            false,
-                            0,
-                            t(locale, "error.ping_failed").to_string(),
-                            Some(e.to_string()),
-                        );
-                    }
-                }
-            }
-        }
-    };
-
-    if let Some(violation) = crate::outbound::direct::check_direct_ips_violation(
-        &candidate_ips,
-        port,
-        self_ports,
-        Some(fake_pool),
-    ) {
-        let (key, detail) = match violation {
-            crate::outbound::direct::DirectIpViolation::FakeIp(ip) => (
-                "error.node_fake_ip",
-                format!(
-                    "Ping probe blocked: resolved Fake-IP {} for {}:{}",
-                    ip,
-                    parsed.host_string(),
-                    port
-                ),
-            ),
-            crate::outbound::direct::DirectIpViolation::SelfLoop(ip) => (
-                "error.node_self_loop",
-                format!(
-                    "Ping probe blocked due to self/loopback IP resolution ({} -> {}:{})",
-                    parsed.host_string(),
-                    ip,
-                    port
-                ),
-            ),
-        };
-        return (false, 0, t(locale, key).to_string(), Some(detail));
-    }
-
-    let remaining = PING_TIMEOUT.saturating_sub(start.elapsed());
-    if remaining.is_zero() {
-        return (false, 0, t(locale, "ping.timeout").to_string(), None);
-    }
-
-    let deadline = tokio::time::Instant::now() + remaining;
-    match crate::outbound::direct::connect_candidates_guarded_with_budget(
-        &candidate_ips,
-        port,
-        deadline,
-        Duration::from_millis(250),
-        PING_TIMEOUT,
-    )
-    .await
-    {
-        Ok(stream) => {
-            drop(stream);
-            let ms = start.elapsed().as_millis() as u64;
-            (true, ms, format!("{} ms", ms), None)
-        }
-        // 面向用户的文案本地化；底层 OS 错误串只放进 detail，供排障而不直接展示
-        Err(crate::outbound::direct::CandidateConnectError::Io(e)) => (
-            false,
-            0,
-            t(locale, "error.ping_failed").to_string(),
-            Some(e.to_string()),
-        ),
-        Err(crate::outbound::direct::CandidateConnectError::TimedOut { .. }) => {
-            (false, 0, t(locale, "ping.timeout").to_string(), None)
-        }
-        Err(crate::outbound::direct::CandidateConnectError::NoCandidates) => (
-            false,
-            0,
-            t(locale, "error.ping_failed").to_string(),
-            Some("No resolved IP candidates available".to_string()),
-        ),
-    }
-}
-
 fn serde_json_to_string<T: serde::Serialize>(val: &T) -> String {
     serde_json::to_string(val).unwrap_or_else(|_| "{}".to_string())
 }
@@ -3309,6 +1831,11 @@ fn serde_json_to_string<T: serde::Serialize>(val: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::node::ping_address;
+    use crate::dns::FakeIpPool;
+    use crate::outbound::chain::ProxyNode;
+    use crate::outbound::socks5::Socks5Client;
+    use crate::router::Rule;
 
     #[test]
     fn test_host_and_origin_validation() {
@@ -4107,9 +2634,9 @@ mod tests {
         assert_eq!(patched_r.ports_raw, "443");
 
         // 5. Simulate parity: IP literal sets target_host=None, Fake-IP restores original domain
-        let pool = FakeIpPool::new_default();
+        let pool = crate::dns::FakeIpPool::new_default();
         let fake_ip = pool.allocate("secret.internal");
-        let sim_ip = handle_simulate_route_with_pool(
+        let sim_ip = simulate_route_with_pool(
             SimulateRouteRequest {
                 process: None,
                 target: "8.8.8.8:443".into(),
@@ -4118,12 +2645,12 @@ mod tests {
             &re,
             Some(&pool),
             Locale::En,
-        );
-        let ip_val: serde_json::Value = serde_json::from_str(&sim_ip.2).unwrap();
-        assert!(ip_val["target_host"].is_null(), "IP literal must keep target_host null: {ip_val}");
-        assert_eq!(ip_val["target_ip"], "8.8.8.8");
+        )
+        .unwrap();
+        assert!(sim_ip.target_host.is_none(), "IP literal must keep target_host null: {sim_ip:?}");
+        assert_eq!(sim_ip.target_ip.as_deref(), Some("8.8.8.8"));
 
-        let sim_fake = handle_simulate_route_with_pool(
+        let sim_fake = simulate_route_with_pool(
             SimulateRouteRequest {
                 process: None,
                 target: format!("{}:443", fake_ip),
@@ -4132,10 +2659,10 @@ mod tests {
             &re,
             Some(&pool),
             Locale::En,
-        );
-        let fake_val: serde_json::Value = serde_json::from_str(&sim_fake.2).unwrap();
-        assert_eq!(fake_val["target_host"], "secret.internal");
-        assert!(fake_val["target_ip"].is_null());
+        )
+        .unwrap();
+        assert_eq!(sim_fake.target_host.as_deref(), Some("secret.internal"));
+        assert!(sim_fake.target_ip.is_none());
     }
 
     #[tokio::test]

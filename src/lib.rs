@@ -8,6 +8,8 @@ pub mod cli;
 #[cfg(windows)]
 pub mod config;
 #[cfg(windows)]
+pub mod control;
+#[cfg(windows)]
 pub mod dns;
 #[cfg(windows)]
 pub mod i18n;
