@@ -44,7 +44,6 @@ impl RelayStream for OutboundTcpStream {
     }
 }
 
-#[cfg(test)]
 impl RelayStream for tokio::io::DuplexStream {
     type ReadHalf = tokio::io::ReadHalf<tokio::io::DuplexStream>;
     type WriteHalf = tokio::io::WriteHalf<tokio::io::DuplexStream>;
@@ -164,7 +163,7 @@ pub(crate) fn is_loopback_domain(host: &str) -> bool {
 }
 
 /// 枚举本机在线网络接口上处于 Preferred 状态的单播 IP 地址（用于防 DNS 重绑定直连本机开放端口）
-pub(crate) fn local_interface_ips() -> Vec<IpAddr> {
+pub fn local_interface_ips() -> Vec<IpAddr> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
