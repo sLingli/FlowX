@@ -4,7 +4,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+mod codec;
 pub mod server;
+mod upstream;
 
 const MAX_REAL_IP_MAPPINGS: usize = 16_384;
 const MAX_REAL_IP_MAPPING_TTL: Duration = Duration::from_secs(120);
