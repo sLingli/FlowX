@@ -1,12 +1,12 @@
+use super::TargetAddr;
+use super::bypass::OutboundTcpStream;
+use super::direct::{DEFAULT_OUTBOUND_UPSTREAM_DNS, connect_proxy_tcp_guarded};
+use crate::dns::FakeIpPool;
+use anyhow::{Result, bail};
 use std::net::SocketAddr;
 use std::time::Duration;
-use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::dns::FakeIpPool;
-use super::bypass::OutboundTcpStream;
-use super::direct::{connect_proxy_tcp_guarded, DEFAULT_OUTBOUND_UPSTREAM_DNS};
-use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -66,7 +66,13 @@ impl Socks4Client {
             Ok(stream)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("SOCKS4 connection timed out ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "SOCKS4 connection timed out ({:?}): {}",
+                DEFAULT_TIMEOUT,
+                self.proxy_addr
+            )
+        })?
     }
 
     pub async fn handshake(&self, stream: TcpStream, target: &TargetAddr) -> Result<TcpStream> {
@@ -77,9 +83,12 @@ impl Socks4Client {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        tokio::time::timeout(DEFAULT_TIMEOUT, self.handshake_internal(&mut stream, target))
-            .await
-            .map_err(|_| anyhow::anyhow!("SOCKS4 handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
+        tokio::time::timeout(
+            DEFAULT_TIMEOUT,
+            self.handshake_internal(&mut stream, target),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("SOCKS4 handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
         Ok(stream)
     }
 
@@ -91,7 +100,10 @@ impl Socks4Client {
             bail!("SOCKS4 user_id contains invalid null byte (\\0)");
         }
         if self.user_id.len() > 255 {
-            bail!("SOCKS4 user_id length exceeds 255 bytes limit: {}", self.user_id.len());
+            bail!(
+                "SOCKS4 user_id length exceeds 255 bytes limit: {}",
+                self.user_id.len()
+            );
         }
 
         let mut req = Vec::new();
@@ -122,10 +134,16 @@ impl Socks4Client {
             }
             TargetAddr::Domain(domain, _) => {
                 if domain.contains('\0') {
-                    bail!("SOCKS4 target domain contains invalid null byte (\\0): {}", domain);
+                    bail!(
+                        "SOCKS4 target domain contains invalid null byte (\\0): {}",
+                        domain
+                    );
                 }
                 if domain.len() > 255 {
-                    bail!("SOCKS4a target domain length exceeds 255 bytes limit: {}", domain.len());
+                    bail!(
+                        "SOCKS4a target domain length exceeds 255 bytes limit: {}",
+                        domain.len()
+                    );
                 }
                 // SOCKS4a domain extension: IP set to 0.0.0.1
                 req.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
@@ -154,7 +172,11 @@ impl Socks4Client {
                 0x5D => "Identd reported user mismatch (93)",
                 _code => "Unknown error code",
             };
-            bail!("SOCKS4 proxy connection failed: {} (code: 0x{:02x})", reason, reply[1]);
+            bail!(
+                "SOCKS4 proxy connection failed: {} (code: 0x{:02x})",
+                reason,
+                reply[1]
+            );
         }
 
         Ok(())

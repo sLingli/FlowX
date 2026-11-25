@@ -190,15 +190,14 @@ impl ProcessTracker {
     /// `client` 为入站连接的对端地址（即发起方本地套接字），`server` 为 FlowX 入站监听端的本地地址。
     /// 仅当系统 TCP 表中存在 `local == client && remote == server` 的行时才认定归属，
     /// 若进程在反查窗口内已退出或不可访问则返回 `None`（绝不缓存未知占位）。
-    pub fn find_by_connection(&self, client: SocketAddr, server: SocketAddr) -> Option<ProcessInfo> {
+    pub fn find_by_connection(
+        &self,
+        client: SocketAddr,
+        server: SocketAddr,
+    ) -> Option<ProcessInfo> {
         let now = Instant::now();
         let pid = get_pid_by_connection(client, server)?;
-        self.resolve_pid_with(
-            pid,
-            now,
-            get_process_start_time,
-            get_process_identity,
-        )
+        self.resolve_pid_with(pid, now, get_process_start_time, get_process_identity)
     }
 
     /// 直接按已知 PID 解析进程信息（复用进程启动时间防 PID 复用校验与 TTL 缓存）
@@ -280,7 +279,10 @@ fn extract_process_name(path: &str) -> String {
         .to_string()
 }
 
-fn normalize_ipv4_pair(client: SocketAddr, server: SocketAddr) -> Option<(SocketAddrV4, SocketAddrV4)> {
+fn normalize_ipv4_pair(
+    client: SocketAddr,
+    server: SocketAddr,
+) -> Option<(SocketAddrV4, SocketAddrV4)> {
     let to_v4 = |addr: SocketAddr| -> Option<SocketAddrV4> {
         match addr {
             SocketAddr::V4(v4) => Some(v4),
@@ -290,7 +292,10 @@ fn normalize_ipv4_pair(client: SocketAddr, server: SocketAddr) -> Option<(Socket
     Some((to_v4(client)?, to_v4(server)?))
 }
 
-fn normalize_ipv6_pair(client: SocketAddr, server: SocketAddr) -> Option<(SocketAddrV6, SocketAddrV6)> {
+fn normalize_ipv6_pair(
+    client: SocketAddr,
+    server: SocketAddr,
+) -> Option<(SocketAddrV6, SocketAddrV6)> {
     let to_v6 = |addr: SocketAddr| -> SocketAddrV6 {
         match addr {
             SocketAddr::V6(v6) => v6,
@@ -381,11 +386,7 @@ where
     None
 }
 
-fn query_extended_tcp_table<Row: Copy, F>(
-    af: u32,
-    table_offset: usize,
-    matcher: F,
-) -> Option<u32>
+fn query_extended_tcp_table<Row: Copy, F>(af: u32, table_offset: usize, matcher: F) -> Option<u32>
 where
     F: FnMut(&Row) -> Option<u32>,
 {
@@ -402,11 +403,7 @@ where
     )
 }
 
-fn query_extended_udp_table<Row: Copy, F>(
-    af: u32,
-    table_offset: usize,
-    matcher: F,
-) -> Option<u32>
+fn query_extended_udp_table<Row: Copy, F>(af: u32, table_offset: usize, matcher: F) -> Option<u32>
 where
     F: FnMut(&Row) -> Option<u32>,
 {
@@ -517,20 +514,21 @@ fn query_windows_udp_v4(target_ip: Option<Ipv4Addr>, target_port: u16) -> Option
 
     let table_offset = std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table);
     let mut wild_pid: Option<u32> = None;
-    let exact = query_extended_udp_table::<MIB_UDPROW_OWNER_PID, _>(AF_INET as u32, table_offset, |row| {
-        let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
-        if local_port != target_port || row.dwOwningPid == 0 {
-            return None;
-        }
-        let local_ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
-        if target_ip.is_some_and(|req_ip| local_ip == req_ip) {
-            return Some(row.dwOwningPid);
-        }
-        if local_ip.is_unspecified() && wild_pid.is_none() {
-            wild_pid = Some(row.dwOwningPid);
-        }
-        None
-    });
+    let exact =
+        query_extended_udp_table::<MIB_UDPROW_OWNER_PID, _>(AF_INET as u32, table_offset, |row| {
+            let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+            if local_port != target_port || row.dwOwningPid == 0 {
+                return None;
+            }
+            let local_ip = Ipv4Addr::from(row.dwLocalAddr.to_ne_bytes());
+            if target_ip.is_some_and(|req_ip| local_ip == req_ip) {
+                return Some(row.dwOwningPid);
+            }
+            if local_ip.is_unspecified() && wild_pid.is_none() {
+                wild_pid = Some(row.dwOwningPid);
+            }
+            None
+        });
     exact.or(wild_pid)
 }
 
@@ -542,20 +540,24 @@ fn query_windows_udp_v6(target_ip: Option<Ipv6Addr>, target_port: u16) -> Option
 
     let table_offset = std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table);
     let mut wild_pid: Option<u32> = None;
-    let exact = query_extended_udp_table::<MIB_UDP6ROW_OWNER_PID, _>(AF_INET6 as u32, table_offset, |row| {
-        let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
-        if local_port != target_port || row.dwOwningPid == 0 {
-            return None;
-        }
-        let local_ip = Ipv6Addr::from(row.ucLocalAddr);
-        if target_ip.is_some_and(|req_ip| local_ip == req_ip) {
-            return Some(row.dwOwningPid);
-        }
-        if local_ip.is_unspecified() && wild_pid.is_none() {
-            wild_pid = Some(row.dwOwningPid);
-        }
-        None
-    });
+    let exact = query_extended_udp_table::<MIB_UDP6ROW_OWNER_PID, _>(
+        AF_INET6 as u32,
+        table_offset,
+        |row| {
+            let local_port = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+            if local_port != target_port || row.dwOwningPid == 0 {
+                return None;
+            }
+            let local_ip = Ipv6Addr::from(row.ucLocalAddr);
+            if target_ip.is_some_and(|req_ip| local_ip == req_ip) {
+                return Some(row.dwOwningPid);
+            }
+            if local_ip.is_unspecified() && wild_pid.is_none() {
+                wild_pid = Some(row.dwOwningPid);
+            }
+            None
+        },
+    );
     exact.or(wild_pid)
 }
 
@@ -592,7 +594,9 @@ impl Drop for HandleGuard {
     }
 }
 
-fn query_windows_process_creation_time(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<u128> {
+fn query_windows_process_creation_time(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+) -> Option<u128> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::GetProcessTimes;
 
@@ -629,7 +633,7 @@ fn get_process_start_time(pid: u32) -> Option<u128> {
 
 fn get_process_identity(pid: u32) -> Option<(String, Option<u128>)> {
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
     };
 
     if pid == 0 {
@@ -721,7 +725,12 @@ mod tests {
         let tracker = Arc::new(ProcessTracker::new());
         let client: SocketAddr = "127.0.0.1:3".parse().unwrap();
         let server: SocketAddr = "127.0.0.1:4".parse().unwrap();
-        assert!(tracker.find_by_connection_async(client, server).await.is_none());
+        assert!(
+            tracker
+                .find_by_connection_async(client, server)
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -749,20 +758,46 @@ mod tests {
             dst[start + 4..start + 8].copy_from_slice(&row.pid.to_ne_bytes());
         };
 
-        write_row(&mut buf, 0, SyntheticRow { local_port: 1000, remote_port: 80, pid: 111 });
-        write_row(&mut buf, 1, SyntheticRow { local_port: 2000, remote_port: 443, pid: 222 });
-        write_row(&mut buf, 2, SyntheticRow { local_port: 3000, remote_port: 8080, pid: 333 });
+        write_row(
+            &mut buf,
+            0,
+            SyntheticRow {
+                local_port: 1000,
+                remote_port: 80,
+                pid: 111,
+            },
+        );
+        write_row(
+            &mut buf,
+            1,
+            SyntheticRow {
+                local_port: 2000,
+                remote_port: 443,
+                pid: 222,
+            },
+        );
+        write_row(
+            &mut buf,
+            2,
+            SyntheticRow {
+                local_port: 3000,
+                remote_port: 8080,
+                pid: 333,
+            },
+        );
 
-        let found = find_in_tcp_table_bytes::<SyntheticRow, _>(&buf, buf.len(), header_offset, |r| {
-            (r.local_port == 3000 && r.remote_port == 8080).then_some(r.pid)
-        });
+        let found =
+            find_in_tcp_table_bytes::<SyntheticRow, _>(&buf, buf.len(), header_offset, |r| {
+                (r.local_port == 3000 && r.remote_port == 8080).then_some(r.pid)
+            });
         assert_eq!(found, Some(333));
 
         // 畸形 dwNumEntries = u32::MAX 且 actual_size > buf.len()，必须被安全钳制而不越界读
         buf[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
-        let clamped = find_in_tcp_table_bytes::<SyntheticRow, _>(&buf, usize::MAX, header_offset, |r| {
-            (r.local_port == 2000).then_some(r.pid)
-        });
+        let clamped =
+            find_in_tcp_table_bytes::<SyntheticRow, _>(&buf, usize::MAX, header_offset, |r| {
+                (r.local_port == 2000).then_some(r.pid)
+            });
         assert_eq!(clamped, Some(222));
 
         // actual_size 小于 2 行时，第 2 行 (index=1) 不可越过 actual_size 读取
@@ -852,7 +887,9 @@ mod tests {
                 },
                 start_time: Some(i as u128),
             };
-            tracker.pid_cache.insert(i, entry, t0 + Duration::from_millis(i as u64));
+            tracker
+                .pid_cache
+                .insert(i, entry, t0 + Duration::from_millis(i as u64));
         }
 
         // 受 MAX 容量=3 约束，最老的条目 (1, 2) 应已被逐出，保留最新 (3, 4, 5)
@@ -870,7 +907,9 @@ mod tests {
     async fn test_resolve_pid_and_async_caches_current_process() {
         let tracker = Arc::new(ProcessTracker::new());
         let pid = std::process::id();
-        let sync_info = tracker.resolve_pid(pid).expect("current pid should resolve synchronously");
+        let sync_info = tracker
+            .resolve_pid(pid)
+            .expect("current pid should resolve synchronously");
         assert_eq!(sync_info.pid, pid);
         assert!(!sync_info.path.is_empty());
         assert!(!sync_info.name.is_empty());
@@ -901,7 +940,9 @@ mod tests {
         // PID 0 (Idle/TIME_WAIT 无归属槽位) 绝不可被误判为 Windows System 内核进程（仅 PID 4 为 System）
         let tracker = ProcessTracker::new();
         assert!(tracker.resolve_pid(0).is_none());
-        let sys_info = tracker.resolve_pid(4).expect("PID 4 should resolve to System");
+        let sys_info = tracker
+            .resolve_pid(4)
+            .expect("PID 4 should resolve to System");
         assert_eq!(sys_info.name, "System");
 
         // 双栈 IPv6 UDP 套接字（显式绑定 ::ffff:127.0.0.1 或 [::]）按 IPv4 地址查询也应命中本进程 PID

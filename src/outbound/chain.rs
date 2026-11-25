@@ -1,14 +1,16 @@
-use std::net::SocketAddr;
-use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
-use crate::dns::FakeIpPool;
+use super::TargetAddr;
 use super::bypass::OutboundTcpStream;
-use super::direct::{connect_proxy_tcp_guarded, validate_direct_ips, DEFAULT_OUTBOUND_UPSTREAM_DNS};
+use super::direct::{
+    DEFAULT_OUTBOUND_UPSTREAM_DNS, connect_proxy_tcp_guarded, validate_direct_ips,
+};
 use super::http::HttpConnectClient;
 use super::socks4::Socks4Client;
 use super::socks5::Socks5Client;
-use super::TargetAddr;
+use crate::dns::FakeIpPool;
+use anyhow::{Context, Result, bail};
+use std::net::SocketAddr;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpStream;
 
 fn validate_chain_hop_target(
     chain_name: &str,
@@ -18,8 +20,10 @@ fn validate_chain_hop_target(
     fake_ip_pool: Option<&FakeIpPool>,
 ) -> Result<()> {
     match target {
-        TargetAddr::Ip(sa) => validate_direct_ips(&[sa.ip()], sa.port(), self_ports, fake_ip_pool, addr)
-            .with_context(|| format!("Proxy chain [{}] hop target rejected", chain_name)),
+        TargetAddr::Ip(sa) => {
+            validate_direct_ips(&[sa.ip()], sa.port(), self_ports, fake_ip_pool, addr)
+                .with_context(|| format!("Proxy chain [{}] hop target rejected", chain_name))
+        }
         TargetAddr::Domain(_, port) => {
             if target.is_loopback_or_unspecified() && self_ports.contains(port) {
                 bail!(
@@ -105,10 +109,18 @@ impl ProxyChain {
         let mut visited = std::collections::HashSet::new();
         for node in &self.nodes {
             let addr = node.server_addr();
-            let target = parse_target_addr(addr)
-                .with_context(|| format!("Proxy chain [{}] contains invalid node address: {}", self.name, addr))?;
+            let target = parse_target_addr(addr).with_context(|| {
+                format!(
+                    "Proxy chain [{}] contains invalid node address: {}",
+                    self.name, addr
+                )
+            })?;
             if !visited.insert(target.clone()) {
-                bail!("Proxy chain [{}] contains duplicate node, circular dependency detected: {}", self.name, addr);
+                bail!(
+                    "Proxy chain [{}] contains duplicate node, circular dependency detected: {}",
+                    self.name,
+                    addr
+                );
             }
             validate_chain_hop_target(&self.name, addr, &target, forbidden_ports, None)?;
         }
@@ -140,7 +152,10 @@ impl ProxyChain {
         self_ports: &[u16],
     ) -> Result<OutboundTcpStream> {
         if self.nodes.is_empty() {
-            bail!("Proxy chain '{}' does not contain any proxy nodes", self.name);
+            bail!(
+                "Proxy chain '{}' does not contain any proxy nodes",
+                self.name
+            );
         }
 
         const CHAIN_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -250,8 +265,12 @@ mod tests {
 
         // Duplicate domain with case variation should also be detected as loop
         let dup_chain = ProxyChain::new("Dup-Chain")
-            .add_node(ProxyNode::Socks5(Socks5Client::new("Proxy.Example.com:1080")))
-            .add_node(ProxyNode::Http(HttpConnectClient::new("proxy.example.com:1080")));
+            .add_node(ProxyNode::Socks5(Socks5Client::new(
+                "Proxy.Example.com:1080",
+            )))
+            .add_node(ProxyNode::Http(HttpConnectClient::new(
+                "proxy.example.com:1080",
+            )));
         assert!(dup_chain.validate_loop(&[40001]).is_err());
     }
 

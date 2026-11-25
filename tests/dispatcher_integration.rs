@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use flowx::dns::FakeIpPool;
 use flowx::interceptor::dispatcher::{
-    dispatch_transparent_stream, DispatcherConfig, ProxyNodeEntry, StreamDispatcher,
+    DispatcherConfig, ProxyNodeEntry, StreamDispatcher, dispatch_transparent_stream,
 };
 use flowx::interceptor::process::ProcessTracker;
 use flowx::monitor::{ConnectionManager, InFlightTracker};
@@ -105,11 +105,8 @@ async fn test_http_forward_dispatcher_blocks_pipelined_smuggling_on_persistent_o
             }
         }
         // Wait briefly: must receive NEITHER premature FIN (Ok(0)) NOR smuggled 2nd request bytes
-        let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(80),
-            s.read(&mut buf),
-        )
-        .await;
+        let probe =
+            tokio::time::timeout(std::time::Duration::from_millis(80), s.read(&mut buf)).await;
         assert!(
             probe.is_err(),
             "Origin expected neither premature EOF nor smuggled bytes, got: {:?}",
@@ -196,7 +193,10 @@ async fn test_dispatch_transparent_stream_sniffs_sni_evaluates_rule_and_preserve
         let (mut s, _) = origin.accept().await.unwrap();
         let mut got = vec![0u8; expected_hello.len()];
         s.read_exact(&mut got).await.unwrap();
-        assert_eq!(got, expected_hello, "Original TLS ClientHello bytes must arrive intact");
+        assert_eq!(
+            got, expected_hello,
+            "Original TLS ClientHello bytes must arrive intact"
+        );
         s.write_all(b"SERVER_OK").await.unwrap();
     });
 
@@ -227,15 +227,7 @@ async fn test_dispatch_transparent_stream_sniffs_sni_evaluates_rule_and_preserve
     let (mut app_side, disp_side) = tokio::io::duplex(8192);
     let peer_addr: SocketAddr = "127.0.0.1:55555".parse().unwrap();
     let disp_handle = tokio::spawn(async move {
-        dispatch_transparent_stream(
-            cfg,
-            disp_side,
-            peer_addr,
-            origin_addr,
-            None,
-            true,
-        )
-        .await
+        dispatch_transparent_stream(cfg, disp_side, peer_addr, origin_addr, None, true).await
     });
 
     app_side.write_all(&client_hello).await.unwrap();
@@ -336,7 +328,10 @@ async fn test_dispatch_transparent_stream_restores_fake_ip_and_rejects_self_port
         true,
     )
     .await;
-    assert!(mapped_res.is_ok(), "Fake-IP domain restore should trigger Action::Block cleanly");
+    assert!(
+        mapped_res.is_ok(),
+        "Fake-IP domain restore should trigger Action::Block cleanly"
+    );
     let mut probe = [0u8; 8];
     assert_eq!(app_mapped.read(&mut probe).await.unwrap(), 0);
 }
@@ -402,8 +397,11 @@ async fn test_dispatch_transparent_stream_sniffs_http_tls_for_immediate_proxy_sk
 
     async fn spawn_mock_socks5_server(
         expect_banner: Option<&'static [u8]>,
-    ) -> (SocketAddr, tokio::sync::oneshot::Receiver<(u8, String, u16)>, tokio::task::JoinHandle<()>)
-    {
+    ) -> (
+        SocketAddr,
+        tokio::sync::oneshot::Receiver<(u8, String, u16)>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (target_tx, target_rx) = tokio::sync::oneshot::channel();
@@ -490,7 +488,10 @@ async fn test_dispatch_transparent_stream_sniffs_http_tls_for_immediate_proxy_sk
     let hello = build_test_tls_client_hello("api.github.com");
     app_443.write_all(&hello).await.unwrap();
     let (atyp_443, host_443, port_443) = target_rx_443.await.unwrap();
-    assert_eq!(atyp_443, 0x03, "port 443 Immediate(Proxy) must sniff SNI as domain");
+    assert_eq!(
+        atyp_443, 0x03,
+        "port 443 Immediate(Proxy) must sniff SNI as domain"
+    );
     assert_eq!(host_443, "api.github.com");
     assert_eq!(port_443, 443);
     let mut ack_443 = [0u8; 14];
@@ -606,7 +607,7 @@ async fn test_dispatch_transparent_stream_tracks_in_flight_guard() {
 
 #[tokio::test]
 async fn test_dispatch_transparent_stream_enforces_domain_port_rules_on_ssh_and_custom_ports_and_blocks_spoofed_localhost()
-{
+ {
     use flowx::outbound::socks5::Socks5Client;
 
     // 1. 端口+域名阻断规则 (ports="22", targets="*.foo", Block) 经 real_ip_to_domain 与 Fake-IP 均立即阻断 SSH，不绕过
@@ -775,7 +776,9 @@ async fn test_dispatch_transparent_stream_enforces_domain_port_rules_on_ssh_and_
     let mut ssh_banner = [0u8; 17];
     tokio::time::timeout(Duration::from_secs(2), app_u22.read_exact(&mut ssh_banner))
         .await
-        .expect("port 22 SSH must not block waiting for client sniff even with needs_domain_sniff=true")
+        .expect(
+            "port 22 SSH must not block waiting for client sniff even with needs_domain_sniff=true",
+        )
         .unwrap();
     assert_eq!(&ssh_banner, b"SSH-2.0-Immediate");
     drop(app_u22);
@@ -793,7 +796,10 @@ async fn test_dispatch_transparent_stream_enforces_domain_port_rules_on_ssh_and_
         s.write_all(&[0x05, 0x00]).await.unwrap();
         let mut hdr = [0u8; 4];
         s.read_exact(&mut hdr).await.unwrap();
-        assert_eq!(hdr[3], 0x01, "spoofed Host: localhost on remote IP must stay as IP target for Proxy");
+        assert_eq!(
+            hdr[3], 0x01,
+            "spoofed Host: localhost on remote IP must stay as IP target for Proxy"
+        );
         let mut ip = [0u8; 6];
         s.read_exact(&mut ip).await.unwrap();
         let dst = std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
@@ -810,7 +816,14 @@ async fn test_dispatch_transparent_stream_enforces_domain_port_rules_on_ssh_and_
     let spoof_cfg = test_config(
         "127.0.0.1:40001".parse().unwrap(),
         vec![
-            flowx::router::Rule::from_raw("LocalBypass", true, None, Some("localhost"), None, Action::Direct),
+            flowx::router::Rule::from_raw(
+                "LocalBypass",
+                true,
+                None,
+                Some("localhost"),
+                None,
+                Action::Direct,
+            ),
             flowx::router::Rule::from_raw("DevProxy", true, None, None, None, Action::Proxy(1)),
         ],
     );
@@ -853,8 +866,8 @@ async fn test_dispatch_transparent_stream_enforces_domain_port_rules_on_ssh_and_
 }
 
 #[tokio::test]
-async fn test_dispatch_transparent_stream_sniffs_non_default_https_over_cached_ip_handles_cdn_ambiguity_and_uses_fake_ip_orig_dns(
-) {
+async fn test_dispatch_transparent_stream_sniffs_non_default_https_over_cached_ip_handles_cdn_ambiguity_and_uses_fake_ip_orig_dns()
+ {
     use flowx::outbound::socks5::Socks5Client;
     use tokio::io::AsyncReadExt;
 
@@ -872,7 +885,10 @@ async fn test_dispatch_transparent_stream_sniffs_non_default_https_over_cached_i
         s.write_all(&[0x05, 0x00]).await.unwrap();
         let mut hdr = [0u8; 4];
         s.read_exact(&mut hdr).await.unwrap();
-        assert_eq!(hdr[3], 0x03, "authoritative TLS SNI must dial Domain on Proxy");
+        assert_eq!(
+            hdr[3], 0x03,
+            "authoritative TLS SNI must dial Domain on Proxy"
+        );
         let mut l = [0u8; 1];
         s.read_exact(&mut l).await.unwrap();
         let mut dom = vec![0u8; l[0] as usize];
@@ -933,7 +949,10 @@ async fn test_dispatch_transparent_stream_sniffs_non_default_https_over_cached_i
     let mut tls_ack = [0u8; 6];
     app_tls.read_exact(&mut tls_ack).await.unwrap();
     assert_eq!(&tls_ack, b"TLS_OK");
-    assert_eq!(sni_rx.await.unwrap(), ("real-sni.example".to_string(), 8444));
+    assert_eq!(
+        sni_rx.await.unwrap(),
+        ("real-sni.example".to_string(), 8444)
+    );
     drop(app_tls);
     tls_handle.await.unwrap().unwrap();
     srv_8444.await.unwrap();
@@ -1083,15 +1102,23 @@ async fn test_dispatch_transparent_stream_sniffs_non_default_https_over_cached_i
 }
 
 #[tokio::test]
-async fn test_p1_1_devproxy_immediate_proxy_sniffs_nonstandard_https_http_and_p2_1_stale_sniff_does_not_delay_direct_or_block(
-) {
+async fn test_p1_1_devproxy_immediate_proxy_sniffs_nonstandard_https_http_and_p2_1_stale_sniff_does_not_delay_direct_or_block()
+ {
     use flowx::outbound::socks5::Socks5Client;
 
     // 1. P1-1: 默认 DevProxy（无域名条件，Immediate(Proxy(1)), needs_domain_sniff=false）
     //    在非标准 HTTPS 端口 8444 与 HTTP 端口 3000 上仍须嗅探 TLS SNI / HTTP Host 并传域名给远端代理
     for (port, payload, expected_host) in [
-        (8444u16, build_test_tls_client_hello("portal.nonstd.example"), "portal.nonstd.example"),
-        (3000u16, b"GET /health HTTP/1.1\r\nHost: web.dev.example:3000\r\n\r\n".to_vec(), "web.dev.example"),
+        (
+            8444u16,
+            build_test_tls_client_hello("portal.nonstd.example"),
+            "portal.nonstd.example",
+        ),
+        (
+            3000u16,
+            b"GET /health HTTP/1.1\r\nHost: web.dev.example:3000\r\n\r\n".to_vec(),
+            "web.dev.example",
+        ),
     ] {
         let socks_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_addr = socks_listener.local_addr().unwrap();
@@ -1104,7 +1131,10 @@ async fn test_p1_1_devproxy_immediate_proxy_sniffs_nonstandard_https_http_and_p2
             s.write_all(&[0x05, 0x00]).await.unwrap();
             let mut hdr = [0u8; 4];
             s.read_exact(&mut hdr).await.unwrap();
-            assert_eq!(hdr[3], 0x03, "DevProxy Immediate(Proxy) on :{port} must sniff and dial Domain");
+            assert_eq!(
+                hdr[3], 0x03,
+                "DevProxy Immediate(Proxy) on :{port} must sniff and dial Domain"
+            );
             let mut l = [0u8; 1];
             s.read_exact(&mut l).await.unwrap();
             let mut dom = vec![0u8; l[0] as usize];

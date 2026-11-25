@@ -144,7 +144,12 @@ async fn test_cli_offline_crud_and_simulate() {
     let store = ConfigStore::new(&path);
     let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
     assert_eq!(
-        rt.proxy_nodes.get(&102).unwrap().client.auth_credentials().1,
+        rt.proxy_nodes
+            .get(&102)
+            .unwrap()
+            .client
+            .auth_credentials()
+            .1,
         Some("--json")
     );
 
@@ -164,7 +169,12 @@ async fn test_cli_offline_crud_and_simulate() {
     .unwrap();
     let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
     assert_eq!(
-        rt.proxy_nodes.get(&102).unwrap().client.auth_credentials().1,
+        rt.proxy_nodes
+            .get(&102)
+            .unwrap()
+            .client
+            .auth_credentials()
+            .1,
         None
     );
 
@@ -573,7 +583,11 @@ async fn test_cli_json_errors_and_password_clear_rules() {
     ])
     .await
     .unwrap();
-    assert!(path.exists(), "Successful offline mutation must persist {}", cfg_str);
+    assert!(
+        path.exists(),
+        "Successful offline mutation must persist {}",
+        cfg_str
+    );
 
     run_cli(&[
         "flowx".into(),
@@ -635,28 +649,33 @@ async fn test_cli_json_errors_and_password_clear_rules() {
 
 #[tokio::test]
 async fn test_cli_transparent_commands_and_config_preservation() {
-    let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-        "flowx_cli_transparent_test_{}_{}.xml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let cfg_path = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "flowx_cli_transparent_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     let _ = std::fs::remove_file(&cfg_path);
     let cfg_str = cfg_path.to_string_lossy().to_string();
 
     // 1. Readonly status must not create missing config file; doctor works cleanly without one
-    assert!(run_cli(&[
-        "flowx".into(),
-        "--config".into(),
-        cfg_str.clone(),
-        "--offline".into(),
-        "transparent".into(),
-        "status".into(),
-    ])
-    .await
-    .is_err());
+    assert!(
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "status".into(),
+        ])
+        .await
+        .is_err()
+    );
     assert!(!cfg_path.exists());
 
     run_cli(&[
@@ -672,41 +691,47 @@ async fn test_cli_transparent_commands_and_config_preservation() {
     assert!(!cfg_path.exists());
 
     // 2. Conflicting options fail fast
-    assert!(run_cli(&[
-        "flowx".into(),
-        "--config".into(),
-        cfg_str.clone(),
-        "--offline".into(),
-        "transparent".into(),
-        "config".into(),
-        "--hijack-dns".into(),
-        "--no-hijack-dns".into(),
-    ])
-    .await
-    .is_err());
-    assert!(run_cli(&[
-        "flowx".into(),
-        "--config".into(),
-        cfg_str.clone(),
-        "--offline".into(),
-        "transparent".into(),
-        "config".into(),
-        "--dll-path".into(),
-        r"C:\ok\WinDivert.dll".into(),
-        "--clear-dll-path".into(),
-    ])
-    .await
-    .is_err());
-    assert!(run_cli(&[
-        "flowx".into(),
-        "--config".into(),
-        cfg_str.clone(),
-        "--offline".into(),
-        "transparent".into(),
-        "config".into(),
-    ])
-    .await
-    .is_err());
+    assert!(
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+            "--hijack-dns".into(),
+            "--no-hijack-dns".into(),
+        ])
+        .await
+        .is_err()
+    );
+    assert!(
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+            "--dll-path".into(),
+            r"C:\ok\WinDivert.dll".into(),
+            "--clear-dll-path".into(),
+        ])
+        .await
+        .is_err()
+    );
+    assert!(
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "transparent".into(),
+            "config".into(),
+        ])
+        .await
+        .is_err()
+    );
 
     // 3. Configure + enable persists to XML and survives node/rule mutations
     run_cli(&[

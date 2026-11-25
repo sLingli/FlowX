@@ -6,11 +6,11 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ConfigStore;
+use crate::control::ControlError;
 use crate::control::rule::parse_and_validate_action;
 use crate::control::transparent::transparent_status_or_fallback;
-use crate::control::ControlError;
 use crate::dns::FakeIpPool;
-use crate::i18n::{t, Locale};
+use crate::i18n::{Locale, t};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::outbound::TargetAddr;
 use crate::router::{RouteContext, RuleEngine, RuleTraceStep};
@@ -222,10 +222,7 @@ pub fn build_system_info(
     started_at: Instant,
     locale: Locale,
 ) -> SystemInfoResponse {
-    let nodes_count = proxy_nodes
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .len();
+    let nodes_count = proxy_nodes.read().unwrap_or_else(|e| e.into_inner()).len();
     let rules = rule_engine.current_rules();
     let rules_count = rules.len();
     let enabled_rules_count = rules.iter().filter(|r| r.enabled).count();

@@ -1,19 +1,19 @@
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
-use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::interceptor::dispatcher::ProxyNodeEntry;
-use crate::outbound::chain::{parse_target_addr, ProxyNode};
+use crate::outbound::TargetAddr;
+use crate::outbound::chain::{ProxyNode, parse_target_addr};
 use crate::outbound::http::HttpConnectClient;
 use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
-use crate::outbound::TargetAddr;
 use crate::router::{Action, Rule, RuleEngine};
 use crate::transparent::TransparentSettings;
 
@@ -28,9 +28,17 @@ fn default_true_bool() -> bool {
 pub struct ProfileConfig {
     #[serde(rename = "@version", default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(rename = "DefaultAction", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "DefaultAction",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub default_action: Option<RuleActionItem>,
-    #[serde(rename = "TransparentProxy", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "TransparentProxy",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub transparent_proxy: Option<TransparentProxyItem>,
     #[serde(rename = "ProxyList", default, skip_serializing_if = "Option::is_none")]
     pub proxy_list: Option<ProxyList>,
@@ -121,7 +129,11 @@ pub struct RuleItem {
     pub enabled: Option<bool>,
     #[serde(rename = "Name")]
     pub name: String,
-    #[serde(rename = "Applications", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "Applications",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub applications: Option<String>,
     #[serde(rename = "Targets", default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<String>,
@@ -157,7 +169,8 @@ impl ProfileConfig {
         let mut buf = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let mut ser = quick_xml::se::Serializer::new(&mut buf);
         ser.indent(' ', 2);
-        self.serialize(ser).context("Failed to serialize ProfileConfig to XML")?;
+        self.serialize(ser)
+            .context("Failed to serialize ProfileConfig to XML")?;
         buf.push('\n');
         Ok(buf)
     }
@@ -189,7 +202,9 @@ impl ProfileConfig {
                         enabled: Some(true),
                         name: "LocalBypass".to_string(),
                         applications: None,
-                        targets: Some("127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16".to_string()),
+                        targets: Some(
+                            "127.0.0.1; localhost; %ComputerName%; ::1; 192.168.0.0/16".to_string(),
+                        ),
                         ports: None,
                         action: RuleActionItem {
                             action_type: "Direct".to_string(),
@@ -199,7 +214,9 @@ impl ProfileConfig {
                     RuleItem {
                         enabled: Some(true),
                         name: "DevProxy".to_string(),
-                        applications: Some("node.exe; *chrome*.exe; *git*.exe; *antigravity*.exe".to_string()),
+                        applications: Some(
+                            "node.exe; *chrome*.exe; *git*.exe; *antigravity*.exe".to_string(),
+                        ),
                         targets: None,
                         ports: None,
                         action: RuleActionItem {
@@ -240,9 +257,21 @@ impl ProfileConfig {
                 }
                 let action = parse_action(&item.action, &proxy_nodes)
                     .with_context(|| format!("Invalid action configuration for rule [{}]", name))?;
-                let apps = item.applications.as_deref().map(str::trim).filter(|s| !s.is_empty());
-                let targets = item.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
-                let ports = item.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let apps = item
+                    .applications
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let targets = item
+                    .targets
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let ports = item
+                    .ports
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
                 let enabled = item.enabled.unwrap_or(true);
                 rules.push(Rule::from_raw(name, enabled, apps, targets, ports, action));
             }
@@ -348,14 +377,15 @@ fn action_to_item(action: &Action) -> RuleActionItem {
     }
 }
 
-fn parse_action(item: &RuleActionItem, proxy_nodes: &HashMap<u32, ProxyNodeEntry>) -> Result<Action> {
+fn parse_action(
+    item: &RuleActionItem,
+    proxy_nodes: &HashMap<u32, ProxyNodeEntry>,
+) -> Result<Action> {
     match item.action_type.trim().to_ascii_uppercase().as_str() {
         "DIRECT" => Ok(Action::Direct),
         "BLOCK" => Ok(Action::Block),
         "PROXY" => {
-            let id = item
-                .value
-                .context("Proxy action missing node ID")?;
+            let id = item.value.context("Proxy action missing node ID")?;
             if !proxy_nodes.contains_key(&id) {
                 bail!("Referenced non-existent proxy node ID: {}", id);
             }
@@ -389,15 +419,23 @@ fn split_server_addr(server_addr: &str) -> (String, u16) {
 fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEntry> {
     let proto = item.proxy_type.trim().to_ascii_uppercase();
     if !matches!(proto.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
-        bail!("Node #{} uses unsupported proxy protocol: {}", item.id, item.proxy_type);
+        bail!(
+            "Node #{} uses unsupported proxy protocol: {}",
+            item.id,
+            item.proxy_type
+        );
     }
     let address = item.address.trim();
     if address.is_empty() || item.port == 0 {
         bail!("Node #{} address or port is invalid", item.id);
     }
     let server_addr = format_host_port(address, item.port);
-    let target_parsed = parse_target_addr(&server_addr)
-        .with_context(|| format!("Node #{} address format is invalid: {}", item.id, server_addr))?;
+    let target_parsed = parse_target_addr(&server_addr).with_context(|| {
+        format!(
+            "Node #{} address format is invalid: {}",
+            item.id, server_addr
+        )
+    })?;
     match &target_parsed {
         crate::outbound::TargetAddr::Ip(sa) => {
             crate::outbound::direct::validate_direct_ips(
@@ -411,7 +449,11 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
         }
         crate::outbound::TargetAddr::Domain(_, port) => {
             if target_parsed.is_loopback_or_unspecified() && self_ports.contains(port) {
-                bail!("Node #{} address points to FlowX internal service port: {}", item.id, server_addr);
+                bail!(
+                    "Node #{} address points to FlowX internal service port: {}",
+                    item.id,
+                    server_addr
+                );
             }
         }
     }
@@ -447,7 +489,10 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
     }
     if proto != "SOCKS4" {
         if username.is_none() && password.is_some() {
-            bail!("Node #{} has a password configured without a username", item.id);
+            bail!(
+                "Node #{} has a password configured without a username",
+                item.id
+            );
         }
         if let Some(orphan_user) = username.as_deref()
             && password.is_none()
@@ -460,7 +505,10 @@ fn build_proxy_entry(item: ProxyItem, self_ports: &[u16]) -> Result<ProxyNodeEnt
         }
     }
     if proto == "HTTP" && username.as_deref().is_some_and(|u| u.contains(':')) {
-        bail!("Node #{} HTTP proxy username cannot contain ':' (RFC 7617)", item.id);
+        bail!(
+            "Node #{} HTTP proxy username cannot contain ':' (RFC 7617)",
+            item.id
+        );
     }
     let name = item
         .name
@@ -611,13 +659,19 @@ impl ConfigStore {
     fn read_existing_opt(&self, self_ports: &[u16]) -> Result<Option<RuntimeProfile>> {
         match std::fs::read_to_string(&self.path) {
             Ok(xml) => {
-                let cfg = ProfileConfig::from_xml(&xml)
-                    .with_context(|| format!("Failed to parse XML configuration file: {}", self.path.display()))?;
+                let cfg = ProfileConfig::from_xml(&xml).with_context(|| {
+                    format!(
+                        "Failed to parse XML configuration file: {}",
+                        self.path.display()
+                    )
+                })?;
                 let runtime = cfg.into_runtime(self_ports)?;
                 Ok(Some(runtime))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("Failed to read configuration file: {}", self.path.display())),
+            Err(e) => Err(e).with_context(|| {
+                format!("Failed to read configuration file: {}", self.path.display())
+            }),
         }
     }
 
@@ -729,15 +783,26 @@ impl ConfigStore {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
 
-        let mut file = opts
-            .open(&tmp_path)
-            .with_context(|| format!("Failed to create temporary configuration file: {}", tmp_path.display()))?;
+        let mut file = opts.open(&tmp_path).with_context(|| {
+            format!(
+                "Failed to create temporary configuration file: {}",
+                tmp_path.display()
+            )
+        })?;
 
         let write_result: Result<()> = (|| {
-            file.write_all(xml.as_bytes())
-                .with_context(|| format!("Failed to write temporary configuration file: {}", tmp_path.display()))?;
-            file.sync_all()
-                .with_context(|| format!("Failed to fsync temporary configuration file: {}", tmp_path.display()))?;
+            file.write_all(xml.as_bytes()).with_context(|| {
+                format!(
+                    "Failed to write temporary configuration file: {}",
+                    tmp_path.display()
+                )
+            })?;
+            file.sync_all().with_context(|| {
+                format!(
+                    "Failed to fsync temporary configuration file: {}",
+                    tmp_path.display()
+                )
+            })?;
             Ok(())
         })();
 
@@ -782,7 +847,10 @@ fn validate_xml_root_profile(xml_content: &str) -> Result<()> {
                     depth = 1;
                 } else if depth == 0 {
                     let found = String::from_utf8_lossy(raw_name.as_ref());
-                    bail!("Unexpected trailing XML element <{}> after </Profile>", found);
+                    bail!(
+                        "Unexpected trailing XML element <{}> after </Profile>",
+                        found
+                    );
                 } else {
                     depth += 1;
                 }
@@ -797,7 +865,10 @@ fn validate_xml_root_profile(xml_content: &str) -> Result<()> {
                     saw_root = true;
                 } else if depth == 0 {
                     let found = String::from_utf8_lossy(raw_name.as_ref());
-                    bail!("Unexpected trailing XML element <{}/> after </Profile>", found);
+                    bail!(
+                        "Unexpected trailing XML element <{}/> after </Profile>",
+                        found
+                    );
                 }
             }
             Ok(Event::End(e)) => {
@@ -853,8 +924,16 @@ mod tests {
         let default_cfg = ProfileConfig::default_profile();
         let xml = default_cfg.to_xml().unwrap();
         assert!(xml.contains("<Profile version=\"1\">"), "xml:\n{}", xml);
-        assert!(xml.contains("<Action type=\"Direct\"/>") || xml.contains("<Action type=\"Direct\" />"), "xml:\n{}", xml);
-        assert!(xml.contains("type=\"Proxy\"") && xml.contains("101"), "xml:\n{}", xml);
+        assert!(
+            xml.contains("<Action type=\"Direct\"/>") || xml.contains("<Action type=\"Direct\" />"),
+            "xml:\n{}",
+            xml
+        );
+        assert!(
+            xml.contains("type=\"Proxy\"") && xml.contains("101"),
+            "xml:\n{}",
+            xml
+        );
 
         let parsed = ProfileConfig::from_xml(&xml).unwrap();
         assert_eq!(parsed, default_cfg);
@@ -877,7 +956,10 @@ mod tests {
           </RuleList>
         </Profile>
         "#;
-        let compact_rt = ProfileConfig::from_xml(compact_xml).unwrap().into_runtime(&[]).unwrap();
+        let compact_rt = ProfileConfig::from_xml(compact_xml)
+            .unwrap()
+            .into_runtime(&[])
+            .unwrap();
         assert_eq!(compact_rt.rules[0].action, Action::Proxy(101));
 
         let runtime = parsed.into_runtime(&[40001, 40080, 1053]).unwrap();
@@ -1069,7 +1151,12 @@ mod tests {
           </ProxyList>
         </Profile>
         "#;
-        assert!(ProfileConfig::from_xml(bad_http_colon).unwrap().into_runtime(&[]).is_err());
+        assert!(
+            ProfileConfig::from_xml(bad_http_colon)
+                .unwrap()
+                .into_runtime(&[])
+                .is_err()
+        );
 
         // SOCKS4 with <Password> (even empty) and control characters on metadata fields must fail
         for bad_node_xml in [
@@ -1079,7 +1166,11 @@ mod tests {
             "<Profile version=\"1\"><ProxyList><Proxy id=\"1\" type=\"SOCKS5\"><Address>10.0.0.2</Address><Port>1080</Port><Username>alice</Username><Password>pw&#x1b;x</Password></Proxy></ProxyList></Profile>",
         ] {
             let parsed = ProfileConfig::from_xml(bad_node_xml).unwrap();
-            assert!(parsed.into_runtime(&[]).is_err(), "expected validation failure for {}", bad_node_xml);
+            assert!(
+                parsed.into_runtime(&[]).is_err(),
+                "expected validation failure for {}",
+                bad_node_xml
+            );
         }
 
         // Password without username still fails fast
@@ -1095,7 +1186,12 @@ mod tests {
           </ProxyList>
         </Profile>
         "#;
-        assert!(ProfileConfig::from_xml(bad_pw_only).unwrap().into_runtime(&[]).is_err());
+        assert!(
+            ProfileConfig::from_xml(bad_pw_only)
+                .unwrap()
+                .into_runtime(&[])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1131,14 +1227,17 @@ mod tests {
         }
 
         // Concurrent load_or_init inside workspace target dir produces a valid config file cleanly
-        let tmp = std::env::current_dir().unwrap().join("target").join(format!(
-            "flowx_init_lock_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_init_lock_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let _ = std::fs::remove_file(&tmp);
         let store = std::sync::Arc::new(ConfigStore::new(&tmp));
         let mut handles = Vec::new();
@@ -1160,14 +1259,17 @@ mod tests {
 
     #[test]
     fn test_config_store_cross_instance_file_lock_serializes_concurrent_saves() {
-        let tmp = std::env::current_dir().unwrap().join("target").join(format!(
-            "flowx_xproc_lock_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_xproc_lock_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let _ = std::fs::remove_file(&tmp);
         let lock_path = ConfigStore::new(&tmp).lock_file_path();
         let _ = std::fs::remove_file(&lock_path);
@@ -1187,7 +1289,9 @@ mod tests {
                         block_quic_for_proxied: true,
                         dll_path: None,
                     });
-                    store.save_profile(&cfg).expect("cross-instance save must succeed");
+                    store
+                        .save_profile(&cfg)
+                        .expect("cross-instance save must succeed");
                 }
             }));
         }
@@ -1209,7 +1313,10 @@ mod tests {
           <TransparentProxy enabled="true" />
         </Profile>
         "#;
-        let minimal_rt = ProfileConfig::from_xml(minimal_xml).unwrap().into_runtime(&[]).unwrap();
+        let minimal_rt = ProfileConfig::from_xml(minimal_xml)
+            .unwrap()
+            .into_runtime(&[])
+            .unwrap();
         assert_eq!(
             minimal_rt.transparent_settings,
             TransparentSettings {
@@ -1233,7 +1340,10 @@ mod tests {
           <RuleList />
         </Profile>
         "#;
-        let full_rt = ProfileConfig::from_xml(full_xml).unwrap().into_runtime(&[]).unwrap();
+        let full_rt = ProfileConfig::from_xml(full_xml)
+            .unwrap()
+            .into_runtime(&[])
+            .unwrap();
         assert_eq!(
             full_rt.transparent_settings,
             TransparentSettings {
@@ -1252,7 +1362,10 @@ mod tests {
         )
         .to_xml()
         .unwrap();
-        let reparsed = ProfileConfig::from_xml(&serialized).unwrap().into_runtime(&[]).unwrap();
+        let reparsed = ProfileConfig::from_xml(&serialized)
+            .unwrap()
+            .into_runtime(&[])
+            .unwrap();
         assert_eq!(reparsed.transparent_settings, full_rt.transparent_settings);
 
         // 3. Unknown fields inside <TransparentProxy> are rejected fail-closed

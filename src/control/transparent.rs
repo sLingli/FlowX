@@ -2,8 +2,8 @@ use serde::Deserialize;
 
 use crate::control::ControlError;
 use crate::transparent::{
-    is_valid_custom_dll_path_input, probe_status, TransparentManager, TransparentRuntimeStatus,
-    TransparentSettings,
+    TransparentManager, TransparentRuntimeStatus, TransparentSettings,
+    is_valid_custom_dll_path_input, probe_status,
 };
 
 #[derive(Debug, Deserialize)]

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::api::http::parse_query_param;
-use crate::api::{control_error_to_http, serde_json_to_string, JSON_CONTENT_TYPE};
+use crate::api::{JSON_CONTENT_TYPE, control_error_to_http, serde_json_to_string};
 use crate::control::routing::{set_default_action, simulate_route_with_pool};
 use crate::control::rule::{
     add_rule, delete_rule, move_rule, patch_rule, toggle_rule, update_rule,
@@ -11,7 +11,7 @@ use crate::control::{
     AddRuleRequest, MoveRuleRequest, PatchRuleRequest, SetDefaultActionRequest,
     SimulateRouteRequest, SystemRuntimeContext, ToggleRuleRequest, UpdateRuleRequest,
 };
-use crate::i18n::{json_error, Locale};
+use crate::i18n::{Locale, json_error};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::router::RuleEngine;
 
@@ -169,7 +169,11 @@ pub(super) fn handle_toggle_rule(
         Err(_) => (
             "400 Bad Request",
             JSON_CONTENT_TYPE,
-            json_error(locale, "ERR_INVALID_TOGGLE_BODY", "error.invalid_toggle_body"),
+            json_error(
+                locale,
+                "ERR_INVALID_TOGGLE_BODY",
+                "error.invalid_toggle_body",
+            ),
         ),
         Ok(req) => match toggle_rule(req, rule_engine) {
             Ok(enabled) => {

@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TcpHeader, TcpHeaderSlice, TransportSlice};
+use etherparse::{
+    NetSlice, PacketBuilder, SlicedPacket, TcpHeader, TcpHeaderSlice, TransportSlice,
+};
 
 pub(super) const MAX_SMOLTCP_TCP_SEG_PAYLOAD: usize = 32_768;
 
@@ -123,12 +125,14 @@ fn parse_lso_or_standard_tcp_packet(raw_ip: &[u8]) -> Option<ParsedTcpRaw<'_>> {
             let tcp_slice = &raw_ip[ihl..ip_end];
             let tcp_hdr = TcpHeaderSlice::from_slice(tcp_slice).ok()?;
             let payload = &tcp_slice[tcp_hdr.slice().len()..];
-            let src_ip =
-                IpAddr::V4(Ipv4Addr::new(raw_ip[12], raw_ip[13], raw_ip[14], raw_ip[15]))
-                    .to_canonical();
-            let dst_ip =
-                IpAddr::V4(Ipv4Addr::new(raw_ip[16], raw_ip[17], raw_ip[18], raw_ip[19]))
-                    .to_canonical();
+            let src_ip = IpAddr::V4(Ipv4Addr::new(
+                raw_ip[12], raw_ip[13], raw_ip[14], raw_ip[15],
+            ))
+            .to_canonical();
+            let dst_ip = IpAddr::V4(Ipv4Addr::new(
+                raw_ip[16], raw_ip[17], raw_ip[18], raw_ip[19],
+            ))
+            .to_canonical();
 
             Some(ParsedTcpRaw {
                 src_ip,
@@ -144,8 +148,8 @@ fn parse_lso_or_standard_tcp_packet(raw_ip: &[u8]) -> Option<ParsedTcpRaw<'_>> {
                 return None;
             }
             let hdr_payload_len = u16::from_be_bytes([raw_ip[4], raw_ip[5]]) as usize;
-            let lso_override =
-                (hdr_payload_len == 0 && raw_ip.len() > 40) || raw_ip.len() > 40 + u16::MAX as usize;
+            let lso_override = (hdr_payload_len == 0 && raw_ip.len() > 40)
+                || raw_ip.len() > 40 + u16::MAX as usize;
             let ip_end = if lso_override {
                 raw_ip.len()
             } else {
@@ -243,7 +247,11 @@ pub(super) fn enqueue_tcp_for_smoltcp(rx_queue: &mut VecDeque<Vec<u8>>, raw_ip: 
 
     let total_chunks = parsed.payload.len().div_ceil(MAX_SMOLTCP_TCP_SEG_PAYLOAD);
     let mut offset = 0usize;
-    for (idx, chunk) in parsed.payload.chunks(MAX_SMOLTCP_TCP_SEG_PAYLOAD).enumerate() {
+    for (idx, chunk) in parsed
+        .payload
+        .chunks(MAX_SMOLTCP_TCP_SEG_PAYLOAD)
+        .enumerate()
+    {
         let mut hdr = base_hdr.clone();
         hdr.sequence_number = base_hdr.sequence_number.wrapping_add(offset as u32);
         if idx > 0 {

@@ -1,8 +1,8 @@
 use std::io::Write;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -297,30 +297,30 @@ pub(super) async fn api_request_raw_with_timeouts(
     connect_timeout: Duration,
     io_timeout: Duration,
 ) -> std::result::Result<(u16, Value), ApiTransportError> {
-    let mut stream =
-        match tokio::time::timeout(connect_timeout, TcpStream::connect(api_addr)).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                return Err(ApiTransportError::ConnectionRefused(format!(
-                    "Connection refused by FlowX API at {}",
-                    api_addr
-                )));
-            }
-            Ok(Err(e)) => {
-                return Err(ApiTransportError::Other(anyhow!(
-                    "Failed to connect to FlowX API at {}: {}",
-                    api_addr,
-                    e
-                )));
-            }
-            Err(_) => {
-                return Err(ApiTransportError::Other(anyhow!(
-                    "Timed out connecting to FlowX API at {} after {}ms",
-                    api_addr,
-                    connect_timeout.as_millis()
-                )));
-            }
-        };
+    let mut stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(api_addr)).await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            return Err(ApiTransportError::ConnectionRefused(format!(
+                "Connection refused by FlowX API at {}",
+                api_addr
+            )));
+        }
+        Ok(Err(e)) => {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Failed to connect to FlowX API at {}: {}",
+                api_addr,
+                e
+            )));
+        }
+        Err(_) => {
+            return Err(ApiTransportError::Other(anyhow!(
+                "Timed out connecting to FlowX API at {} after {}ms",
+                api_addr,
+                connect_timeout.as_millis()
+            )));
+        }
+    };
 
     let accept_lang = locale.accept_language_header();
     let body_str = body.map(|b| b.to_string()).unwrap_or_default();
@@ -487,7 +487,10 @@ pub(super) async fn api_request_raw_with_timeouts(
     };
 
     let body_text = std::str::from_utf8(&body_bytes).map_err(|_| {
-        ApiTransportError::Other(anyhow!("Response body from {} is not valid UTF-8", api_addr))
+        ApiTransportError::Other(anyhow!(
+            "Response body from {} is not valid UTF-8",
+            api_addr
+        ))
     })?;
     let json_val = if body_text.trim().is_empty() {
         if (200..300).contains(&status_code) {

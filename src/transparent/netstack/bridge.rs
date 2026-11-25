@@ -44,12 +44,7 @@ impl NetstackSignal {
         }
     }
 
-    pub fn push_outbound_tcp(
-        &self,
-        raw_ip: Vec<u8>,
-        meta: PacketInterfaceMeta,
-        pid: Option<u32>,
-    ) {
+    pub fn push_outbound_tcp(&self, raw_ip: Vec<u8>, meta: PacketInterfaceMeta, pid: Option<u32>) {
         self.push_outbound_tcp_with_fragments(raw_ip, meta, pid, None);
     }
 
@@ -484,10 +479,19 @@ impl<'a> TxToken for VirtualTxToken<'a> {
 }
 
 impl Device for VirtualIpDevice {
-    type RxToken<'a> = VirtualRxToken where Self: 'a;
-    type TxToken<'a> = VirtualTxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = VirtualRxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = VirtualTxToken<'a>
+    where
+        Self: 'a;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx_queue.pop_front()?;
         Some((VirtualRxToken(pkt), VirtualTxToken(&mut self.tx_queue)))
     }

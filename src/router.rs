@@ -1,9 +1,9 @@
+use self::parser::{AppMatcher, DomainMatcher};
+use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use ipnet::IpNet;
-use serde::{Deserialize, Serialize};
-use self::parser::{AppMatcher, DomainMatcher};
 
 pub mod parser;
 
@@ -158,7 +158,11 @@ impl Rule {
         if !self.enabled {
             return true;
         }
-        if self.application_patterns.as_ref().is_some_and(Vec::is_empty) {
+        if self
+            .application_patterns
+            .as_ref()
+            .is_some_and(Vec::is_empty)
+        {
             return true;
         }
         if self.ports.as_ref().is_some_and(Vec::is_empty) {
@@ -343,9 +347,8 @@ fn cached_local_interface_ips() -> Vec<IpAddr> {
     const TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
     let now = std::time::Instant::now();
-    let lock = CACHE.get_or_init(|| {
-        std::sync::Mutex::new((now, crate::outbound::local_interface_ips()))
-    });
+    let lock =
+        CACHE.get_or_init(|| std::sync::Mutex::new((now, crate::outbound::local_interface_ips())));
     let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     if now.duration_since(guard.0) >= TTL {
         guard.1 = crate::outbound::local_interface_ips();
@@ -406,7 +409,10 @@ fn is_non_hijackable_local_qname(qname: &str, local_hostname: &str) -> bool {
         return true;
     }
     let lower = norm.to_ascii_lowercase();
-    let local_norm = local_hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+    let local_norm = local_hostname
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     lower == "localhost"
         || lower.ends_with(".localhost")
         || lower.ends_with(".local")
@@ -503,7 +509,15 @@ impl RuleEngine {
         ports_raw: Option<&str>,
         action: Action,
     ) -> Option<Rule> {
-        self.update_rule_with_enabled(rule_id, name, apps_raw, targets_raw, ports_raw, action, None)
+        self.update_rule_with_enabled(
+            rule_id,
+            name,
+            apps_raw,
+            targets_raw,
+            ports_raw,
+            action,
+            None,
+        )
     }
 
     /// 原地更新规则，并可选原子修改启用状态（供 PATCH 端点使用）
@@ -538,7 +552,11 @@ impl RuleEngine {
     pub fn delete_rule(&self, rule_id: u64) -> bool {
         let mut guard = self.rules.write().unwrap_or_else(|e| e.into_inner());
         let before_len = guard.len();
-        let new_rules: Vec<Rule> = (**guard).iter().filter(|r| r.id != rule_id).cloned().collect();
+        let new_rules: Vec<Rule> = (**guard)
+            .iter()
+            .filter(|r| r.id != rule_id)
+            .cloned()
+            .collect();
         if new_rules.len() < before_len {
             *guard = Arc::new(new_rules);
             true
@@ -729,8 +747,8 @@ impl RuleEngine {
             // 1) 显式限定到其他应用的规则：仅当其明确指定域名且命中 qname 且非 Direct 时记录候选劫持，
             //    绝不允许 target_domains=None 的仅应用规则（如 DevProxy）劫持全机 Dnscache，也不抢先覆盖后续全局 Direct 规则；
             // 2) 全局无应用限定或显式匹配 svchost.exe 的规则按顺序权威生效。
-            let explicitly_scoped_to_other_app = rule.application_patterns.is_some()
-                && rule.matches_app_only(&ctx).is_err();
+            let explicitly_scoped_to_other_app =
+                rule.application_patterns.is_some() && rule.matches_app_only(&ctx).is_err();
 
             if explicitly_scoped_to_other_app {
                 if rule.target_domains.is_some()
@@ -852,14 +870,12 @@ impl RuleEngine {
                 continue;
             }
             let wildcard_target = rule.target_domains.is_none() && rule.target_subnets.is_none();
-            let subnet_matched = rule
-                .target_subnets
-                .as_ref()
-                .is_some_and(|subs| target_ip.is_some_and(|ip| subs.iter().any(|s| s.contains(&ip))));
-            let domain_applicable = rule
-                .target_domains
-                .as_ref()
-                .is_some_and(|domains| rule_has_applicable_domain(domains, target_ip, &local_hostname));
+            let subnet_matched = rule.target_subnets.as_ref().is_some_and(|subs| {
+                target_ip.is_some_and(|ip| subs.iter().any(|s| s.contains(&ip)))
+            });
+            let domain_applicable = rule.target_domains.as_ref().is_some_and(|domains| {
+                rule_has_applicable_domain(domains, target_ip, &local_hostname)
+            });
 
             if !(wildcard_target || subnet_matched || domain_applicable) {
                 continue;
@@ -932,8 +948,12 @@ pub fn format_action_desc(action: &Action, locale: crate::i18n::Locale) -> Strin
     match action {
         Action::Direct => crate::i18n::t(locale, "action.direct").to_string(),
         Action::Block => crate::i18n::t(locale, "action.block").to_string(),
-        Action::Proxy(id) => crate::i18n::t(locale, "action.proxy_prefix").replace("{}", &id.to_string()),
-        Action::Chain(id) => crate::i18n::t(locale, "action.chain_prefix").replace("{}", &id.to_string()),
+        Action::Proxy(id) => {
+            crate::i18n::t(locale, "action.proxy_prefix").replace("{}", &id.to_string())
+        }
+        Action::Chain(id) => {
+            crate::i18n::t(locale, "action.chain_prefix").replace("{}", &id.to_string())
+        }
     }
 }
 
@@ -1048,7 +1068,14 @@ mod tests {
     #[test]
     fn test_update_rule_preserves_id_and_order_and_default_action_updates() {
         let r1 = Rule::from_raw("First", true, Some("a.exe"), None, None, Action::Direct);
-        let r2 = Rule::from_raw("Second", false, Some("b.exe"), Some("example.com"), Some("80"), Action::Block);
+        let r2 = Rule::from_raw(
+            "Second",
+            false,
+            Some("b.exe"),
+            Some("example.com"),
+            Some("80"),
+            Action::Block,
+        );
         let r3 = Rule::from_raw("Third", true, Some("c.exe"), None, None, Action::Direct);
         let (id1, id2, id3) = (r1.id, r2.id, r3.id);
 
@@ -1070,7 +1097,10 @@ mod tests {
         assert_eq!(updated.name, "SecondEdited");
 
         let views = engine.list_rules_view();
-        assert_eq!(views.iter().map(|v| v.id).collect::<Vec<_>>(), vec![id1, id2, id3]);
+        assert_eq!(
+            views.iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![id1, id2, id3]
+        );
         assert_eq!(views[1].name, "SecondEdited");
         assert_eq!(views[1].apps, "git.exe");
         assert_eq!(views[1].targets, "*.github.com");
@@ -1093,8 +1123,22 @@ mod tests {
     #[test]
     fn test_simulate_route_trace_and_reasons() {
         let r_disabled = Rule::from_raw("DisabledRule", false, None, None, None, Action::Block);
-        let r_app = Rule::from_raw("OnlyCurl", true, Some("curl.exe"), None, None, Action::Direct);
-        let r_port = Rule::from_raw("OnlySsh", true, Some("git.exe"), None, Some("22"), Action::Direct);
+        let r_app = Rule::from_raw(
+            "OnlyCurl",
+            true,
+            Some("curl.exe"),
+            None,
+            None,
+            Action::Direct,
+        );
+        let r_port = Rule::from_raw(
+            "OnlySsh",
+            true,
+            Some("git.exe"),
+            None,
+            Some("22"),
+            Action::Direct,
+        );
         let r_target = Rule::from_raw(
             "GitInternal",
             true,
@@ -1168,7 +1212,10 @@ mod tests {
         );
         for (name, path) in [
             ("node.exe", r"C:\Program Files\nodejs\node.exe"),
-            ("google-chrome.exe", r"C:\Program Files\Google\Chrome\Application\google-chrome.exe"),
+            (
+                "google-chrome.exe",
+                r"C:\Program Files\Google\Chrome\Application\google-chrome.exe",
+            ),
             ("git.exe", r"C:\Program Files\Git\cmd\git.exe"),
         ] {
             let ctx = RouteContext {
@@ -1178,7 +1225,10 @@ mod tests {
                 target_ip: None,
                 target_port: 443,
             };
-            assert!(win_rule.check_match(&ctx).is_ok(), "{name} should match .exe rule");
+            assert!(
+                win_rule.check_match(&ctx).is_ok(),
+                "{name} should match .exe rule"
+            );
         }
 
         // 目录包含 `git` 但进程名不是 `git` 的 `C:\Users\git\curl.exe` 不应被 `*git*.exe` 跨目录误命中
@@ -1189,10 +1239,20 @@ mod tests {
             target_ip: None,
             target_port: 443,
         };
-        assert_eq!(win_rule.check_match(&ctx_dir_collision), Err("app_mismatch"));
+        assert_eq!(
+            win_rule.check_match(&ctx_dir_collision),
+            Err("app_mismatch")
+        );
 
         // `*.exe` 与 `*.*` 绝不命中无扩展名的 System 进程或未知进程 None
-        let ext_rule = Rule::from_raw("ExeAndExt", true, Some("*.exe; *.*"), None, None, Action::Block);
+        let ext_rule = Rule::from_raw(
+            "ExeAndExt",
+            true,
+            Some("*.exe; *.*"),
+            None,
+            None,
+            Action::Block,
+        );
         let ctx_system_no_ext = RouteContext {
             process_path: Some("System"),
             process_name: Some("System"),
@@ -1200,7 +1260,10 @@ mod tests {
             target_ip: None,
             target_port: 443,
         };
-        assert_eq!(ext_rule.check_match(&ctx_system_no_ext), Err("app_mismatch"));
+        assert_eq!(
+            ext_rule.check_match(&ctx_system_no_ext),
+            Err("app_mismatch")
+        );
         let ctx_unknown_none = RouteContext {
             process_path: None,
             process_name: None,
@@ -1242,7 +1305,10 @@ mod tests {
             target_ip: None,
             target_port: 80,
         };
-        assert_eq!(short_rule.check_match(&ctx_nested_path), Err("app_mismatch"));
+        assert_eq!(
+            short_rule.check_match(&ctx_nested_path),
+            Err("app_mismatch")
+        );
 
         // 不相关进程不应误命中
         let ctx_other = RouteContext {
@@ -1260,10 +1326,38 @@ mod tests {
     fn test_needs_domain_for_routing_decisions() {
         let engine = RuleEngine::new(
             vec![
-                Rule::from_raw("DisabledDomain", false, None, Some("disabled.example"), None, Action::Proxy(1)),
-                Rule::from_raw("GameDirect", true, Some("game.exe"), None, None, Action::Direct),
-                Rule::from_raw("LanDirect", true, None, Some("192.168.0.0/16"), None, Action::Direct),
-                Rule::from_raw("ChromeSniProxy", true, Some("chrome.exe"), Some("*.google.com"), Some("443"), Action::Proxy(1)),
+                Rule::from_raw(
+                    "DisabledDomain",
+                    false,
+                    None,
+                    Some("disabled.example"),
+                    None,
+                    Action::Proxy(1),
+                ),
+                Rule::from_raw(
+                    "GameDirect",
+                    true,
+                    Some("game.exe"),
+                    None,
+                    None,
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "LanDirect",
+                    true,
+                    None,
+                    Some("192.168.0.0/16"),
+                    None,
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "ChromeSniProxy",
+                    true,
+                    Some("chrome.exe"),
+                    Some("*.google.com"),
+                    Some("443"),
+                    Action::Proxy(1),
+                ),
             ],
             Action::Direct,
         );
@@ -1273,31 +1367,56 @@ mod tests {
 
         // GameDirect matches app cleanly before any domain rule -> Immediate(Direct)
         assert_eq!(
-            engine.needs_domain_for_routing(Some(r"C:\Games\game.exe"), Some("game.exe"), Some(public_ip), 443),
+            engine.needs_domain_for_routing(
+                Some(r"C:\Games\game.exe"),
+                Some("game.exe"),
+                Some(public_ip),
+                443
+            ),
             DomainNeedDecision::Immediate(Action::Direct)
         );
 
         // LAN IP matches earlier CIDR rule even for Chrome:443 -> Immediate(Direct)
         assert_eq!(
-            engine.needs_domain_for_routing(Some(r"C:\Program Files\chrome.exe"), Some("chrome.exe"), Some(lan_ip), 443),
+            engine.needs_domain_for_routing(
+                Some(r"C:\Program Files\chrome.exe"),
+                Some("chrome.exe"),
+                Some(lan_ip),
+                443
+            ),
             DomainNeedDecision::Immediate(Action::Direct)
         );
 
         // Chrome on 443 to public IP can match ChromeSniProxy if domain is google.com -> NeedsDomainSniff
         assert_eq!(
-            engine.needs_domain_for_routing(Some(r"C:\Program Files\chrome.exe"), Some("chrome.exe"), Some(public_ip), 443),
+            engine.needs_domain_for_routing(
+                Some(r"C:\Program Files\chrome.exe"),
+                Some("chrome.exe"),
+                Some(public_ip),
+                443
+            ),
             DomainNeedDecision::NeedsDomainSniff
         );
 
         // Chrome on port 22 cannot match ChromeSniProxy (port 443) and DisabledDomain is ignored -> Immediate(Direct)
         assert_eq!(
-            engine.needs_domain_for_routing(Some(r"C:\Program Files\chrome.exe"), Some("chrome.exe"), Some(public_ip), 22),
+            engine.needs_domain_for_routing(
+                Some(r"C:\Program Files\chrome.exe"),
+                Some("chrome.exe"),
+                Some(public_ip),
+                22
+            ),
             DomainNeedDecision::Immediate(Action::Direct)
         );
 
         // Unrelated app on 443 cannot match ChromeSniProxy -> Immediate(Direct default)
         assert_eq!(
-            engine.needs_domain_for_routing(Some(r"C:\Windows\System32\OpenSSH\ssh.exe"), Some("ssh.exe"), Some(public_ip), 443),
+            engine.needs_domain_for_routing(
+                Some(r"C:\Windows\System32\OpenSSH\ssh.exe"),
+                Some("ssh.exe"),
+                Some(public_ip),
+                443
+            ),
             DomainNeedDecision::Immediate(Action::Direct)
         );
     }
@@ -1556,7 +1675,12 @@ mod tests {
             DnsHijackDecision::Hijack
         );
         assert_eq!(
-            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "host.sshport.example", true),
+            mixed_engine.classify_dns_query(
+                None,
+                Some("svchost.exe"),
+                "host.sshport.example",
+                true
+            ),
             DnsHijackDecision::Hijack
         );
         assert_eq!(
@@ -1575,14 +1699,33 @@ mod tests {
         );
         // 无端口限定的显式应用域名代理规则在无后续全局 Direct 冲突时，允许在 svchost.exe 阶段预分配 Fake-IP
         assert_eq!(
-            mixed_engine.classify_dns_query(None, Some("svchost.exe"), "git.corp-tunnel.example", true),
+            mixed_engine.classify_dns_query(
+                None,
+                Some("svchost.exe"),
+                "git.corp-tunnel.example",
+                true
+            ),
             DnsHijackDecision::Hijack
         );
         // 端口限定 Direct 规则（BypassHttpsOnly: 443）不抢先放行其它端口：若下方存在同域其它端口代理规则，仍须返回 Hijack
         let port_override_engine = RuleEngine::new(
             vec![
-                Rule::from_raw("DirectHttpsOnly", true, None, Some("svc.example"), Some("443"), Action::Direct),
-                Rule::from_raw("ProxyRestExample", true, None, Some("*.example"), None, Action::Proxy(101)),
+                Rule::from_raw(
+                    "DirectHttpsOnly",
+                    true,
+                    None,
+                    Some("svc.example"),
+                    Some("443"),
+                    Action::Direct,
+                ),
+                Rule::from_raw(
+                    "ProxyRestExample",
+                    true,
+                    None,
+                    Some("*.example"),
+                    None,
+                    Action::Proxy(101),
+                ),
             ],
             Action::Direct,
         );
@@ -1597,7 +1740,14 @@ mod tests {
 
         // 即使全局默认代理，mDNS / .arpa / localhost / 单标签名 / 本机主机名也绝不被 Fake-IP 劫持
         let global_proxy = RuleEngine::new(
-            vec![Rule::from_raw("DirectApex", true, None, Some("direct.example"), None, Action::Direct)],
+            vec![Rule::from_raw(
+                "DirectApex",
+                true,
+                None,
+                Some("direct.example"),
+                None,
+                Action::Direct,
+            )],
             Action::Proxy(101),
         );
         assert_eq!(
@@ -1609,7 +1759,12 @@ mod tests {
             DnsHijackDecision::Passthrough
         );
         assert_eq!(
-            global_proxy.classify_dns_query(None, Some("svchost.exe"), "1.0.0.127.in-addr.arpa", true),
+            global_proxy.classify_dns_query(
+                None,
+                Some("svchost.exe"),
+                "1.0.0.127.in-addr.arpa",
+                true
+            ),
             DnsHijackDecision::Passthrough
         );
         assert_eq!(
@@ -1741,7 +1896,12 @@ mod tests {
             DnsHijackDecision::Hijack
         );
         assert_eq!(
-            explicit_lan_proxy.classify_dns_query(None, Some("svchost.exe"), "srv.localdomain", true),
+            explicit_lan_proxy.classify_dns_query(
+                None,
+                Some("svchost.exe"),
+                "srv.localdomain",
+                true
+            ),
             DnsHijackDecision::Hijack
         );
         // .local (mDNS) 仍保持不可劫持
@@ -1796,7 +1956,12 @@ mod tests {
             DnsHijackDecision::Passthrough
         );
         assert_eq!(
-            dead_rules_engine.classify_dns_query(None, Some("svchost.exe"), "a.deadport.example", true),
+            dead_rules_engine.classify_dns_query(
+                None,
+                Some("svchost.exe"),
+                "a.deadport.example",
+                true
+            ),
             DnsHijackDecision::Passthrough
         );
         assert!(!dead_rules_engine.should_inspect_shared_dns(
@@ -1809,9 +1974,9 @@ mod tests {
             Some("svchost.exe"),
             "public.example",
         ));
-        assert!(!dead_rules_engine.has_reachable_app_scoped_override(
-            Some("93.184.216.34".parse().unwrap()),
-            443,
-        ));
+        assert!(
+            !dead_rules_engine
+                .has_reachable_app_scoped_override(Some("93.184.216.34".parse().unwrap()), 443,)
+        );
     }
 }

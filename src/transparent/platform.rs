@@ -7,15 +7,13 @@ pub fn is_process_elevated() -> bool {
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0
-            || token.is_null()
-        {
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 || token.is_null() {
             return false;
         }
         let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
@@ -43,11 +41,11 @@ pub(crate) fn is_low_integrity_rid(rid: u32) -> bool {
 pub(crate) fn process_integrity_rid() -> Option<u32> {
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, ERROR_INSUFFICIENT_BUFFER, HANDLE,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, GetLastError, HANDLE,
     };
     use windows_sys::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid,
-        TokenIntegrityLevel, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -107,12 +105,9 @@ pub fn is_low_integrity_process() -> bool {
 pub(super) unsafe fn load_system32_library(
     dll_name: &str,
 ) -> io::Result<windows_sys::Win32::Foundation::HMODULE> {
-    use windows_sys::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    use windows_sys::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 
-    let wide: Vec<u16> = dll_name
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    let wide: Vec<u16> = dll_name.encode_utf16().chain(std::iter::once(0)).collect();
     let module = unsafe {
         LoadLibraryExW(
             wide.as_ptr(),
@@ -272,9 +267,7 @@ pub fn build_elevated_relaunch_args(
             idx += 2;
             continue;
         }
-        if arg.starts_with("--replace-pid=")
-            || arg == "--transparent"
-            || arg == "--no-transparent"
+        if arg.starts_with("--replace-pid=") || arg == "--transparent" || arg == "--no-transparent"
         {
             idx += 1;
             continue;
@@ -324,9 +317,8 @@ impl StaComGuard {
             return None;
         };
         let co_initialize_ex: CoInitializeExFn = unsafe { std::mem::transmute(co_init_fn_ptr) };
-        let hr = unsafe {
-            co_initialize_ex(std::ptr::null(), COINIT_APARTMENTTHREADED_DISABLE_OLE1DDE)
-        };
+        let hr =
+            unsafe { co_initialize_ex(std::ptr::null(), COINIT_APARTMENTTHREADED_DISABLE_OLE1DDE) };
         // S_OK (0) 或 S_FALSE (1) 需要配对 CoUninitialize；RPC_E_CHANGED_MODE 等则不调用
         let should_uninit = hr == 0 || hr == 1;
         Some(Self {
@@ -449,7 +441,9 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
     let code = ret as isize;
     if code <= 32 {
         let msg = match code {
-            5 | 1223 => "ERR_TRANSPARENT_UAC_CANCELLED: Administrator elevation prompt was cancelled or denied.",
+            5 | 1223 => {
+                "ERR_TRANSPARENT_UAC_CANCELLED: Administrator elevation prompt was cancelled or denied."
+            }
             2 | 3 => "Failed to locate executable path while requesting elevation.",
             _ => "ShellExecuteW(runas) failed to launch elevated FlowX instance.",
         };

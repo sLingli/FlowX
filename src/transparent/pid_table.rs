@@ -107,13 +107,7 @@ impl SocketPidTable {
     }
 
     /// 将 IP Helper 后备查询拿到的精确 `(proto, local_ip, local_port) -> pid` 回填到分片缓存
-    pub fn record_resolved_pid(
-        &self,
-        protocol: u8,
-        local_ip: IpAddr,
-        local_port: u16,
-        pid: u32,
-    ) {
+    pub fn record_resolved_pid(&self, protocol: u8, local_ip: IpAddr, local_port: u16, pid: u32) {
         if pid == 0 || local_port == 0 || !matches!(protocol, 6 | 17) {
             return;
         }
@@ -210,10 +204,13 @@ impl SocketPidTable {
                         shard.exact.remove(&(protocol, norm_ip, local_port));
                     }
                 } else if pid != 0
-                    && let Some(existing) = shard.wild.get(&(protocol, norm_ip.is_ipv6(), local_port))
+                    && let Some(existing) =
+                        shard.wild.get(&(protocol, norm_ip.is_ipv6(), local_port))
                     && existing.pid == pid
                 {
-                    shard.wild.remove(&(protocol, norm_ip.is_ipv6(), local_port));
+                    shard
+                        .wild
+                        .remove(&(protocol, norm_ip.is_ipv6(), local_port));
                 }
             }
             _ => {}
@@ -388,7 +385,10 @@ mod tests {
         let nic = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 20));
         let t0 = Instant::now();
 
-        assert_eq!(table.lookup_status_at(17, nic, 59999, t0), PidTableLookup::Miss);
+        assert_eq!(
+            table.lookup_status_at(17, nic, 59999, t0),
+            PidTableLookup::Miss
+        );
         table.record_negative_lookup_at(17, nic, 59999, t0);
         assert_eq!(
             table.lookup_status_at(17, nic, 59999, t0 + Duration::from_secs(1)),

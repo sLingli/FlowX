@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{error, info};
 
 use crate::api::http::send_http_response;
@@ -172,7 +172,11 @@ impl ApiServer {
     }
 
     /// 启动异步 HTTP API 监听服务（支持并发连接限流、内部在途排空与优雅停机）
-    pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        &self,
+        listener: TcpListener,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         let actual_port = listener.local_addr().unwrap_or(self.bind_addr).port();
         let mut self_ports = self.self_ports.clone();
         if !self_ports.contains(&actual_port) {
@@ -331,8 +335,13 @@ mod tests {
         let mgr = Arc::new(ConnectionManager::new());
         let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
         let nodes = Arc::new(RwLock::new(HashMap::new()));
-        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-            .with_self_ports(vec![40001, 40080, 1053]);
+        let srv = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            mgr,
+            Arc::clone(&re),
+            Arc::clone(&nodes),
+        )
+        .with_self_ports(vec![40001, 40080, 1053]);
         let listener = srv.bind().await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = watch::channel(false);
@@ -366,9 +375,11 @@ mod tests {
         )
         .await;
         assert!(r_node.starts_with("HTTP/1.1 200 OK"));
-        let node_id = serde_json::from_str::<serde_json::Value>(r_node.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"]
-            .as_u64()
-            .unwrap() as u32;
+        let node_id =
+            serde_json::from_str::<serde_json::Value>(r_node.split("\r\n\r\n").nth(1).unwrap())
+                .unwrap()["id"]
+                .as_u64()
+                .unwrap() as u32;
         assert!(api_nodes.read().unwrap().contains_key(&node_id));
 
         let chain_rule = Rule::from_raw(
@@ -396,11 +407,19 @@ mod tests {
         assert!(r_bad_switch.starts_with("HTTP/1.1 400 Bad Request"));
         assert!(r_bad_switch.contains("ERR_MISSING_NODE_FOR_PROXY"));
         assert_eq!(
-            api_re.current_rules().iter().find(|r| r.id == chain_rule_id).unwrap().action,
+            api_re
+                .current_rules()
+                .iter()
+                .find(|r| r.id == chain_rule_id)
+                .unwrap()
+                .action,
             Action::Chain(node_id)
         );
 
-        let switch_with_node = format!(r#"{{"id":{},"action":"Proxy","node_id":{}}}"#, chain_rule_id, node_id);
+        let switch_with_node = format!(
+            r#"{{"id":{},"action":"Proxy","node_id":{}}}"#,
+            chain_rule_id, node_id
+        );
         let r_ok_switch = raw_http(
             api_addr,
             &format!(
@@ -413,7 +432,12 @@ mod tests {
         .await;
         assert!(r_ok_switch.starts_with("HTTP/1.1 200 OK"));
         assert_eq!(
-            api_re.current_rules().iter().find(|r| r.id == chain_rule_id).unwrap().action,
+            api_re
+                .current_rules()
+                .iter()
+                .find(|r| r.id == chain_rule_id)
+                .unwrap()
+                .action,
             Action::Proxy(node_id)
         );
 
@@ -426,7 +450,10 @@ mod tests {
             read_full_http_request_with_timeout(&mut s, &mut buf, Duration::from_millis(40)).await
         });
         let mut slow_client = TcpStream::connect(l_addr).await.unwrap();
-        slow_client.write_all(b"POST /api/nodes HTTP/1.1\r\n").await.unwrap();
+        slow_client
+            .write_all(b"POST /api/nodes HTTP/1.1\r\n")
+            .await
+            .unwrap();
         let read_err = srv_task.await.unwrap().unwrap_err();
         assert_eq!(read_err.http_status(), "408 Request Timeout");
         assert_eq!(read_err.code_and_key().0, "ERR_REQUEST_TIMEOUT");
@@ -439,8 +466,13 @@ mod tests {
         let mgr = Arc::new(ConnectionManager::new());
         let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
         let nodes = Arc::new(RwLock::new(HashMap::new()));
-        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-            .with_config_store(store);
+        let srv = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            mgr,
+            Arc::clone(&re),
+            Arc::clone(&nodes),
+        )
+        .with_config_store(store);
         let listener = srv.bind().await.unwrap();
         let s_addr = listener.local_addr().unwrap();
         let s_port = s_addr.port();
@@ -539,12 +571,19 @@ mod tests {
             Duration::from_millis(400),
             raw_http(
                 api_addr,
-                &format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", api_port),
+                &format!(
+                    "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                    api_port
+                ),
             ),
         )
         .await
         .expect("/api/health starved by stalled mutations");
-        assert!(r_health.starts_with("HTTP/1.1 200 OK"), "health: {}", r_health);
+        assert!(
+            r_health.starts_with("HTTP/1.1 200 OK"),
+            "health: {}",
+            r_health
+        );
 
         let kill_body = format!(r#"{{"id":{}}}"#, tracked.id);
         let r_kill = tokio::time::timeout(
@@ -568,18 +607,28 @@ mod tests {
         let mut saw_overloaded_503 = 0usize;
         for h in handles {
             let resp = h.await.unwrap();
-            assert!(!resp.starts_with("HTTP/1.1 200"), "unexpected commit: {}", resp);
+            assert!(
+                !resp.starts_with("HTTP/1.1 200"),
+                "unexpected commit: {}",
+                resp
+            );
             if resp.contains("ERR_CONFIG_PERSIST_FAILED") {
                 saw_persist_timeout_500 += 1;
             } else if resp.contains("ERR_OVERLOADED") {
                 saw_overloaded_503 += 1;
             } else {
-                panic!("unexpected error response during stalled mutation flood: {}", resp);
+                panic!(
+                    "unexpected error response during stalled mutation flood: {}",
+                    resp
+                );
             }
         }
         assert!(saw_persist_timeout_500 >= 1);
         assert!(saw_overloaded_503 >= 1);
-        assert!(nodes.read().unwrap().is_empty(), "stalled writes must roll back memory");
+        assert!(
+            nodes.read().unwrap().is_empty(),
+            "stalled writes must roll back memory"
+        );
 
         let _ = release_tx.send(());
         let _ = blocker_thread.join();
@@ -591,19 +640,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_transparent_status_config_toggle_and_persist_rollback() {
-        use crate::dns::server::DnsServer;
         use crate::dns::FakeIpPool;
+        use crate::dns::server::DnsServer;
         use crate::interceptor::dispatcher::DispatcherConfig;
         use crate::interceptor::process::ProcessTracker;
 
-        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-            "flowx_api_transparent_test_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let cfg_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_api_transparent_test_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let _ = std::fs::remove_file(&cfg_path);
 
         let store = Arc::new(ConfigStore::new(&cfg_path));
@@ -638,11 +690,16 @@ mod tests {
             TransparentSettings::default(),
         ));
 
-        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-            .with_self_ports(vec![40001, 40080, 1053])
-            .with_config_store(Arc::clone(&store))
-            .with_transparent_manager(Arc::clone(&t_mgr))
-            .with_persist_timeout(Duration::from_millis(500));
+        let srv = ApiServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            mgr,
+            Arc::clone(&re),
+            Arc::clone(&nodes),
+        )
+        .with_self_ports(vec![40001, 40080, 1053])
+        .with_config_store(Arc::clone(&store))
+        .with_transparent_manager(Arc::clone(&t_mgr))
+        .with_persist_timeout(Duration::from_millis(500));
         let listener = srv.bind().await.unwrap();
         let addr = listener.local_addr().unwrap();
         let port = addr.port();
@@ -652,7 +709,10 @@ mod tests {
         // 1. /api/system embeds transparent status and /api/transparent/status works
         let sys_resp = raw_http(
             addr,
-            &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+            &format!(
+                "GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                port
+            ),
         )
         .await;
         assert!(sys_resp.starts_with("HTTP/1.1 200 OK"), "sys: {sys_resp}");
@@ -660,10 +720,16 @@ mod tests {
 
         let status_resp = raw_http(
             addr,
-            &format!("GET /api/transparent/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+            &format!(
+                "GET /api/transparent/status HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+                port
+            ),
         )
         .await;
-        assert!(status_resp.starts_with("HTTP/1.1 200 OK"), "status: {status_resp}");
+        assert!(
+            status_resp.starts_with("HTTP/1.1 200 OK"),
+            "status: {status_resp}"
+        );
         assert!(status_resp.contains(r#""enabled":false"#));
         assert!(status_resp.contains(r#""hijack_dns":true"#));
 
@@ -686,7 +752,10 @@ mod tests {
                 ),
             )
             .await;
-            assert!(bad_resp.starts_with("HTTP/1.1 400 Bad Request"), "bad: {bad_resp}");
+            assert!(
+                bad_resp.starts_with("HTTP/1.1 400 Bad Request"),
+                "bad: {bad_resp}"
+            );
             assert!(bad_resp.contains("ERR_TRANSPARENT_INVALID_DLL_PATH"));
         }
 
@@ -726,7 +795,10 @@ mod tests {
             ),
         )
         .await;
-        assert!(node_resp.starts_with("HTTP/1.1 200 OK"), "node: {node_resp}");
+        assert!(
+            node_resp.starts_with("HTTP/1.1 200 OK"),
+            "node: {node_resp}"
+        );
         let saved_after_node = store.load_existing(&[]).unwrap();
         assert!(!saved_after_node.transparent_settings.hijack_dns);
         assert_eq!(
@@ -780,9 +852,15 @@ mod tests {
             ),
         )
         .await;
-        assert!(rb_resp.starts_with("HTTP/1.1 500 Internal Server Error"), "rb: {rb_resp}");
+        assert!(
+            rb_resp.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "rb: {rb_resp}"
+        );
         assert!(rb_resp.contains("ERR_CONFIG_PERSIST_FAILED"));
-        assert!(!t_mgr.settings().hijack_dns, "hijack_dns should roll back on persist timeout");
+        assert!(
+            !t_mgr.settings().hijack_dns,
+            "hijack_dns should roll back on persist timeout"
+        );
         assert_eq!(
             t_mgr.settings().dll_path.as_deref(),
             Some(r"Z:\__nonexistent_windivert_test__\WinDivert.dll")
@@ -823,7 +901,10 @@ mod tests {
             Some(&shutdown_tx),
         )
         .await;
-        assert!(res.is_err(), "writing after shutdown/disconnect should return error");
+        assert!(
+            res.is_err(),
+            "writing after shutdown/disconnect should return error"
+        );
         assert!(
             *shutdown_rx.borrow(),
             "shutdown_tx must still be triggered when elevated response write fails"
@@ -882,7 +963,10 @@ mod tests {
         assert!(!*elev_rx.borrow());
 
         release_mutation_locks_before_response(&mut g_opt, &mut p_opt, true, Some(&elev_tx));
-        assert!(waiter.await.unwrap(), "shutdown_tx must be visible before mutation_lock unlocks");
+        assert!(
+            waiter.await.unwrap(),
+            "shutdown_tx must be visible before mutation_lock unlocks"
+        );
     }
 
     #[tokio::test]
@@ -971,7 +1055,10 @@ mod tests {
         )
         .await
         .expect("regular mutations must not stall on interactive UAC");
-        assert!(mut_resp.starts_with("HTTP/1.1 200 OK"), "mut_resp: {mut_resp}");
+        assert!(
+            mut_resp.starts_with("HTTP/1.1 200 OK"),
+            "mut_resp: {mut_resp}"
+        );
 
         // 4. 模拟用户在首个 UAC 取消授权：请求 1 返回 409 UAC_CANCELLED，且期间 calls 仍为 1（绝不弹出第二个 UAC）
         release_tx
@@ -1177,7 +1264,10 @@ mod tests {
         );
         let resp = raw_http(addr, &req).await;
         assert!(resp.starts_with("HTTP/1.1 409 Conflict"), "resp: {resp}");
-        assert!(resp.contains("ERR_TRANSPARENT_LOW_INTEGRITY"), "resp: {resp}");
+        assert!(
+            resp.contains("ERR_TRANSPARENT_LOW_INTEGRITY"),
+            "resp: {resp}"
+        );
         assert!(resp.contains("blocked at Low IL"), "resp: {resp}");
         assert!(!*shutdown_rx.borrow());
 

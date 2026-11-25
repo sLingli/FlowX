@@ -412,10 +412,16 @@ mod tests {
         assert!(is_tcp_port_bypassed(port));
 
         drop(g1);
-        assert!(is_tcp_port_bypassed(port), "Overlapping guard must preserve bypass registration");
+        assert!(
+            is_tcp_port_bypassed(port),
+            "Overlapping guard must preserve bypass registration"
+        );
 
         drop(g2);
-        assert!(!is_tcp_port_bypassed(port), "Port must clear once final guard drops");
+        assert!(
+            !is_tcp_port_bypassed(port),
+            "Port must clear once final guard drops"
+        );
     }
 
     #[tokio::test]

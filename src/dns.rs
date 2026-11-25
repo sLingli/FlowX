@@ -1,5 +1,5 @@
-use std::collections::{BinaryHeap, HashMap};
 use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -50,10 +50,7 @@ pub(crate) fn sanitize_upstream_dns_addr(
     let unusable = match canon {
         SocketAddr::V4(v4) => {
             let ip4 = v4.ip();
-            ip4.is_unspecified()
-                || ip4.is_broadcast()
-                || ip4.is_multicast()
-                || ip4.is_link_local()
+            ip4.is_unspecified() || ip4.is_broadcast() || ip4.is_multicast() || ip4.is_link_local()
         }
         SocketAddr::V6(v6) => {
             let ip6 = v6.ip();
@@ -65,7 +62,8 @@ pub(crate) fn sanitize_upstream_dns_addr(
     if unusable {
         return None;
     }
-    if fake_ip_pool.is_some_and(|p| p.is_fake_ip_addr(ip)) || FakeIpPool::is_default_fake_ip_addr(ip)
+    if fake_ip_pool.is_some_and(|p| p.is_fake_ip_addr(ip))
+        || FakeIpPool::is_default_fake_ip_addr(ip)
     {
         return None;
     }
@@ -83,15 +81,11 @@ fn is_private_or_local_dns_ip(ip: IpAddr) -> bool {
     match ip.to_canonical() {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || (a == 100 && (64..=127).contains(&b)) // RFC 6598 CGNAT (Tailscale/VPN)
+            v4.is_private() || v4.is_loopback() || (a == 100 && (64..=127).contains(&b)) // RFC 6598 CGNAT (Tailscale/VPN)
         }
         IpAddr::V6(v6) => {
             let seg0 = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unicast_link_local()
-                || (seg0 & 0xfe00) == 0xfc00 // RFC 4193 ULA
+            v6.is_loopback() || v6.is_unicast_link_local() || (seg0 & 0xfe00) == 0xfc00 // RFC 4193 ULA
         }
     }
 }
@@ -282,8 +276,7 @@ impl PoolState {
                 orig_dns,
             },
         );
-        self.expiry_heap
-            .push(Reverse((expire, seq, u32::from(ip))));
+        self.expiry_heap.push(Reverse((expire, seq, u32::from(ip))));
         if self.expiry_heap.len() > self.ip_to_domain.len().saturating_mul(4).max(256) {
             self.rebuild_expiry_heap();
         }
@@ -413,7 +406,11 @@ impl FakeIpPool {
             let mut found = None;
             for _ in 0..cap {
                 let candidate = Ipv4Addr::from(cursor);
-                cursor = if cursor >= self.max { self.min } else { cursor + 1 };
+                cursor = if cursor >= self.max {
+                    self.min
+                } else {
+                    cursor + 1
+                };
                 match state.ip_to_domain.get(&candidate) {
                     None => {
                         found = Some(candidate);
@@ -583,7 +580,10 @@ impl FakeIpPool {
                 .is_some_and(|Reverse((exp, _, _))| *exp <= now)
         };
         if real_has_expired {
-            let mut state = self.real_ip_cache.write().unwrap_or_else(|e| e.into_inner());
+            let mut state = self
+                .real_ip_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
             state.prune_expired(now);
         }
 
@@ -644,7 +644,10 @@ impl FakeIpPool {
 
         let now = Instant::now();
         let expire = now + effective_ttl;
-        let mut state = self.real_ip_cache.write().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .real_ip_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         let new_keys_needed = valid_ips
             .iter()
             .filter(|ip| !state.map.contains_key(ip))
@@ -874,7 +877,8 @@ mod tests {
         let unspecified: IpAddr = "0.0.0.0".parse().unwrap();
         let link_local: IpAddr = "169.254.1.10".parse().unwrap();
         let corp_dns: SocketAddr = "10.0.0.53:53".parse().unwrap();
-        let fake_v4: IpAddr = IpAddr::V4(pool.allocate_with_dns("fake-only.example", Some(corp_dns)));
+        let fake_v4: IpAddr =
+            IpAddr::V4(pool.allocate_with_dns("fake-only.example", Some(corp_dns)));
 
         // Fake-IP 应保留原始上游 DNS 线索供 Direct 回源
         assert_eq!(
@@ -927,12 +931,7 @@ mod tests {
             .with_self_ports(vec![1053, 40001, 40080]);
         let corp_dns: SocketAddr = "10.0.0.53:53".parse().unwrap();
         let pub_dns: SocketAddr = "8.8.8.8:53".parse().unwrap();
-        let scoped_ll_v6 = SocketAddr::V6(SocketAddrV6::new(
-            "fe80::1".parse().unwrap(),
-            53,
-            0,
-            7,
-        ));
+        let scoped_ll_v6 = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 53, 0, 7));
         let unscoped_ll_v6: SocketAddr = "[fe80::1]:53".parse().unwrap();
 
         // 1. 双 DNS 交替查询：企业 VPN DNS 不被 8.8.8.8 覆盖，且两者均保留，不触发写锁/堆抖动
@@ -948,8 +947,14 @@ mod tests {
 
         let seq_before = pool.inner.read().unwrap().alloc_seq;
         // 再次交替命中已记录的两种 DNS 必须走读锁快速路径（alloc_seq 不增长）
-        assert_eq!(pool.allocate_with_dns("git.corp.example", Some(corp_dns)), ip);
-        assert_eq!(pool.allocate_with_dns("git.corp.example", Some(pub_dns)), ip);
+        assert_eq!(
+            pool.allocate_with_dns("git.corp.example", Some(corp_dns)),
+            ip
+        );
+        assert_eq!(
+            pool.allocate_with_dns("git.corp.example", Some(pub_dns)),
+            ip
+        );
         assert_eq!(pool.inner.read().unwrap().alloc_seq, seq_before);
 
         // 2. 即使先收到公网 DNS 后收到企业 DNS，企业 DNS 仍应排在公网 DNS 之前
@@ -963,7 +968,10 @@ mod tests {
 
         // 3. 过滤不可用 DNS：self_port、169.254/16、255.255.255.255、无 scope_id 的 fe80::，但保留带 scope_id 的 fe80::
         let ip_san = pool.allocate_with_dns("san.example", Some("127.0.0.1:1053".parse().unwrap()));
-        assert_eq!(pool.restore_with_dns_list(&ip_san).unwrap().1, Vec::<SocketAddr>::new());
+        assert_eq!(
+            pool.restore_with_dns_list(&ip_san).unwrap().1,
+            Vec::<SocketAddr>::new()
+        );
         assert_eq!(
             pool.allocate_with_dns("san.example", Some("169.254.1.1:53".parse().unwrap())),
             ip_san
@@ -976,12 +984,18 @@ mod tests {
             pool.allocate_with_dns("san.example", Some(unscoped_ll_v6)),
             ip_san
         );
-        assert_eq!(pool.restore_with_dns_list(&ip_san).unwrap().1, Vec::<SocketAddr>::new());
+        assert_eq!(
+            pool.restore_with_dns_list(&ip_san).unwrap().1,
+            Vec::<SocketAddr>::new()
+        );
         assert_eq!(
             pool.allocate_with_dns("san.example", Some(scoped_ll_v6)),
             ip_san
         );
-        assert_eq!(pool.restore_with_dns_list(&ip_san).unwrap().1, vec![scoped_ll_v6]);
+        assert_eq!(
+            pool.restore_with_dns_list(&ip_san).unwrap().1,
+            vec![scoped_ll_v6]
+        );
 
         // 4. 过期但尚未被 GC 回收时，以 orig_dns=None 重新 allocate 绝不得复活旧 VPN DNS
         std::thread::sleep(Duration::from_millis(120));

@@ -1,13 +1,13 @@
+use anyhow::{Context, Result, anyhow, bail};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
-use anyhow::{anyhow, bail, Context, Result};
 
-use crate::dns::server::{resolve_via_upstream_dns, DnsNxDomainError};
+use super::bypass::{OutboundTcpStream, connect_tcp_guarded};
+use super::{TargetAddr, is_local_or_loopback_ip, is_loopback_domain, local_interface_ips};
+use crate::dns::server::{DnsNxDomainError, resolve_via_upstream_dns};
 use crate::dns::{
-    canonicalize_socket_addr_preserving_scope, sanitize_upstream_dns_addr, FakeIpPool,
+    FakeIpPool, canonicalize_socket_addr_preserving_scope, sanitize_upstream_dns_addr,
 };
-use super::bypass::{connect_tcp_guarded, OutboundTcpStream};
-use super::{is_local_or_loopback_ip, is_loopback_domain, local_interface_ips, TargetAddr};
 
 /// Maximum timeout for direct TCP connection (including upstream DNS resolution)
 const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -190,8 +190,14 @@ impl DirectOutbound {
         fake_ip_pool: Option<&FakeIpPool>,
         self_ports: &[u16],
     ) -> Result<OutboundTcpStream> {
-        Self::connect_guarded_with_dns_candidates(target, upstream_dns, &[], fake_ip_pool, self_ports)
-            .await
+        Self::connect_guarded_with_dns_candidates(
+            target,
+            upstream_dns,
+            &[],
+            fake_ip_pool,
+            self_ports,
+        )
+        .await
     }
 
     /// 显式直连：若存在 `preferred_dns`（例如透明 Fake-IP 分配阶段记录的原路由器/企业分域 DNS），
@@ -205,8 +211,14 @@ impl DirectOutbound {
         self_ports: &[u16],
     ) -> Result<OutboundTcpStream> {
         let slice = preferred_dns.as_slice();
-        Self::connect_guarded_with_dns_candidates(target, upstream_dns, slice, fake_ip_pool, self_ports)
-            .await
+        Self::connect_guarded_with_dns_candidates(
+            target,
+            upstream_dns,
+            slice,
+            fake_ip_pool,
+            self_ports,
+        )
+        .await
     }
 
     /// 支持多 `orig_dns` 候选列表的显式直连回源解析（企业 VPN DNS + 备选网卡 DNS 共存时依次尝试，
@@ -248,8 +260,9 @@ impl DirectOutbound {
                         ]
                     } else {
                         let dns_deadline = tokio::time::Instant::now()
-                            + DIRECT_DNS_TIMEOUT
-                                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                            + DIRECT_DNS_TIMEOUT.min(
+                                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                            );
                         let canonical_upstream =
                             canonicalize_socket_addr_preserving_scope(upstream_dns);
                         let mut orig_candidates: Vec<SocketAddr> = Vec::new();
@@ -270,8 +283,8 @@ impl DirectOutbound {
                         let mut saw_authoritative_nxdomain = false;
 
                         for (idx, &dns_server) in orig_candidates.iter().enumerate() {
-                            let rem = dns_deadline
-                                .saturating_duration_since(tokio::time::Instant::now());
+                            let rem =
+                                dns_deadline.saturating_duration_since(tokio::time::Instant::now());
                             if rem.is_zero() {
                                 break;
                             }
@@ -317,8 +330,8 @@ impl DirectOutbound {
                                 )
                             });
                         } else if has_fallback_upstream {
-                            let fb_budget = dns_deadline
-                                .saturating_duration_since(tokio::time::Instant::now());
+                            let fb_budget =
+                                dns_deadline.saturating_duration_since(tokio::time::Instant::now());
                             if !fb_budget.is_zero() {
                                 resolve_via_upstream_dns(
                                     domain,
@@ -381,40 +394,53 @@ impl DirectOutbound {
                     .await
                     {
                         Ok(stream) => Ok(stream),
-                        Err(CandidateConnectError::Io(e)) => Err(anyhow::Error::new(e)).with_context(|| {
-                            format!("Direct connection to target domain failed: {}:{}", domain, port)
-                        }),
+                        Err(CandidateConnectError::Io(e)) => Err(anyhow::Error::new(e))
+                            .with_context(|| {
+                                format!(
+                                    "Direct connection to target domain failed: {}:{}",
+                                    domain, port
+                                )
+                            }),
                         Err(CandidateConnectError::TimedOut { budget, addr }) => Err(anyhow!(
                             "Direct connection attempt timed out ({:?}) for {}",
                             budget,
                             addr
                         ))
                         .with_context(|| {
-                            format!("Direct connection to target domain failed: {}:{}", domain, port)
+                            format!(
+                                "Direct connection to target domain failed: {}:{}",
+                                domain, port
+                            )
                         }),
                         Err(CandidateConnectError::NoCandidates) => {
-                            bail!("No resolved IP candidates available for {}:{}", domain, port)
+                            bail!(
+                                "No resolved IP candidates available for {}:{}",
+                                domain,
+                                port
+                            )
                         }
                     }
                 }
             }
         };
-        tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, fut).await.map_err(|_| {
-            anyhow!(
-                "Direct connection timed out ({:?}): {}:{}",
-                DIRECT_CONNECT_TIMEOUT,
-                target.host_string(),
-                target.port()
-            )
-        })?
+        tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, fut)
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "Direct connection timed out ({:?}): {}:{}",
+                    DIRECT_CONNECT_TIMEOUT,
+                    target.host_string(),
+                    target.port()
+                )
+            })?
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UdpSocket;
     use crate::dns::server::DnsPacketParser;
+    use tokio::net::UdpSocket;
 
     #[tokio::test]
     async fn test_direct_outbound_blocks_dns_rebinding_to_self_port() {
@@ -430,10 +456,16 @@ mod tests {
                     // 同时返回 93.184.216.34 和 127.0.0.1 混合记录，校验任何一条命中本机都整体拦截
                     let mut r = Vec::new();
                     r.extend_from_slice(&tx.to_be_bytes());
-                    r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
+                    r.extend_from_slice(&[
+                        0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+                    ]);
                     r.extend_from_slice(&buf[12..q.raw_len]);
-                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 93, 184, 216, 34]);
-                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1]);
+                    r.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 93, 184, 216, 34,
+                    ]);
+                    r.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1,
+                    ]);
                     r
                 } else {
                     DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)
@@ -459,10 +491,14 @@ mod tests {
         assert!(err.to_string().contains("Fake-IP"));
 
         let fake_mapped_target = TargetAddr::Ip("[::ffff:198.18.0.10]:1080".parse().unwrap());
-        let err_mapped =
-            DirectOutbound::connect(&fake_mapped_target, DEFAULT_OUTBOUND_UPSTREAM_DNS, None, &[])
-                .await
-                .unwrap_err();
+        let err_mapped = DirectOutbound::connect(
+            &fake_mapped_target,
+            DEFAULT_OUTBOUND_UPSTREAM_DNS,
+            None,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert!(err_mapped.to_string().contains("Fake-IP"));
         let pool = FakeIpPool::new_default();
         assert!(matches!(
@@ -494,12 +530,18 @@ mod tests {
                     // Return unreachable/reserved TEST-NET-1 first, then localhost 127.0.0.1
                     let mut r = Vec::new();
                     r.extend_from_slice(&tx.to_be_bytes());
-                    r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
+                    r.extend_from_slice(&[
+                        0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+                    ]);
                     r.extend_from_slice(&buf[12..q.raw_len]);
                     // 127.0.0.2 (connection refused fast) or 192.0.2.1 (blackhole capped at <=4s);
                     // pick non-listening loopback/local test IP if fast, or verify failover to 127.0.0.1
-                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 99]);
-                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1]);
+                    r.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 99,
+                    ]);
+                    r.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1,
+                    ]);
                     r
                 } else {
                     DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)
@@ -585,8 +627,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_direct_outbound_skips_unusable_preferred_dns_and_does_not_leak_nxdomain() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         // 1. P3-1: 权威 orig_dns 返回 NXDOMAIN 时绝不得回退查询公网 fallback upstream_dns
         let corp_dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -7,13 +7,13 @@ mod rule;
 mod status_sim;
 mod transparent;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 pub use args::{
-    parse_global_opts, print_help, resolve_launch_mode, should_run_cli, wants_json_output,
-    GlobalCliOpts, LaunchMode,
+    GlobalCliOpts, LaunchMode, parse_global_opts, print_help, resolve_launch_mode, should_run_cli,
+    wants_json_output,
 };
-pub use http_client::{emit_cli_error_and_exit, format_cli_error_json, ApiHttpError};
+pub use http_client::{ApiHttpError, emit_cli_error_and_exit, format_cli_error_json};
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
     let opts = parse_global_opts(args)?;
@@ -57,19 +57,19 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cli::args::{
-        normalize_api_addr, parse_cli_invocation, parse_flags_with_spec,
-        resolve_config_path_from_env, ArgSpec,
+        ArgSpec, normalize_api_addr, parse_cli_invocation, parse_flags_with_spec,
+        resolve_config_path_from_env,
     };
     use crate::cli::bridge::DEFAULT_SELF_PORTS;
     use crate::cli::conn::conn_matches_filter;
     use crate::cli::http_client::{
-        api_request_raw_with_timeouts, ApiTransportError, SilentExitError, API_CONNECT_TIMEOUT,
-        API_IO_TIMEOUT,
+        API_CONNECT_TIMEOUT, API_IO_TIMEOUT, ApiTransportError, SilentExitError,
+        api_request_raw_with_timeouts,
     };
     use crate::cli::transparent::build_transparent_doctor_report;
     use crate::config::ConfigStore;
     use crate::i18n::Locale;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -102,7 +102,9 @@ mod tests {
             ])
             .unwrap(),
             LaunchMode::Serve {
-                config_path: resolve_config_path_from_env(std::env::var("FLOWX_CONFIG").ok().as_deref()),
+                config_path: resolve_config_path_from_env(
+                    std::env::var("FLOWX_CONFIG").ok().as_deref()
+                ),
                 transparent_override: Some(true),
                 replace_pid: Some(4321),
             }
@@ -116,24 +118,27 @@ mod tests {
             ])
             .unwrap(),
             LaunchMode::Serve {
-                config_path: resolve_config_path_from_env(std::env::var("FLOWX_CONFIG").ok().as_deref()),
+                config_path: resolve_config_path_from_env(
+                    std::env::var("FLOWX_CONFIG").ok().as_deref()
+                ),
                 transparent_override: Some(false),
                 replace_pid: Some(777),
             }
         );
-        assert!(resolve_launch_mode(&[
-            "flowx".into(),
-            "--transparent".into(),
-            "--no-transparent".into(),
-        ])
-        .is_err());
-        assert!(resolve_launch_mode(&[
-            "flowx".into(),
-            "--replace-pid".into(),
-            "0".into(),
-        ])
-        .is_err());
-        assert!(parse_global_opts(&["flowx".into(), "--transparent".into(), "status".into()]).is_err());
+        assert!(
+            resolve_launch_mode(&[
+                "flowx".into(),
+                "--transparent".into(),
+                "--no-transparent".into(),
+            ])
+            .is_err()
+        );
+        assert!(
+            resolve_launch_mode(&["flowx".into(), "--replace-pid".into(), "0".into(),]).is_err()
+        );
+        assert!(
+            parse_global_opts(&["flowx".into(), "--transparent".into(), "status".into()]).is_err()
+        );
         assert!(should_run_cli(&["flowx".into(), "status".into()]));
         assert!(should_run_cli(&["flowx".into(), "--help".into()]));
         assert!(should_run_cli(&[
@@ -143,7 +148,11 @@ mod tests {
         ]));
         assert!(should_run_cli(&["flowx".into(), "--config".into()]));
         assert!(resolve_launch_mode(&["flowx".into(), "--config".into()]).is_err());
-        assert!(should_run_cli(&["flowx".into(), "--json".into(), "serve".into()]));
+        assert!(should_run_cli(&[
+            "flowx".into(),
+            "--json".into(),
+            "serve".into()
+        ]));
         assert!(parse_global_opts(&["flowx".into(), "--json".into(), "serve".into()]).is_err());
         assert!(should_run_cli(&["flowx".into(), "--unknown".into()]));
         assert!(parse_global_opts(&["flowx".into(), "--unknown".into()]).is_err());
@@ -336,12 +345,7 @@ mod tests {
         assert_eq!(inv.opts.rest, vec!["node", "list"]);
 
         let (pos, flags) = parse_flags_with_spec(
-            &[
-                "--name".into(),
-                "R1".into(),
-                "--".into(),
-                "-literal".into(),
-            ],
+            &["--name".into(), "R1".into(), "--".into(), "-literal".into()],
             ArgSpec {
                 cmd_label: "flowx test",
                 value_flags: &["name"],
@@ -491,14 +495,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_transparent_dll_path_validation_and_doctor_report_semantics() {
-        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-            "flowx_cli_tp_val_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let cfg_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_cli_tp_val_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let cfg_str = cfg_path.display().to_string();
 
         // 1. Invalid --dll-path emits structured ERR_TRANSPARENT_INVALID_DLL_PATH matching API
@@ -522,7 +529,9 @@ mod tests {
                 bad_path.into(),
             ])
             .await
-            .expect_err(&format!("expected invalid --dll-path rejection for {bad_path:?}"));
+            .expect_err(&format!(
+                "expected invalid --dll-path rejection for {bad_path:?}"
+            ));
             let err_json = format_cli_error_json(&err);
             assert_eq!(
                 err_json["code"], "ERR_TRANSPARENT_INVALID_DLL_PATH",
@@ -551,11 +560,13 @@ mod tests {
             build_transparent_doctor_report("ONLINE", &err_status, "./local-cli.xml");
         assert_eq!(online_err_report["ready"], false);
         assert_eq!(online_err_report["config_path"], r"D:\Daemon\prod.xml");
-        assert!(online_err_report["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str().unwrap_or("").contains("signature check failed")));
+        assert!(
+            online_err_report["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("signature check failed"))
+        );
 
         // 3. Online doctor without server config_path reports null instead of local CLI config path
         let online_no_cfg = json!({
@@ -593,11 +604,13 @@ mod tests {
             build_transparent_doctor_report("ONLINE", &low_il_status, "./local-cli.xml");
         assert_eq!(low_il_report["ready"], false);
         assert_eq!(low_il_report["low_integrity"], true);
-        assert!(low_il_report["issues"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str().unwrap_or("").contains("Low Mandatory Integrity")));
+        assert!(
+            low_il_report["issues"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str().unwrap_or("").contains("Low Mandatory Integrity"))
+        );
     }
 
     #[tokio::test]
@@ -672,14 +685,17 @@ mod tests {
         elev_srv.await.unwrap();
 
         // 3. Offline & online `node update --clear-user` + conflict rejection + `node ping --all`
-        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-            "flowx_cli_parity_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let cfg_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_cli_parity_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let _ = std::fs::remove_file(&cfg_path);
         let cfg_str = cfg_path.to_string_lossy().to_string();
 
@@ -815,14 +831,17 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-            "flowx_cli_rule_clr_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let cfg_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_cli_rule_clr_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         let _ = std::fs::remove_file(&cfg_path);
         let cfg_str = cfg_path.to_string_lossy().to_string();
 

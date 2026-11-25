@@ -12,19 +12,19 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 mod entry {
+    use anyhow::Context;
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
-    use anyhow::Context;
-    use tracing::{info, warn, Level};
+    use tracing::{Level, info, warn};
     use tracing_subscriber::FmtSubscriber;
 
     use flowx::api::{ApiServer, SystemRuntimeContext};
     use flowx::cli;
     use flowx::config::ConfigStore;
-    use flowx::dns::server::DnsServer;
     use flowx::dns::FakeIpPool;
+    use flowx::dns::server::DnsServer;
     use flowx::interceptor::dispatcher::{DispatcherConfig, StreamDispatcher};
     use flowx::interceptor::process::ProcessTracker;
     use flowx::monitor::{ConnectionManager, InFlightTracker};
@@ -85,20 +85,21 @@ mod entry {
     pub(super) async fn run() -> anyhow::Result<()> {
         let raw_args: Vec<String> = std::env::args().collect();
         let wants_json = cli::wants_json_output(&raw_args);
-        let (config_path, transparent_override, replace_pid) = match cli::resolve_launch_mode(&raw_args) {
-            Ok(cli::LaunchMode::Serve {
-                config_path,
-                transparent_override,
-                replace_pid,
-            }) => (config_path, transparent_override, replace_pid),
-            Ok(cli::LaunchMode::Cli) => {
-                if let Err(err) = cli::run_cli(&raw_args).await {
-                    cli::emit_cli_error_and_exit(&err, wants_json);
+        let (config_path, transparent_override, replace_pid) =
+            match cli::resolve_launch_mode(&raw_args) {
+                Ok(cli::LaunchMode::Serve {
+                    config_path,
+                    transparent_override,
+                    replace_pid,
+                }) => (config_path, transparent_override, replace_pid),
+                Ok(cli::LaunchMode::Cli) => {
+                    if let Err(err) = cli::run_cli(&raw_args).await {
+                        cli::emit_cli_error_and_exit(&err, wants_json);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            Err(err) => cli::emit_cli_error_and_exit(&err, wants_json),
-        };
+                Err(err) => cli::emit_cli_error_and_exit(&err, wants_json),
+            };
 
         // 1. 初始化标准结构化日志（支持通过 FLOWX_LOG / RUST_LOG 调整日志级别，默认 INFO）
         let subscriber = FmtSubscriber::builder()
@@ -136,7 +137,10 @@ mod entry {
             .load_or_init(&self_ports)
             .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
         if created_default {
-            info!("[Config] No configuration file found, generated default profile: {}", config_path);
+            info!(
+                "[Config] No configuration file found, generated default profile: {}",
+                config_path
+            );
         } else {
             info!(
                 "[Config] Loaded profile {} ({} proxy nodes, {} routing rules)",
@@ -184,8 +188,8 @@ mod entry {
             self_ports: self_ports.clone(),
             in_flight: Some(Arc::clone(&in_flight)),
         };
-        let dispatcher = StreamDispatcher::new(dispatcher_config.clone())
-            .with_in_flight(Arc::clone(&in_flight));
+        let dispatcher =
+            StreamDispatcher::new(dispatcher_config.clone()).with_in_flight(Arc::clone(&in_flight));
         let dispatcher_listener = dispatcher.bind().await?;
 
         let transparent_mgr = TransparentManager::new_with_persisted(
@@ -241,7 +245,10 @@ mod entry {
                         .await
                         .unwrap_or_else(|je| Err(anyhow::anyhow!("save task join error: {je}")))
                         {
-                            warn!("[Transparent] Started cleanly via UAC elevation, but failed to persist enabled=true: {:#}", e);
+                            warn!(
+                                "[Transparent] Started cleanly via UAC elevation, but failed to persist enabled=true: {:#}",
+                                e
+                            );
                         }
                     }
                 }
@@ -263,7 +270,8 @@ mod entry {
         }
 
         // 7. 在托管 JoinSet 中启动异步核心服务任务，任一核心任务异常提前退出时触发停机并向上返回错误
-        let mut core_tasks: tokio::task::JoinSet<(&'static str, anyhow::Result<()>)> = tokio::task::JoinSet::new();
+        let mut core_tasks: tokio::task::JoinSet<(&'static str, anyhow::Result<()>)> =
+            tokio::task::JoinSet::new();
 
         let rx1 = shutdown_rx.clone();
         let dns_task_srv = Arc::clone(&dns_server);
@@ -356,7 +364,10 @@ mod entry {
         };
         while !core_tasks.is_empty() && drain_start.elapsed() < max_drain_wait {
             let remaining = max_drain_wait.saturating_sub(drain_start.elapsed());
-            if tokio::time::timeout(remaining, core_tasks.join_next()).await.is_err() {
+            if tokio::time::timeout(remaining, core_tasks.join_next())
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -377,8 +388,7 @@ mod entry {
             }
             info!(
                 "[Shutdown] Waiting for {} active connections and {} in-flight tasks to drain...",
-                active,
-                pending
+                active, pending
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -400,7 +410,7 @@ mod entry {
         let _ = tokio::task::spawn_blocking(move || {
             use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
             use windows_sys::Win32::System::Threading::{
-                OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+                OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
             };
 
             let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
@@ -425,8 +435,10 @@ mod entry {
         use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
 
         let mut sig_c = ctrl_c().context("Failed to register Windows CTRL_C handler")?;
-        let mut sig_break = ctrl_break().context("Failed to register Windows CTRL_BREAK handler")?;
-        let mut sig_close = ctrl_close().context("Failed to register Windows CTRL_CLOSE handler")?;
+        let mut sig_break =
+            ctrl_break().context("Failed to register Windows CTRL_BREAK handler")?;
+        let mut sig_close =
+            ctrl_close().context("Failed to register Windows CTRL_CLOSE handler")?;
         let mut sig_logoff =
             ctrl_logoff().context("Failed to register Windows CTRL_LOGOFF handler")?;
         let mut sig_shutdown =
@@ -621,7 +633,9 @@ mod entry {
 
         #[tokio::test]
         async fn test_windows_console_signal_handlers_register_and_kill_all_connections_cancels() {
-            use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+            use tokio::signal::windows::{
+                ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown,
+            };
             // 验证所有 5 类 Windows 控制台事件处理器均可在当前运行环境正常注册
             assert!(ctrl_c().is_ok());
             assert!(ctrl_break().is_ok());

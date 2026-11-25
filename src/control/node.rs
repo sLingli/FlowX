@@ -5,16 +5,16 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
-use crate::control::routing::SystemRuntimeContext;
 use crate::control::ControlError;
+use crate::control::routing::SystemRuntimeContext;
 use crate::dns::FakeIpPool;
-use crate::i18n::{t, Locale};
+use crate::i18n::{Locale, t};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
-use crate::outbound::chain::{parse_target_addr, ProxyNode};
+use crate::outbound::TargetAddr;
+use crate::outbound::chain::{ProxyNode, parse_target_addr};
 use crate::outbound::http::HttpConnectClient;
 use crate::outbound::socks4::Socks4Client;
 use crate::outbound::socks5::Socks5Client;
-use crate::outbound::TargetAddr;
 use crate::router::{Action, RuleEngine};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,10 +291,7 @@ fn resolve_updated_credentials(
                 "error.password_without_username",
             ));
         }
-        if clear_password == Some(false)
-            && !has_raw_password_field
-            && existing_password.is_some()
-        {
+        if clear_password == Some(false) && !has_raw_password_field && existing_password.is_some() {
             return Err(ControlError::bad_request(
                 "ERR_CONFLICTING_PASSWORD_OPTIONS",
                 "error.conflicting_password_options",
@@ -417,7 +414,11 @@ pub fn update_node(
         ));
     };
 
-    let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
+    let existing_password = existing
+        .client
+        .auth_credentials()
+        .1
+        .map(ToString::to_string);
     let (username, password) = resolve_updated_credentials(
         false,
         &protocol,
@@ -459,9 +460,14 @@ pub fn patch_node(
 
     let name_raw = req.name.unwrap_or_else(|| existing.name.clone());
     let protocol_raw = req.protocol.unwrap_or_else(|| existing.protocol.clone());
-    let server_addr_raw = req.server_addr.unwrap_or_else(|| existing.server_addr.clone());
+    let server_addr_raw = req
+        .server_addr
+        .unwrap_or_else(|| existing.server_addr.clone());
     if req.clear_username == Some(true)
-        && req.username.as_deref().is_some_and(|u| !u.trim().is_empty())
+        && req
+            .username
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
     {
         return Err(ControlError::bad_request(
             "ERR_CONFLICTING_USERNAME_OPTIONS",
@@ -485,7 +491,11 @@ pub fn patch_node(
         self_ports,
     )?;
 
-    let existing_password = existing.client.auth_credentials().1.map(ToString::to_string);
+    let existing_password = existing
+        .client
+        .auth_credentials()
+        .1
+        .map(ToString::to_string);
     let (username, password) = resolve_updated_credentials(
         true,
         &protocol,
@@ -525,7 +535,10 @@ pub fn delete_node(
         _ => false,
     }) || matches!(current_default, Action::Proxy(pid) if pid == node_id);
     if is_referenced {
-        return Err(ControlError::conflict("ERR_NODE_IN_USE", "error.node_in_use"));
+        return Err(ControlError::conflict(
+            "ERR_NODE_IN_USE",
+            "error.node_in_use",
+        ));
     }
 
     let removed = {

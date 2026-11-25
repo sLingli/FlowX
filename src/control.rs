@@ -3,7 +3,7 @@ pub mod routing;
 pub mod rule;
 pub mod transparent;
 
-use crate::i18n::{json_error, t, Locale};
+use crate::i18n::{Locale, json_error, t};
 
 pub use node::{
     AddNodeRequest, PatchNodeRequest, PingNodeRequest, PingResponse, ProxyNodeView,

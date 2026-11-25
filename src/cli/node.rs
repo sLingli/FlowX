@@ -1,14 +1,14 @@
 use std::io::Write;
 
-use anyhow::{anyhow, bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, anyhow, bail};
+use serde_json::{Value, json};
 
-use crate::cli::args::{parse_flags_with_spec, resolve_id_arg, ArgSpec, GlobalCliOpts};
+use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec, resolve_id_arg};
 use crate::cli::bridge::{
-    control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly, DEFAULT_SELF_PORTS,
+    DEFAULT_SELF_PORTS, control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly,
 };
 use crate::cli::http_client::{
-    api_request_or_offline, api_request_raw, ensure_api_ok, ApiTransportError, SilentExitError,
+    ApiTransportError, SilentExitError, api_request_or_offline, api_request_raw, ensure_api_ok,
 };
 use crate::control::node::{add_node, list_nodes, patch_node, ping_address};
 use crate::control::{AddNodeRequest, PatchNodeRequest, PingResponse, ProxyNodeView};
@@ -34,15 +34,15 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 0,
                 },
             )?;
-            let list: Vec<ProxyNodeView> =
-                if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/nodes", None).await?
-                {
-                    let v = ensure_api_ok(st, val)?;
-                    serde_json::from_value(v)?
-                } else {
-                    let rt = load_offline_runtime_readonly(&opts.config_path)?;
-                    list_nodes(&rt.nodes)
-                };
+            let list: Vec<ProxyNodeView> = if let Some((st, val)) =
+                api_request_or_offline(opts, "GET", "/api/nodes", None).await?
+            {
+                let v = ensure_api_ok(st, val)?;
+                serde_json::from_value(v)?
+            } else {
+                let rt = load_offline_runtime_readonly(&opts.config_path)?;
+                list_nodes(&rt.nodes)
+            };
 
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&list)?);
@@ -50,7 +50,11 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 println!("No proxy nodes configured.");
             } else {
                 for n in list {
-                    let auth = if n.auth_configured { "auth=yes" } else { "auth=no" };
+                    let auth = if n.auth_configured {
+                        "auth=yes"
+                    } else {
+                        "auth=no"
+                    };
                     println!(
                         "#{:<4} {:<18} {:<8} {:<22} ({})",
                         n.id, n.name, n.protocol, n.server_addr, auth
@@ -136,11 +140,7 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 1,
                 },
             )?;
-            let id_str = resolve_id_arg(
-                &pos,
-                &flags,
-                "Missing node <ID> for `flowx node update`",
-            )?;
+            let id_str = resolve_id_arg(&pos, &flags, "Missing node <ID> for `flowx node update`")?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
             let clear_password_flag = flags.contains_key("clear-password");
@@ -216,20 +216,12 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 1,
                 },
             )?;
-            let id_str = resolve_id_arg(
-                &pos,
-                &flags,
-                "Missing node <ID> for `flowx node remove`",
-            )?;
+            let id_str = resolve_id_arg(&pos, &flags, "Missing node <ID> for `flowx node remove`")?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
-            let res_val = if let Some((st, val)) = api_request_or_offline(
-                opts,
-                "DELETE",
-                &format!("/api/nodes?id={}", id),
-                None,
-            )
-            .await?
+            let res_val = if let Some((st, val)) =
+                api_request_or_offline(opts, "DELETE", &format!("/api/nodes?id={}", id), None)
+                    .await?
             {
                 ensure_api_ok(st, val)?
             } else {
@@ -283,17 +275,16 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 return ping_all_nodes(opts).await;
             }
-            let id_str =
-                resolve_id_arg(&pos, &flags, "Missing node <ID> or --all for `flowx node ping`")?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing node <ID> or --all for `flowx node ping`",
+            )?;
             let id: u32 = id_str.parse().context("Invalid node ID")?;
 
-            let res_val = if let Some((st, val)) = api_request_or_offline(
-                opts,
-                "POST",
-                "/api/nodes/ping",
-                Some(&json!({ "id": id })),
-            )
-            .await?
+            let res_val = if let Some((st, val)) =
+                api_request_or_offline(opts, "POST", "/api/nodes/ping", Some(&json!({ "id": id })))
+                    .await?
             {
                 ensure_api_ok(st, val)?
             } else {

@@ -1,7 +1,7 @@
-use std::net::IpAddr;
+use super::PortRange;
 use glob::{MatchOptions, Pattern};
 use ipnet::IpNet;
-use super::PortRange;
+use std::net::IpAddr;
 
 pub const APP_MATCH_OPTIONS: MatchOptions = MatchOptions {
     case_sensitive: false,
@@ -343,12 +343,17 @@ pub fn parse_ports(raw: &str) -> Option<Vec<PortRange>> {
         }
 
         if let Some((start_s, end_s)) = trimmed.split_once('-') {
-            if let (Ok(start), Ok(end)) = (start_s.trim().parse::<u16>(), end_s.trim().parse::<u16>())
-                && start <= end {
-                    ranges.push(PortRange { start, end });
-                }
+            if let (Ok(start), Ok(end)) =
+                (start_s.trim().parse::<u16>(), end_s.trim().parse::<u16>())
+                && start <= end
+            {
+                ranges.push(PortRange { start, end });
+            }
         } else if let Ok(port) = trimmed.parse::<u16>() {
-            ranges.push(PortRange { start: port, end: port });
+            ranges.push(PortRange {
+                start: port,
+                end: port,
+            });
         }
     }
 
@@ -410,7 +415,8 @@ mod tests {
 
     #[test]
     fn test_parse_applications() {
-        let pats = parse_applications(r#"node.exe; *chrome*.exe; "C:\Program Files\App\app.exe""#).unwrap();
+        let pats = parse_applications(r#"node.exe; *chrome*.exe; "C:\Program Files\App\app.exe""#)
+            .unwrap();
         assert_eq!(pats.len(), 3);
         assert!(pats[0].matches(&["node.exe"], &[]));
         assert!(!pats[0].matches(&["node"], &[]));
@@ -423,8 +429,16 @@ mod tests {
         assert_eq!(wild_exe.len(), 2);
         assert!(!wild_exe.iter().any(|m| m.matches(&["System"], &["System"])));
         assert!(wild_exe.iter().any(|m| m.matches(&["curl.exe"], &[])));
-        assert!(wild_exe.iter().any(|m| m.matches(&[], &["c:/tools/curl.exe"])));
-        assert!(!wild_exe.iter().any(|m| m.matches(&[], &["c:/tools/sub/curl.exe"])));
+        assert!(
+            wild_exe
+                .iter()
+                .any(|m| m.matches(&[], &["c:/tools/curl.exe"]))
+        );
+        assert!(
+            !wild_exe
+                .iter()
+                .any(|m| m.matches(&[], &["c:/tools/sub/curl.exe"]))
+        );
     }
 
     #[test]
@@ -465,11 +479,12 @@ mod tests {
         );
 
         // P1-4 回归 2：主机名伪装成 CIDR (`0.0.0.0/0`) 或全通配符 (`*`) 绝不可被编译进 subnets 或匹配任意域
-        let (cidr_domains, cidr_subnets) = parse_targets_with_hostname(
-            "localhost; %ComputerName%",
-            Some("0.0.0.0/0"),
+        let (cidr_domains, cidr_subnets) =
+            parse_targets_with_hostname("localhost; %ComputerName%", Some("0.0.0.0/0"));
+        assert!(
+            cidr_subnets.is_none(),
+            "Injected CIDR via hostname must not compile into subnets"
         );
-        assert!(cidr_subnets.is_none(), "Injected CIDR via hostname must not compile into subnets");
         let cidr_domains = cidr_domains.unwrap_or_default();
         assert!(!cidr_domains.iter().any(|d| d.matches("example.com")));
 

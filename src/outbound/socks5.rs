@@ -1,12 +1,12 @@
+use super::TargetAddr;
+use super::bypass::OutboundTcpStream;
+use super::direct::{DEFAULT_OUTBOUND_UPSTREAM_DNS, connect_proxy_tcp_guarded};
+use crate::dns::FakeIpPool;
+use anyhow::{Result, bail};
 use std::net::SocketAddr;
 use std::time::Duration;
-use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::dns::FakeIpPool;
-use super::bypass::OutboundTcpStream;
-use super::direct::{connect_proxy_tcp_guarded, DEFAULT_OUTBOUND_UPSTREAM_DNS};
-use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -67,7 +67,13 @@ impl Socks5Client {
             Ok(stream)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("SOCKS5 connection timed out ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "SOCKS5 connection timed out ({:?}): {}",
+                DEFAULT_TIMEOUT,
+                self.proxy_addr
+            )
+        })?
     }
 
     /// Perform SOCKS5 handshake over an already established stream (e.g. for proxy chaining)
@@ -79,9 +85,12 @@ impl Socks5Client {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        tokio::time::timeout(DEFAULT_TIMEOUT, self.handshake_internal(&mut stream, target))
-            .await
-            .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
+        tokio::time::timeout(
+            DEFAULT_TIMEOUT,
+            self.handshake_internal(&mut stream, target),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("SOCKS5 handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
         Ok(stream)
     }
 
@@ -121,17 +130,26 @@ impl Socks5Client {
                     let mut auth_resp = [0u8; 2];
                     stream.read_exact(&mut auth_resp).await?;
                     if auth_resp[0] != 0x01 {
-                        bail!("SOCKS5 auth sub-negotiation response version error: 0x{:02x}", auth_resp[0]);
+                        bail!(
+                            "SOCKS5 auth sub-negotiation response version error: 0x{:02x}",
+                            auth_resp[0]
+                        );
                     }
                     if auth_resp[1] != 0x00 {
-                        bail!("SOCKS5 authentication failed (status: 0x{:02x})", auth_resp[1]);
+                        bail!(
+                            "SOCKS5 authentication failed (status: 0x{:02x})",
+                            auth_resp[1]
+                        );
                     }
                 } else {
                     bail!("Proxy requires authentication, but no credentials provided");
                 }
             }
             0xFF => bail!("SOCKS5 proxy rejected authentication methods offered by client (0xFF)"),
-            other => bail!("SOCKS5 unsupported authentication response code: 0x{:02x}", other),
+            other => bail!(
+                "SOCKS5 unsupported authentication response code: 0x{:02x}",
+                other
+            ),
         }
 
         // 2. Initiate CONNECT request (CMD = 0x01)
@@ -153,7 +171,10 @@ impl Socks5Client {
             },
             TargetAddr::Domain(domain, port) => {
                 if domain.len() > 255 {
-                    bail!("SOCKS5 target domain length exceeds RFC 1928 limit (max 255 bytes): {}", domain);
+                    bail!(
+                        "SOCKS5 target domain length exceeds RFC 1928 limit (max 255 bytes): {}",
+                        domain
+                    );
                 }
                 connect_req.push(0x03); // ATYP: Domain
                 connect_req.push(domain.len() as u8);
@@ -183,7 +204,11 @@ impl Socks5Client {
                 0x08 => "Address type not supported",
                 _code => "Unknown error code",
             };
-            bail!("SOCKS5 target connection failed: {} (code 0x{:02x})", reason, reply_header[1]);
+            bail!(
+                "SOCKS5 target connection failed: {} (code 0x{:02x})",
+                reason,
+                reply_header[1]
+            );
         }
 
         // Read bound address field to clear buffer
@@ -202,7 +227,10 @@ impl Socks5Client {
                 let mut buf = [0u8; 18]; // 16 bytes IPv6 + 2 bytes Port
                 stream.read_exact(&mut buf).await?;
             }
-            other => bail!("SOCKS5 returned unknown bound address type: 0x{:02x}", other),
+            other => bail!(
+                "SOCKS5 returned unknown bound address type: 0x{:02x}",
+                other
+            ),
         }
 
         Ok(())
@@ -215,8 +243,7 @@ mod tests {
 
     #[test]
     fn test_socks5_client_creation() {
-        let client = Socks5Client::new("127.0.0.1:1080")
-            .with_auth("user".into(), "pass".into());
+        let client = Socks5Client::new("127.0.0.1:1080").with_auth("user".into(), "pass".into());
         assert_eq!(client.proxy_addr, "127.0.0.1:1080");
         assert_eq!(client.auth, Some(("user".into(), "pass".into())));
     }
@@ -229,13 +256,18 @@ mod tests {
             for _ in 0..2 {
                 let mut buf = [0u8; 512];
                 let (n, src) = mock_dns.recv_from(&mut buf).await.unwrap();
-                let (tx, q) = crate::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                let (tx, q) =
+                    crate::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
                 let resp = if q.qtype == 1 {
                     let mut r = Vec::new();
                     r.extend_from_slice(&tx.to_be_bytes());
-                    r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                    r.extend_from_slice(&[
+                        0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                    ]);
                     r.extend_from_slice(&buf[12..q.raw_len]);
-                    r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1]);
+                    r.extend_from_slice(&[
+                        0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1,
+                    ]);
                     r
                 } else {
                     crate::dns::server::DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)

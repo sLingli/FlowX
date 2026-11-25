@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionSnapshot {
@@ -241,10 +241,8 @@ impl ConnectionManager {
             let conns = self.connections.read().unwrap_or_else(|e| e.into_inner());
             conns.values().map(Arc::clone).collect()
         };
-        let mut list: Vec<ConnectionSnapshot> = active_conns
-            .into_iter()
-            .map(|c| c.snapshot())
-            .collect();
+        let mut list: Vec<ConnectionSnapshot> =
+            active_conns.into_iter().map(|c| c.snapshot()).collect();
         list.sort_by_key(|c| std::cmp::Reverse(c.id));
         list
     }
@@ -271,10 +269,13 @@ impl ConnectionManager {
             let last_up = self.last_total_up.swap(total_up, Ordering::Relaxed);
             let last_down = self.last_total_down.swap(total_down, Ordering::Relaxed);
             let up_bytes_per_sec = ((total_up.saturating_sub(last_up) as f64) / elapsed) as u64;
-            let down_bytes_per_sec = ((total_down.saturating_sub(last_down) as f64) / elapsed) as u64;
+            let down_bytes_per_sec =
+                ((total_down.saturating_sub(last_down) as f64) / elapsed) as u64;
 
-            self.current_up_speed.store(up_bytes_per_sec, Ordering::Relaxed);
-            self.current_down_speed.store(down_bytes_per_sec, Ordering::Relaxed);
+            self.current_up_speed
+                .store(up_bytes_per_sec, Ordering::Relaxed);
+            self.current_down_speed
+                .store(down_bytes_per_sec, Ordering::Relaxed);
             *tick_guard = now;
         }
 
@@ -321,7 +322,9 @@ impl InFlightTracker {
 
     pub fn enter(self: &Arc<Self>) -> InFlightGuard {
         self.count.fetch_add(1, Ordering::AcqRel);
-        InFlightGuard { tracker: Arc::clone(self) }
+        InFlightGuard {
+            tracker: Arc::clone(self),
+        }
     }
 
     pub fn count(&self) -> usize {

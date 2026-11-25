@@ -4,15 +4,15 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::net::UdpSocket;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tracing::{debug, error, info, warn};
 
 use super::codec::parse_answer_ips_with_ttl;
 use super::upstream::{
-    forward_raw_query_with_limit, is_transient_udp_recv_error, ForwardQueryOutcome,
-    MAX_DNS_UPSTREAM_CONCURRENCY, MAX_UDP_DNS_PACKET_LEN,
+    ForwardQueryOutcome, MAX_DNS_UPSTREAM_CONCURRENCY, MAX_UDP_DNS_PACKET_LEN,
+    forward_raw_query_with_limit, is_transient_udp_recv_error,
 };
-use super::{canonicalize_socket_addr_preserving_scope, FakeIpPool};
+use super::{FakeIpPool, canonicalize_socket_addr_preserving_scope};
 use crate::monitor::InFlightTracker;
 
 pub use super::codec::{DnsPacketParser, DnsQuestion};
@@ -20,7 +20,7 @@ pub use super::codec::{DnsPacketParser, DnsQuestion};
 pub(crate) use super::codec::{csprng_u16, observe_passive_dns_response, peek_dns_response_key};
 #[allow(unused_imports)]
 pub(crate) use super::upstream::{
-    resolve_via_upstream_dns, resolve_via_upstream_dns_with_options, DnsNxDomainError,
+    DnsNxDomainError, resolve_via_upstream_dns, resolve_via_upstream_dns_with_options,
 };
 
 /// 本地 DNS 拦截处理服务
@@ -145,7 +145,10 @@ impl DnsServer {
         let socket = UdpSocket::bind(self.bind_addr)
             .await
             .with_context(|| format!("Failed to bind DNS server socket ({})", self.bind_addr))?;
-        info!("[DNS Engine] Local DNS hijack and leak-prevention service bound on {}", self.bind_addr);
+        info!(
+            "[DNS Engine] Local DNS hijack and leak-prevention service bound on {}",
+            self.bind_addr
+        );
         Ok(Arc::new(socket))
     }
 
@@ -222,7 +225,9 @@ impl DnsServer {
         orig_dst: SocketAddr,
     ) -> Option<Vec<u8>> {
         let Ok(_permit) = self.concurrency_limit.clone().try_acquire_owned() else {
-            warn!("[DNS Engine] Dropped transparent inspect DNS query exceeding concurrency limit (5000)");
+            warn!(
+                "[DNS Engine] Dropped transparent inspect DNS query exceeding concurrency limit (5000)"
+            );
             return None;
         };
         let _in_flight = self.in_flight.as_ref().map(|t| t.enter());
@@ -230,7 +235,10 @@ impl DnsServer {
         let (client_tx_id, question) = match DnsPacketParser::parse_question(query_bytes) {
             Ok(parsed) => parsed,
             Err(e) => {
-                warn!("[DNS Engine] Failed to parse transparent inspect DNS query: {}", e);
+                warn!(
+                    "[DNS Engine] Failed to parse transparent inspect DNS query: {}",
+                    e
+                );
                 return None;
             }
         };
@@ -257,12 +265,8 @@ impl DnsServer {
                 if matches!(question.qtype, 1 | 28)
                     && question.qclass == 1
                     && (resp_bytes[3] & 0x0F) == 0
-                    && let Ok((ips, min_ttl)) = parse_answer_ips_with_ttl(
-                        &resp_bytes,
-                        &question,
-                        ans_off,
-                        Some(&self.pool),
-                    )
+                    && let Ok((ips, min_ttl)) =
+                        parse_answer_ips_with_ttl(&resp_bytes, &question, ans_off, Some(&self.pool))
                     && !ips.is_empty()
                 {
                     let ttl_hint = min_ttl.map(|s| Duration::from_secs(u64::from(s)));
@@ -276,7 +280,11 @@ impl DnsServer {
     }
 
     /// Run asynchronous UDP DNS listener loop (supports graceful shutdown, concurrency limit, and ephemeral upstream isolation)
-    pub async fn run(&self, socket: Arc<UdpSocket>, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        &self,
+        socket: Arc<UdpSocket>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         let mut buf = vec![0u8; MAX_UDP_DNS_PACKET_LEN];
         let mut transient_err_streak: u32 = 0;
 
@@ -359,9 +367,9 @@ impl DnsServer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::codec::{build_dns_query_packet, decode_dns_name};
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    use super::super::codec::{build_dns_query_packet, decode_dns_name};
 
     fn build_sample_query(tx_id: u16, domain: &str, qtype: u16) -> Vec<u8> {
         let mut q = Vec::new();
@@ -388,7 +396,8 @@ mod tests {
         assert_eq!(question.qtype, 1);
 
         let fake_ip = Ipv4Addr::new(198, 18, 0, 10);
-        let resp = DnsPacketParser::build_a_response(tx_id, &sample_query, question.raw_len, fake_ip);
+        let resp =
+            DnsPacketParser::build_a_response(tx_id, &sample_query, question.raw_len, fake_ip);
 
         // 校验响应头
         assert_eq!(resp[0..2], [0x12, 0x34]);
@@ -399,11 +408,15 @@ mod tests {
 
     #[test]
     fn test_parse_dns_rejection() {
-        let mut query = vec![0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut query = vec![
+            0x12, 0x34, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         query.extend_from_slice(&[3, b'c', b'o', b'm', 0, 0, 1, 0, 1]);
         assert!(DnsPacketParser::parse_question(&query).is_err());
 
-        let mut query_long = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut query_long = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         query_long.push(64);
         query_long.extend_from_slice(&[b'a'; 64]);
         query_long.push(0);
@@ -411,11 +424,15 @@ mod tests {
         assert!(DnsPacketParser::parse_question(&query_long).is_err());
 
         // 测试空域名 (Root Query) 被拒绝
-        let query_empty = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 1, 0, 1];
+        let query_empty = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0, 0, 1, 0, 1,
+        ];
         assert!(DnsPacketParser::parse_question(&query_empty).is_err());
 
         // P0-3 回归测试：包含非 ASCII UTF-8（如 "élocalhost"）的 DNS 查询必须在入口被拒绝
-        let mut query_utf8 = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut query_utf8 = vec![
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         let utf8_label = "élocalhost".as_bytes();
         query_utf8.push(utf8_label.len() as u8);
         query_utf8.extend_from_slice(utf8_label);
@@ -445,7 +462,9 @@ mod tests {
         );
         assert_eq!(over_domain.len(), 254);
         assert!(build_dns_query_packet(0x4243, &over_domain, 1).is_err());
-        let mut wire_over = vec![0x42, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut wire_over = vec![
+            0x42, 0x43, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         for label in over_domain.split('.') {
             wire_over.push(label.len() as u8);
             wire_over.extend_from_slice(label.as_bytes());
@@ -485,17 +504,24 @@ mod tests {
             client.send_to(&q, dns_addr).await.unwrap();
 
             let mut resp = [0u8; 512];
-            let (n, _) = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv_from(&mut resp))
-                .await
-                .unwrap()
-                .unwrap();
+            let (n, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.recv_from(&mut resp),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert!(n >= 12);
             assert_eq!(u16::from_be_bytes([resp[0], resp[1]]), tx_id);
             assert_eq!([resp[2], resp[3]], [0x81, 0x80]); // NOERROR
             assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0); // ANCOUNT=0
         }
 
-        assert_eq!(upstream_hits.load(Ordering::Relaxed), 0, "SVCB/HTTPS/AAAA queries must not leak to public DNS");
+        assert_eq!(
+            upstream_hits.load(Ordering::Relaxed),
+            0,
+            "SVCB/HTTPS/AAAA queries must not leak to public DNS"
+        );
     }
 
     /// P0-2 / P1-5 Regression Test: Concurrent upstream queries use isolated ephemeral sockets & strict QR/Question/TxID/source validation
@@ -513,7 +539,11 @@ mod tests {
                 let mut buf2 = [0u8; 512];
                 let (n2, src2) = mock_upstream.recv_from(&mut buf2).await.unwrap();
 
-                assert_ne!(src1.port(), src2.port(), "Each forwarded query should bind an isolated ephemeral source port");
+                assert_ne!(
+                    src1.port(),
+                    src2.port(),
+                    "Each forwarded query should bind an isolated ephemeral source port"
+                );
 
                 // 1. 错误源地址伪造包应被丢弃
                 let mut spoof_resp = buf1[..n1].to_vec();
@@ -528,11 +558,8 @@ mod tests {
                 qr0_resp.extend_from_slice(b"SPOOFED");
                 let _ = mock_upstream.send_to(&qr0_resp, src1).await;
 
-                let mut wrong_q_resp = build_sample_query(
-                    u16::from_be_bytes([buf1[0], buf1[1]]),
-                    "wrong.example",
-                    16,
-                );
+                let mut wrong_q_resp =
+                    build_sample_query(u16::from_be_bytes([buf1[0], buf1[1]]), "wrong.example", 16);
                 wrong_q_resp[2] = 0x81;
                 wrong_q_resp.extend_from_slice(b"SPOOFED");
                 let _ = mock_upstream.send_to(&wrong_q_resp, src1).await;
@@ -580,10 +607,9 @@ mod tests {
 
         let mut r1 = [0u8; 512];
         let mut r2 = [0u8; 512];
-        let (res1, res2) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async { tokio::join!(client1.recv_from(&mut r1), client2.recv_from(&mut r2)) },
-        )
+        let (res1, res2) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(client1.recv_from(&mut r1), client2.recv_from(&mut r2))
+        })
         .await
         .unwrap();
         let (len1, len2) = (res1.unwrap().0, res2.unwrap().0);
@@ -596,10 +622,22 @@ mod tests {
         let p2 = &r2[..len2];
         assert!(!p1.windows(7).any(|w| w == b"SPOOFED"));
         assert!(!p2.windows(7).any(|w| w == b"SPOOFED"));
-        assert!(p1.windows(9).any(|w| w == b"ANS-ALPHA"), "Client 1 must receive alpha response");
-        assert!(!p1.windows(9).any(|w| w == b"ANS-BETA!"), "Client 1 must not receive beta response");
-        assert!(p2.windows(9).any(|w| w == b"ANS-BETA!"), "Client 2 must receive beta response");
-        assert!(!p2.windows(9).any(|w| w == b"ANS-ALPHA"), "Client 2 must not receive alpha response");
+        assert!(
+            p1.windows(9).any(|w| w == b"ANS-ALPHA"),
+            "Client 1 must receive alpha response"
+        );
+        assert!(
+            !p1.windows(9).any(|w| w == b"ANS-BETA!"),
+            "Client 1 must not receive beta response"
+        );
+        assert!(
+            p2.windows(9).any(|w| w == b"ANS-BETA!"),
+            "Client 2 must receive beta response"
+        );
+        assert!(
+            !p2.windows(9).any(|w| w == b"ANS-ALPHA"),
+            "Client 2 must not receive alpha response"
+        );
     }
 
     #[tokio::test]
@@ -623,17 +661,24 @@ mod tests {
                         resp.extend_from_slice(&buf[12..q.raw_len]);
                         // Answer 1: CNAME alias.example
                         resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x05, 0x00, 0x01, 0, 0, 0, 60]);
-                        let alias = [5u8, b'a', b'l', b'i', b'a', b's', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0];
+                        let alias = [
+                            5u8, b'a', b'l', b'i', b'a', b's', 7, b'e', b'x', b'a', b'm', b'p',
+                            b'l', b'e', 0,
+                        ];
                         resp.extend_from_slice(&(alias.len() as u16).to_be_bytes());
                         let alias_offset = resp.len() as u16;
                         resp.extend_from_slice(&alias);
                         let ptr_alias = (0xC000u16 | alias_offset).to_be_bytes();
                         // Answer 2: Fake-IP 198.18.0.55 (should be dropped)
                         resp.extend_from_slice(&ptr_alias);
-                        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0, 0, 0, 10, 0, 4, 198, 18, 0, 55]);
+                        resp.extend_from_slice(&[
+                            0x00, 0x01, 0x00, 0x01, 0, 0, 0, 10, 0, 4, 198, 18, 0, 55,
+                        ]);
                         // Answer 3: Real IP 93.184.216.34
                         resp.extend_from_slice(&ptr_alias);
-                        resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+                        resp.extend_from_slice(&[
+                            0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34,
+                        ]);
                     } else {
                         // AAAA empty NOERROR
                         resp.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
@@ -661,12 +706,24 @@ mod tests {
     #[test]
     fn test_transient_udp_recv_error_classification() {
         use std::io::{Error, ErrorKind};
-        assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::ConnectionReset)));
-        assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::WouldBlock)));
-        assert!(is_transient_udp_recv_error(&Error::from(ErrorKind::Interrupted)));
-        assert!(is_transient_udp_recv_error(&Error::from_raw_os_error(10040)));
-        assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::PermissionDenied)));
-        assert!(!is_transient_udp_recv_error(&Error::from(ErrorKind::InvalidInput)));
+        assert!(is_transient_udp_recv_error(&Error::from(
+            ErrorKind::ConnectionReset
+        )));
+        assert!(is_transient_udp_recv_error(&Error::from(
+            ErrorKind::WouldBlock
+        )));
+        assert!(is_transient_udp_recv_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        assert!(is_transient_udp_recv_error(&Error::from_raw_os_error(
+            10040
+        )));
+        assert!(!is_transient_udp_recv_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_transient_udp_recv_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
     }
 
     #[tokio::test]
@@ -732,9 +789,13 @@ mod tests {
                 assert_eq!(q.qtype, 1, "Only A query expected when include_ipv6=false");
                 let mut resp = Vec::new();
                 resp.extend_from_slice(&tx.to_be_bytes());
-                resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                resp.extend_from_slice(&[
+                    0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                ]);
                 resp.extend_from_slice(&buf[12..q.raw_len]);
-                resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 30, 0, 4, 93, 184, 216, 34]);
+                resp.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 30, 0, 4, 93, 184, 216, 34,
+                ]);
                 mock_upstream.send_to(&resp, src).await.unwrap();
 
                 // Verify no second AAAA query arrives
@@ -743,7 +804,10 @@ mod tests {
                     mock_upstream.recv_from(&mut buf),
                 )
                 .await;
-                assert!(extra.is_err(), "Unexpected extra DNS query when include_ipv6=false");
+                assert!(
+                    extra.is_err(),
+                    "Unexpected extra DNS query when include_ipv6=false"
+                );
             })
         };
 
@@ -832,8 +896,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_transparent_inspect_query_is_strictly_passive_and_preserves_all_upstream_semantics(
-    ) {
+    async fn test_process_transparent_inspect_query_is_strictly_passive_and_preserves_all_upstream_semantics()
+     {
         let mock_up = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mock_addr = mock_up.local_addr().unwrap();
         let (stop_tx, mut stop_rx) = watch::channel(false);
@@ -1155,11 +1219,15 @@ mod tests {
         encode_name("evil.example", &mut bad_cname);
         bad_cname.extend_from_slice(&[0x00, 0x01, 0x00, 0x01, 0, 0, 0, 10, 0, 4, 1, 2, 3, 4]);
         let (bad_ips, _) = parse_answer_ips_with_ttl(&bad_cname, &q, bad_off, None).unwrap();
-        assert!(bad_ips.is_empty(), "truncated CNAME RDATA must not read past rdata_end");
+        assert!(
+            bad_ips.is_empty(),
+            "truncated CNAME RDATA must not read past rdata_end"
+        );
     }
 
     #[tokio::test]
-    async fn test_dual_stack_dropped_aaaa_grace_window_nxdomain_conn_reset_and_inspect_no_redirect() {
+    async fn test_dual_stack_dropped_aaaa_grace_window_nxdomain_conn_reset_and_inspect_no_redirect()
+    {
         use std::net::SocketAddrV6;
 
         // 1. P2-2: A 返回后静默丢弃 AAAA 不得拖满 2s 超时（应在 ~150ms 宽限窗口内快速返回）

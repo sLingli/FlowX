@@ -116,9 +116,10 @@ impl RequestReadError {
                 ("ERR_INCOMPLETE_HEADERS", "error.incomplete_headers")
             }
             RequestReadError::NonUtf8Headers => ("ERR_NON_UTF8_HEADERS", "error.non_utf8_headers"),
-            RequestReadError::InvalidFraming => {
-                ("ERR_INVALID_REQUEST_FRAMING", "error.invalid_request_framing")
-            }
+            RequestReadError::InvalidFraming => (
+                "ERR_INVALID_REQUEST_FRAMING",
+                "error.invalid_request_framing",
+            ),
             RequestReadError::UnsupportedTransferEncoding => {
                 ("ERR_UNSUPPORTED_TE", "error.unsupported_transfer_encoding")
             }
@@ -207,7 +208,10 @@ pub(super) fn validate_and_parse_headers(
             return Err(RequestReadError::InvalidFraming);
         }
         let val_bytes = &line[colon + 1..];
-        if val_bytes.iter().any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f) {
+        if val_bytes
+            .iter()
+            .any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
             return Err(RequestReadError::InvalidFraming);
         }
         let Ok(val) = std::str::from_utf8(val_bytes) else {

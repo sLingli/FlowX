@@ -1,11 +1,11 @@
+use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{Semaphore, watch};
 use tracing::{error, info, warn};
 
 use crate::dns::FakeIpPool;
@@ -15,7 +15,7 @@ use crate::monitor::{ConnectionManager, InFlightTracker};
 use crate::outbound::chain::{ProxyChain, ProxyNode};
 use crate::outbound::direct::DirectOutbound;
 use crate::outbound::{
-    is_local_or_loopback_ip, local_interface_ips, relay_stream_monitored, RelayStream, TargetAddr,
+    RelayStream, TargetAddr, is_local_or_loopback_ip, local_interface_ips, relay_stream_monitored,
 };
 use crate::router::{Action, RouteContext, RuleEngine};
 
@@ -245,7 +245,12 @@ impl StreamDispatcher {
     pub async fn bind(&self) -> Result<TcpListener> {
         let listener = TcpListener::bind(self.config.bind_addr)
             .await
-            .with_context(|| format!("Failed to bind mixed inbound port ({})", self.config.bind_addr))?;
+            .with_context(|| {
+                format!(
+                    "Failed to bind mixed inbound port ({})",
+                    self.config.bind_addr
+                )
+            })?;
         info!(
             "[Dispatcher] Mixed proxy inbound (SOCKS5 / SOCKS4a / HTTP) bound on {}",
             self.config.bind_addr
@@ -254,7 +259,11 @@ impl StreamDispatcher {
     }
 
     /// 启动本地入站连接调度监听服务（支持优雅停机）
-    pub async fn run(&self, listener: TcpListener, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        &self,
+        listener: TcpListener,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
         loop {
             if *shutdown_rx.borrow() {
                 info!("[Dispatcher] Shutdown signal already set, stopping accepting new streams");
@@ -283,7 +292,9 @@ impl StreamDispatcher {
             let permit = match self.concurrency_limit.clone().try_acquire_owned() {
                 Ok(p) => p,
                 Err(_) => {
-                    warn!("[Dispatcher] Active connections exceeded limit (10000), rejecting new connection");
+                    warn!(
+                        "[Dispatcher] Active connections exceeded limit (10000), rejecting new connection"
+                    );
                     drop(local_stream);
                     continue;
                 }
@@ -451,7 +462,9 @@ async fn evaluate_and_relay_stream<S: RelayStream>(
     // 7. 按动作建立出站连接
     if action == Action::Block {
         if let Some(kind) = session.inbound_kind {
-            inbound::send_failure(&mut local_stream, kind, true).await.ok();
+            inbound::send_failure(&mut local_stream, kind, true)
+                .await
+                .ok();
         }
         return Ok(());
     }
@@ -550,9 +563,19 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
     let proc_info = match pid_hint {
         Some(pid) => match config.tracker.resolve_pid_async(pid).await {
             Some(info) => Some(info),
-            None => config.tracker.find_by_connection_async(peer_addr, orig_dst).await,
+            None => {
+                config
+                    .tracker
+                    .find_by_connection_async(peer_addr, orig_dst)
+                    .await
+            }
         },
-        None => config.tracker.find_by_connection_async(peer_addr, orig_dst).await,
+        None => {
+            config
+                .tracker
+                .find_by_connection_async(peer_addr, orig_dst)
+                .await
+        }
     };
 
     // 3. 若命中 Fake-IP 池直接还原域名与原始上游 DNS；否则优先按需嗅探 TLS SNI / HTTP Host，仅在无嗅探结果时回退至唯一被动 DNS 映射
@@ -591,9 +614,9 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                 crate::router::DomainNeedDecision::Immediate(
                     Action::Proxy(_) | Action::Chain(_),
                 ) => (true, !is_common_http_tls_port(orig_dst.port())),
-                crate::router::DomainNeedDecision::Immediate(
-                    Action::Direct | Action::Block,
-                ) => (false, false),
+                crate::router::DomainNeedDecision::Immediate(Action::Direct | Action::Block) => {
+                    (false, false)
+                }
             };
             let ep_key = (orig_dst.ip().to_canonical(), orig_dst.port());
             let skip_alt_server_first =
@@ -611,11 +634,9 @@ pub async fn dispatch_transparent_stream<S: RelayStream>(
                 TRANSPARENT_SNIFF_TIMEOUT
             };
             let (sniffed_host, buffered) = if need_sniff {
-                let outcome = crate::transparent::sniffer::peek_host_prefix(
-                    &mut local_stream,
-                    sniff_timeout,
-                )
-                .await?;
+                let outcome =
+                    crate::transparent::sniffer::peek_host_prefix(&mut local_stream, sniff_timeout)
+                        .await?;
                 if opportunistic_sniff {
                     if outcome.timed_out && outcome.buffered.is_empty() {
                         record_server_first_endpoint(ep_key);
@@ -708,12 +729,24 @@ async fn handle_connection(
         http_body_framing,
         body_prefix,
         http_is_head,
-    } = tokio::time::timeout(INBOUND_HANDSHAKE_TIMEOUT, inbound::read_request(&mut local_stream))
-        .await
-        .map_err(|_| anyhow!("Inbound handshake timed out ({:?}), peer {}", INBOUND_HANDSHAKE_TIMEOUT, peer_addr))??;
+    } = tokio::time::timeout(
+        INBOUND_HANDSHAKE_TIMEOUT,
+        inbound::read_request(&mut local_stream),
+    )
+    .await
+    .map_err(|_| {
+        anyhow!(
+            "Inbound handshake timed out ({:?}), peer {}",
+            INBOUND_HANDSHAKE_TIMEOUT,
+            peer_addr
+        )
+    })??;
 
     // 2. Reverse lookup caller process via TCP 4-tuple (async non-blocking)
-    let proc_info = config.tracker.find_by_connection_async(peer_addr, server_addr).await;
+    let proc_info = config
+        .tracker
+        .find_by_connection_async(peer_addr, server_addr)
+        .await;
     let proc_name = proc_info
         .as_ref()
         .map(|p| p.name.clone())
@@ -728,8 +761,13 @@ async fn handle_connection(
                     (TargetAddr::Domain(domain, addr.port()), orig_dns_list)
                 }
                 None => {
-                    inbound::send_failure(&mut local_stream, kind, false).await.ok();
-                    bail!("Fake-IP {} domain mapping expired or does not exist", addr.ip());
+                    inbound::send_failure(&mut local_stream, kind, false)
+                        .await
+                        .ok();
+                    bail!(
+                        "Fake-IP {} domain mapping expired or does not exist",
+                        addr.ip()
+                    );
                 }
             }
         }
@@ -738,7 +776,9 @@ async fn handle_connection(
 
     // 4. Loop prevention: reject requests targeting FlowX internal service ports
     if is_self_target(&target, &server_addr, &config.self_ports) {
-        inbound::send_failure(&mut local_stream, kind, true).await.ok();
+        inbound::send_failure(&mut local_stream, kind, true)
+            .await
+            .ok();
         bail!(
             "Loopback request rejected: {} (PID {}) attempted to access internal port {}:{}",
             proc_name,
@@ -802,16 +842,31 @@ async fn connect_outbound(
             let pool = Some(config.fake_ip_pool.as_ref());
             match &client {
                 ProxyNode::Socks5(s) => {
-                    s.connect_with_policy_guarded(target, config.upstream_dns, pool, &config.self_ports)
-                        .await
+                    s.connect_with_policy_guarded(
+                        target,
+                        config.upstream_dns,
+                        pool,
+                        &config.self_ports,
+                    )
+                    .await
                 }
                 ProxyNode::Http(h) => {
-                    h.connect_with_policy_guarded(target, config.upstream_dns, pool, &config.self_ports)
-                        .await
+                    h.connect_with_policy_guarded(
+                        target,
+                        config.upstream_dns,
+                        pool,
+                        &config.self_ports,
+                    )
+                    .await
                 }
                 ProxyNode::Socks4(s) => {
-                    s.connect_with_policy_guarded(target, config.upstream_dns, pool, &config.self_ports)
-                        .await
+                    s.connect_with_policy_guarded(
+                        target,
+                        config.upstream_dns,
+                        pool,
+                        &config.self_ports,
+                    )
+                    .await
                 }
             }
         }
@@ -855,11 +910,31 @@ mod tests {
     fn test_is_self_target() {
         let server: SocketAddr = "127.0.0.1:40001".parse().unwrap();
         let ports = [40001, 40080];
-        assert!(is_self_target(&TargetAddr::Ip("127.0.0.1:40001".parse().unwrap()), &server, &ports));
-        assert!(is_self_target(&TargetAddr::Ip("0.0.0.0:40080".parse().unwrap()), &server, &ports));
-        assert!(is_self_target(&TargetAddr::Domain("LocalHost".into(), 40080), &server, &ports));
-        assert!(!is_self_target(&TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()), &server, &ports));
-        assert!(!is_self_target(&TargetAddr::Domain("example.com".into(), 40001), &server, &ports));
+        assert!(is_self_target(
+            &TargetAddr::Ip("127.0.0.1:40001".parse().unwrap()),
+            &server,
+            &ports
+        ));
+        assert!(is_self_target(
+            &TargetAddr::Ip("0.0.0.0:40080".parse().unwrap()),
+            &server,
+            &ports
+        ));
+        assert!(is_self_target(
+            &TargetAddr::Domain("LocalHost".into(), 40080),
+            &server,
+            &ports
+        ));
+        assert!(!is_self_target(
+            &TargetAddr::Ip("127.0.0.1:8080".parse().unwrap()),
+            &server,
+            &ports
+        ));
+        assert!(!is_self_target(
+            &TargetAddr::Domain("example.com".into(), 40001),
+            &server,
+            &ports
+        ));
     }
 
     fn build_test_tls_client_hello(sni: &str) -> Vec<u8> {
@@ -899,8 +974,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_p2_3_immediate_proxy_avoids_120ms_stall_on_alt_and_custom_server_first_ports_while_sniffing_custom_https(
-    ) {
+    async fn test_p2_3_immediate_proxy_avoids_120ms_stall_on_alt_and_custom_server_first_ports_while_sniffing_custom_https()
+     {
         use crate::outbound::socks5::Socks5Client;
         use tokio::io::AsyncReadExt;
 
@@ -1076,7 +1151,10 @@ mod tests {
             s.write_all(&[0x05, 0x00]).await.unwrap();
             let mut hdr = [0u8; 4];
             s.read_exact(&mut hdr).await.unwrap();
-            assert_eq!(hdr[3], 0x03, "NeedsDomainSniff on port 2222 must sniff TLS SNI");
+            assert_eq!(
+                hdr[3], 0x03,
+                "NeedsDomainSniff on port 2222 must sniff TLS SNI"
+            );
             let mut l = [0u8; 1];
             s.read_exact(&mut l).await.unwrap();
             let mut dom = vec![0u8; l[0] as usize];
@@ -1112,7 +1190,9 @@ mod tests {
                     protocol: "SOCKS5".into(),
                     server_addr: domain_2222_socks_addr.to_string(),
                     username: None,
-                    client: ProxyNode::Socks5(Socks5Client::new(domain_2222_socks_addr.to_string())),
+                    client: ProxyNode::Socks5(Socks5Client::new(
+                        domain_2222_socks_addr.to_string(),
+                    )),
                 },
             );
             Arc::new(cfg)
@@ -1133,7 +1213,10 @@ mod tests {
         let mut ack_2222 = [0u8; 6];
         app_2222.read_exact(&mut ack_2222).await.unwrap();
         assert_eq!(&ack_2222, b"OK2222");
-        assert_eq!(sni2222_rx.await.unwrap(), ("panel.2222.example".to_string(), 2222));
+        assert_eq!(
+            sni2222_rx.await.unwrap(),
+            ("panel.2222.example".to_string(), 2222)
+        );
         drop(app_2222);
         h_2222.await.unwrap().unwrap();
         srv_2222.await.unwrap();
@@ -1153,7 +1236,10 @@ mod tests {
             s.write_all(&[0x05, 0x00]).await.unwrap();
             let mut hdr = [0u8; 4];
             s.read_exact(&mut hdr).await.unwrap();
-            assert_eq!(hdr[3], 0x03, "arbitrary HTTPS port 18443 must still dial authoritative SNI domain");
+            assert_eq!(
+                hdr[3], 0x03,
+                "arbitrary HTTPS port 18443 must still dial authoritative SNI domain"
+            );
             let mut l = [0u8; 1];
             s.read_exact(&mut l).await.unwrap();
             let mut dom = vec![0u8; l[0] as usize];
@@ -1186,8 +1272,14 @@ mod tests {
         let mut ack = [0u8; 7];
         app_t.read_exact(&mut ack).await.unwrap();
         assert_eq!(&ack, b"OK18443");
-        assert_eq!(sni_rx.await.unwrap(), ("custom-port.example".to_string(), 18443));
-        assert!(!should_skip_opportunistic_sniff((custom_tls_ep.ip(), custom_tls_ep.port())));
+        assert_eq!(
+            sni_rx.await.unwrap(),
+            ("custom-port.example".to_string(), 18443)
+        );
+        assert!(!should_skip_opportunistic_sniff((
+            custom_tls_ep.ip(),
+            custom_tls_ep.port()
+        )));
         clear_server_first_endpoint_cache();
         drop(app_t);
         h_t.await.unwrap().unwrap();

@@ -1,12 +1,12 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 
 use crate::cli::args::{
-    parse_flags_with_spec, resolve_id_arg, split_action_spec, ArgSpec, GlobalCliOpts,
+    ArgSpec, GlobalCliOpts, parse_flags_with_spec, resolve_id_arg, split_action_spec,
 };
 use crate::cli::bridge::{
-    control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly, load_rule_backend,
-    offline_resolve_rule_id, resolve_rule_id_from_views, RuleBackend,
+    RuleBackend, control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly,
+    load_rule_backend, offline_resolve_rule_id, resolve_rule_id_from_views,
 };
 use crate::cli::http_client::{api_request_or_offline, api_request_strict, ensure_api_ok};
 use crate::control::rule::{add_rule, patch_rule};
@@ -37,14 +37,14 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 .get("search")
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty());
-            let list: Vec<RuleView> =
-                if let Some((st, val)) = api_request_or_offline(opts, "GET", "/api/rules", None).await?
-                {
-                    serde_json::from_value(ensure_api_ok(st, val)?)?
-                } else {
-                    let rt = load_offline_runtime_readonly(&opts.config_path)?;
-                    rt.engine.list_rules_view_with_locale(opts.locale)
-                };
+            let list: Vec<RuleView> = if let Some((st, val)) =
+                api_request_or_offline(opts, "GET", "/api/rules", None).await?
+            {
+                serde_json::from_value(ensure_api_ok(st, val)?)?
+            } else {
+                let rt = load_offline_runtime_readonly(&opts.config_path)?;
+                rt.engine.list_rules_view_with_locale(opts.locale)
+            };
 
             let indexed: Vec<(usize, RuleView)> = list
                 .into_iter()
@@ -75,7 +75,11 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 for (idx, r) in indexed {
                     let state_str = if r.enabled { "ON " } else { "OFF" };
                     let apps = if r.apps.is_empty() { "*" } else { &r.apps };
-                    let targets = if r.targets.is_empty() { "*" } else { &r.targets };
+                    let targets = if r.targets.is_empty() {
+                        "*"
+                    } else {
+                        &r.targets
+                    };
                     let ports = if r.ports.is_empty() { "*" } else { &r.ports };
                     println!(
                         "#{:<3} (id={:<3}) [{}] {:<18} action={:<16} apps={} | targets={} | ports={}",
@@ -179,11 +183,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 1,
                 },
             )?;
-            let id_str = resolve_id_arg(
-                &pos,
-                &flags,
-                "Missing rule <ID> for `flowx rule update`",
-            )?;
+            let id_str = resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule update`")?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
 
             let has_enable = flags.contains_key("enable");
@@ -244,13 +244,9 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                         "node_id": node_id,
                         "enabled": enabled,
                     });
-                    let (st, val) = api_request_strict(
-                        &opts.api_addr,
-                        "PATCH",
-                        "/api/rules",
-                        Some(&payload),
-                    )
-                    .await?;
+                    let (st, val) =
+                        api_request_strict(&opts.api_addr, "PATCH", "/api/rules", Some(&payload))
+                            .await?;
                     (resolved_id, ensure_api_ok(st, val)?)
                 }
                 RuleBackend::Offline(rt) => {
@@ -294,11 +290,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 1,
                 },
             )?;
-            let id_str = resolve_id_arg(
-                &pos,
-                &flags,
-                "Missing rule <ID> for `flowx rule toggle`",
-            )?;
+            let id_str = resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule toggle`")?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
             let has_enable = flags.contains_key("enable");
             let has_disable = flags.contains_key("disable");
@@ -363,8 +355,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 2,
                 },
             )?;
-            let id_str =
-                resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule move`")?;
+            let id_str = resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule move`")?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
             let flag_dir = flags.get("dir").or_else(|| flags.get("direction"));
             let direction = match (pos.get(1), flag_dir) {
@@ -395,7 +386,9 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     let moved = rt
                         .engine
                         .move_rule(resolved_id, &direction)
-                        .ok_or_else(|| anyhow!("Invalid move target or direction '{}'", direction))?;
+                        .ok_or_else(|| {
+                            anyhow!("Invalid move target or direction '{}'", direction)
+                        })?;
                     if moved {
                         rt.save()?;
                     }
@@ -429,11 +422,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 1,
                 },
             )?;
-            let id_str = resolve_id_arg(
-                &pos,
-                &flags,
-                "Missing rule <ID> for `flowx rule remove`",
-            )?;
+            let id_str = resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule remove`")?;
             let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
 
             let (resolved_id, res_val) = match load_rule_backend(opts).await? {

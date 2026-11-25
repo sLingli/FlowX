@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use tokio::sync::Semaphore;
 
 use crate::api::http::parse_query_param;
-use crate::api::{control_error_to_http, serde_json_to_string, JSON_CONTENT_TYPE};
+use crate::api::{JSON_CONTENT_TYPE, control_error_to_http, serde_json_to_string};
 use crate::control::node::{
     add_node, delete_node, list_nodes, patch_node, ping_address_with_context, update_node,
 };
@@ -12,7 +12,7 @@ use crate::control::{
     AddNodeRequest, PatchNodeRequest, PingNodeRequest, PingResponse, SystemRuntimeContext,
     UpdateNodeRequest,
 };
-use crate::i18n::{json_error, Locale};
+use crate::i18n::{Locale, json_error};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::router::RuleEngine;
 
@@ -173,11 +173,7 @@ pub(super) async fn handle_ping_node(
                 message: msg,
                 detail,
             };
-            (
-                "200 OK",
-                JSON_CONTENT_TYPE,
-                serde_json_to_string(&ping_res),
-            )
+            ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&ping_res))
         } else {
             (
                 "404 Not Found",

@@ -1,12 +1,12 @@
+use super::TargetAddr;
+use super::bypass::OutboundTcpStream;
+use super::direct::{DEFAULT_OUTBOUND_UPSTREAM_DNS, connect_proxy_tcp_guarded};
+use crate::dns::FakeIpPool;
+use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use std::time::Duration;
-use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use crate::dns::FakeIpPool;
-use super::bypass::OutboundTcpStream;
-use super::direct::{connect_proxy_tcp_guarded, DEFAULT_OUTBOUND_UPSTREAM_DNS};
-use super::TargetAddr;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -66,7 +66,13 @@ impl HttpConnectClient {
             Ok(stream)
         })
         .await
-        .map_err(|_| anyhow::anyhow!("HTTP proxy connection timed out ({:?}): {}", DEFAULT_TIMEOUT, self.proxy_addr))?
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "HTTP proxy connection timed out ({:?}): {}",
+                DEFAULT_TIMEOUT,
+                self.proxy_addr
+            )
+        })?
     }
 
     /// Perform HTTP CONNECT tunnel handshake on an existing TCP stream
@@ -78,9 +84,14 @@ impl HttpConnectClient {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        tokio::time::timeout(DEFAULT_TIMEOUT, self.handshake_internal(&mut stream, target))
-            .await
-            .map_err(|_| anyhow::anyhow!("HTTP CONNECT handshake timed out ({:?})", DEFAULT_TIMEOUT))??;
+        tokio::time::timeout(
+            DEFAULT_TIMEOUT,
+            self.handshake_internal(&mut stream, target),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("HTTP CONNECT handshake timed out ({:?})", DEFAULT_TIMEOUT)
+        })??;
         Ok(stream)
     }
 
@@ -151,7 +162,11 @@ impl HttpConnectClient {
                 504 => "Gateway Timeout",
                 _ => "Non-2xx response",
             };
-            bail!("HTTP CONNECT tunnel establishment failed [{}]: {}", status_code, reason);
+            bail!(
+                "HTTP CONNECT tunnel establishment failed [{}]: {}",
+                status_code,
+                reason
+            );
         }
 
         Ok(())
@@ -163,18 +178,29 @@ fn parse_connect_status_line(first_line: &str) -> Result<u16> {
     let rest = first_line
         .strip_prefix("HTTP/1.1 ")
         .or_else(|| first_line.strip_prefix("HTTP/1.0 "))
-        .ok_or_else(|| anyhow::anyhow!("HTTP proxy returned invalid status line version: {:?}", first_line))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "HTTP proxy returned invalid status line version: {:?}",
+                first_line
+            )
+        })?;
 
     let bytes = rest.as_bytes();
     if bytes.len() < 3 || !bytes[..3].iter().all(|b| b.is_ascii_digit()) {
-        bail!("HTTP proxy returned malformed status code: {:?}", first_line);
+        bail!(
+            "HTTP proxy returned malformed status code: {:?}",
+            first_line
+        );
     }
     if bytes.len() > 3 && bytes[3] != b' ' {
         bail!("HTTP proxy status code must be 3 digits: {:?}", first_line);
     }
     // Reject leading zero like 0200 (handled above via len>3 != ' '), or 020 (< 100)
     if bytes[0] == b'0' {
-        bail!("HTTP proxy returned invalid status code leading zero: {:?}", first_line);
+        bail!(
+            "HTTP proxy returned invalid status code leading zero: {:?}",
+            first_line
+        );
     }
     let code: u16 = rest[..3]
         .parse()
@@ -283,9 +309,15 @@ mod tests {
 
     #[test]
     fn test_parse_connect_status_line_strict() {
-        assert_eq!(parse_connect_status_line("HTTP/1.1 200 Connection established").unwrap(), 200);
+        assert_eq!(
+            parse_connect_status_line("HTTP/1.1 200 Connection established").unwrap(),
+            200
+        );
         assert_eq!(parse_connect_status_line("HTTP/1.0 200").unwrap(), 200);
-        assert_eq!(parse_connect_status_line("HTTP/1.1 407 Proxy Authentication Required").unwrap(), 407);
+        assert_eq!(
+            parse_connect_status_line("HTTP/1.1 407 Proxy Authentication Required").unwrap(),
+            407
+        );
 
         for bad in [
             "HTTP/1.1 +200 OK",
@@ -297,12 +329,18 @@ mod tests {
             "HTTP/1.1 200OK",
             "NOTHTTP 200 OK",
         ] {
-            assert!(parse_connect_status_line(bad).is_err(), "expected err for {:?}", bad);
+            assert!(
+                parse_connect_status_line(bad).is_err(),
+                "expected err for {:?}",
+                bad
+            );
         }
 
         assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\r\nProxy-Agent: x\r\n\r\n").is_ok());
         assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\n\r\n\r\n").is_err());
-        assert!(parse_connect_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").is_err());
+        assert!(
+            parse_connect_response_head(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n").is_err()
+        );
     }
 
     #[tokio::test]
@@ -316,7 +354,14 @@ mod tests {
         });
 
         let client = HttpConnectClient::new(proxy_addr.to_string());
-        for bad_host in ["evil.com/path", "evil.com?x=1", "evil.com#frag", "user@evil.com", "evil.com\tHTTP/1.1", "evil\0.com"] {
+        for bad_host in [
+            "evil.com/path",
+            "evil.com?x=1",
+            "evil.com#frag",
+            "user@evil.com",
+            "evil.com\tHTTP/1.1",
+            "evil\0.com",
+        ] {
             let s = TcpStream::connect(proxy_addr).await.unwrap();
             let err = client
                 .handshake(s, &TargetAddr::Domain(bad_host.into(), 443))

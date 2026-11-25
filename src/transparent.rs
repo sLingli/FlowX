@@ -15,21 +15,21 @@ use serde::{Deserialize, Serialize};
 use crate::dns::server::DnsServer;
 use crate::interceptor::dispatcher::DispatcherConfig;
 
+#[allow(unused_imports)]
+pub(crate) use platform::{
+    SECURITY_MANDATORY_MEDIUM_RID, is_low_integrity_rid, process_integrity_rid,
+};
 pub use platform::{
     build_elevated_relaunch_args, flush_dns_cache, is_low_integrity_process, is_process_elevated,
     quote_windows_arg, relaunch_elevated_with_replace_pid,
 };
 #[allow(unused_imports)]
-pub(crate) use platform::{
-    is_low_integrity_rid, process_integrity_rid, SECURITY_MANDATORY_MEDIUM_RID,
-};
-#[allow(unused_imports)]
 pub(crate) use runtime::{
-    next_net_rx_buf_len, windivert_dns_inspect_inbound_filter, windivert_network_filter,
-    INITIAL_NET_RX_BUF_LEN, MAX_NET_RX_BUF_LEN,
+    INITIAL_NET_RX_BUF_LEN, MAX_NET_RX_BUF_LEN, next_net_rx_buf_len,
+    windivert_dns_inspect_inbound_filter, windivert_network_filter,
 };
 
-use runtime::{start_windivert_runtime, stop_windivert_runtime, ActiveRuntime};
+use runtime::{ActiveRuntime, start_windivert_runtime, stop_windivert_runtime};
 
 /// 透明代理配置（持久化至 `<TransparentProxy>`）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -367,7 +367,12 @@ impl TransparentManager {
         rt_handle: &tokio::runtime::Handle,
         cfg: &TransparentSettings,
     ) -> Result<(), String> {
-        if self.runtime.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        if self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return Ok(());
         }
 
@@ -388,7 +393,11 @@ impl TransparentManager {
     }
 
     fn stop_locked(&self) {
-        let rt_opt = self.runtime.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let rt_opt = self
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         let Some(rt) = rt_opt else {
             return;
         };
@@ -405,7 +414,7 @@ impl Drop for TransparentManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use platform::{load_system32_library, resolve_system32_executable, StaComGuard};
+    use platform::{StaComGuard, load_system32_library, resolve_system32_executable};
 
     #[test]
     fn test_transparent_settings_defaults_and_elevation_arg_quoting() {

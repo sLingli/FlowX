@@ -1,17 +1,15 @@
-use anyhow::{bail, Result};
-use serde_json::{json, Value};
+use anyhow::{Result, bail};
+use serde_json::{Value, json};
 
-use crate::cli::args::{parse_flags_with_spec, ArgSpec, GlobalCliOpts};
-use crate::cli::bridge::{
-    control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly,
-};
+use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec};
+use crate::cli::bridge::{control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly};
 use crate::cli::http_client::{
-    api_request_or_offline, api_request_strict_with_io_timeout, ensure_api_ok, ApiHttpError,
-    API_ELEVATE_IO_TIMEOUT,
+    API_ELEVATE_IO_TIMEOUT, ApiHttpError, api_request_or_offline,
+    api_request_strict_with_io_timeout, ensure_api_ok,
 };
-use crate::control::transparent::apply_transparent_config_fields;
 use crate::control::TransparentConfigRequest;
-use crate::transparent::{probe_status, TransparentSettings};
+use crate::control::transparent::apply_transparent_config_fields;
+use crate::transparent::{TransparentSettings, probe_status};
 
 fn print_transparent_status(st: &Value, mode_label: &str) {
     println!(

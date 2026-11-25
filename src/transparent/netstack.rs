@@ -19,12 +19,12 @@ use crate::router::{Action, DomainNeedDecision, RuleEngine};
 
 pub use bridge::{NetstackSignal, SmoltcpReadHalf, SmoltcpStream, SmoltcpWriteHalf};
 pub use packet::{
-    build_synthetic_tcp_rst, parse_tcp_packet, select_passthrough_packets, EmittedIpPacket,
-    OutboundTcpQueueItem, PacketInterfaceMeta, ParsedTcpPacket, TcpFlowKey,
+    EmittedIpPacket, OutboundTcpQueueItem, PacketInterfaceMeta, ParsedTcpPacket, TcpFlowKey,
+    build_synthetic_tcp_rst, parse_tcp_packet, select_passthrough_packets,
 };
 
 use bridge::{
-    close_bridge_and_collect_wakers, SmoltcpBridge, VirtualIpDevice, BRIDGE_BUFFER_LIMIT,
+    BRIDGE_BUFFER_LIMIT, SmoltcpBridge, VirtualIpDevice, close_bridge_and_collect_wakers,
 };
 use packet::enqueue_tcp_for_smoltcp;
 
@@ -89,7 +89,8 @@ impl NetstackEngine {
         let now_std = Instant::now();
         let now = SmolInstant::from_millis(0);
         let mut cfg = Config::new(HardwareAddress::Ip);
-        cfg.random_seed = (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
+        cfg.random_seed =
+            (std::process::id() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xA5A5_5A5A;
 
         let mut iface = Interface::new(cfg, &mut device, now);
         iface.set_any_ip(true);
@@ -137,9 +138,16 @@ impl NetstackEngine {
         self.passthrough
             .retain(|_, entry| now.saturating_duration_since(entry.last_seen) <= PASSTHROUGH_TTL);
         if self.passthrough.len() > MAX_PASSTHROUGH_FLOWS {
-            let mut items: Vec<_> = self.passthrough.iter().map(|(k, v)| (*k, v.last_seen)).collect();
+            let mut items: Vec<_> = self
+                .passthrough
+                .iter()
+                .map(|(k, v)| (*k, v.last_seen))
+                .collect();
             items.sort_unstable_by_key(|(_, ts)| *ts);
-            let remove_cnt = self.passthrough.len().saturating_sub(MAX_PASSTHROUGH_FLOWS * 3 / 4);
+            let remove_cnt = self
+                .passthrough
+                .len()
+                .saturating_sub(MAX_PASSTHROUGH_FLOWS * 3 / 4);
             for (k, _) in items.into_iter().take(remove_cnt) {
                 self.passthrough.remove(&k);
             }
@@ -332,7 +340,10 @@ impl NetstackEngine {
                         false
                     } else {
                         insert_syn_passthrough(&mut self.passthrough);
-                        return TcpIngestOutcome::Passthrough(EmittedIpPacket { data: raw_ip, meta });
+                        return TcpIngestOutcome::Passthrough(EmittedIpPacket {
+                            data: raw_ip,
+                            meta,
+                        });
                     }
                 }
                 DomainNeedDecision::Immediate(Action::Block) => {
@@ -427,7 +438,8 @@ impl NetstackEngine {
 
         let smol_now = self.smol_now();
         match self.iface.poll_delay(smol_now, &self.sockets) {
-            Some(d) => Duration::from_millis(d.total_millis()).clamp(Duration::from_millis(1), Duration::from_millis(50)),
+            Some(d) => Duration::from_millis(d.total_millis())
+                .clamp(Duration::from_millis(1), Duration::from_millis(50)),
             None => Duration::from_millis(50),
         }
     }
@@ -446,7 +458,10 @@ impl NetstackEngine {
             let state = sock.state();
             if matches!(
                 state,
-                tcp::State::Established | tcp::State::CloseWait | tcp::State::FinWait1 | tcp::State::FinWait2
+                tcp::State::Established
+                    | tcp::State::CloseWait
+                    | tcp::State::FinWait1
+                    | tcp::State::FinWait2
             ) {
                 session.ever_established = true;
             }
@@ -457,7 +472,11 @@ impl NetstackEngine {
             let mut remove_session = false;
 
             {
-                let mut inner = session.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = session
+                    .bridge
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
 
                 // A. socket -> to_app（先消费缓冲区残余数据）
                 if !inner.app_read_closed {
@@ -671,7 +690,11 @@ impl NetstackEngine {
             let mut wake_write: Option<Waker> = None;
             let mut wake_flush: Option<Waker> = None;
             {
-                let mut inner = session.bridge.inner.lock().unwrap_or_else(|e| e.into_inner());
+                let mut inner = session
+                    .bridge
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 close_bridge_and_collect_wakers(
                     &mut inner,
                     true,
@@ -702,13 +725,13 @@ impl Drop for NetstackEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io;
-    use etherparse::{PacketBuilder, SlicedPacket, TcpHeader, TransportSlice};
     use crate::outbound::RelayStream;
+    use etherparse::{PacketBuilder, SlicedPacket, TcpHeader, TransportSlice};
+    use std::io;
     use std::net::{Ipv4Addr, Ipv6Addr};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use crate::outbound::bypass::{register_bypass_port, BypassProtocol};
+    use crate::outbound::bypass::{BypassProtocol, register_bypass_port};
     use crate::router::Rule;
 
     fn build_syn(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, seq: u32) -> Vec<u8> {
@@ -744,13 +767,7 @@ mod tests {
         out
     }
 
-    fn build_syn_v6(
-        src: Ipv6Addr,
-        sport: u16,
-        dst: Ipv6Addr,
-        dport: u16,
-        seq: u32,
-    ) -> Vec<u8> {
+    fn build_syn_v6(src: Ipv6Addr, sport: u16, dst: Ipv6Addr, dport: u16, seq: u32) -> Vec<u8> {
         let mut hdr = TcpHeader::new(sport, dport, seq, 65535);
         hdr.syn = true;
         let builder = PacketBuilder::ipv6(src.octets(), dst.octets(), 64).tcp_header(hdr);
@@ -797,9 +814,27 @@ mod tests {
         };
 
         // 1. 存量连接（无 SYN 标志）未经追踪 -> 立即平滑放行
-        let ack_pkt = build_ack([192, 168, 1, 10], 40010, [93, 184, 216, 34], 443, 100, 200, false, b"hi");
+        let ack_pkt = build_ack(
+            [192, 168, 1, 10],
+            40010,
+            [93, 184, 216, 34],
+            443,
+            100,
+            200,
+            false,
+            b"hi",
+        );
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack_pkt, meta, Some(99999), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                ack_pkt,
+                meta,
+                Some(99999),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Passthrough(_)
         ));
         assert!(accepted.is_empty());
@@ -809,7 +844,16 @@ mod tests {
         {
             let _guard = register_bypass_port(BypassProtocol::Tcp, 40011);
             assert!(matches!(
-                engine.ingest_outbound_tcp(syn_bypass.clone(), meta, Some(99999), None, None, None, &mut accepted, &mut tx),
+                engine.ingest_outbound_tcp(
+                    syn_bypass.clone(),
+                    meta,
+                    Some(99999),
+                    None,
+                    None,
+                    None,
+                    &mut accepted,
+                    &mut tx
+                ),
                 TcpIngestOutcome::Passthrough(_)
             ));
         }
@@ -902,12 +946,24 @@ mod tests {
         // 1. Client SYN -> smoltcp emits SYN+ACK
         let syn = build_syn(src, sport, dst, dport, client_isn);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn, meta, Some(88888), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn,
+                meta,
+                Some(88888),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         assert_eq!(accepted.len(), 1);
         let flow = accepted.pop().unwrap();
-        assert_eq!(flow.orig_dst, SocketAddr::new(IpAddr::V4(Ipv4Addr::from(dst)), dport));
+        assert_eq!(
+            flow.orig_dst,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::from(dst)), dport)
+        );
 
         assert_eq!(tx.len(), 1);
         assert_eq!(tx[0].meta.if_idx, 11);
@@ -979,7 +1035,10 @@ mod tests {
             if writer_handle.is_finished() && saw_server_fin {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "Timed out waiting for smoltcp response & FIN");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out waiting for smoltcp response & FIN"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         writer_handle.await.unwrap();
@@ -987,7 +1046,14 @@ mod tests {
         assert!(saw_server_fin);
     }
 
-    fn build_rst(src: [u8; 4], sport: u16, dst: [u8; 4], dport: u16, seq: u32, ack: u32) -> Vec<u8> {
+    fn build_rst(
+        src: [u8; 4],
+        sport: u16,
+        dst: [u8; 4],
+        dport: u16,
+        seq: u32,
+        ack: u32,
+    ) -> Vec<u8> {
         let mut hdr = TcpHeader::new(sport, dport, seq, 65535);
         hdr.rst = true;
         hdr.ack = true;
@@ -1016,7 +1082,16 @@ mod tests {
         };
         let syn = build_syn(src, sport, dst, dport, 1000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let syn_ack = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
@@ -1024,7 +1099,16 @@ mod tests {
 
         let ack = build_ack(src, sport, dst, dport, 1001, syn_ack.seq + 1, false, &[]);
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                ack,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let flow = accepted.pop().unwrap();
@@ -1092,7 +1176,10 @@ mod tests {
             if writer.is_finished() && fin_pkt.is_some() {
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "Timed out waiting for graceful FIN");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out waiting for graceful FIN"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         writer.await.unwrap();
@@ -1224,7 +1311,16 @@ mod tests {
         let dst6 = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
         let syn6 = build_syn_v6(src6, 61111, dst6, 443, 5000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn6, meta, Some(77777), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn6,
+                meta,
+                Some(77777),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         assert_eq!(tx.len(), 1);
@@ -1241,7 +1337,16 @@ mod tests {
         builder.write(&mut lso_pkt, &large_payload).unwrap();
 
         assert!(matches!(
-            engine.ingest_outbound_tcp(lso_pkt, meta, Some(77777), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                lso_pkt,
+                meta,
+                Some(77777),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let flow = accepted.pop().unwrap();
@@ -1615,7 +1720,16 @@ mod tests {
         let mut fin_pkt = Vec::with_capacity(builder.size(0));
         builder.write(&mut fin_pkt, &[]).unwrap();
         assert!(matches!(
-            engine.ingest_outbound_tcp(fin_pkt, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                fin_pkt,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
 
@@ -1626,7 +1740,10 @@ mod tests {
         while !sh.is_finished() {
             tx.clear();
             engine.pump(&mut tx);
-            assert!(tokio::time::Instant::now() < deadline, "Timed out waiting for shutdown pump");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out waiting for shutdown pump"
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         sh.await.unwrap();
@@ -1638,11 +1755,23 @@ mod tests {
         accepted.clear();
         let syn2 = build_syn(src, sport, dst, dport, 9000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn2, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn2,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         // 不得生成延迟 RST 误伤新生 SYN，应直接返回新 SYN/ACK 且接受新连接
-        assert!(!tx.iter().any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst)));
+        assert!(
+            !tx.iter()
+                .any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst))
+        );
         let syn_ack2 = tx
             .iter()
             .filter_map(|p| parse_tcp_packet(&p.data))
@@ -1666,7 +1795,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_netstack_syn_received_rst_reverts_to_listen_is_reaped_and_does_not_hijack_next_syn() {
+    async fn test_netstack_syn_received_rst_reverts_to_listen_is_reaped_and_does_not_hijack_next_syn()
+     {
         let signal = Arc::new(NetstackSignal::new());
         let mut engine = NetstackEngine::new(signal);
         let meta = PacketInterfaceMeta::default();
@@ -1681,7 +1811,16 @@ mod tests {
         // 1. 仅完成 SYN -> SYN/ACK，使 socket 停留在 SynReceived（非零 listen_ep）
         let syn1 = build_syn(src, sport, dst, dport, 1000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn1, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn1,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let syn_ack1 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
@@ -1691,7 +1830,16 @@ mod tests {
         // 2. 客户端在 SynReceived 阶段发送 RST（如 Chrome 取消预连接）：smoltcp 会将该句柄重置回 State::Listen
         let rst = build_rst(src, sport, dst, dport, 1001, syn_ack1.seq + 1);
         assert!(matches!(
-            engine.ingest_outbound_tcp(rst, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                rst,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
 
@@ -1711,7 +1859,16 @@ mod tests {
         accepted.clear();
         let syn2 = build_syn(src, 54112, dst, dport, 2000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn2, meta, Some(9001), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn2,
+                meta,
+                Some(9001),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         assert_eq!(accepted.len(), 1);
@@ -1742,13 +1899,40 @@ mod tests {
         let mut syn4 = Vec::with_capacity(syn4_b.size(0));
         syn4_b.write(&mut syn4, &[]).unwrap();
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn4, meta4, Some(8888), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn4,
+                meta4,
+                Some(8888),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let syn_ack4 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
-        let ack4 = build_ack([10, 0, 0, 2], 56001, [1, 1, 1, 1], 443, 1001, syn_ack4.seq + 1, false, &[]);
+        let ack4 = build_ack(
+            [10, 0, 0, 2],
+            56001,
+            [1, 1, 1, 1],
+            443,
+            1001,
+            syn_ack4.seq + 1,
+            false,
+            &[],
+        );
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack4, meta4, Some(8888), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                ack4,
+                meta4,
+                Some(8888),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let flow4 = accepted.pop().unwrap();
@@ -1807,7 +1991,16 @@ mod tests {
         tx.clear();
         accepted.clear();
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn6, meta6, Some(8889), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn6,
+                meta6,
+                Some(8889),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let syn_ack6 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
@@ -1819,7 +2012,16 @@ mod tests {
         let mut ack6 = Vec::with_capacity(ack6_builder.size(0));
         ack6_builder.write(&mut ack6, &[]).unwrap();
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack6, meta6, Some(8889), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                ack6,
+                meta6,
+                Some(8889),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let flow6 = accepted.pop().unwrap();
@@ -1836,10 +2038,20 @@ mod tests {
         pkt6[4..6].copy_from_slice(&0u16.to_be_bytes());
         assert_eq!(pkt6.len(), 40 + 20 + 70_000);
 
-        let parsed6 = parse_tcp_packet(&pkt6).expect("IPv6 LSO >64KB with payload_len=0 must parse");
+        let parsed6 =
+            parse_tcp_packet(&pkt6).expect("IPv6 LSO >64KB with payload_len=0 must parse");
         assert_eq!(parsed6.payload_len, 70_000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(pkt6, meta6, Some(8889), None, None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                pkt6,
+                meta6,
+                Some(8889),
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         {
@@ -1943,13 +2155,23 @@ mod tests {
         assert!(accepted.is_empty());
 
         let emitted = select_passthrough_packets(single_pkt, item.orig_fragments);
-        assert_eq!(emitted.len(), 2, "must emit exact original fragments instead of stripped single packet");
+        assert_eq!(
+            emitted.len(),
+            2,
+            "must emit exact original fragments instead of stripped single packet"
+        );
         assert_eq!(emitted[0].data, frag0);
         assert_eq!(emitted[1].data, frag1);
         assert_eq!(emitted[0].meta.if_idx, 7);
         assert_eq!(emitted[0].meta.sub_if_idx, 2);
-        assert_eq!(emitted[0].data[6], 44, "original Fragment header must stay intact");
-        assert_eq!(emitted[0].data[40], 60, "original DestOpt extension header must stay intact");
+        assert_eq!(
+            emitted[0].data[6], 44,
+            "original Fragment header must stay intact"
+        );
+        assert_eq!(
+            emitted[0].data[40], 60,
+            "original DestOpt extension header must stay intact"
+        );
     }
 
     #[tokio::test]
@@ -1974,26 +2196,80 @@ mod tests {
         // 连接 1 与连接 2 先完成握手，避免后续 ack2 的 pump_internal 排空连接 1 的 to_socket 缓冲
         let syn1 = build_syn([10, 0, 0, 2], 59201, [93, 184, 216, 34], 443, 100);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn1, meta, Some(7001), Some(&re), None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn1,
+                meta,
+                Some(7001),
+                Some(&re),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let sa1 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
-        let ack1 = build_ack([10, 0, 0, 2], 59201, [93, 184, 216, 34], 443, 101, sa1.seq + 1, false, &[]);
+        let ack1 = build_ack(
+            [10, 0, 0, 2],
+            59201,
+            [93, 184, 216, 34],
+            443,
+            101,
+            sa1.seq + 1,
+            false,
+            &[],
+        );
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack1, meta, Some(7001), Some(&re), None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                ack1,
+                meta,
+                Some(7001),
+                Some(&re),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let flow1 = accepted.pop().unwrap();
 
         let syn2 = build_syn([10, 0, 0, 2], 59202, [93, 184, 216, 34], 443, 200);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn2, meta, Some(7002), Some(&re), None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                syn2,
+                meta,
+                Some(7002),
+                Some(&re),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let sa2 = parse_tcp_packet(&tx.pop().unwrap().data).unwrap();
-        let ack2 = build_ack([10, 0, 0, 2], 59202, [93, 184, 216, 34], 443, 201, sa2.seq + 1, false, &[]);
+        let ack2 = build_ack(
+            [10, 0, 0, 2],
+            59202,
+            [93, 184, 216, 34],
+            443,
+            201,
+            sa2.seq + 1,
+            false,
+            &[],
+        );
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack2, meta, Some(7002), Some(&re), None, None, &mut accepted, &mut tx),
+            engine.ingest_outbound_tcp(
+                ack2,
+                meta,
+                Some(7002),
+                Some(&re),
+                None,
+                None,
+                &mut accepted,
+                &mut tx
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let flow2 = accepted.pop().unwrap();
@@ -2069,7 +2345,16 @@ mod tests {
         // 完成 TCP 三次握手进入 Established
         let syn = build_syn(client_ip, 52010, server_ip, 443, 1000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            engine.ingest_outbound_tcp(
+                syn,
+                meta,
+                None,
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx_out
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let syn_ack = parse_tcp_packet(&tx_out[0].data).unwrap();
@@ -2086,7 +2371,16 @@ mod tests {
             &[],
         );
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            engine.ingest_outbound_tcp(
+                ack,
+                meta,
+                None,
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx_out
+            ),
             TcpIngestOutcome::Intercepted
         ));
         assert_eq!(engine.active_flow_count(), 1);
@@ -2120,7 +2414,9 @@ mod tests {
             "dropping halves after cancelled poll_shutdown must abort and free slot"
         );
         assert!(
-            tx_out.iter().any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst)),
+            tx_out
+                .iter()
+                .any(|p| parse_tcp_packet(&p.data).is_some_and(|t| t.rst)),
             "ungraceful abort after cancelled poll_shutdown should emit RST"
         );
     }
@@ -2144,7 +2440,16 @@ mod tests {
         // 1. 收到 SYN 后进入 SynReceived，并模拟 actor 主循环紧接着调用 engine.pump()
         let syn = build_syn(client_ip, 52020, server_ip, 443, 1000);
         assert!(matches!(
-            engine.ingest_outbound_tcp(syn, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            engine.ingest_outbound_tcp(
+                syn,
+                meta,
+                None,
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx_out
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let syn_ack = parse_tcp_packet(&tx_out[0].data).unwrap();
@@ -2156,7 +2461,8 @@ mod tests {
         // 2. 在客户端 ACK 与首个载荷到达前，AsyncRead 必须处于 Pending，绝不能因 SynReceived 返回 Ok(0) EOF
         let mut flow = accepted.pop().unwrap();
         let mut buf = [0u8; 64];
-        let early_read = tokio::time::timeout(Duration::from_millis(20), flow.stream.read(&mut buf)).await;
+        let early_read =
+            tokio::time::timeout(Duration::from_millis(20), flow.stream.read(&mut buf)).await;
         assert!(
             early_read.is_err(),
             "read() during SynReceived must stay Pending rather than returning premature EOF"
@@ -2174,7 +2480,16 @@ mod tests {
             b"\x16\x03\x01\x00\x05hello",
         );
         assert!(matches!(
-            engine.ingest_outbound_tcp(ack_data, meta, None, None, None, None, &mut accepted, &mut tx_out),
+            engine.ingest_outbound_tcp(
+                ack_data,
+                meta,
+                None,
+                None,
+                None,
+                None,
+                &mut accepted,
+                &mut tx_out
+            ),
             TcpIngestOutcome::Intercepted
         ));
         let n = tokio::time::timeout(Duration::from_millis(100), flow.stream.read(&mut buf))
@@ -2183,7 +2498,8 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[..n], b"\x16\x03\x01\x00\x05hello");
 
-        let second_read = tokio::time::timeout(Duration::from_millis(20), flow.stream.read(&mut buf)).await;
+        let second_read =
+            tokio::time::timeout(Duration::from_millis(20), flow.stream.read(&mut buf)).await;
         assert!(
             second_read.is_err(),
             "read() after consuming first flight without FIN must remain Pending"

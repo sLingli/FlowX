@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use super::FakeIpPool;
 
@@ -241,11 +241,7 @@ impl DnsPacketParser {
     }
 
     /// 构造空的 NOERROR 应答 (用于阻断 IPv6 AAAA 及现代浏览器 HTTPS/SVCB 记录，防止 DNS 泄露与 Fake-IP 绕过)
-    pub fn build_empty_response(
-        tx_id: u16,
-        original_query: &[u8],
-        question_len: usize,
-    ) -> Vec<u8> {
+    pub fn build_empty_response(tx_id: u16, original_query: &[u8], question_len: usize) -> Vec<u8> {
         let mut resp = Vec::with_capacity(question_len);
         resp.extend_from_slice(&tx_id.to_be_bytes());
         resp.extend_from_slice(&[0x81, 0x80]);
@@ -263,7 +259,7 @@ pub(crate) fn csprng_u16() -> u16 {
     let mut bytes = [0u8; 2];
 
     use windows_sys::Win32::Security::Cryptography::{
-        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };
     let status = unsafe {
         BCryptGenRandom(
@@ -399,8 +395,7 @@ pub(crate) fn observe_passive_dns_response(
     if (resp_bytes[3] & 0x0F) != 0 {
         return false;
     }
-    if let Ok((ips, min_ttl)) =
-        parse_answer_ips_with_ttl(resp_bytes, question, ans_off, Some(pool))
+    if let Ok((ips, min_ttl)) = parse_answer_ips_with_ttl(resp_bytes, question, ans_off, Some(pool))
         && !ips.is_empty()
     {
         let ttl_hint = min_ttl.map(|s| Duration::from_secs(u64::from(s)));
@@ -506,8 +501,7 @@ pub(super) fn parse_answer_ips_with_ttl(
         let mut progressed = false;
         for (owner, target, cname_ttl) in &cnames {
             if let Some(&owner_cname_ttl) = reachable.get(owner) {
-                let candidate_ttl =
-                    Some(owner_cname_ttl.map_or(*cname_ttl, |t| t.min(*cname_ttl)));
+                let candidate_ttl = Some(owner_cname_ttl.map_or(*cname_ttl, |t| t.min(*cname_ttl)));
                 match reachable.get(target) {
                     None => {
                         reachable.insert(target.clone(), candidate_ttl);
@@ -552,6 +546,5 @@ pub(super) fn parse_answer_ips(
     first_answer_offset: usize,
     fake_ip_pool: Option<&FakeIpPool>,
 ) -> Result<Vec<IpAddr>> {
-    parse_answer_ips_with_ttl(resp, question, first_answer_offset, fake_ip_pool)
-        .map(|(ips, _)| ips)
+    parse_answer_ips_with_ttl(resp, question, first_answer_offset, fake_ip_pool).map(|(ips, _)| ips)
 }

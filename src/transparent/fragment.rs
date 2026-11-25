@@ -44,12 +44,8 @@ fn ipv6_ext_header_len(nh: u8, slice: &[u8]) -> Option<usize> {
         return None;
     }
     match nh {
-        IP_PROTO_HOPOPT
-        | IP_PROTO_ROUTING
-        | IP_PROTO_DESTOPT
-        | IP_PROTO_MOBILITY
-        | IP_PROTO_HIP
-        | IP_PROTO_SHIM6 => Some(((slice[1] as usize) + 1) * 8),
+        IP_PROTO_HOPOPT | IP_PROTO_ROUTING | IP_PROTO_DESTOPT | IP_PROTO_MOBILITY
+        | IP_PROTO_HIP | IP_PROTO_SHIM6 => Some(((slice[1] as usize) + 1) * 8),
         IP_PROTO_AH => Some(((slice[1] as usize) + 2) * 4),
         _ => None,
     }
@@ -68,7 +64,10 @@ fn walk_ipv6_ext_headers(mut nh: u8, data: &[u8]) -> ExtWalk {
             return ExtWalk::NestedFragOrMalformed;
         }
         if !is_ipv6_extension_header(nh) {
-            return ExtWalk::Transport { proto: nh, offset: pos };
+            return ExtWalk::Transport {
+                proto: nh,
+                offset: pos,
+            };
         }
         let Some(ext_len) = ipv6_ext_header_len(nh, &data[pos..]) else {
             return ExtWalk::Incomplete { next_nh: nh };
@@ -82,7 +81,10 @@ fn walk_ipv6_ext_headers(mut nh: u8, data: &[u8]) -> ExtWalk {
     if nh == IP_PROTO_FRAGMENT || is_ipv6_extension_header(nh) {
         ExtWalk::NestedFragOrMalformed
     } else {
-        ExtWalk::Transport { proto: nh, offset: pos }
+        ExtWalk::Transport {
+            proto: nh,
+            offset: pos,
+        }
     }
 }
 
@@ -325,7 +327,9 @@ impl FragmentTracker {
                 }
 
                 // RFC 791 / RFC 8200 合法性检查：非末尾分片载荷长度必须为 8 字节正整数倍
-                if more_fragments && (frag_payload.is_empty() || !frag_payload.len().is_multiple_of(8)) {
+                if more_fragments
+                    && (frag_payload.is_empty() || !frag_payload.len().is_multiple_of(8))
+                {
                     self.remove_group(&key);
                     return FragmentOutcome::Drop;
                 }
@@ -379,7 +383,8 @@ impl FragmentTracker {
                             return FragmentOutcome::Drop;
                         }
                     } else if !more_fragments
-                        && let Some((&last_off, last_chunk)) = existing_group.chunks.iter().next_back()
+                        && let Some((&last_off, last_chunk)) =
+                            existing_group.chunks.iter().next_back()
                         && last_off + last_chunk.payload.len() > chunk_end
                     {
                         self.remove_group(&key);
@@ -809,7 +814,15 @@ mod tests {
     use crate::transparent::dns_hijack::parse_udp_packet;
     use crate::transparent::netstack::parse_tcp_packet;
 
-    fn make_ipv4_packet(src: [u8; 4], dst: [u8; 4], proto: u8, id: u16, offset_bytes: usize, mf: bool, payload: &[u8]) -> Vec<u8> {
+    fn make_ipv4_packet(
+        src: [u8; 4],
+        dst: [u8; 4],
+        proto: u8,
+        id: u16,
+        offset_bytes: usize,
+        mf: bool,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let total_len = (20 + payload.len()) as u16;
         let flags_frag = ((offset_bytes / 8) as u16) | if mf { 0x2000 } else { 0 };
         let mut out = vec![0u8; total_len as usize];
@@ -867,10 +880,29 @@ mod tests {
         builder.write(&mut unfrag, &dns_payload).unwrap();
         let udp_segment = &unfrag[20..]; // 8 + 40 = 48 字节
 
-        let frag1 = make_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], IP_PROTO_UDP, 0x1234, 24, false, &udp_segment[24..]);
-        let frag0 = make_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], IP_PROTO_UDP, 0x1234, 0, true, &udp_segment[..24]);
+        let frag1 = make_ipv4_packet(
+            [10, 0, 0, 2],
+            [8, 8, 8, 8],
+            IP_PROTO_UDP,
+            0x1234,
+            24,
+            false,
+            &udp_segment[24..],
+        );
+        let frag0 = make_ipv4_packet(
+            [10, 0, 0, 2],
+            [8, 8, 8, 8],
+            IP_PROTO_UDP,
+            0x1234,
+            0,
+            true,
+            &udp_segment[..24],
+        );
 
-        assert!(matches!(tracker.ingest(&frag1, meta, None), FragmentOutcome::Pending));
+        assert!(matches!(
+            tracker.ingest(&frag1, meta, None),
+            FragmentOutcome::Pending
+        ));
         assert_eq!(tracker.active_group_count(), 1);
 
         let FragmentOutcome::Reassembled {
@@ -907,10 +939,29 @@ mod tests {
             is_ipv6: true,
             ..Default::default()
         };
-        let frag0 = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, 0xCAFEBABE, 0, true, &tcp_seg[..16]);
-        let frag1 = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, 0xCAFEBABE, 16, false, &tcp_seg[16..]);
+        let frag0 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_TCP,
+            0xCAFEBABE,
+            0,
+            true,
+            &tcp_seg[..16],
+        );
+        let frag1 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_TCP,
+            0xCAFEBABE,
+            16,
+            false,
+            &tcp_seg[16..],
+        );
 
-        assert!(matches!(tracker.ingest(&frag0, meta, None), FragmentOutcome::Pending));
+        assert!(matches!(
+            tracker.ingest(&frag0, meta, None),
+            FragmentOutcome::Pending
+        ));
         let FragmentOutcome::Reassembled { full_packet, .. } = tracker.ingest(&frag1, meta, None)
         else {
             panic!("expected completed IPv6 TCP reassembly");
@@ -952,20 +1003,54 @@ mod tests {
         ));
 
         // 2. 重叠分片 TearDrop/逃逸攻击必须立即整组丢弃
-        let f_ok = make_ipv4_packet([10, 0, 0, 2], [1, 1, 1, 1], IP_PROTO_TCP, 0x3333, 0, true, &[1u8; 16]);
-        let f_overlap = make_ipv4_packet([10, 0, 0, 2], [1, 1, 1, 1], IP_PROTO_TCP, 0x3333, 8, false, &[2u8; 16]);
-        assert!(matches!(tracker.ingest(&f_ok, meta, Some(&fake_pool)), FragmentOutcome::Pending));
-        assert!(matches!(tracker.ingest(&f_overlap, meta, Some(&fake_pool)), FragmentOutcome::Drop));
+        let f_ok = make_ipv4_packet(
+            [10, 0, 0, 2],
+            [1, 1, 1, 1],
+            IP_PROTO_TCP,
+            0x3333,
+            0,
+            true,
+            &[1u8; 16],
+        );
+        let f_overlap = make_ipv4_packet(
+            [10, 0, 0, 2],
+            [1, 1, 1, 1],
+            IP_PROTO_TCP,
+            0x3333,
+            8,
+            false,
+            &[2u8; 16],
+        );
+        assert!(matches!(
+            tracker.ingest(&f_ok, meta, Some(&fake_pool)),
+            FragmentOutcome::Pending
+        ));
+        assert!(matches!(
+            tracker.ingest(&f_overlap, meta, Some(&fake_pool)),
+            FragmentOutcome::Drop
+        ));
         assert_eq!(tracker.active_group_count(), 0);
         assert_eq!(tracker.buffered_bytes(), 0);
 
         // 3. 孤立非首片 UDP 分片进入 Pending 后超时清理，绝不泄露给网卡
-        let orphan = make_ipv4_packet([10, 0, 0, 2], [1, 1, 1, 1], IP_PROTO_UDP, 0x4444, 24, false, &[3u8; 16]);
+        let orphan = make_ipv4_packet(
+            [10, 0, 0, 2],
+            [1, 1, 1, 1],
+            IP_PROTO_UDP,
+            0x4444,
+            24,
+            false,
+            &[3u8; 16],
+        );
         let t0 = Instant::now();
-        assert!(matches!(tracker.ingest_at(t0, &orphan, meta, Some(&fake_pool)), FragmentOutcome::Pending));
+        assert!(matches!(
+            tracker.ingest_at(t0, &orphan, meta, Some(&fake_pool)),
+            FragmentOutcome::Pending
+        ));
         assert_eq!(tracker.active_group_count(), 1);
         let t_later = t0 + FRAGMENT_TTL + Duration::from_secs(1);
-        let other_icmp = make_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], 1, 0x5555, 0, true, &[0u8; 24]);
+        let other_icmp =
+            make_ipv4_packet([10, 0, 0, 2], [8, 8, 8, 8], 1, 0x5555, 0, true, &[0u8; 24]);
         // 合法 ICMP 分片允许放行，且已超时的孤立 UDP 分片顺带被回收
         assert!(matches!(
             tracker.ingest_at(t_later, &other_icmp, meta, Some(&fake_pool)),
@@ -1018,7 +1103,10 @@ mod tests {
         );
 
         // 先收到 Fragment 1 (next_hdr = DestOpt 60)：绝不可误当作非 TCP/UDP 放行，必须 Pending
-        assert!(matches!(tracker.ingest(&f1, meta, None), FragmentOutcome::Pending));
+        assert!(matches!(
+            tracker.ingest(&f1, meta, None),
+            FragmentOutcome::Pending
+        ));
         let FragmentOutcome::Reassembled { full_packet, .. } = tracker.ingest(&f0, meta, None)
         else {
             panic!("expected IPv6 packet with post-Fragment DestOpt to reassemble cleanly");
@@ -1045,7 +1133,10 @@ mod tests {
             false,
             &nested_payload,
         );
-        assert!(matches!(tracker.ingest(&nested_pkt, meta, None), FragmentOutcome::Drop));
+        assert!(matches!(
+            tracker.ingest(&nested_pkt, meta, None),
+            FragmentOutcome::Drop
+        ));
         assert_eq!(tracker.active_group_count(), 0);
     }
 
@@ -1098,7 +1189,10 @@ mod tests {
             &post_frag[32..],
         );
 
-        assert!(matches!(tracker.ingest(&f1, meta, None), FragmentOutcome::Pending));
+        assert!(matches!(
+            tracker.ingest(&f1, meta, None),
+            FragmentOutcome::Pending
+        ));
         let FragmentOutcome::Reassembled {
             full_packet,
             orig_fragments,
@@ -1136,9 +1230,13 @@ mod tests {
         };
         let pf0 = build_pre_frag(0, true, &pre_post_payload[..16]);
         let pf1 = build_pre_frag(16, false, &pre_post_payload[16..]);
-        assert!(matches!(tracker.ingest(&pf0, meta, None), FragmentOutcome::Pending));
-        let FragmentOutcome::Reassembled { full_packet: full2, .. } =
-            tracker.ingest(&pf1, meta, None)
+        assert!(matches!(
+            tracker.ingest(&pf0, meta, None),
+            FragmentOutcome::Pending
+        ));
+        let FragmentOutcome::Reassembled {
+            full_packet: full2, ..
+        } = tracker.ingest(&pf1, meta, None)
         else {
             panic!("expected pre-Fragment Mobility + post-Fragment HIP packet to reassemble");
         };
@@ -1167,7 +1265,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fragment_rfc6946_atomic_isolation_post_frag_non_tcp_8th_ext_header_and_eviction_order() {
+    fn test_fragment_rfc6946_atomic_isolation_post_frag_non_tcp_8th_ext_header_and_eviction_order()
+    {
         let mut tracker = FragmentTracker::new();
         let meta = PacketInterfaceMeta {
             is_ipv6: true,
@@ -1185,11 +1284,23 @@ mod tests {
             .unwrap();
         let tcp_seg = &full_tcp[40..];
         let shared_id = 0xCAFE_0001u32;
-        let normal_f0 = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 0, true, &tcp_seg[..16]);
-        let normal_f1 = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 16, false, &tcp_seg[16..]);
+        let normal_f0 =
+            make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 0, true, &tcp_seg[..16]);
+        let normal_f1 = make_ipv6_frag_packet(
+            src6,
+            dst6,
+            IP_PROTO_TCP,
+            shared_id,
+            16,
+            false,
+            &tcp_seg[16..],
+        );
         let atomic = make_ipv6_frag_packet(src6, dst6, IP_PROTO_TCP, shared_id, 0, false, tcp_seg);
 
-        assert!(matches!(tracker.ingest(&normal_f0, meta, None), FragmentOutcome::Pending));
+        assert!(matches!(
+            tracker.ingest(&normal_f0, meta, None),
+            FragmentOutcome::Pending
+        ));
         assert_eq!(tracker.active_group_count(), 1);
         assert!(matches!(
             tracker.ingest(&atomic, meta, None),
@@ -1230,7 +1341,10 @@ mod tests {
                 &post_payload[16..],
             );
             // 先收 f1 再收 f0，确认不丢弃也不卡死
-            assert!(matches!(tracker.ingest(&f1, meta, None), FragmentOutcome::Pending));
+            assert!(matches!(
+                tracker.ingest(&f1, meta, None),
+                FragmentOutcome::Pending
+            ));
             match tracker.ingest(&f0, meta, None) {
                 FragmentOutcome::PassthroughGroup(frags) => assert_eq!(frags.len(), 2),
                 other => panic!(
@@ -1247,7 +1361,10 @@ mod tests {
         ext8_data.extend_from_slice(&[IP_PROTO_TCP, 0, 0, 0, 0, 0, 0, 0]);
         assert!(matches!(
             walk_ipv6_ext_headers(IP_PROTO_DESTOPT, &ext8_data),
-            ExtWalk::Transport { proto: IP_PROTO_TCP, offset: 64 }
+            ExtWalk::Transport {
+                proto: IP_PROTO_TCP,
+                offset: 64
+            }
         ));
         let mut ext9_data = Vec::new();
         for _ in 0..8 {

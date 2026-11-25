@@ -181,7 +181,15 @@ where
     };
 
     let down_task = relay_downlink(rr, lw, conn_down, start, last_down);
-    run_relay_with_watchdog(up_task, down_task, start, last_activity_us, conn, idle_timeout).await
+    run_relay_with_watchdog(
+        up_task,
+        down_task,
+        start,
+        last_activity_us,
+        conn,
+        idle_timeout,
+    )
+    .await
 }
 
 pub async fn relay_stream<L: RelayStream, R: RelayStream>(

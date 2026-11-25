@@ -33,7 +33,10 @@ pub fn is_valid_sniffed_host(host: &str) -> bool {
         if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
             return false;
         }
-        if !bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
             return false;
         }
     }
@@ -591,7 +594,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_p2_2_http_host_validates_port_rejects_unbracketed_ipv6_duplicate_host_and_obs_fold() {
+    async fn test_p2_2_http_host_validates_port_rejects_unbracketed_ipv6_duplicate_host_and_obs_fold()
+     {
         for bad_req in [
             b"GET / HTTP/1.1\r\nHost: dead:beef::1\r\n\r\n".as_slice(),
             b"GET / HTTP/1.1\r\nHost: example.com:notaport\r\n\r\n".as_slice(),

@@ -93,7 +93,10 @@ fn validate_rule_probe(
     ports_clean: Option<&str>,
 ) -> Result<(), ControlError> {
     if apps_clean.is_some()
-        && rule.application_patterns.as_ref().is_some_and(Vec::is_empty)
+        && rule
+            .application_patterns
+            .as_ref()
+            .is_some_and(Vec::is_empty)
     {
         return Err(ControlError::bad_request(
             "ERR_INVALID_APP_PATTERN",
@@ -134,8 +137,16 @@ pub fn add_rule(
     let action = parse_and_validate_action(&req.action, req.node_id, proxy_nodes)?;
 
     let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let targets_clean = req.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let ports_clean = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let targets_clean = req
+        .targets
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ports_clean = req
+        .ports
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let rule = Rule::from_raw(name, true, apps_clean, targets_clean, ports_clean, action);
     validate_rule_probe(&rule, apps_clean, targets_clean, ports_clean)?;
@@ -161,8 +172,16 @@ pub fn update_rule(
     let action = parse_and_validate_action(&req.action, req.node_id, proxy_nodes)?;
 
     let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let targets_clean = req.targets.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let ports_clean = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let targets_clean = req
+        .targets
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ports_clean = req
+        .ports
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let probe = Rule::from_raw_with_id(
         req.id,

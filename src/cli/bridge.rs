@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use anyhow::{Context, Result};
 
 use crate::cli::args::GlobalCliOpts;
-use crate::cli::http_client::{api_request_or_offline, ensure_api_ok, ApiHttpError};
+use crate::cli::http_client::{ApiHttpError, api_request_or_offline, ensure_api_ok};
 use crate::config::ConfigStore;
 use crate::control::ControlError;
 use crate::i18n::Locale;

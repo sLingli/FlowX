@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use etherparse::PacketBuilder;
 
-use crate::dns::server::{
-    observe_passive_dns_response, peek_dns_response_key, DnsPacketParser, DnsQuestion,
-};
 use crate::dns::FakeIpPool;
+use crate::dns::server::{
+    DnsPacketParser, DnsQuestion, observe_passive_dns_response, peek_dns_response_key,
+};
 use crate::interceptor::process::ProcessTracker;
 use crate::outbound::bypass::is_udp_port_bypassed_for_family;
 use crate::router::{Action, DnsHijackDecision, DomainNeedDecision, RuleEngine};
@@ -89,7 +89,9 @@ impl PendingInspectDnsTable {
         };
         let mut map = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() >= MAX_PENDING_INSPECT_DNS && !map.contains_key(&key) {
-            map.retain(|_, v| now.saturating_duration_since(v.recorded_at) <= PENDING_INSPECT_DNS_TTL);
+            map.retain(|_, v| {
+                now.saturating_duration_since(v.recorded_at) <= PENDING_INSPECT_DNS_TTL
+            });
             if map.len() >= MAX_PENDING_INSPECT_DNS
                 && let Some(oldest_key) = map
                     .iter()
@@ -163,10 +165,9 @@ impl PendingInspectDnsTable {
             if matched {
                 map.remove(&key)
             } else {
-                if map
-                    .get(&key)
-                    .is_some_and(|e| now.saturating_duration_since(e.recorded_at) > PENDING_INSPECT_DNS_TTL)
-                {
+                if map.get(&key).is_some_and(|e| {
+                    now.saturating_duration_since(e.recorded_at) > PENDING_INSPECT_DNS_TTL
+                }) {
                     map.remove(&key);
                 }
                 None
@@ -217,15 +218,9 @@ pub fn is_shared_system_dns_process(
     process_path: Option<&str>,
     process_name: Option<&str>,
 ) -> bool {
-    let base = process_name
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            process_path.and_then(|p| {
-                p.rsplit(['\\', '/'])
-                    .next()
-                    .filter(|s| !s.is_empty())
-            })
-        });
+    let base = process_name.filter(|s| !s.trim().is_empty()).or_else(|| {
+        process_path.and_then(|p| p.rsplit(['\\', '/']).next().filter(|s| !s.is_empty()))
+    });
     let Some(name) = base.map(str::trim) else {
         return false;
     };
@@ -285,8 +280,12 @@ pub fn parse_udp_packet(raw_ip: &[u8]) -> Option<ParsedUdpPacket<'_>> {
             } else {
                 return None;
             };
-            let src = IpAddr::V4(Ipv4Addr::new(raw_ip[12], raw_ip[13], raw_ip[14], raw_ip[15]));
-            let dst = IpAddr::V4(Ipv4Addr::new(raw_ip[16], raw_ip[17], raw_ip[18], raw_ip[19]));
+            let src = IpAddr::V4(Ipv4Addr::new(
+                raw_ip[12], raw_ip[13], raw_ip[14], raw_ip[15],
+            ));
+            let dst = IpAddr::V4(Ipv4Addr::new(
+                raw_ip[16], raw_ip[17], raw_ip[18], raw_ip[19],
+            ));
             (src, dst, &raw_ip[ihl..ip_end], false)
         }
         6 => {
@@ -294,8 +293,8 @@ pub fn parse_udp_packet(raw_ip: &[u8]) -> Option<ParsedUdpPacket<'_>> {
                 return None;
             }
             let hdr_payload_len = u16::from_be_bytes([raw_ip[4], raw_ip[5]]) as usize;
-            let offload_override =
-                (hdr_payload_len == 0 && raw_ip.len() > 40) || raw_ip.len() > 40 + u16::MAX as usize;
+            let offload_override = (hdr_payload_len == 0 && raw_ip.len() > 40)
+                || raw_ip.len() > 40 + u16::MAX as usize;
             let ip_end = if offload_override {
                 raw_ip.len()
             } else {
@@ -447,9 +446,7 @@ pub fn decide_udp_packet_with_if_idx(
     }
 
     // 发往 Fake-IP 地址段的任意非 53 端口 UDP（443 QUIC、8443、游戏/STUN 等）均无法直接穿透公网，必须全部拦截丢弃
-    if pkt.dst_port != 53
-        && fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(pkt.dst_ip))
-    {
+    if pkt.dst_port != 53 && fake_ip_pool.is_some_and(|pool| pool.is_fake_ip_addr(pkt.dst_ip)) {
         return if pkt.dst_port == 443 {
             UdpDecision::DropQuic
         } else {
@@ -533,7 +530,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::dns::server::DnsServer;
-    use crate::outbound::bypass::{register_bypass_port, BypassProtocol};
+    use crate::outbound::bypass::{BypassProtocol, register_bypass_port};
     use crate::router::Rule;
 
     fn build_sample_dns_query(id: u16, host: &str, qtype: u16) -> Vec<u8> {
@@ -593,7 +590,10 @@ mod tests {
         let reply_ip_v4 =
             build_udp_reply_ip_packet(&parsed_v4, &dns_resp).expect("reply build should succeed");
         let parsed_reply_v4 = parse_udp_packet(&reply_ip_v4).expect("reply IP packet should parse");
-        assert_eq!(parsed_reply_v4.src_ip, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert_eq!(
+            parsed_reply_v4.src_ip,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))
+        );
         assert_eq!(
             parsed_reply_v4.dst_ip,
             IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20))
@@ -1057,7 +1057,8 @@ mod tests {
     }
 
     #[test]
-    fn test_p1_3_pending_inspect_dns_table_passive_observation_including_fe80_and_spoof_rejection() {
+    fn test_p1_3_pending_inspect_dns_table_passive_observation_including_fe80_and_spoof_rejection()
+    {
         let pool = FakeIpPool::new_default();
         let table = PendingInspectDnsTable::new();
         let client_ip: IpAddr = "fe80::2".parse().unwrap();
@@ -1070,7 +1071,9 @@ mod tests {
         resp.extend_from_slice(&0x7123u16.to_be_bytes());
         resp.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
         resp.extend_from_slice(&query[12..]);
-        resp.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 45, 0, 4, 93, 184, 216, 77]);
+        resp.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 45, 0, 4, 93, 184, 216, 77,
+        ]);
 
         // 错误源服务器伪造包不得命中或消耗待观测项
         let spoof_ip: IpAddr = "fe80::99".parse().unwrap();
@@ -1110,7 +1113,9 @@ mod tests {
         dns_resp1.extend_from_slice(&0x5101u16.to_be_bytes());
         dns_resp1.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
         dns_resp1.extend_from_slice(&q1[12..]);
-        dns_resp1.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 10, 20, 30, 40]);
+        dns_resp1.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 10, 20, 30, 40,
+        ]);
         let mut raw_unfrag = Vec::new();
         PacketBuilder::ipv4(server_v4.octets(), client_v4.octets(), 64)
             .udp(53, 51001)
@@ -1140,7 +1145,9 @@ mod tests {
         dns_resp2.extend_from_slice(&0x5102u16.to_be_bytes());
         dns_resp2.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01]);
         dns_resp2.extend_from_slice(&q2[12..]);
-        dns_resp2.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 81]);
+        dns_resp2.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 81,
+        ]);
         dns_resp2.push(0x00);
         dns_resp2.extend_from_slice(&[0x00, 41, 0x10, 0x00, 0, 0, 0, 0]);
         dns_resp2.extend_from_slice(&1500u16.to_be_bytes());
@@ -1178,16 +1185,16 @@ mod tests {
         dns_resp3.extend_from_slice(&0x5103u16.to_be_bytes());
         dns_resp3.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
         dns_resp3.extend_from_slice(&q3[12..]);
-        dns_resp3.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 82]);
+        dns_resp3.extend_from_slice(&[
+            0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 60, 0, 4, 93, 184, 216, 82,
+        ]);
         let mut raw_v6 = Vec::new();
         PacketBuilder::ipv6(server_v6.octets(), client_v6.octets(), 64)
             .udp(53, 51003)
             .write(&mut raw_v6, &dns_resp3)
             .unwrap();
         assert!(observe_inbound_dns_packet_for_inspect(
-            &raw_v6,
-            &table,
-            &pool,
+            &raw_v6, &table, &pool,
         ));
         assert_eq!(
             pool.lookup_real_ip_domain(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 82)))

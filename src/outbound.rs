@@ -14,8 +14,8 @@ pub mod socks4;
 pub mod socks5;
 
 pub use bypass::OutboundTcpStream;
-pub use http_relay::{relay_http_forward_monitored, relay_http_forward_monitored_with_timeout};
 pub(crate) use http_relay::{find_http_header_end, trim_http_ows};
+pub use http_relay::{relay_http_forward_monitored, relay_http_forward_monitored_with_timeout};
 pub use relay::{relay_stream, relay_stream_monitored, relay_stream_monitored_with_timeout};
 
 /// 可拆分全双工中继流抽象（统一支持原生 `TcpStream`、带端口绕过守卫的 `OutboundTcpStream` 及未来 `smoltcp` 透明流）
@@ -166,12 +166,12 @@ pub(crate) fn is_loopback_domain(host: &str) -> bool {
 pub fn local_interface_ips() -> Vec<IpAddr> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
-        GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
     };
     use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows_sys::Win32::Networking::WinSock::{
-        IpDadStatePreferred, AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+        AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred, SOCKADDR_IN, SOCKADDR_IN6,
     };
 
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
@@ -304,7 +304,10 @@ impl TargetAddr {
         let authority = if allow_userinfo {
             authority.rsplit('@').next().unwrap_or(authority)
         } else if authority.contains('@') {
-            anyhow::bail!("Target address must not contain userinfo (@): {}", authority);
+            anyhow::bail!(
+                "Target address must not contain userinfo (@): {}",
+                authority
+            );
         } else {
             authority
         };
@@ -327,7 +330,10 @@ impl TargetAddr {
                 None => (authority, None),
             };
             if host.contains(':') {
-                anyhow::bail!("For IPv6 addresses, please use [addr]:port format: {}", authority);
+                anyhow::bail!(
+                    "For IPv6 addresses, please use [addr]:port format: {}",
+                    authority
+                );
             }
             (host, port_opt)
         };
@@ -336,7 +342,9 @@ impl TargetAddr {
             Some(p) => p
                 .parse::<u16>()
                 .map_err(|_| anyhow::anyhow!("Invalid port number: {}", p))?,
-            None => default_port.ok_or_else(|| anyhow::anyhow!("Missing port number: {}", authority))?,
+            None => {
+                default_port.ok_or_else(|| anyhow::anyhow!("Missing port number: {}", authority))?
+            }
         };
         Self::from_host_port(host, port)
     }
@@ -386,7 +394,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use http_relay::{
-        parse_and_rewrite_http_response_head, HttpResponseFraming, ParsedHttpResponseHead,
+        HttpResponseFraming, ParsedHttpResponseHead, parse_and_rewrite_http_response_head,
     };
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -415,7 +423,10 @@ mod tests {
         let (mut server_r, mut server_w) = server_app.into_split();
 
         // 客户端发送一次请求后保持写端打开但静默（模拟 HTTP 长下载上行无后续数据）
-        client_w.write_all(b"GET /large HTTP/1.1\r\n\r\n").await.unwrap();
+        client_w
+            .write_all(b"GET /large HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
         let mut req_buf = vec![0u8; 64];
         let req_len = server_r.read(&mut req_buf).await.unwrap();
         assert_eq!(&req_buf[..req_len], b"GET /large HTTP/1.1\r\n\r\n");
@@ -444,7 +455,9 @@ mod tests {
         client_w.shutdown().await.unwrap();
         server_task.await.unwrap();
 
-        let (up, down) = relay_handle.await.unwrap().expect("Unidirectional active transfer should not time out while other side is silent");
+        let (up, down) = relay_handle.await.unwrap().expect(
+            "Unidirectional active transfer should not time out while other side is silent",
+        );
         assert_eq!(up, 23);
         assert_eq!(down, 60);
     }
@@ -485,7 +498,10 @@ mod tests {
         client_r.read_to_end(&mut reply).await.unwrap();
         assert_eq!(&reply, b"pongpongpongpong");
 
-        let (up, down) = relay_handle.await.unwrap().expect("Opposite direction data stream after half-close should complete successfully");
+        let (up, down) = relay_handle
+            .await
+            .unwrap()
+            .expect("Opposite direction data stream after half-close should complete successfully");
         assert_eq!(up, 4);
         assert_eq!(down, 16);
     }
@@ -504,7 +520,10 @@ mod tests {
         )
         .await;
 
-        assert!(res.is_err(), "Prolonged mutual silence should trigger idle timeout cleanup");
+        assert!(
+            res.is_err(),
+            "Prolonged mutual silence should trigger idle timeout cleanup"
+        );
     }
 
     #[test]
@@ -560,7 +579,8 @@ mod tests {
 
         // Remote must receive NEITHER premature EOF (P1-1) NOR smuggled pipelined bytes
         let mut probe = [0u8; 64];
-        let early = tokio::time::timeout(Duration::from_millis(80), server_r.read(&mut probe)).await;
+        let early =
+            tokio::time::timeout(Duration::from_millis(80), server_r.read(&mut probe)).await;
         assert!(
             early.is_err(),
             "Expected neither premature EOF nor smuggled bytes, got: {:?}",
@@ -604,14 +624,22 @@ mod tests {
         });
         let (mut client_r, mut client_w) = client_app.into_split();
         let (mut server_r, mut server_w) = server_app.into_split();
-        client_w.write_all(b"lloGET /evil HTTP/1.1\r\n\r\n").await.unwrap();
+        client_w
+            .write_all(b"lloGET /evil HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
 
         let mut remote_body = [0u8; 5];
         server_r.read_exact(&mut remote_body).await.unwrap();
         assert_eq!(&remote_body, b"hello");
         let mut probe = [0u8; 64];
-        let after_exact = tokio::time::timeout(Duration::from_millis(80), server_r.read(&mut probe)).await;
-        assert!(after_exact.is_err(), "Expected open write half and zero smuggling, got: {:?}", after_exact);
+        let after_exact =
+            tokio::time::timeout(Duration::from_millis(80), server_r.read(&mut probe)).await;
+        assert!(
+            after_exact.is_err(),
+            "Expected open write half and zero smuggling, got: {:?}",
+            after_exact
+        );
 
         server_w
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nresp1")
@@ -620,9 +648,13 @@ mod tests {
         server_w.shutdown().await.unwrap();
         let mut client_resp = Vec::new();
         client_r.read_to_end(&mut client_resp).await.unwrap();
-        let expected_resp1 = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nresp1";
+        let expected_resp1 =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nresp1";
         assert_eq!(&client_resp[..], expected_resp1);
-        assert_eq!(relay.await.unwrap().unwrap(), (5, expected_resp1.len() as u64));
+        assert_eq!(
+            relay.await.unwrap().unwrap(),
+            (5, expected_resp1.len() as u64)
+        );
 
         // 2. Chunked encoding with trailer + trailing pipelined request
         let (client_app, local_relay) = tcp_pair().await;
@@ -650,8 +682,13 @@ mod tests {
         let mut remote_chunked = vec![0u8; expected_chunked.len()];
         server_r2.read_exact(&mut remote_chunked).await.unwrap();
         assert_eq!(&remote_chunked[..], expected_chunked);
-        let after_chunked = tokio::time::timeout(Duration::from_millis(80), server_r2.read(&mut probe)).await;
-        assert!(after_chunked.is_err(), "Expected open write half and zero chunked smuggling, got: {:?}", after_chunked);
+        let after_chunked =
+            tokio::time::timeout(Duration::from_millis(80), server_r2.read(&mut probe)).await;
+        assert!(
+            after_chunked.is_err(),
+            "Expected open write half and zero chunked smuggling, got: {:?}",
+            after_chunked
+        );
 
         server_w2
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nresp2")
@@ -660,7 +697,8 @@ mod tests {
         server_w2.shutdown().await.unwrap();
         let mut client_resp2 = Vec::new();
         client_r2.read_to_end(&mut client_resp2).await.unwrap();
-        let expected_resp2 = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nresp2";
+        let expected_resp2 =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nresp2";
         assert_eq!(&client_resp2[..], expected_resp2);
         assert_eq!(
             relay2.await.unwrap().unwrap(),
@@ -694,7 +732,8 @@ mod tests {
         assert_eq!(&head_body, b"part");
 
         // Origin rejects upload early with 401 and closes without waiting for remaining 10MB body
-        let reject = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno";
+        let reject =
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno";
         server_w.write_all(reject).await.unwrap();
         server_w.shutdown().await.unwrap();
 
@@ -889,7 +928,10 @@ mod tests {
             }
             scanned = buf.len();
         }
-        assert_eq!(found, Some(b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n".len()));
+        assert_eq!(
+            found,
+            Some(b"GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n".len())
+        );
 
         // Split right before each byte of `\r\n\r\n`
         let sample = b"GET / HTTP/1.1\r\n\r\n";

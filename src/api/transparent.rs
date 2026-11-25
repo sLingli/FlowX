@@ -1,18 +1,18 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::watch;
 
-use crate::api::{control_error_to_http, serde_json_to_string, ElevateRunner, JSON_CONTENT_TYPE};
+use crate::api::{ElevateRunner, JSON_CONTENT_TYPE, control_error_to_http, serde_json_to_string};
 use crate::config::ConfigStore;
 use crate::control::transparent::{
     apply_transparent_config_fields, classify_transparent_apply_error,
     classify_transparent_elevate_error, transparent_status_or_fallback,
 };
 use crate::control::{TransparentConfigRequest, TransparentToggleRequest};
-use crate::i18n::{json_error, t, Locale};
+use crate::i18n::{Locale, json_error, t};
 use crate::transparent::{
-    relaunch_elevated_with_replace_pid, TransparentManager, TransparentSettings,
+    TransparentManager, TransparentSettings, relaunch_elevated_with_replace_pid,
 };
 
 pub(super) struct TransparentRollbackState {
@@ -25,8 +25,7 @@ pub(super) fn handle_transparent_status(
     config_store: Option<&ConfigStore>,
 ) -> (&'static str, &'static str, String) {
     let status_view = transparent_status_or_fallback(transparent_manager);
-    let mut body_val =
-        serde_json::to_value(&status_view).unwrap_or_else(|_| serde_json::json!({}));
+    let mut body_val = serde_json::to_value(&status_view).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = body_val.as_object_mut() {
         obj.insert(
             "config_path".to_string(),
@@ -119,7 +118,11 @@ async fn apply_transparent_and_stage(
                 prev_persisted_enabled: prev_persisted,
             });
             *should_persist = true;
-            ("200 OK", JSON_CONTENT_TYPE, serde_json_to_string(&mgr.status()))
+            (
+                "200 OK",
+                JSON_CONTENT_TYPE,
+                serde_json_to_string(&mgr.status()),
+            )
         }
         Ok(Err(raw_err)) => map_transparent_apply_error(locale, &raw_err),
         Err(join_err) => map_transparent_apply_error(

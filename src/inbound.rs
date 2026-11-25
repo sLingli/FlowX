@@ -7,8 +7,8 @@
 //! (Wintun / WinDivert) 的情况下，`local_addr()` 永远是 FlowX 自身的监听地址，
 //! 会导致每条连接都被识别为发往 `127.0.0.1:<入站端口>` 并直连回自身，形成无限自连循环。
 
+use anyhow::{Context, Result, bail};
 use std::net::{IpAddr, Ipv4Addr};
-use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::outbound::TargetAddr;
@@ -64,7 +64,10 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut first = [0u8; 1];
-    stream.read_exact(&mut first).await.context("Failed to read first inbound byte")?;
+    stream
+        .read_exact(&mut first)
+        .await
+        .context("Failed to read first inbound byte")?;
     match first[0] {
         0x05 => read_socks5(stream).await,
         0x04 => read_socks4(stream).await,
@@ -80,7 +83,11 @@ where
 {
     match kind {
         // BND.ADDR 填 0.0.0.0:0，客户端普遍不使用该字段
-        InboundKind::Socks5 => stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await,
+        InboundKind::Socks5 => {
+            stream
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+        }
         InboundKind::Socks4 => stream.write_all(&[0x00, 0x5A, 0, 0, 0, 0, 0, 0]).await,
         InboundKind::HttpConnect => {
             stream
@@ -92,7 +99,11 @@ where
 }
 
 /// 规则阻断或出站失败时，按协议向客户端回复失败
-pub async fn send_failure<S>(stream: &mut S, kind: InboundKind, blocked: bool) -> std::io::Result<()>
+pub async fn send_failure<S>(
+    stream: &mut S,
+    kind: InboundKind,
+    blocked: bool,
+) -> std::io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
@@ -100,7 +111,9 @@ where
         InboundKind::Socks5 => {
             // 0x02: 规则集拒绝; 0x05: 连接被拒绝
             let rep = if blocked { 0x02 } else { 0x05 };
-            stream.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await
+            stream
+                .write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
         }
         InboundKind::Socks4 => stream.write_all(&[0x00, 0x5B, 0, 0, 0, 0, 0, 0]).await,
         InboundKind::HttpConnect | InboundKind::HttpForward => {
@@ -140,7 +153,10 @@ where
     }
     if header[1] != 0x01 {
         // 0x07: Command not supported (BIND / UDP ASSOCIATE 暂不支持)
-        stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
+        stream
+            .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .ok();
         bail!("SOCKS5 unsupported command: 0x{:02x}", header[1]);
     }
 
@@ -173,7 +189,10 @@ where
                 .and_then(|host| make_target(&host, port))
         }
         other => {
-            stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
+            stream
+                .write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .ok();
             bail!("SOCKS5 unsupported address type: 0x{:02x}", other);
         }
     };
@@ -181,7 +200,10 @@ where
         Ok(t) => t,
         Err(e) => {
             // 0x01: general SOCKS server failure (e.g., port 0 or invalid domain)
-            stream.write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.ok();
+            stream
+                .write_all(&[0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .ok();
             return Err(e);
         }
     };
@@ -214,12 +236,16 @@ where
     let ip = Ipv4Addr::new(header[3], header[4], header[5], header[6]);
 
     // USERID（以 NUL 结尾，忽略内容）
-    read_nul_terminated(stream, 255).await.context("Failed to read SOCKS4 USERID")?;
+    read_nul_terminated(stream, 255)
+        .await
+        .context("Failed to read SOCKS4 USERID")?;
 
     // SOCKS4a：DSTIP 为 0.0.0.x (x != 0) 时，USERID 之后紧跟以 NUL 结尾的域名
     let o = ip.octets();
     let target_res: Result<TargetAddr> = if o[0] == 0 && o[1] == 0 && o[2] == 0 && o[3] != 0 {
-        let domain = read_nul_terminated(stream, 255).await.context("Failed to read SOCKS4a domain")?;
+        let domain = read_nul_terminated(stream, 255)
+            .await
+            .context("Failed to read SOCKS4a domain")?;
         String::from_utf8(domain)
             .context("SOCKS4a target domain is not valid UTF-8")
             .and_then(|host| make_target(&host, port))
@@ -310,7 +336,8 @@ where
         bail!("HTTP request line is not valid UTF-8");
     };
     let mut parts = request_line.split(' ');
-    let (Some(method), Some(uri), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    let (Some(method), Some(uri), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         reply_http_error(stream, "400 Bad Request").await;
         bail!("Malformed HTTP request line: {:?}", request_line);
@@ -354,7 +381,10 @@ where
         };
         if authority.contains(['?', '#', '@', '\\']) {
             reply_http_error(stream, "400 Bad Request").await;
-            bail!("HTTP proxy authority contains forbidden delimiter: {}", authority);
+            bail!(
+                "HTTP proxy authority contains forbidden delimiter: {}",
+                authority
+            );
         }
         if path.bytes().any(|b| b <= 0x1f || b == 0x7f) {
             reply_http_error(stream, "400 Bad Request").await;
@@ -419,7 +449,10 @@ where
             };
             let trimmed = crate::outbound::trim_http_ows(v);
             let parsed_cl = trimmed.parse::<u64>().ok();
-            if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) || parsed_cl.is_none() {
+            if trimmed.is_empty()
+                || !trimmed.bytes().all(|b| b.is_ascii_digit())
+                || parsed_cl.is_none()
+            {
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Malformed Content-Length header: {:?}", trimmed);
             }
@@ -445,7 +478,9 @@ where
                 bail!("Upgrade header is not supported on plain HTTP proxy requests");
             }
             upgrade_seen = true;
-        } else if name.eq_ignore_ascii_case(b"connection") || name.eq_ignore_ascii_case(b"proxy-connection") {
+        } else if name.eq_ignore_ascii_case(b"connection")
+            || name.eq_ignore_ascii_case(b"proxy-connection")
+        {
             let Ok(v) = std::str::from_utf8(val) else {
                 reply_http_error(stream, "400 Bad Request").await;
                 bail!("Invalid Connection header");
@@ -460,11 +495,16 @@ where
                     bail!("Malformed token in Connection header: {:?}", token);
                 }
                 let lower = token.to_ascii_lowercase();
-                if matches!(lower.as_str(), "host" | "content-length" | "transfer-encoding")
-                    || (!is_connect && lower == "upgrade")
+                if matches!(
+                    lower.as_str(),
+                    "host" | "content-length" | "transfer-encoding"
+                ) || (!is_connect && lower == "upgrade")
                 {
                     reply_http_error(stream, "400 Bad Request").await;
-                    bail!("Connection header must not nominate framing header: {}", lower);
+                    bail!(
+                        "Connection header must not nominate framing header: {}",
+                        lower
+                    );
                 }
                 nominated_hop_headers.push(lower.into_bytes());
             }
@@ -488,13 +528,18 @@ where
     }
     if let Some(host_str) = host_header {
         let host_default_port = if is_connect { None } else { Some(80) };
-        let Ok(host_target) = TargetAddr::parse_authority(host_str, host_default_port, false) else {
+        let Ok(host_target) = TargetAddr::parse_authority(host_str, host_default_port, false)
+        else {
             reply_http_error(stream, "400 Bad Request").await;
             bail!("Invalid Host header: {:?}", host_str);
         };
         if host_target != target {
             reply_http_error(stream, "400 Bad Request").await;
-            bail!("Host header {:?} does not match request target {:?}", host_str, target);
+            bail!(
+                "Host header {:?} does not match request target {:?}",
+                host_str,
+                target
+            );
         }
     }
 
@@ -534,7 +579,9 @@ where
         ]
         .iter()
         .any(|h| name.eq_ignore_ascii_case(h));
-        let is_nominated_hop = nominated_hop_headers.iter().any(|h| name.eq_ignore_ascii_case(h));
+        let is_nominated_hop = nominated_hop_headers
+            .iter()
+            .any(|h| name.eq_ignore_ascii_case(h));
         if !is_fixed_hop && !is_nominated_hop {
             rewritten.extend_from_slice(line);
             rewritten.extend_from_slice(b"\r\n");
@@ -556,7 +603,20 @@ pub(crate) fn is_http_token_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric()
         || matches!(
             b,
-            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
         )
 }
 
@@ -590,7 +650,10 @@ async fn reply_http_error<S>(stream: &mut S, status: &str)
 where
     S: AsyncWrite + Unpin,
 {
-    let resp = format!("HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", status);
+    let resp = format!(
+        "HTTP/1.1 {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        status
+    );
     let _ = stream.write_all(resp.as_bytes()).await;
 }
 
@@ -620,7 +683,8 @@ mod tests {
     #[tokio::test]
     async fn test_socks5_domain_request() {
         let (mut client, mut server) = duplex(1024);
-        let task = tokio::spawn(async move { read_request(&mut server).await.map(|r| (r, server)) });
+        let task =
+            tokio::spawn(async move { read_request(&mut server).await.map(|r| (r, server)) });
 
         client.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
         let mut reply = [0u8; 2];
@@ -660,12 +724,17 @@ mod tests {
     async fn test_http_connect_request() {
         let (mut client, mut server) = duplex(4096);
         client
-            .write_all(b"CONNECT [2001:db8::1]:8443 HTTP/1.1\r\nHost: [2001:db8::1]:8443\r\n\r\nEARLY")
+            .write_all(
+                b"CONNECT [2001:db8::1]:8443 HTTP/1.1\r\nHost: [2001:db8::1]:8443\r\n\r\nEARLY",
+            )
             .await
             .unwrap();
         let r = read_request(&mut server).await.unwrap();
         assert_eq!(r.kind, InboundKind::HttpConnect);
-        assert_eq!(r.target, TargetAddr::Ip("[2001:db8::1]:8443".parse().unwrap()));
+        assert_eq!(
+            r.target,
+            TargetAddr::Ip("[2001:db8::1]:8443".parse().unwrap())
+        );
         assert_eq!(r.pending, b"EARLY");
     }
 
@@ -690,7 +759,10 @@ mod tests {
         assert!(!text.contains("smuggled"));
         assert!(!text.to_lowercase().contains("keep-alive"));
         assert!(text.ends_with("Connection: close\r\n\r\n"));
-        assert!(r.body_prefix.starts_with(b"GET http://evil.example/smuggled"));
+        assert!(
+            r.body_prefix
+                .starts_with(b"GET http://evil.example/smuggled")
+        );
     }
 
     #[tokio::test]
@@ -702,7 +774,10 @@ mod tests {
         .await
         .unwrap();
         let r1 = read_request(&mut s1).await.unwrap();
-        assert_eq!(r1.http_body_framing, Some(HttpBodyFraming::ContentLength(5)));
+        assert_eq!(
+            r1.http_body_framing,
+            Some(HttpBodyFraming::ContentLength(5))
+        );
         assert!(!r1.pending.ends_with(b"helloEXTRA"));
         assert_eq!(r1.body_prefix, b"helloEXTRA");
 
@@ -720,7 +795,10 @@ mod tests {
     #[tokio::test]
     async fn test_http_origin_form_rejected() {
         let (mut client, mut server) = duplex(4096);
-        client.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
         assert!(read_request(&mut server).await.is_err());
         let mut resp = vec![0u8; 64];
         let n = client.read(&mut resp).await.unwrap();
@@ -749,7 +827,11 @@ mod tests {
         for raw in bad_cases {
             let (mut client, mut server) = duplex(4096);
             client.write_all(raw).await.unwrap();
-            assert!(read_request(&mut server).await.is_err(), "expected err for {:?}", String::from_utf8_lossy(raw));
+            assert!(
+                read_request(&mut server).await.is_err(),
+                "expected err for {:?}",
+                String::from_utf8_lossy(raw)
+            );
             let mut resp = vec![0u8; 64];
             let n = client.read(&mut resp).await.unwrap();
             let text = String::from_utf8_lossy(&resp[..n]);
@@ -764,8 +846,14 @@ mod tests {
 
     #[test]
     fn test_parse_authority() {
-        assert_eq!(parse_authority("a.com:443", None).unwrap(), TargetAddr::Domain("a.com".into(), 443));
-        assert_eq!(parse_authority("a.com", Some(80)).unwrap(), TargetAddr::Domain("a.com".into(), 80));
+        assert_eq!(
+            parse_authority("a.com:443", None).unwrap(),
+            TargetAddr::Domain("a.com".into(), 443)
+        );
+        assert_eq!(
+            parse_authority("a.com", Some(80)).unwrap(),
+            TargetAddr::Domain("a.com".into(), 80)
+        );
         assert!(parse_authority("a.com", None).is_err());
         assert!(parse_authority("user:pass@a.com:443", None).is_err());
         assert!(parse_authority("bad host:80", None).is_err());
@@ -806,7 +894,10 @@ mod tests {
         let parsed = parse_http_from_start(&mut server)
             .await
             .expect("exact MAX_HTTP_HEADER should pass");
-        assert_eq!(parsed.target, TargetAddr::Domain("example.com".to_string(), 443));
+        assert_eq!(
+            parsed.target,
+            TargetAddr::Domain("example.com".to_string(), 443)
+        );
         // Read capped at MAX_HTTP_HEADER, so trailing bytes remain unread in stream until relay.
         let mut rest = Vec::new();
         server.read_to_end(&mut rest).await.unwrap();
@@ -816,7 +907,10 @@ mod tests {
         // Headers reaching MAX_HTTP_HEADER WITHOUT terminator return 431.
         let mut too_long = Vec::with_capacity(MAX_HTTP_HEADER + 16);
         too_long.extend_from_slice(prefix);
-        too_long.extend(std::iter::repeat_n(b'b', MAX_HTTP_HEADER - prefix.len() + 16));
+        too_long.extend(std::iter::repeat_n(
+            b'b',
+            MAX_HTTP_HEADER - prefix.len() + 16,
+        ));
         let (mut client2, mut server2) = tokio::io::duplex(MAX_HTTP_HEADER * 2);
         let write_task2 = tokio::spawn(async move {
             let _ = client2.write_all(&too_long).await;
@@ -828,7 +922,10 @@ mod tests {
         assert!(parse_http_from_start(&mut server2).await.is_err());
         drop(server2);
         let resp = write_task2.await.unwrap();
-        assert!(resp.starts_with("HTTP/1.1 431 "), "expected 431, got: {resp}");
+        assert!(
+            resp.starts_with("HTTP/1.1 431 "),
+            "expected 431, got: {resp}"
+        );
     }
 
     #[tokio::test]
@@ -901,7 +998,10 @@ mod tests {
             client3.shutdown().await.unwrap();
         });
         let ok = parse_http_from_start(&mut server3).await.unwrap();
-        assert_eq!(ok.target, TargetAddr::Domain("example.com".to_string(), 443));
+        assert_eq!(
+            ok.target,
+            TargetAddr::Domain("example.com".to_string(), 443)
+        );
     }
 
     #[tokio::test]
@@ -910,12 +1010,20 @@ mod tests {
         let s5_cases: Vec<Vec<u8>> = vec![
             vec![0x05, 0x01, 0x00, 0x01, 1, 2, 3, 4, 0x00, 0x00],
             vec![
-                0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00,
-                0x00,
+                0x05, 0x01, 0x00, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0x00, 0x00,
             ],
-            [vec![0x05, 0x01, 0x00, 0x03, 11], b"example.com".to_vec(), vec![0x00, 0x00]]
-                .concat(),
-            [vec![0x05, 0x01, 0x00, 0x03, 8], b"bad host".to_vec(), vec![0x01, 0xbb]].concat(),
+            [
+                vec![0x05, 0x01, 0x00, 0x03, 11],
+                b"example.com".to_vec(),
+                vec![0x00, 0x00],
+            ]
+            .concat(),
+            [
+                vec![0x05, 0x01, 0x00, 0x03, 8],
+                b"bad host".to_vec(),
+                vec![0x01, 0xbb],
+            ]
+            .concat(),
             vec![0x05, 0x01, 0x00, 0x03, 2, 0xff, 0xfe, 0x01, 0xbb],
         ];
 

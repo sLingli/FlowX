@@ -2,15 +2,15 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use super::codec::{
-    build_dns_query_packet, csprng_u16, parse_answer_ips, validate_upstream_dns_response,
-    DnsQuestion,
+    DnsQuestion, build_dns_query_packet, csprng_u16, parse_answer_ips,
+    validate_upstream_dns_response,
 };
-use super::{canonicalize_socket_addr_preserving_scope, FakeIpPool};
+use super::{FakeIpPool, canonicalize_socket_addr_preserving_scope};
 
 pub(super) const MAX_DNS_UPSTREAM_CONCURRENCY: usize = 1024;
 pub(super) const UPSTREAM_DNS_TIMEOUT: Duration = Duration::from_secs(2);

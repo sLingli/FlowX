@@ -1,10 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::json;
 
-use crate::cli::args::{parse_flags_with_spec, split_action_spec, ArgSpec, GlobalCliOpts};
-use crate::cli::bridge::{
-    control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly,
-};
+use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec, split_action_spec};
+use crate::cli::bridge::{control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly};
 use crate::cli::http_client::{api_request_or_offline, api_request_strict, ensure_api_ok};
 use crate::control::routing::{set_default_action, simulate_route};
 use crate::control::{SetDefaultActionRequest, SimulateRouteRequest};
@@ -27,7 +25,8 @@ pub(super) async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
         },
     )?;
 
-    if let Some((status, raw_sys)) = api_request_or_offline(opts, "GET", "/api/system", None).await?
+    if let Some((status, raw_sys)) =
+        api_request_or_offline(opts, "GET", "/api/system", None).await?
     {
         let sys_val = ensure_api_ok(status, raw_sys)?;
         let (stats_status, raw_stats) =

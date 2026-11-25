@@ -30,13 +30,27 @@ async fn test_api_security_and_validation() {
     let port = addr.port();
 
     // 1. 无通配 CORS 且拦截 DNS Rebinding / 跨源请求，并包含反点击劫持头
-    let ok_resp = raw_http(addr, &format!("GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port)).await;
+    let ok_resp = raw_http(
+        addr,
+        &format!(
+            "GET /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            port
+        ),
+    )
+    .await;
     assert!(ok_resp.starts_with("HTTP/1.1 200 OK"));
     assert!(!ok_resp.contains("Access-Control-Allow-Origin"));
     assert!(ok_resp.contains("X-Frame-Options: DENY"));
     assert!(ok_resp.contains("Content-Security-Policy: frame-ancestors 'none'"));
 
-    let evil_host = raw_http(addr, &format!("GET /api/health HTTP/1.1\r\nHost: evil.com:{}\r\n\r\n", port)).await;
+    let evil_host = raw_http(
+        addr,
+        &format!(
+            "GET /api/health HTTP/1.1\r\nHost: evil.com:{}\r\n\r\n",
+            port
+        ),
+    )
+    .await;
     assert!(evil_host.starts_with("HTTP/1.1 403 Forbidden"));
 
     let evil_origin = raw_http(
@@ -144,9 +158,14 @@ async fn test_api_mutates_and_persists_xml() {
     let mgr = Arc::new(ConnectionManager::new());
     let re = Arc::new(RuleEngine::new(rt.rules, rt.default_action));
     let nodes = Arc::new(RwLock::new(rt.proxy_nodes));
-    let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-        .with_self_ports(vec![40001, 40080, 1053])
-        .with_config_store(Arc::clone(&store));
+    let srv = ApiServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        mgr,
+        Arc::clone(&re),
+        Arc::clone(&nodes),
+    )
+    .with_self_ports(vec![40001, 40080, 1053])
+    .with_config_store(Arc::clone(&store));
     let listener = srv.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = watch::channel(false);
@@ -169,7 +188,12 @@ async fn test_api_mutates_and_persists_xml() {
 
     let (reloaded, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
     assert_eq!(reloaded.proxy_nodes.len(), 2);
-    assert!(reloaded.proxy_nodes.values().any(|n| n.name == "HK-Test" && n.protocol == "HTTP"));
+    assert!(
+        reloaded
+            .proxy_nodes
+            .values()
+            .any(|n| n.name == "HK-Test" && n.protocol == "HTTP")
+    );
 
     let _ = std::fs::remove_file(&path);
 }
@@ -201,10 +225,15 @@ async fn test_api_system_and_rule_toggle_move() {
         started_at: Instant::now(),
     });
 
-    let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-        .with_self_ports(vec![40001, 40080, 1053])
-        .with_config_store(Arc::clone(&store))
-        .with_runtime_context(sys_ctx);
+    let srv = ApiServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        mgr,
+        Arc::clone(&re),
+        Arc::clone(&nodes),
+    )
+    .with_self_ports(vec![40001, 40080, 1053])
+    .with_config_store(Arc::clone(&store))
+    .with_runtime_context(sys_ctx);
     let listener = srv.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = watch::channel(false);
@@ -215,7 +244,10 @@ async fn test_api_system_and_rule_toggle_move() {
     // 1. 系统信息端点
     let sys_resp = raw_http(
         addr,
-        &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        &format!(
+            "GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            port
+        ),
     )
     .await;
     assert!(sys_resp.starts_with("HTTP/1.1 200 OK"));
@@ -331,7 +363,11 @@ async fn test_delete_node_checks_default_action_and_kill_preserves_raii_guard() 
     .await;
     assert!(kill_resp.contains("\"killed\":true"));
     assert!(active.is_cancelled());
-    assert_eq!(mgr.active_count(), 1, "API must not bypass ConnectionGuard to unregister connections early");
+    assert_eq!(
+        mgr.active_count(),
+        1,
+        "API must not bypass ConnectionGuard to unregister connections early"
+    );
 
     mgr.unregister(active.id);
     assert_eq!(mgr.active_count(), 0);
@@ -404,14 +440,20 @@ async fn test_api_i18n_negotiation_and_localized_errors() {
     // 5. System API 返回与语言匹配的动作描述
     let sys_zh = raw_http(
         addr,
-        &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\n\r\n", port),
+        &format!(
+            "GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: zh-CN\r\n\r\n",
+            port
+        ),
     )
     .await;
     assert!(sys_zh.contains("Direct (直连)"));
 
     let sys_en = raw_http(
         addr,
-        &format!("GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\n\r\n", port),
+        &format!(
+            "GET /api/system HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept-Language: en-US\r\n\r\n",
+            port
+        ),
     )
     .await;
     assert!(sys_en.contains("\"default_action\":\"Direct\""));
@@ -472,8 +514,14 @@ async fn test_api_connections_view_is_localized() {
         ),
     )
     .await;
-    assert!(zh.contains("Proxy (节点-101)"), "zh action should be localized: {zh}");
-    assert!(zh.contains("\"rule_name\":\"默认\""), "zh rule_name should be localized: {zh}");
+    assert!(
+        zh.contains("Proxy (节点-101)"),
+        "zh action should be localized: {zh}"
+    );
+    assert!(
+        zh.contains("\"rule_name\":\"默认\""),
+        "zh rule_name should be localized: {zh}"
+    );
     assert!(zh.contains("\"action_type\":\"Proxy\""));
     assert!(zh.contains("\"action_id\":101"));
 
@@ -485,7 +533,10 @@ async fn test_api_connections_view_is_localized() {
         ),
     )
     .await;
-    assert!(en.contains("Proxy (Node-101)"), "en action should be localized: {en}");
+    assert!(
+        en.contains("Proxy (Node-101)"),
+        "en action should be localized: {en}"
+    );
     assert!(en.contains("\"rule_name\":\"Default\""));
 }
 
@@ -502,9 +553,14 @@ async fn test_api_update_node_rule_default_and_simulate() {
     let mgr = Arc::new(ConnectionManager::new());
     let re = Arc::new(RuleEngine::new(rt.rules, rt.default_action));
     let nodes = Arc::new(RwLock::new(rt.proxy_nodes));
-    let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-        .with_self_ports(vec![40001, 40080, 1053])
-        .with_config_store(Arc::clone(&store));
+    let srv = ApiServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        mgr,
+        Arc::clone(&re),
+        Arc::clone(&nodes),
+    )
+    .with_self_ports(vec![40001, 40080, 1053])
+    .with_config_store(Arc::clone(&store));
     let listener = srv.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, rx) = watch::channel(false);
@@ -554,7 +610,10 @@ async fn test_api_update_node_rule_default_and_simulate() {
         ),
     )
     .await;
-    assert!(resp_rule.starts_with("HTTP/1.1 200 OK"), "resp_rule: {resp_rule}");
+    assert!(
+        resp_rule.starts_with("HTTP/1.1 200 OK"),
+        "resp_rule: {resp_rule}"
+    );
 
     // 3. POST /api/rules/default 修改默认兜底动作
     let def_body = r#"{"action":"Proxy","node_id":101}"#;
@@ -568,12 +627,16 @@ async fn test_api_update_node_rule_default_and_simulate() {
         ),
     )
     .await;
-    assert!(resp_def.starts_with("HTTP/1.1 200 OK"), "resp_def: {resp_def}");
+    assert!(
+        resp_def.starts_with("HTTP/1.1 200 OK"),
+        "resp_def: {resp_def}"
+    );
     assert!(resp_def.contains("\"default_action_type\":\"Proxy\""));
     assert!(resp_def.contains("\"default_node_id\":101"));
 
     // 4. POST /api/rules/simulate 测试路由命中与轨迹
-    let sim_body = r#"{"process":"C:\\Program Files\\Git\\bin\\git.exe","target":"api.github.com:443"}"#;
+    let sim_body =
+        r#"{"process":"C:\\Program Files\\Git\\bin\\git.exe","target":"api.github.com:443"}"#;
     let resp_sim = raw_http(
         addr,
         &format!(
@@ -584,7 +647,10 @@ async fn test_api_update_node_rule_default_and_simulate() {
         ),
     )
     .await;
-    assert!(resp_sim.starts_with("HTTP/1.1 200 OK"), "resp_sim: {resp_sim}");
+    assert!(
+        resp_sim.starts_with("HTTP/1.1 200 OK"),
+        "resp_sim: {resp_sim}"
+    );
     assert!(resp_sim.contains("\"matched_rule_name\":\"GitRule\""));
     assert!(resp_sim.contains("\"is_default\":false"));
     assert!(resp_sim.contains("\"reason\":\"target_mismatch\""));
@@ -594,7 +660,10 @@ async fn test_api_update_node_rule_default_and_simulate() {
     let (reloaded, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
     let node101 = reloaded.proxy_nodes.get(&101).unwrap();
     assert_eq!(node101.name, "SG-Auth-Renamed");
-    assert_eq!(node101.client.auth_credentials(), (Some("alice"), Some("secret")));
+    assert_eq!(
+        node101.client.auth_credentials(),
+        (Some("alice"), Some("secret"))
+    );
     assert_eq!(reloaded.rules[1].name, "GitRule");
     assert_eq!(reloaded.default_action, Action::Proxy(101));
 
@@ -621,7 +690,10 @@ async fn test_api_bind_non_loopback_and_framing_hardening() {
         ),
     )
     .await;
-    assert!(te_resp.starts_with("HTTP/1.1 501 Not Implemented"), "te_resp: {te_resp}");
+    assert!(
+        te_resp.starts_with("HTTP/1.1 501 Not Implemented"),
+        "te_resp: {te_resp}"
+    );
 
     // 2. 拒绝重复 Host 头 (400)
     let dup_host = raw_http(
@@ -632,7 +704,10 @@ async fn test_api_bind_non_loopback_and_framing_hardening() {
         ),
     )
     .await;
-    assert!(dup_host.starts_with("HTTP/1.1 400 Bad Request"), "dup_host: {dup_host}");
+    assert!(
+        dup_host.starts_with("HTTP/1.1 400 Bad Request"),
+        "dup_host: {dup_host}"
+    );
 
     // 3. 拒绝在 EOF 前截断 Content-Length 的不完整请求
     {
@@ -650,16 +725,25 @@ async fn test_api_bind_non_loopback_and_framing_hardening() {
         let mut buf = Vec::new();
         s.read_to_end(&mut buf).await.unwrap();
         let txt = String::from_utf8(buf).unwrap();
-        assert!(txt.starts_with("HTTP/1.1 400 Bad Request"), "trunc eof: {txt}");
+        assert!(
+            txt.starts_with("HTTP/1.1 400 Bad Request"),
+            "trunc eof: {txt}"
+        );
     }
 
     // 4. 拒绝无效请求行
     let bad_rl = raw_http(
         addr,
-        &format!("GET  /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        &format!(
+            "GET  /api/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            port
+        ),
     )
     .await;
-    assert!(bad_rl.starts_with("HTTP/1.1 400 Bad Request"), "bad_rl: {bad_rl}");
+    assert!(
+        bad_rl.starts_with("HTTP/1.1 400 Bad Request"),
+        "bad_rl: {bad_rl}"
+    );
 }
 
 #[tokio::test]
@@ -679,7 +763,10 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
         ),
     )
     .await;
-    assert!(resp_s4.starts_with("HTTP/1.1 400 Bad Request"), "s4_pw: {resp_s4}");
+    assert!(
+        resp_s4.starts_with("HTTP/1.1 400 Bad Request"),
+        "s4_pw: {resp_s4}"
+    );
     assert!(resp_s4.contains("ERR_SOCKS4_PASSWORD_UNSUPPORTED"));
 
     // 2. 添加带密码 SOCKS5 节点并验证 GET /api/nodes 返回 password_configured=true
@@ -698,7 +785,10 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
 
     let list_nodes = raw_http(
         addr,
-        &format!("GET /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", port),
+        &format!(
+            "GET /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            port
+        ),
     )
     .await;
     assert!(list_nodes.contains("\"password_configured\":true"));
@@ -715,9 +805,18 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
         ),
     )
     .await;
-    assert!(r_patch_name.starts_with("HTTP/1.1 200 OK"), "r_patch_name: {r_patch_name}");
+    assert!(
+        r_patch_name.starts_with("HTTP/1.1 200 OK"),
+        "r_patch_name: {r_patch_name}"
+    );
     assert_eq!(
-        nodes.read().unwrap().get(&101).unwrap().client.auth_credentials(),
+        nodes
+            .read()
+            .unwrap()
+            .get(&101)
+            .unwrap()
+            .client
+            .auth_credentials(),
         (Some("alice"), Some("pw1"))
     );
 
@@ -755,7 +854,14 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
     }
 
     // 4. PATCH /api/rules 保留未修改条件字段
-    let add_r = Rule::from_raw("R1", true, Some("curl"), Some("*.example.com"), Some("443"), Action::Direct);
+    let add_r = Rule::from_raw(
+        "R1",
+        true,
+        Some("curl"),
+        Some("*.example.com"),
+        Some("443"),
+        Action::Direct,
+    );
     let rid = add_r.id;
     re.add_rule(add_r);
     let patch_rule_body = format!(r#"{{"id":{},"name":"R1-Renamed"}}"#, rid);
@@ -769,7 +875,10 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
         ),
     )
     .await;
-    assert!(r_patch_rule.starts_with("HTTP/1.1 200 OK"), "r_patch_rule: {r_patch_rule}");
+    assert!(
+        r_patch_rule.starts_with("HTTP/1.1 200 OK"),
+        "r_patch_rule: {r_patch_rule}"
+    );
     let cur_r = re.current_rules();
     let patched_r = cur_r.iter().find(|r| r.id == rid).unwrap();
     assert_eq!(patched_r.name, "R1-Renamed");
@@ -790,7 +899,10 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
         Locale::En,
     )
     .unwrap();
-    assert!(sim_ip.target_host.is_none(), "IP literal must keep target_host null: {sim_ip:?}");
+    assert!(
+        sim_ip.target_host.is_none(),
+        "IP literal must keep target_host null: {sim_ip:?}"
+    );
     assert_eq!(sim_ip.target_ip.as_deref(), Some("8.8.8.8"));
 
     let sim_fake = simulate_route_with_pool(
@@ -879,7 +991,8 @@ async fn test_api_persist_failure_rolls_back_and_returns_500_and_auth_validation
     let (api_addr, api_nodes, _api_re, _tx2) = spawn_test_api().await;
     let api_port = api_addr.port();
 
-    let pw_only = r#"{"name":"bad","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","password":"secret"}"#;
+    let pw_only =
+        r#"{"name":"bad","protocol":"SOCKS5","server_addr":"10.0.0.2:1080","password":"secret"}"#;
     let r_pw_only = raw_http(
         api_addr,
         &format!(
@@ -1009,7 +1122,11 @@ async fn test_api_update_and_patch_new_password_with_keep_false() {
         ),
     )
     .await;
-    assert!(r_put.starts_with("HTTP/1.1 200 OK"), "PUT failed: {}", r_put);
+    assert!(
+        r_put.starts_with("HTTP/1.1 200 OK"),
+        "PUT failed: {}",
+        r_put
+    );
     assert_eq!(
         api_nodes
             .read()
@@ -1036,7 +1153,11 @@ async fn test_api_update_and_patch_new_password_with_keep_false() {
         ),
     )
     .await;
-    assert!(r_patch.starts_with("HTTP/1.1 200 OK"), "PATCH failed: {}", r_patch);
+    assert!(
+        r_patch.starts_with("HTTP/1.1 200 OK"),
+        "PATCH failed: {}",
+        r_patch
+    );
     assert_eq!(
         api_nodes
             .read()
@@ -1098,12 +1219,17 @@ async fn test_api_node_and_ping_block_fake_ip_and_local_interface_self_ports() {
     // 3. ping_address_with_context must reject Fake-IP, self_port loopback/local-interface, and DNS rebinding to self_port
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound_port = listener.local_addr().unwrap().port();
-    let (ok_fake, _, msg_fake, _) = ping_address("198.18.0.10:1080", &[bound_port], Locale::En).await;
+    let (ok_fake, _, msg_fake, _) =
+        ping_address("198.18.0.10:1080", &[bound_port], Locale::En).await;
     assert!(!ok_fake);
     assert!(msg_fake.contains("Fake-IP"));
 
-    let (ok_self, _, msg_self, _) =
-        ping_address(&format!("127.0.0.1:{}", bound_port), &[bound_port], Locale::En).await;
+    let (ok_self, _, msg_self, _) = ping_address(
+        &format!("127.0.0.1:{}", bound_port),
+        &[bound_port],
+        Locale::En,
+    )
+    .await;
     assert!(!ok_self);
     assert!(msg_self.contains("internal service"));
 
@@ -1128,11 +1254,14 @@ async fn test_api_node_and_ping_block_fake_ip_and_local_interface_self_ports() {
             for _ in 0..2 {
                 let mut buf = [0u8; 512];
                 let (n, src) = mock_dns.recv_from(&mut buf).await.unwrap();
-                let (tx, q) = flowx::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
+                let (tx, q) =
+                    flowx::dns::server::DnsPacketParser::parse_question(&buf[..n]).unwrap();
                 let resp = if q.qtype == 28 {
                     let mut r = Vec::new();
                     r.extend_from_slice(&tx.to_be_bytes());
-                    r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00]);
+                    r.extend_from_slice(&[
+                        0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+                    ]);
                     r.extend_from_slice(&buf[12..q.raw_len]);
                     r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x1c, 0x00, 0x01, 0, 0, 0, 5, 0, 16]);
                     r.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
@@ -1160,7 +1289,11 @@ async fn test_api_node_and_ping_block_fake_ip_and_local_interface_self_ports() {
             Locale::En,
         )
         .await;
-        assert!(ok_aaaa, "pure-AAAA ping should succeed when block_ipv6=true: {}", msg_aaaa);
+        assert!(
+            ok_aaaa,
+            "pure-AAAA ping should succeed when block_ipv6=true: {}",
+            msg_aaaa
+        );
         let _ = tokio::time::timeout(Duration::from_secs(1), dns_task).await;
         let _ = tokio::time::timeout(Duration::from_secs(1), accept_v6).await;
     }
@@ -1190,8 +1323,12 @@ async fn test_api_node_and_ping_block_fake_ip_and_local_interface_self_ports() {
                 r.extend_from_slice(&[0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]);
                 r.extend_from_slice(&buf[12..q.raw_len]);
                 // First candidate: TEST-NET-2 blackhole/unreachable, second candidate: reachable 127.0.0.1
-                r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 198, 51, 100, 1]);
-                r.extend_from_slice(&[0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1]);
+                r.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 198, 51, 100, 1,
+                ]);
+                r.extend_from_slice(&[
+                    0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0, 0, 0, 5, 0, 4, 127, 0, 0, 1,
+                ]);
                 r
             } else {
                 flowx::dns::server::DnsPacketParser::build_empty_response(tx, &buf, q.raw_len)
@@ -1216,7 +1353,11 @@ async fn test_api_node_and_ping_block_fake_ip_and_local_interface_self_ports() {
         Locale::En,
     )
     .await;
-    assert!(ok_multi, "multi-IP ping should failover within 2s budget: {}", msg_multi);
+    assert!(
+        ok_multi,
+        "multi-IP ping should failover within 2s budget: {}",
+        msg_multi
+    );
     let _ = tokio::time::timeout(Duration::from_secs(1), dns_multi_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), accept_v4).await;
 }
@@ -1242,12 +1383,18 @@ async fn test_api_paired_credentials_and_auth_configured() {
             ),
         )
         .await;
-        assert!(r.starts_with("HTTP/1.1 400 Bad Request"), "proto {} resp: {}", proto, r);
+        assert!(
+            r.starts_with("HTTP/1.1 400 Bad Request"),
+            "proto {} resp: {}",
+            proto,
+            r
+        );
         assert!(r.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
     }
 
     // 2. SOCKS4 POST with standalone UserID succeeds and auth_configured == true
-    let s4_body = r#"{"name":"s4user","protocol":"SOCKS4","server_addr":"10.0.0.2:1080","username":"s4id"}"#;
+    let s4_body =
+        r#"{"name":"s4user","protocol":"SOCKS4","server_addr":"10.0.0.2:1080","username":"s4id"}"#;
     let r_s4 = raw_http(
         api_addr,
         &format!(
@@ -1259,7 +1406,10 @@ async fn test_api_paired_credentials_and_auth_configured() {
     )
     .await;
     assert!(r_s4.starts_with("HTTP/1.1 200 OK"), "s4 resp: {}", r_s4);
-    let s4_id = serde_json::from_str::<serde_json::Value>(r_s4.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"].as_u64().unwrap() as u32;
+    let s4_id = serde_json::from_str::<serde_json::Value>(r_s4.split("\r\n\r\n").nth(1).unwrap())
+        .unwrap()["id"]
+        .as_u64()
+        .unwrap() as u32;
 
     // 3. Switching SOCKS4 node (with UserID) to SOCKS5 without supplying a password must reject
     let upgrade_no_pw = format!(r#"{{"id":{},"protocol":"SOCKS5"}}"#, s4_id);
@@ -1289,10 +1439,16 @@ async fn test_api_paired_credentials_and_auth_configured() {
     )
     .await;
     assert!(r_s5.starts_with("HTTP/1.1 200 OK"));
-    let s5_id = serde_json::from_str::<serde_json::Value>(r_s5.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"].as_u64().unwrap() as u32;
+    let s5_id = serde_json::from_str::<serde_json::Value>(r_s5.split("\r\n\r\n").nth(1).unwrap())
+        .unwrap()["id"]
+        .as_u64()
+        .unwrap() as u32;
 
     // Setting a new username alongside clear_password on PUT/PATCH rejects
-    let patch_new_user_clear = format!(r#"{{"id":{},"username":"bob","clear_password":true}}"#, s5_id);
+    let patch_new_user_clear = format!(
+        r#"{{"id":{},"username":"bob","clear_password":true}}"#,
+        s5_id
+    );
     let r_bad_patch = raw_http(
         api_addr,
         &format!(
@@ -1321,7 +1477,11 @@ async fn test_api_paired_credentials_and_auth_configured() {
         ),
     )
     .await;
-    assert!(r_put_clear.starts_with("HTTP/1.1 200 OK"), "put_clear: {}", r_put_clear);
+    assert!(
+        r_put_clear.starts_with("HTTP/1.1 200 OK"),
+        "put_clear: {}",
+        r_put_clear
+    );
     {
         let guard = api_nodes.read().unwrap();
         let s5 = guard.get(&s5_id).unwrap();
@@ -1331,7 +1491,10 @@ async fn test_api_paired_credentials_and_auth_configured() {
 
     let r_list = raw_http(
         api_addr,
-        &format!("GET /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", api_port),
+        &format!(
+            "GET /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n",
+            api_port
+        ),
     )
     .await;
     assert!(r_list.starts_with("HTTP/1.1 200 OK"));
@@ -1360,7 +1523,11 @@ async fn test_api_paired_credentials_and_auth_configured() {
         ),
     )
     .await;
-    assert!(r_put_s4_s5.starts_with("HTTP/1.1 400 Bad Request"), "resp: {}", r_put_s4_s5);
+    assert!(
+        r_put_s4_s5.starts_with("HTTP/1.1 400 Bad Request"),
+        "resp: {}",
+        r_put_s4_s5
+    );
     assert!(r_put_s4_s5.contains("ERR_USERNAME_WITHOUT_PASSWORD"));
     {
         let guard = api_nodes.read().unwrap();
@@ -1370,7 +1537,10 @@ async fn test_api_paired_credentials_and_auth_configured() {
     }
 
     // 6. PUT/PATCH credential flag parity: keep_password=true + non-empty password, clear_username + username, SOCKS4 + ""
-    let keep_and_pw_patch = format!(r#"{{"id":{},"username":"alice","password":"pw2","keep_password":true}}"#, s5_id);
+    let keep_and_pw_patch = format!(
+        r#"{{"id":{},"username":"alice","password":"pw2","keep_password":true}}"#,
+        s5_id
+    );
     let r_keep_and_pw = raw_http(
         api_addr,
         &format!(
@@ -1401,7 +1571,10 @@ async fn test_api_paired_credentials_and_auth_configured() {
     assert!(r_keep_and_pw_put.starts_with("HTTP/1.1 400 Bad Request"));
     assert!(r_keep_and_pw_put.contains("ERR_CONFLICTING_PASSWORD_OPTIONS"));
 
-    let conflict_user_patch = format!(r#"{{"id":{},"username":"bob","clear_username":true}}"#, s5_id);
+    let conflict_user_patch = format!(
+        r#"{{"id":{},"username":"bob","clear_username":true}}"#,
+        s5_id
+    );
     let r_clear_user_conflict = raw_http(
         api_addr,
         &format!(
@@ -1503,7 +1676,10 @@ async fn test_api_patch_clear_password_parity_conflict_and_control_chars() {
         let guard = nodes.read().unwrap();
         let entry = guard.get(&id).unwrap();
         assert_eq!(entry.username.as_deref(), Some("alice"));
-        assert_eq!(entry.client.auth_credentials(), (Some("alice"), Some("secret")));
+        assert_eq!(
+            entry.client.auth_credentials(),
+            (Some("alice"), Some("secret"))
+        );
     }
 
     // PUT with null username + clear_password=false + omitted keep_password also rejects cleanly
@@ -1539,7 +1715,11 @@ async fn test_api_patch_clear_password_parity_conflict_and_control_chars() {
         ),
     )
     .await;
-    assert!(r_patch_clear.starts_with("HTTP/1.1 200 OK"), "patch_clear: {}", r_patch_clear);
+    assert!(
+        r_patch_clear.starts_with("HTTP/1.1 200 OK"),
+        "patch_clear: {}",
+        r_patch_clear
+    );
     {
         let guard = nodes.read().unwrap();
         let entry = guard.get(&id).unwrap();
@@ -1548,10 +1728,8 @@ async fn test_api_patch_clear_password_parity_conflict_and_control_chars() {
     }
 
     // PATCH changing username alongside clear_password=true still rejects
-    let patch_clear_diff_user = format!(
-        r#"{{"id":{},"username":"bob","clear_password":true}}"#,
-        id
-    );
+    let patch_clear_diff_user =
+        format!(r#"{{"id":{},"username":"bob","clear_password":true}}"#, id);
     let r_patch_diff = raw_http(
         api_addr,
         &format!(
@@ -1590,8 +1768,17 @@ async fn test_api_patch_clear_password_parity_conflict_and_control_chars() {
             ),
         )
         .await;
-        assert!(r_bad.starts_with("HTTP/1.1 400 Bad Request"), "resp: {}", r_bad);
-        assert!(r_bad.contains(expected_code), "expected {} in {}", expected_code, r_bad);
+        assert!(
+            r_bad.starts_with("HTTP/1.1 400 Bad Request"),
+            "resp: {}",
+            r_bad
+        );
+        assert!(
+            r_bad.contains(expected_code),
+            "expected {} in {}",
+            expected_code,
+            r_bad
+        );
     }
 
     let _ = shutdown_tx.send(true);
@@ -1600,19 +1787,22 @@ async fn test_api_patch_clear_password_parity_conflict_and_control_chars() {
 
 #[tokio::test]
 async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_override() {
-    use flowx::dns::server::DnsServer;
     use flowx::dns::FakeIpPool;
+    use flowx::dns::server::DnsServer;
     use flowx::interceptor::dispatcher::DispatcherConfig;
     use flowx::interceptor::process::ProcessTracker;
 
-    let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-        "flowx_api_transparent_override_test_{}_{}.xml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let cfg_path = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "flowx_api_transparent_override_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     let _ = std::fs::remove_file(&cfg_path);
 
     let store = Arc::new(ConfigStore::new(&cfg_path));
@@ -1654,10 +1844,15 @@ async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_ov
         true,
     );
 
-    let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-        .with_self_ports(vec![40001, 40080, 1053])
-        .with_config_store(Arc::clone(&store))
-        .with_transparent_manager(Arc::clone(&t_mgr));
+    let srv = ApiServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        mgr,
+        Arc::clone(&re),
+        Arc::clone(&nodes),
+    )
+    .with_self_ports(vec![40001, 40080, 1053])
+    .with_config_store(Arc::clone(&store))
+    .with_transparent_manager(Arc::clone(&t_mgr));
     let listener = srv.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
@@ -1708,19 +1903,22 @@ async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_ov
 
 #[tokio::test]
 async fn test_api_transparent_config_succeeds_after_boot_start_failure() {
-    use flowx::dns::server::DnsServer;
     use flowx::dns::FakeIpPool;
+    use flowx::dns::server::DnsServer;
     use flowx::interceptor::dispatcher::DispatcherConfig;
     use flowx::interceptor::process::ProcessTracker;
 
-    let cfg_path = std::env::current_dir().unwrap().join("target").join(format!(
-        "flowx_api_boot_fail_cfg_test_{}_{}.xml",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let cfg_path = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "flowx_api_boot_fail_cfg_test_{}_{}.xml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
     let _ = std::fs::remove_file(&cfg_path);
 
     let store = Arc::new(ConfigStore::new(&cfg_path));
@@ -1769,10 +1967,15 @@ async fn test_api_transparent_config_succeeds_after_boot_start_failure() {
     assert!(!t_mgr.settings().enabled);
     assert!(t_mgr.persisted_settings().enabled);
 
-    let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, Arc::clone(&re), Arc::clone(&nodes))
-        .with_self_ports(vec![40001, 40080, 1053])
-        .with_config_store(Arc::clone(&store))
-        .with_transparent_manager(Arc::clone(&t_mgr));
+    let srv = ApiServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        mgr,
+        Arc::clone(&re),
+        Arc::clone(&nodes),
+    )
+    .with_self_ports(vec![40001, 40080, 1053])
+    .with_config_store(Arc::clone(&store))
+    .with_transparent_manager(Arc::clone(&t_mgr));
     let listener = srv.bind().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
@@ -1790,7 +1993,10 @@ async fn test_api_transparent_config_succeeds_after_boot_start_failure() {
         ),
     )
     .await;
-    assert!(resp.starts_with("HTTP/1.1 200 OK"), "config update must not lock out: {resp}");
+    assert!(
+        resp.starts_with("HTTP/1.1 200 OK"),
+        "config update must not lock out: {resp}"
+    );
     let saved = store.load_existing(&[]).unwrap();
     assert!(saved.transparent_settings.enabled);
     assert!(!saved.transparent_settings.hijack_dns);

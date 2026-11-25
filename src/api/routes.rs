@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::error;
 
 use crate::api::http::{
@@ -15,14 +15,13 @@ use crate::api::http::{
     send_http_response,
 };
 use crate::api::transparent::{
-    finalize_elevate_response_and_log, handle_transparent_config,
+    TransparentRollbackState, finalize_elevate_response_and_log, handle_transparent_config,
     handle_transparent_elevate_after_gate, handle_transparent_status, handle_transparent_toggle,
-    TransparentRollbackState,
 };
-use crate::api::{nodes, rules, system, ElevateRunner, JSON_CONTENT_TYPE};
+use crate::api::{ElevateRunner, JSON_CONTENT_TYPE, nodes, rules, system};
 use crate::config::ConfigStore;
 use crate::control::SystemRuntimeContext;
-use crate::i18n::{json_error, Locale};
+use crate::i18n::{Locale, json_error};
 use crate::interceptor::dispatcher::ProxyNodeEntry;
 use crate::monitor::ConnectionManager;
 use crate::router::RuleEngine;
@@ -126,15 +125,17 @@ pub(super) async fn handle_api_request(
         .await?;
         return Ok(());
     }
-    let (path, query) = path_and_query.split_once('?').unwrap_or((path_and_query, ""));
+    let (path, query) = path_and_query
+        .split_once('?')
+        .unwrap_or((path_and_query, ""));
 
     let accept_lang = extract_header(&headers, "accept-language");
     // 只取 lang 查询参数本身，避免把整段 query 交给子串匹配（如 ?keywords=lang=zh 误命中）
     let locale = Locale::from_header_or_query(accept_lang, parse_query_param(query, "lang"));
 
     // 安全校验 1: Host 头必须为本地回环地址，防止 DNS Rebinding
-    let host_ok = extract_header(&headers, "host")
-        .is_some_and(|h| is_allowed_host(h, actual_port, false));
+    let host_ok =
+        extract_header(&headers, "host").is_some_and(|h| is_allowed_host(h, actual_port, false));
     if !host_ok {
         send_http_response(
             &mut stream,
@@ -209,7 +210,8 @@ pub(super) async fn handle_api_request(
         (method, path),
         ("POST", "/api/connections/kill" | "/api/nodes/ping")
             | ("DELETE", "/api/nodes" | "/api/rules")
-    ) && (!body_bytes.is_empty() || parse_query_param(query, "id").is_none()))
+    ) && (!body_bytes.is_empty()
+        || parse_query_param(query, "id").is_none()))
         || (method == "POST" && path == "/api/transparent/elevate" && !body_bytes.is_empty());
     if requires_json_ct && !has_json_content_type(&headers) {
         send_http_response(
@@ -427,12 +429,20 @@ pub(super) async fn handle_api_request(
             system::handle_kill_connection(&monitor, query, req_body, locale)
         }
         ("GET", "/api/nodes") => nodes::handle_list_nodes(&proxy_nodes),
-        ("POST", "/api/nodes") => {
-            nodes::handle_post_node(req_body, &proxy_nodes, &self_ports, locale, &mut should_persist)
-        }
-        ("PUT", "/api/nodes") => {
-            nodes::handle_put_node(req_body, &proxy_nodes, &self_ports, locale, &mut should_persist)
-        }
+        ("POST", "/api/nodes") => nodes::handle_post_node(
+            req_body,
+            &proxy_nodes,
+            &self_ports,
+            locale,
+            &mut should_persist,
+        ),
+        ("PUT", "/api/nodes") => nodes::handle_put_node(
+            req_body,
+            &proxy_nodes,
+            &self_ports,
+            locale,
+            &mut should_persist,
+        ),
         ("PATCH", "/api/nodes") => nodes::handle_patch_node_http(
             req_body,
             &proxy_nodes,
@@ -461,12 +471,20 @@ pub(super) async fn handle_api_request(
             .await
         }
         ("GET", "/api/rules") => rules::handle_list_rules(&rule_engine, locale),
-        ("POST", "/api/rules") => {
-            rules::handle_post_rule(req_body, &rule_engine, &proxy_nodes, locale, &mut should_persist)
-        }
-        ("PUT", "/api/rules") => {
-            rules::handle_put_rule(req_body, &rule_engine, &proxy_nodes, locale, &mut should_persist)
-        }
+        ("POST", "/api/rules") => rules::handle_post_rule(
+            req_body,
+            &rule_engine,
+            &proxy_nodes,
+            locale,
+            &mut should_persist,
+        ),
+        ("PUT", "/api/rules") => rules::handle_put_rule(
+            req_body,
+            &rule_engine,
+            &proxy_nodes,
+            locale,
+            &mut should_persist,
+        ),
         ("PATCH", "/api/rules") => rules::handle_patch_rule_http(
             req_body,
             &rule_engine,
@@ -525,9 +543,7 @@ pub(super) async fn handle_api_request(
 
     if should_persist {
         let mut persisted_ok = true;
-        let persist_transparent = transparent_manager
-            .as_ref()
-            .map(|m| m.persisted_settings());
+        let persist_transparent = transparent_manager.as_ref().map(|m| m.persisted_settings());
         if let Some(store) = config_store.as_ref()
             && let Err(e) = persist_config_async_with_timeout(
                 Arc::clone(store),
@@ -610,9 +626,7 @@ pub(super) fn release_mutation_locks_before_response(
     trigger_elevated_shutdown: bool,
     shutdown_tx: Option<&watch::Sender<bool>>,
 ) {
-    if trigger_elevated_shutdown
-        && let Some(tx) = shutdown_tx
-    {
+    if trigger_elevated_shutdown && let Some(tx) = shutdown_tx {
         let _ = tx.send(true);
     }
     drop(mutation_guard.take());

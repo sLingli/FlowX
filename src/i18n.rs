@@ -72,7 +72,10 @@ impl Locale {
             let mut valid_q = true;
             for param in parts {
                 let param = param.trim();
-                if let Some(raw_q) = param.strip_prefix("q=").or_else(|| param.strip_prefix("Q=")) {
+                if let Some(raw_q) = param
+                    .strip_prefix("q=")
+                    .or_else(|| param.strip_prefix("Q="))
+                {
                     match raw_q.trim().parse::<f32>() {
                         Ok(w) if w.is_finite() && (0.0..=1.0).contains(&w) => {
                             weight = w;
@@ -93,7 +96,8 @@ impl Locale {
             }
         }
         // 显式 q=0 表示客户端拒绝该语言，不应被选中
-        best.filter(|(weight, _)| *weight > 0.0).map(|(_, locale)| locale)
+        best.filter(|(weight, _)| *weight > 0.0)
+            .map(|(_, locale)| locale)
     }
 
     /// 从进程环境变量按 POSIX 优先级 (`FLOWX_LANG` -> `LC_ALL` -> `LC_MESSAGES` -> `LANG`) 自动探测语言
@@ -192,16 +196,22 @@ fn translate_zh(key: &str) -> &'static str {
         "error.invalid_password" => "代理密码包含非法字符或超出 255 字节限制",
         "error.empty_password" => "新增节点时密码不能为空字符串；若无需密码请留空或不传",
         "error.password_without_username" => "配置代理密码时必须同时提供用户名",
-        "error.username_without_password" => "HTTP/SOCKS5 代理配置用户名时必须同时提供密码（仅 SOCKS4 支持单独配置 UserID）",
+        "error.username_without_password" => {
+            "HTTP/SOCKS5 代理配置用户名时必须同时提供密码（仅 SOCKS4 支持单独配置 UserID）"
+        }
         "error.conflicting_password_options" => "密码参数冲突：清空密码与保留旧密码不可同时启用",
-        "error.conflicting_username_options" => "用户名参数冲突：clear_username 与非空 username 不能同时使用",
+        "error.conflicting_username_options" => {
+            "用户名参数冲突：clear_username 与非空 username 不能同时使用"
+        }
         "error.password_required_on_user_change" => "修改代理用户名时必须提供新密码",
         "error.socks4_password_unsupported" => "SOCKS4 协议仅支持 UserID，不支持密码认证",
         "error.config_persist_failed" => "配置持久化写入磁盘失败，已回滚本次内存变更",
         "error.mutation_overloaded" => "当前配置写入并发过高，请稍后重试",
         "error.missing_node_id" => "缺少节点 ID",
         "error.node_not_found" => "指定的代理节点不存在",
-        "error.node_in_use" => "节点正被路由规则或默认兜底动作引用，禁止删除。请先修改或删除关联配置",
+        "error.node_in_use" => {
+            "节点正被路由规则或默认兜底动作引用，禁止删除。请先修改或删除关联配置"
+        }
         "ping.timeout" => "连接超时 (2000ms)",
         "error.ping_failed" => "节点连通性探测失败",
 
@@ -237,11 +247,17 @@ fn translate_zh(key: &str) -> &'static str {
         "error.invalid_transparent_body" => "透明代理请求体格式无效",
         "error.transparent_invalid_dll_path" => "WinDivert DLL 路径格式无效或包含非法字符",
         "error.transparent_requires_admin" => "开启系统级透明代理需要以管理员身份运行 FlowX",
-        "error.transparent_missing_driver" => "未找到 WinDivert.dll 或 WinDivert64.sys，请将驱动文件置于程序同级目录或指定路径",
+        "error.transparent_missing_driver" => {
+            "未找到 WinDivert.dll 或 WinDivert64.sys，请将驱动文件置于程序同级目录或指定路径"
+        }
         "error.transparent_uac_cancelled" => "管理员提权授权已取消或被系统拒绝",
         "error.transparent_already_elevated" => "当前进程已具备管理员权限",
-        "error.transparent_elevate_in_progress" => "管理员提权重启正在进行中，请完成当前 UAC 授权或等待重启完成",
-        "error.transparent_low_integrity" => "当前进程处于 Windows 低完整性级别（通常源于沙盒或受限目录继承了低完整性标签），无法触发 UAC 提权，请将程序移至普通目录或以管理员终端启动",
+        "error.transparent_elevate_in_progress" => {
+            "管理员提权重启正在进行中，请完成当前 UAC 授权或等待重启完成"
+        }
+        "error.transparent_low_integrity" => {
+            "当前进程处于 Windows 低完整性级别（通常源于沙盒或受限目录继承了低完整性标签），无法触发 UAC 提权，请将程序移至普通目录或以管理员终端启动"
+        }
         "error.transparent_elevate_failed" => "触发管理员提权重启失败",
         "error.transparent_start_failed" => "WinDivert 透明代理启动失败",
         "error.server_shutting_down" => "FlowX 服务正在关闭，暂不接受新的变更请求",
@@ -263,7 +279,9 @@ fn translate_en(key: &str) -> &'static str {
         "error.invalid_host" => "Invalid Host header, local console access only",
         "error.invalid_origin" => "Cross-origin request rejected (Origin validation failed)",
         "error.invalid_fetch_site" => "Cross-site API request rejected (Sec-Fetch-Site)",
-        "error.invalid_referer" => "Cross-site mutation request rejected (Referer validation failed)",
+        "error.invalid_referer" => {
+            "Cross-site mutation request rejected (Referer validation failed)"
+        }
         "error.request_too_large" => "HTTP request body exceeds 1MB limit",
         "error.invalid_content_length" => "Invalid Content-Length header",
         "error.request_read_failed" => "Failed to read HTTP request",
@@ -276,27 +294,57 @@ fn translate_en(key: &str) -> &'static str {
         // Node management
         "error.invalid_node_body" => "Invalid node request payload",
         "error.empty_node_name" => "Node name cannot be empty",
-        "error.invalid_node_name" => "Node name contains invalid control characters or exceeds 255 bytes",
-        "error.unsupported_protocol" => "Unsupported proxy protocol, only SOCKS5 / SOCKS4 / HTTP supported",
-        "error.invalid_node_addr" => "Invalid node server address format, expected IP:Port or Host:Port",
+        "error.invalid_node_name" => {
+            "Node name contains invalid control characters or exceeds 255 bytes"
+        }
+        "error.unsupported_protocol" => {
+            "Unsupported proxy protocol, only SOCKS5 / SOCKS4 / HTTP supported"
+        }
+        "error.invalid_node_addr" => {
+            "Invalid node server address format, expected IP:Port or Host:Port"
+        }
         "error.invalid_node_port" => "Invalid node server address or port",
         "error.node_self_loop" => "Node address cannot point to FlowX internal service ports",
         "error.node_fake_ip" => "Node server address cannot use a Fake-IP reserved address",
-        "error.invalid_username" => "Proxy username contains invalid characters or exceeds 255 bytes",
+        "error.invalid_username" => {
+            "Proxy username contains invalid characters or exceeds 255 bytes"
+        }
         "error.http_username_colon" => "HTTP proxy Basic username cannot contain ':'",
-        "error.invalid_password" => "Proxy password contains invalid characters or exceeds 255 bytes",
-        "error.empty_password" => "Password cannot be empty when creating a node; omit or pass null if unused",
-        "error.password_without_username" => "Proxy password cannot be configured without a username",
-        "error.username_without_password" => "HTTP/SOCKS5 proxy username requires a password (only SOCKS4 allows standalone UserID)",
-        "error.conflicting_password_options" => "Conflicting password options: cannot combine clearing and keeping password",
-        "error.conflicting_username_options" => "Conflicting username options: cannot combine clear_username with a non-empty username",
-        "error.password_required_on_user_change" => "A new password must be provided when changing the proxy username",
-        "error.socks4_password_unsupported" => "SOCKS4 only supports UserID and does not support passwords",
-        "error.config_persist_failed" => "Failed to persist configuration changes to disk; in-memory state rolled back",
-        "error.mutation_overloaded" => "Too many concurrent configuration mutations; please retry later",
+        "error.invalid_password" => {
+            "Proxy password contains invalid characters or exceeds 255 bytes"
+        }
+        "error.empty_password" => {
+            "Password cannot be empty when creating a node; omit or pass null if unused"
+        }
+        "error.password_without_username" => {
+            "Proxy password cannot be configured without a username"
+        }
+        "error.username_without_password" => {
+            "HTTP/SOCKS5 proxy username requires a password (only SOCKS4 allows standalone UserID)"
+        }
+        "error.conflicting_password_options" => {
+            "Conflicting password options: cannot combine clearing and keeping password"
+        }
+        "error.conflicting_username_options" => {
+            "Conflicting username options: cannot combine clear_username with a non-empty username"
+        }
+        "error.password_required_on_user_change" => {
+            "A new password must be provided when changing the proxy username"
+        }
+        "error.socks4_password_unsupported" => {
+            "SOCKS4 only supports UserID and does not support passwords"
+        }
+        "error.config_persist_failed" => {
+            "Failed to persist configuration changes to disk; in-memory state rolled back"
+        }
+        "error.mutation_overloaded" => {
+            "Too many concurrent configuration mutations; please retry later"
+        }
         "error.missing_node_id" => "Node ID is required",
         "error.node_not_found" => "Specified proxy node not found",
-        "error.node_in_use" => "Node is referenced by active rules or default fallback action and cannot be deleted. Please modify or remove related configurations first",
+        "error.node_in_use" => {
+            "Node is referenced by active rules or default fallback action and cannot be deleted. Please modify or remove related configurations first"
+        }
         "ping.timeout" => "Connection timed out (2000ms)",
         "error.ping_failed" => "Node connectivity probe failed",
 
@@ -307,7 +355,9 @@ fn translate_en(key: &str) -> &'static str {
         "error.invalid_rule_action" => "Invalid rule action, only Direct / Block / Proxy supported",
         "error.invalid_app_pattern" => "Invalid application matching syntax",
         "error.invalid_target_pattern" => "Invalid target host/domain matching syntax",
-        "error.invalid_port_format" => "Invalid port format, please use format like 80; 443; 8000-8080",
+        "error.invalid_port_format" => {
+            "Invalid port format, please use format like 80; 443; 8000-8080"
+        }
         "error.missing_rule_id" => "Rule ID is required",
         "error.rule_not_found" => "Routing rule not found",
         "error.invalid_toggle_body" => "Invalid rule toggle request payload",
@@ -315,7 +365,9 @@ fn translate_en(key: &str) -> &'static str {
         "error.invalid_move_direction" => "Move direction only supports up / down / top / bottom",
         "error.invalid_default_action_body" => "Invalid default fallback action request payload",
         "error.invalid_simulate_body" => "Invalid route simulation request payload",
-        "error.invalid_simulate_target" => "Simulation target host cannot be empty and port must be between 1 and 65535",
+        "error.invalid_simulate_target" => {
+            "Simulation target host cannot be empty and port must be between 1 and 65535"
+        }
 
         // Status & Actions
         "status.ok" => "Operational",
@@ -330,16 +382,32 @@ fn translate_en(key: &str) -> &'static str {
         // Transparent proxy
         "error.transparent_unavailable" => "Transparent proxy manager is not initialized",
         "error.invalid_transparent_body" => "Invalid transparent proxy request payload",
-        "error.transparent_invalid_dll_path" => "Invalid WinDivert DLL path format or illegal characters",
-        "error.transparent_requires_admin" => "Transparent proxy requires running FlowX as Administrator",
-        "error.transparent_missing_driver" => "WinDivert.dll or WinDivert64.sys not found; place both files next to flowx.exe or set DllPath",
-        "error.transparent_uac_cancelled" => "Administrator UAC elevation prompt was cancelled or denied",
-        "error.transparent_already_elevated" => "FlowX is already running with Administrator privileges",
-        "error.transparent_elevate_in_progress" => "Administrator elevation relaunch is already in progress",
-        "error.transparent_low_integrity" => "Current process is running at Windows Low Integrity Level (often inherited from a restricted/sandboxed folder) and cannot trigger UAC elevation; move FlowX to a standard directory or run from an Administrator terminal",
+        "error.transparent_invalid_dll_path" => {
+            "Invalid WinDivert DLL path format or illegal characters"
+        }
+        "error.transparent_requires_admin" => {
+            "Transparent proxy requires running FlowX as Administrator"
+        }
+        "error.transparent_missing_driver" => {
+            "WinDivert.dll or WinDivert64.sys not found; place both files next to flowx.exe or set DllPath"
+        }
+        "error.transparent_uac_cancelled" => {
+            "Administrator UAC elevation prompt was cancelled or denied"
+        }
+        "error.transparent_already_elevated" => {
+            "FlowX is already running with Administrator privileges"
+        }
+        "error.transparent_elevate_in_progress" => {
+            "Administrator elevation relaunch is already in progress"
+        }
+        "error.transparent_low_integrity" => {
+            "Current process is running at Windows Low Integrity Level (often inherited from a restricted/sandboxed folder) and cannot trigger UAC elevation; move FlowX to a standard directory or run from an Administrator terminal"
+        }
         "error.transparent_elevate_failed" => "Failed to launch elevated FlowX instance",
         "error.transparent_start_failed" => "Failed to start WinDivert transparent proxy",
-        "error.server_shutting_down" => "FlowX server is shutting down and cannot accept new mutations",
+        "error.server_shutting_down" => {
+            "FlowX server is shutting down and cannot accept new mutations"
+        }
 
         _ => "Unknown error",
     }
@@ -351,31 +419,58 @@ mod tests {
 
     #[test]
     fn test_locale_resolution() {
-        assert_eq!(Locale::from_header_or_query(Some("zh-CN,zh;q=0.9"), None), Locale::Zh);
-        assert_eq!(Locale::from_header_or_query(Some("en-US,en;q=0.9"), None), Locale::En);
-        assert_eq!(Locale::from_header_or_query(None, Some("lang=zh")), Locale::Zh);
-        assert_eq!(Locale::from_header_or_query(None, Some("lang=en")), Locale::En);
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN,zh;q=0.9"), None),
+            Locale::Zh
+        );
+        assert_eq!(
+            Locale::from_header_or_query(Some("en-US,en;q=0.9"), None),
+            Locale::En
+        );
+        assert_eq!(
+            Locale::from_header_or_query(None, Some("lang=zh")),
+            Locale::Zh
+        );
+        assert_eq!(
+            Locale::from_header_or_query(None, Some("lang=en")),
+            Locale::En
+        );
         assert_eq!(Locale::from_header_or_query(None, None), Locale::En);
         // 查询参数优先于请求头
-        assert_eq!(Locale::from_header_or_query(Some("zh-CN"), Some("en-US")), Locale::En);
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN"), Some("en-US")),
+            Locale::En
+        );
         // 不支持的语言回退到默认 En
-        assert_eq!(Locale::from_header_or_query(Some("fr-FR,fr;q=0.9"), None), Locale::En);
+        assert_eq!(
+            Locale::from_header_or_query(Some("fr-FR,fr;q=0.9"), None),
+            Locale::En
+        );
         // q 权重：en 权重更高时不应因为 zh 出现在前面而误选 zh
         assert_eq!(
             Locale::from_header_or_query(Some("zh-CN;q=0.1,en-US;q=0.9"), None),
             Locale::En
         );
         // q=0 表示客户端拒绝该语言
-        assert_eq!(Locale::from_header_or_query(Some("zh-CN;q=0,en-US;q=0.8"), None), Locale::En);
+        assert_eq!(
+            Locale::from_header_or_query(Some("zh-CN;q=0,en-US;q=0.8"), None),
+            Locale::En
+        );
         // 查询参数为裸语言标记（不强制要求 lang= 前缀）
-        assert_eq!(Locale::from_header_or_query(None, Some("zh-cn")), Locale::Zh);
+        assert_eq!(
+            Locale::from_header_or_query(None, Some("zh-cn")),
+            Locale::Zh
+        );
     }
 
     #[test]
     fn test_action_placeholders_present() {
         for locale in [Locale::Zh, Locale::En] {
             for key in ["action.proxy_prefix", "action.chain_prefix"] {
-                assert!(t(locale, key).contains("{}"), "missing placeholder for {key}");
+                assert!(
+                    t(locale, key).contains("{}"),
+                    "missing placeholder for {key}"
+                );
             }
         }
     }
@@ -383,7 +478,10 @@ mod tests {
     #[test]
     fn test_translation_keys() {
         assert_eq!(t(Locale::Zh, "error.missing_conn_id"), "缺少连接 ID");
-        assert_eq!(t(Locale::En, "error.missing_conn_id"), "Connection ID is required");
+        assert_eq!(
+            t(Locale::En, "error.missing_conn_id"),
+            "Connection ID is required"
+        );
         assert_eq!(t(Locale::Zh, "status.ok"), "运行正常");
         assert_eq!(t(Locale::En, "status.ok"), "Operational");
 

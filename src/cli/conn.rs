@@ -1,10 +1,10 @@
 use std::io::Write;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::cli::args::{parse_flags_with_spec, resolve_id_arg, ArgSpec, GlobalCliOpts};
-use crate::cli::http_client::{api_request_strict, ensure_api_ok, SilentExitError};
+use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec, resolve_id_arg};
+use crate::cli::http_client::{SilentExitError, api_request_strict, ensure_api_ok};
 
 pub(super) async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
     if opts.offline {
@@ -93,8 +93,11 @@ pub(super) async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 1,
                 },
             )?;
-            let id_str =
-                resolve_id_arg(&pos, &flags, "Missing connection <ID> for `flowx conn kill`")?;
+            let id_str = resolve_id_arg(
+                &pos,
+                &flags,
+                "Missing connection <ID> for `flowx conn kill`",
+            )?;
             let id: u64 = id_str.parse().context("Invalid connection ID")?;
             let (st, val) = api_request_strict(
                 &opts.api_addr,

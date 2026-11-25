@@ -5,12 +5,12 @@ use std::thread::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::dns::server::DnsServer;
-use crate::interceptor::dispatcher::{dispatch_transparent_stream, DispatcherConfig};
+use crate::interceptor::dispatcher::{DispatcherConfig, dispatch_transparent_stream};
 
 use super::platform::{flush_dns_cache, is_process_elevated};
 use super::{
-    dns_hijack, fragment, netstack, pid_table, windivert_ffi, TransparentSettings,
-    TransparentStatsCounters,
+    TransparentSettings, TransparentStatsCounters, dns_hijack, fragment, netstack, pid_table,
+    windivert_ffi,
 };
 
 fn resolve_outbound_pid(
@@ -230,7 +230,9 @@ impl NetRxContext {
                     self.emit_passthrough(raw, addr, fallback_fragments);
                 }
                 dns_hijack::UdpDecision::DropQuic => {
-                    self.stats.quic_blocked_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .quic_blocked_total
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 dns_hijack::UdpDecision::DropFakeIp => {}
                 dns_hijack::UdpDecision::InspectDns => {
@@ -246,7 +248,9 @@ impl NetRxContext {
                     self.emit_passthrough(raw, addr, fallback_fragments);
                 }
                 dns_hijack::UdpDecision::HandleDns => {
-                    self.stats.dns_hijacked_total.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .dns_hijacked_total
+                        .fetch_add(1, Ordering::Relaxed);
                     let owned_payload = udp.payload.to_vec();
                     let req_meta = (
                         udp.src_ip,
@@ -295,12 +299,13 @@ impl NetRxContext {
                             if let Ok(mut reply_ip) =
                                 dns_hijack::build_udp_reply_ip_packet(&pseudo_req, &resp_payload)
                             {
-                                let mut inj_addr = windivert_ffi::WinDivertAddress::inbound_injection(
-                                    net_data.if_idx,
-                                    net_data.sub_if_idx,
-                                    loopback,
-                                    req_meta.4,
-                                );
+                                let mut inj_addr =
+                                    windivert_ffi::WinDivertAddress::inbound_injection(
+                                        net_data.if_idx,
+                                        net_data.sub_if_idx,
+                                        loopback,
+                                        req_meta.4,
+                                    );
                                 net_inj.calc_checksums(&mut reply_ip, &mut inj_addr);
                                 let _ = net_inj.send(&reply_ip, &inj_addr);
                             }
@@ -327,7 +332,8 @@ impl NetRxContext {
             }
             let local_ep = std::net::SocketAddr::new(tcp.src_ip, tcp.src_port);
             let remote_ep = std::net::SocketAddr::new(tcp.dst_ip, tcp.dst_port);
-            let pid = resolve_outbound_pid(&self.table, 6, local_ep, remote_ep, tcp.syn && !tcp.ack);
+            let pid =
+                resolve_outbound_pid(&self.table, 6, local_ep, remote_ep, tcp.syn && !tcp.ack);
             if pid.is_some_and(pid_table::SocketPidTable::is_self_pid) {
                 self.stats
                     .tcp_passthrough_total
@@ -391,8 +397,7 @@ pub(super) fn start_windivert_runtime(
     // 在打开 WinDivert 句柄前即置位 transparent_active，消除并发出站连接/UDP DNS 跳过 BypassPortRegistry 登记的 TOCTOU 窗口
     let mut active_startup_guard = TransparentActiveStartupGuard::activate();
 
-    let socket_filter =
-        "(tcp or udp) and (event == BIND or event == CONNECT or event == LISTEN or event == ACCEPT or event == CLOSE)";
+    let socket_filter = "(tcp or udp) and (event == BIND or event == CONNECT or event == LISTEN or event == ACCEPT or event == CLOSE)";
     let socket_handle = Arc::new(
         windivert_ffi::WinDivertHandle::open(
             Arc::clone(&api),

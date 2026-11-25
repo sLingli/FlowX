@@ -1,4 +1,4 @@
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
@@ -8,8 +8,7 @@ use windows_sys::Win32::Foundation::{
     FreeLibrary, GetLastError, HANDLE, HMODULE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
-    LOAD_LIBRARY_SEARCH_SYSTEM32,
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 
 pub const WINDIVERT_FLAG_SNIFF: u64 = 0x0001;
@@ -278,29 +277,18 @@ impl WinDivertAddress {
             ..Self::default()
         };
         addr.set_outbound(true);
-        addr.union_data.network = WinDivertDataNetwork {
-            if_idx,
-            sub_if_idx,
-        };
+        addr.union_data.network = WinDivertDataNetwork { if_idx, sub_if_idx };
         addr
     }
 
     /// 构造用于入站注入的干净 NETWORK 层地址（保留原接口索引与 loopback/ipv6 标志，Outbound = false）
-    pub fn inbound_injection(
-        if_idx: u32,
-        sub_if_idx: u32,
-        loopback: bool,
-        ipv6: bool,
-    ) -> Self {
+    pub fn inbound_injection(if_idx: u32, sub_if_idx: u32, loopback: bool, ipv6: bool) -> Self {
         let mut addr = Self::default();
         addr.set_outbound(false);
         addr.set_loopback(loopback);
         addr.set_impostor(false);
         addr.set_ipv6(ipv6);
-        addr.union_data.network = WinDivertDataNetwork {
-            if_idx,
-            sub_if_idx,
-        };
+        addr.union_data.network = WinDivertDataNetwork { if_idx, sub_if_idx };
         addr
     }
 
@@ -329,12 +317,8 @@ pub fn decode_windivert_addr(raw: &[u32; 4], is_ipv6: bool) -> IpAddr {
     IpAddr::V6(Ipv6Addr::from(v)).to_canonical()
 }
 
-type FnWinDivertOpen = unsafe extern "C" fn(
-    filter: *const i8,
-    layer: u32,
-    priority: i16,
-    flags: u64,
-) -> HANDLE;
+type FnWinDivertOpen =
+    unsafe extern "C" fn(filter: *const i8, layer: u32, priority: i16, flags: u64) -> HANDLE;
 type FnWinDivertRecv = unsafe extern "C" fn(
     handle: HANDLE,
     p_packet: *mut c_void,
@@ -419,7 +403,10 @@ pub(crate) fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
     Some(cand)
 }
 
-fn locate_windivert_in_candidates(candidates: Vec<PathBuf>, sys_name: &str) -> WinDivertAvailability {
+fn locate_windivert_in_candidates(
+    candidates: Vec<PathBuf>,
+    sys_name: &str,
+) -> WinDivertAvailability {
     let mut searched_dirs = Vec::new();
     let mut partial: Option<(Option<PathBuf>, Option<PathBuf>)> = None;
 
@@ -449,10 +436,7 @@ fn locate_windivert_in_candidates(candidates: Vec<PathBuf>, sys_name: &str) -> W
         }
 
         if partial.is_none() && (dll_ok || sys_ok) {
-            partial = Some((
-                dll_ok.then_some(abs_dll),
-                sys_ok.then_some(sys_cand),
-            ));
+            partial = Some((dll_ok.then_some(abs_dll), sys_ok.then_some(sys_cand)));
         }
     }
 
@@ -527,7 +511,10 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 
 unsafe fn load_proc<T>(module: HMODULE, name: &str) -> io::Result<T> {
     let cname = CString::new(name).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, format!("invalid symbol name: {name}"))
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid symbol name: {name}"),
+        )
     })?;
     let proc = unsafe { GetProcAddress(module, cname.as_ptr() as *const u8) };
     match proc {
@@ -641,7 +628,10 @@ impl WinDivertHandle {
         flags: u64,
     ) -> io::Result<Self> {
         let c_filter = CString::new(filter).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "WinDivert filter contains interior NUL")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "WinDivert filter contains interior NUL",
+            )
         })?;
         let handle = unsafe { (api.fn_open)(c_filter.as_ptr(), layer as u32, priority, flags) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
@@ -862,7 +852,11 @@ mod tests {
         let root = std::env::current_dir()
             .unwrap()
             .join("target")
-            .join(format!("flowx_windivert_pair_{}_{}", std::process::id(), nonce));
+            .join(format!(
+                "flowx_windivert_pair_{}_{}",
+                std::process::id(),
+                nonce
+            ));
         let _clean = CleanDir(root.clone());
         let dir_dll_only = root.join("dll_only");
         let dir_sys_only = root.join("sys_only");
@@ -914,7 +908,13 @@ mod tests {
         assert!(paired.sys_found);
         assert_eq!(
             paired.dll_path.as_deref(),
-            Some(dir_paired.join("WinDivert.dll").display().to_string().as_str())
+            Some(
+                dir_paired
+                    .join("WinDivert.dll")
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
         );
         assert_eq!(
             paired.sys_path.as_deref(),

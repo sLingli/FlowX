@@ -5,8 +5,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::monitor::ActiveConnection;
 
-use super::relay::{await_relay_with_watchdog, record_activity_us};
 use super::RelayStream;
+use super::relay::{await_relay_with_watchdog, record_activity_us};
 
 /// Trim HTTP optional whitespace (`SP` and `HTAB`, per RFC 9110) without stripping Unicode whitespace.
 pub(crate) fn trim_http_ows(s: &str) -> &str {
@@ -116,7 +116,10 @@ impl<R: AsyncRead + Unpin> PrefixedTcpReader<R> {
 
     /// 读取以 `\r\n\r\n` 结束的 HTTP 头部块（不包含末尾 `\r\n\r\n`），严格受限于 `max_bytes`
     /// 若在首字节前即遇到 clean EOF，则返回 `Ok(None)`
-    async fn read_http_header_block(&mut self, max_bytes: usize) -> std::io::Result<Option<Vec<u8>>> {
+    async fn read_http_header_block(
+        &mut self,
+        max_bytes: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         let mut tmp = [0u8; 4096];
         let mut scanned_len = 0usize;
         loop {
@@ -484,9 +487,7 @@ pub(super) fn parse_and_rewrite_http_response_head(
             for part in v.split(',') {
                 let coding = trim_http_ows(part).to_ascii_lowercase();
                 if coding.is_empty() || !coding.bytes().all(crate::inbound::is_http_token_byte) {
-                    return Err(invalid(
-                        "Invalid Transfer-Encoding coding in HTTP response",
-                    ));
+                    return Err(invalid("Invalid Transfer-Encoding coding in HTTP response"));
                 }
                 te_codings.push(coding);
             }
@@ -511,14 +512,19 @@ pub(super) fn parse_and_rewrite_http_response_head(
             "HTTP response contains both Content-Length and Transfer-Encoding",
         ));
     }
-    let chunked_count = te_codings.iter().filter(|c| c.as_str() == "chunked").count();
+    let chunked_count = te_codings
+        .iter()
+        .filter(|c| c.as_str() == "chunked")
+        .count();
     let is_chunked = if chunked_count > 1 {
         return Err(invalid(
             "Duplicate chunked coding in response Transfer-Encoding",
         ));
     } else if chunked_count == 1 {
         if te_codings.last().map(|s| s.as_str()) != Some("chunked") {
-            return Err(invalid("chunked must be the final Transfer-Encoding coding"));
+            return Err(invalid(
+                "chunked must be the final Transfer-Encoding coding",
+            ));
         }
         true
     } else {
