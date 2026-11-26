@@ -680,10 +680,24 @@ async fn persist_config_async_with_timeout(
         rule_engine,
         transparent.as_ref(),
     );
-    let handle = tokio::task::spawn_blocking(move || store.save_profile(&cfg));
-    tokio::time::timeout(timeout, handle)
-        .await
-        .with_context(|| format!("Configuration persistence timed out after {:?}", timeout))?
-        .context("Configuration persistence background task failed")??;
-    Ok(())
+    let cancel_token = Arc::new(crate::config::PersistCancelToken::new());
+    let token_for_task = Arc::clone(&cancel_token);
+    let mut handle =
+        tokio::task::spawn_blocking(move || store.save_profile_cancellable(&cfg, &token_for_task));
+    match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(join_res) => {
+            join_res.context("Configuration persistence background task failed")??;
+            Ok(())
+        }
+        Err(_) => {
+            if cancel_token.try_cancel() {
+                anyhow::bail!("Configuration persistence timed out after {:?}", timeout);
+            }
+            // 后台写盘线程已跨过提交闸门进入最终原子 rename：等待其完成以确保内存状态与磁盘严格一致
+            handle
+                .await
+                .context("Configuration persistence background task failed")??;
+            Ok(())
+        }
+    }
 }

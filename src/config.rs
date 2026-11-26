@@ -561,6 +561,53 @@ pub(crate) fn has_control_or_oversize(s: &str, max_bytes: usize) -> bool {
     s.chars().any(char::is_control) || s.len() > max_bytes
 }
 
+/// 配置文件原子落盘取消/提交态仲裁令牌，防止异步超时回滚后的延迟阻塞写盘覆盖 `flowx.xml`
+pub(crate) struct PersistCancelToken {
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl PersistCancelToken {
+    const PENDING: u8 = 0;
+    const COMMITTING: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            state: std::sync::atomic::AtomicU8::new(Self::PENDING),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    /// 异步侧超时时尝试取消落盘：返回 `true` 表示已成功拦截（后台线程绝不会执行最终 rename）；
+    /// 返回 `false` 表示后台线程已进入最终提交态，调用方应等待其落盘完成以保持内存与磁盘一致。
+    pub(crate) fn try_cancel(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::PENDING,
+                Self::CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// 阻塞写盘线程在执行最终 `rename` 前的原子提交闸门：返回 `false` 表示调用方已超时取消。
+    fn try_begin_commit(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::PENDING,
+                Self::COMMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 /// 配置文件存储管理器：负责 XML 加载与原子回写持久化
 pub struct ConfigStore {
     pub path: PathBuf,
@@ -736,7 +783,28 @@ impl ConfigStore {
     pub fn save_profile(&self, cfg: &ProfileConfig) -> Result<()> {
         let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _file_lock = self.acquire_cross_process_lock()?;
-        self.write_config_atomic(cfg)
+        self.write_config_atomic_inner(cfg, None)
+    }
+
+    /// 带取消仲裁令牌的原子写盘：若异步侧已超时取消，在获取锁后及最终 `rename` 临界点前中止写入并清理临时文件，
+    /// 彻底杜绝已回滚的旧配置快照延迟落盘或覆盖后续新配置。
+    pub(crate) fn save_profile_cancellable(
+        &self,
+        cfg: &ProfileConfig,
+        cancel_token: &PersistCancelToken,
+    ) -> Result<()> {
+        if cancel_token.is_cancelled() {
+            bail!("Configuration persistence cancelled before acquiring save lock");
+        }
+        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel_token.is_cancelled() {
+            bail!("Configuration persistence cancelled after waiting for save lock");
+        }
+        let _file_lock = self.acquire_cross_process_lock()?;
+        if cancel_token.is_cancelled() {
+            bail!("Configuration persistence cancelled after acquiring file lock");
+        }
+        self.write_config_atomic_inner(cfg, Some(cancel_token))
     }
 
     /// 串行化读取当前内存快照并原子写回 XML 文件
@@ -761,6 +829,14 @@ impl ConfigStore {
     }
 
     fn write_config_atomic(&self, cfg: &ProfileConfig) -> Result<()> {
+        self.write_config_atomic_inner(cfg, None)
+    }
+
+    fn write_config_atomic_inner(
+        &self,
+        cfg: &ProfileConfig,
+        cancel_token: Option<&PersistCancelToken>,
+    ) -> Result<()> {
         let xml = cfg.to_xml()?;
         let parent_dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(parent) = parent_dir {
@@ -810,6 +886,13 @@ impl ConfigStore {
         if let Err(e) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e);
+        }
+
+        if let Some(token) = cancel_token
+            && !token.try_begin_commit()
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            bail!("Configuration persistence cancelled before atomic replace");
         }
 
         if let Err(e) = rename_with_windows_retry(&tmp_path, &self.path) {

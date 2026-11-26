@@ -632,10 +632,41 @@ mod tests {
 
         let _ = release_tx.send(());
         let _ = blocker_thread.join();
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        // 确认已超时回滚的暂存快照绝不会在锁释放后延迟覆盖磁盘配置
+        let on_disk_after_unlock = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(
+            !on_disk_after_unlock.contains("flood-"),
+            "timed-out rolled-back snapshots must never be written to disk after lock release: {on_disk_after_unlock}"
+        );
+
+        // 锁释放后的新配置变更必须正常落盘且不被先前已取消的任务覆写
+        let fresh_body = r#"{"name":"post-recovery","protocol":"SOCKS5","server_addr":"10.0.0.10:1080"}"#;
+        let r_fresh = raw_http(
+            api_addr,
+            &format!(
+                "POST /api/nodes HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                api_port,
+                fresh_body.len(),
+                fresh_body
+            ),
+        )
+        .await;
+        assert!(r_fresh.starts_with("HTTP/1.1 200 OK"), "fresh: {r_fresh}");
+        let on_disk_after_fresh = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(on_disk_after_fresh.contains("post-recovery"));
+        assert!(!on_disk_after_fresh.contains("flood-"));
+
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_file(&cfg_path);
+        let _ = std::fs::remove_file(
+            cfg_path
+                .parent()
+                .unwrap()
+                .join(format!(".{}.lock", cfg_path.file_name().unwrap().to_string_lossy())),
+        );
     }
 
     #[tokio::test]

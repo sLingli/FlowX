@@ -66,33 +66,46 @@ pub(crate) fn process_integrity_rid() -> Option<u32> {
             CloseHandle(token);
             return None;
         }
-        let mut buf = vec![0u8; ret_len as usize];
+        let buf_words = (ret_len as usize).div_ceil(std::mem::size_of::<u64>());
+        let mut buf = vec![0u64; buf_words];
+        let buf_bytes = buf.len().saturating_mul(std::mem::size_of::<u64>());
+        let Ok(buf_bytes_u32) = u32::try_from(buf_bytes) else {
+            CloseHandle(token);
+            return None;
+        };
         let ok = GetTokenInformation(
             token,
             TokenIntegrityLevel,
             buf.as_mut_ptr().cast::<c_void>(),
-            ret_len,
+            buf_bytes_u32,
             &mut ret_len,
         );
         CloseHandle(token);
-        if ok == 0 || (ret_len as usize) < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+        if ok == 0
+            || (ret_len as usize) < std::mem::size_of::<TOKEN_MANDATORY_LABEL>()
+            || (ret_len as usize) > buf_bytes
+        {
             return None;
         }
-        let label = &*(buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
+        let label = std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
         let sid = label.Label.Sid;
         if sid.is_null() || IsValidSid(sid) == 0 {
             return None;
         }
         let count_ptr = GetSidSubAuthorityCount(sid);
-        if count_ptr.is_null() || *count_ptr == 0 {
+        if count_ptr.is_null() {
             return None;
         }
-        let last_idx = u32::from(*count_ptr - 1);
+        let count = std::ptr::read_unaligned(count_ptr);
+        if count == 0 {
+            return None;
+        }
+        let last_idx = u32::from(count - 1);
         let rid_ptr = GetSidSubAuthority(sid, last_idx);
         if rid_ptr.is_null() {
             return None;
         }
-        Some(*rid_ptr)
+        Some(std::ptr::read_unaligned(rid_ptr))
     }
 }
 

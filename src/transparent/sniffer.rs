@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-const MAX_SNIFF_BYTES: usize = 32_768;
+const MAX_SNIFF_BYTES: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SniffOutcome {
@@ -180,7 +180,7 @@ fn parse_http_host_value(raw_val: &str) -> Option<String> {
 
 fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
     // 扫描请求头直至空行（\r\n\r\n），校验端口合法性、拒绝行内孤立 \r、obs-fold 续行与重复 Host 冲突；
-    // 若超大 Cookie/Authorization 请求头超出 MAX_SNIFF_BYTES 且已合法唯一捕获到 Host，则按已校验结果返回
+    // 仅在完整见到头部结束空行时才返回 Found(host)，防止超过 MAX_SNIFF_BYTES 时绕过后续重复 Host 或末端残片检查
     let mut start = 0usize;
     let mut is_request_line = true;
     let mut header_end = false;
@@ -228,11 +228,13 @@ fn parse_http_host_header(buf: &[u8]) -> SniffProbe {
         }
     }
 
-    if header_end || buf.len() >= MAX_SNIFF_BYTES {
+    if header_end {
         match found_host {
             Some(host) => SniffProbe::Found(host),
             None => SniffProbe::NotMatchable,
         }
+    } else if buf.len() >= MAX_SNIFF_BYTES {
+        SniffProbe::NotMatchable
     } else {
         SniffProbe::NeedMore
     }
@@ -641,21 +643,45 @@ mod tests {
         assert!(!out_ok.timed_out);
         assert_eq!(out_ok.buffered, good_req);
 
-        // 超长 Cookie 请求头（超过 8192B 与超过 MAX_SNIFF_BYTES）已合法解析到 Host 时仍应返回捕获到的 Host
-        let huge_cookie = "c".repeat(MAX_SNIFF_BYTES + 2048);
-        let huge_req = format!(
-            "GET /sso HTTP/1.1\r\nHost: huge-cookie.example\r\nCookie: tok={huge_cookie}\r\n\r\n"
+        // 1. 合法超大 Cookie 请求头（超过 32 KiB 但在 64 KiB 上限内且见到完整 \r\n\r\n）应正常提取 Host
+        let large_cookie = "c".repeat(40_960);
+        let large_req = format!(
+            "GET /sso HTTP/1.1\r\nHost: huge-cookie.example\r\nCookie: tok={large_cookie}\r\n\r\n"
         );
-        let (mut c_huge, mut s_huge) = tokio::io::duplex(MAX_SNIFF_BYTES + 4096);
-        let req_bytes = huge_req.into_bytes();
+        let large_bytes = large_req.into_bytes();
+        assert!(large_bytes.len() > 32_768 && large_bytes.len() < MAX_SNIFF_BYTES);
+        let (mut c_large, mut s_large) = tokio::io::duplex(MAX_SNIFF_BYTES + 4096);
+        let write_large = large_bytes.clone();
+        let w_large = tokio::spawn(async move {
+            let _ = c_large.write_all(&write_large).await;
+        });
+        let out_large = peek_host_prefix(&mut s_large, Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert_eq!(out_large.host.as_deref(), Some("huge-cookie.example"));
+        assert!(!out_large.timed_out);
+        assert_eq!(out_large.buffered, large_bytes);
+        drop(s_large);
+        let _ = w_large.await;
+
+        // 2. 超过 MAX_SNIFF_BYTES (64 KiB) 仍未见完整空行（含截断后隐藏冲突重复 Host 的走私请求）必须退回 NotMatchable (None)
+        let huge_cookie = "c".repeat(MAX_SNIFF_BYTES + 2048);
+        let smuggle_req = format!(
+            "GET /sso HTTP/1.1\r\nHost: benign.example\r\nCookie: tok={huge_cookie}\r\nHost: evil.example\r\n\r\n"
+        );
+        let (mut c_huge, mut s_huge) = tokio::io::duplex(MAX_SNIFF_BYTES + 8192);
+        let req_bytes = smuggle_req.into_bytes();
         let write_bytes = req_bytes.clone();
         let w = tokio::spawn(async move {
             let _ = c_huge.write_all(&write_bytes).await;
         });
-        let out_huge = peek_host_prefix(&mut s_huge, Duration::from_millis(300))
+        let out_huge = peek_host_prefix(&mut s_huge, Duration::from_millis(500))
             .await
             .unwrap();
-        assert_eq!(out_huge.host.as_deref(), Some("huge-cookie.example"));
+        assert_eq!(
+            out_huge.host, None,
+            "oversized incomplete HTTP header past MAX_SNIFF_BYTES must not return early Found(host)"
+        );
         assert!(!out_huge.timed_out);
         assert_eq!(out_huge.buffered.len(), MAX_SNIFF_BYTES);
         assert_eq!(out_huge.buffered.as_slice(), &req_bytes[..MAX_SNIFF_BYTES]);
