@@ -354,8 +354,24 @@ pub struct WinDivertAvailability {
     pub searched_dirs: Vec<String>,
 }
 
+fn has_invalid_windows_component_chars(path: &Path) -> bool {
+    for comp in path.components() {
+        if let std::path::Component::Normal(part) = comp {
+            let Some(s) = part.to_str() else {
+                return true;
+            };
+            if s.chars()
+                .any(|c| c.is_control() || matches!(c, '"' | '<' | '>' | '|' | '*' | '?' | ':'))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn is_trusted_local_absolute_path(path: &Path) -> bool {
-    if !path.is_absolute() {
+    if !path.is_absolute() || has_invalid_windows_component_chars(path) {
         return false;
     }
     let mut has_disk_prefix = false;
@@ -380,11 +396,39 @@ pub(crate) fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
     if trimmed.is_empty() {
         return None;
     }
-    let pb = PathBuf::from(trimmed);
+    let has_trailing_sep = trimmed.ends_with('\\') || trimmed.ends_with('/');
+    let normalized = if has_trailing_sep {
+        let stripped = trimmed.trim_end_matches(['\\', '/']);
+        if stripped.is_empty() {
+            return None;
+        }
+        // 驱动器根目录（如 `C:\` 或 `\\?\C:\`）须保留尾部 `\`，否则 `C:` 变成相对路径
+        if stripped.ends_with(':') {
+            format!("{stripped}\\")
+        } else {
+            stripped.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    let pb = PathBuf::from(&normalized);
     if !is_trusted_local_absolute_path(&pb) {
         return None;
     }
-    let cand = if pb.is_dir()
+
+    let cand = if has_trailing_sep {
+        // 显式以 `\` 或 `/` 结尾表示目录：拒绝 `...\WinDivert.dll\` 等把 DLL 文件误加尾斜杠的路径
+        // （除非磁盘上确实存在同名目录）；支持未提前创建的含点号目录（如 `C:\WinDivert-2.2.2-A\`）
+        if pb
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("WinDivert.dll"))
+            && !pb.is_dir()
+        {
+            return None;
+        }
+        pb.join("WinDivert.dll")
+    } else if pb.is_dir()
         || (pb.extension().is_none()
             && !pb
                 .file_name()
@@ -394,6 +438,7 @@ pub(crate) fn resolve_candidate_dll_path(raw: &str) -> Option<PathBuf> {
     } else {
         pb
     };
+
     if !cand
         .file_name()
         .is_some_and(|n| n.eq_ignore_ascii_case("WinDivert.dll"))
@@ -958,5 +1003,29 @@ mod tests {
             resolve_candidate_dll_path(r"C:\FlowX\driver"),
             Some(PathBuf::from(r"C:\FlowX\driver\WinDivert.dll"))
         );
+        // P2-3 回归：末尾斜杠目录（含点号版本号目录、根目录、Verbatim 前缀）、误加斜杠的 WinDivert.dll\ 及非法字符
+        assert_eq!(
+            resolve_candidate_dll_path(r"C:\WinDivert-2.2.2-A\"),
+            Some(PathBuf::from(r"C:\WinDivert-2.2.2-A").join("WinDivert.dll"))
+        );
+        assert_eq!(
+            resolve_candidate_dll_path(r"C:\WinDivert-2.2.2-A/x64/"),
+            Some(PathBuf::from(r"C:\WinDivert-2.2.2-A/x64").join("WinDivert.dll"))
+        );
+        assert_eq!(
+            resolve_candidate_dll_path(r"C:\"),
+            Some(PathBuf::from(r"C:\").join("WinDivert.dll"))
+        );
+        assert_eq!(
+            resolve_candidate_dll_path(r"\\?\C:\WinDivert-2.2.2-A\"),
+            Some(PathBuf::from(r"\\?\C:\WinDivert-2.2.2-A").join("WinDivert.dll"))
+        );
+        assert!(resolve_candidate_dll_path(r"C:\tools\WinDivert.dll\").is_none());
+        assert!(resolve_candidate_dll_path(r"C:\tools\WinDivert.dll/").is_none());
+        assert!(resolve_candidate_dll_path(r#"C:\WinDivert""#).is_none());
+        assert!(resolve_candidate_dll_path(r"C:\bad|dir\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"C:\bad?dir\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"C:\bad*dir\WinDivert.dll").is_none());
+        assert!(resolve_candidate_dll_path(r"C:\bad:dir\WinDivert.dll").is_none());
     }
 }

@@ -91,17 +91,33 @@ impl DomainMatcher {
         }
     }
 
-    /// 判断域名匹配器是否仅针对本机自身标识（如 `localhost`、`*.localhost` 或当前主机名），
+    /// 判断域名匹配器是否仅针对本机自身标识（如 `localhost`、`*.localhost`、`*.sub.localhost`、当前主机名或其子域），
     /// 用于在访问公网单播 IP 时跳过不必要的 SNI/Host 嗅探，避免 `LocalBypass` 拖慢或污染透明代理。
     pub fn is_host_local(&self, local_hostname: &str) -> bool {
         let host_norm = local_hostname.trim().trim_end_matches('.');
-        match self {
-            DomainMatcher::Exact(exact) => {
-                exact.eq_ignore_ascii_case("localhost")
-                    || exact.ends_with(".localhost")
-                    || (!host_norm.is_empty() && exact.eq_ignore_ascii_case(host_norm))
+        let is_local_domain = |raw: &str| -> bool {
+            let n = raw.trim().trim_end_matches('.');
+            let nb = n.as_bytes();
+            let localhost_suffix = b".localhost";
+            if nb.eq_ignore_ascii_case(b"localhost")
+                || (nb.len() > localhost_suffix.len()
+                    && nb[nb.len() - localhost_suffix.len()..]
+                        .eq_ignore_ascii_case(localhost_suffix))
+            {
+                return true;
             }
-            DomainMatcher::Suffix(suffix) => suffix.eq_ignore_ascii_case("localhost"),
+            if host_norm.is_empty() {
+                return false;
+            }
+            let hb = host_norm.as_bytes();
+            nb.eq_ignore_ascii_case(hb)
+                || (nb.len() > hb.len() + 1
+                    && nb[nb.len() - hb.len() - 1] == b'.'
+                    && nb[nb.len() - hb.len()..].eq_ignore_ascii_case(hb))
+        };
+        match self {
+            DomainMatcher::Exact(exact) => is_local_domain(exact),
+            DomainMatcher::Suffix(suffix) => is_local_domain(suffix),
             DomainMatcher::Pattern(_) => false,
         }
     }
@@ -460,11 +476,30 @@ mod tests {
         assert!(!domains.iter().any(|d| d.matches("notlocal")));
         assert!(!domains.iter().any(|d| d.matches("evil.com")));
 
-        // 仅含 %HOSTNAME% 的存量规则展开后必须被识别为本机域名，不会对公网 IP 误触发 NeedsDomainSniff
-        let (legacy_domains, _) = parse_targets_with_hostname("%HOSTNAME%", Some("my-workstation"));
+        // 仅含 %HOSTNAME% 及其子域/通配变体与 *.sub.localhost 展开后必须被识别为本机域名，不会对公网 IP 误触发 NeedsDomainSniff
+        let (legacy_domains, _) = parse_targets_with_hostname(
+            "%HOSTNAME%; *.%HOSTNAME%; sub.%HOSTNAME%; *.sub.%HOSTNAME%; *.sub.localhost",
+            Some("my-workstation"),
+        );
         let legacy_domains = legacy_domains.unwrap();
-        assert_eq!(legacy_domains.len(), 1);
-        assert!(legacy_domains[0].is_host_local("my-workstation"));
+        assert_eq!(legacy_domains.len(), 5);
+        for d in &legacy_domains {
+            assert!(
+                d.is_host_local("my-workstation"),
+                "expected host-local matcher for {:?}",
+                d
+            );
+        }
+        assert!(
+            !DomainMatcher::parse("notmy-workstation")
+                .unwrap()
+                .is_host_local("my-workstation")
+        );
+        assert!(
+            !DomainMatcher::parse("*.notmy-workstation")
+                .unwrap()
+                .is_host_local("my-workstation")
+        );
 
         // P1-4 回归 1：主机名注入分号与通配符绝不可拆分注入 `*.evil.com`
         let (inj_domains, inj_subnets) = parse_targets_with_hostname(

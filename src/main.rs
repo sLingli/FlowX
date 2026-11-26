@@ -64,6 +64,7 @@ mod entry {
         }
 
         async fn stop_async(&mut self) {
+            self.mgr.mark_shutting_down();
             if self.stopped {
                 return;
             }
@@ -75,6 +76,7 @@ mod entry {
 
     impl Drop for TransparentStopGuard {
         fn drop(&mut self) {
+            self.mgr.mark_shutting_down();
             if !self.stopped {
                 self.stopped = true;
                 self.mgr.stop();
@@ -227,6 +229,10 @@ mod entry {
         .with_shutdown_sender(shutdown_tx.clone());
         let api_listener = api_server.bind().await?;
 
+        // 5.5 在启动透明代理前提前注册 Windows 5 路控制台停机信号并持续保活至停机排空全部完成，
+        // 避免启动期或首次 Ctrl+C 排空期间收到关闭/二次 Ctrl+C 时绕过 WinDivert 停止与 DNS 缓存清理。
+        let mut os_signals = WindowsShutdownSignals::register()?;
+
         // 6. 若配置或启动参数开启了透明代理，则尝试加载 WinDivert 驱动；失败时保留守护进程并记录诊断供前端修复
         if transparent_mgr.settings().enabled {
             let t_mgr = Arc::clone(&transparent_mgr);
@@ -340,7 +346,7 @@ mod entry {
         let wait_result = wait_for_shutdown_or_core_exit(
             &mut core_tasks,
             &mut main_shutdown_rx,
-            wait_for_shutdown_signal(),
+            os_signals.recv(),
         )
         .await;
 
@@ -351,8 +357,19 @@ mod entry {
             Err(err) => (true, true, Some(err)),
         };
 
-        // 优先通知核心服务停机并立刻关闭 WinDivert + 冲刷系统 DNS 缓存，确保在 Windows 关窗/注销超时前消除 Fake-IP 残留
+        // 优先通知核心服务停机、封锁透明代理重启并立刻关闭 WinDivert + 冲刷系统 DNS 缓存，
+        // 确保在 Windows 关窗/注销超时前消除 Fake-IP 残留且杜绝排空期回滚重新拉起驱动
         let _ = shutdown_tx.send(true);
+        transparent_mgr.mark_shutting_down();
+        if cancel_active_conns {
+            let killed = connection_manager.kill_all_connections();
+            if killed > 0 {
+                info!(
+                    "[Shutdown] Cancelled {} lingering active connections for fast handoff/exit",
+                    killed
+                );
+            }
+        }
         transparent_stop_guard.stop_async().await;
 
         // 优雅排空：等待所有核心循环（包括释放监听端口与回写 /api/transparent/elevate 的 200 OK）退出
@@ -375,7 +392,7 @@ mod entry {
             let killed = connection_manager.kill_all_connections();
             if killed > 0 {
                 info!(
-                    "[Shutdown] Cancelled {} lingering active connections for fast handoff/exit",
+                    "[Shutdown] Cancelled {} late-arriving active connections during drain",
                     killed
                 );
             }
@@ -396,6 +413,9 @@ mod entry {
             core_tasks.abort_all();
             while core_tasks.join_next().await.is_some() {}
         }
+
+        // 显式保持 os_signals 存活至全部停机排空与 WinDivert 停止结束后再释放
+        drop(os_signals);
 
         if let Some(err) = final_error {
             return Err(err);
@@ -431,25 +451,38 @@ mod entry {
         .await;
     }
 
-    async fn wait_for_shutdown_signal() -> anyhow::Result<OsShutdownSignal> {
-        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    struct WindowsShutdownSignals {
+        sig_c: tokio::signal::windows::CtrlC,
+        sig_break: tokio::signal::windows::CtrlBreak,
+        sig_close: tokio::signal::windows::CtrlClose,
+        sig_logoff: tokio::signal::windows::CtrlLogoff,
+        sig_shutdown: tokio::signal::windows::CtrlShutdown,
+    }
 
-        let mut sig_c = ctrl_c().context("Failed to register Windows CTRL_C handler")?;
-        let mut sig_break =
-            ctrl_break().context("Failed to register Windows CTRL_BREAK handler")?;
-        let mut sig_close =
-            ctrl_close().context("Failed to register Windows CTRL_CLOSE handler")?;
-        let mut sig_logoff =
-            ctrl_logoff().context("Failed to register Windows CTRL_LOGOFF handler")?;
-        let mut sig_shutdown =
-            ctrl_shutdown().context("Failed to register Windows CTRL_SHUTDOWN handler")?;
+    impl WindowsShutdownSignals {
+        fn register() -> anyhow::Result<Self> {
+            use tokio::signal::windows::{
+                ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown,
+            };
+            Ok(Self {
+                sig_c: ctrl_c().context("Failed to register Windows CTRL_C handler")?,
+                sig_break: ctrl_break().context("Failed to register Windows CTRL_BREAK handler")?,
+                sig_close: ctrl_close().context("Failed to register Windows CTRL_CLOSE handler")?,
+                sig_logoff: ctrl_logoff()
+                    .context("Failed to register Windows CTRL_LOGOFF handler")?,
+                sig_shutdown: ctrl_shutdown()
+                    .context("Failed to register Windows CTRL_SHUTDOWN handler")?,
+            })
+        }
 
-        tokio::select! {
-            Some(()) = sig_c.recv() => Ok(OsShutdownSignal { name: "Ctrl+C", urgent: false }),
-            Some(()) = sig_break.recv() => Ok(OsShutdownSignal { name: "Ctrl+Break", urgent: false }),
-            Some(()) = sig_close.recv() => Ok(OsShutdownSignal { name: "Console Close", urgent: true }),
-            Some(()) = sig_logoff.recv() => Ok(OsShutdownSignal { name: "Windows Logoff", urgent: true }),
-            Some(()) = sig_shutdown.recv() => Ok(OsShutdownSignal { name: "Windows Shutdown", urgent: true }),
+        async fn recv(&mut self) -> anyhow::Result<OsShutdownSignal> {
+            tokio::select! {
+                Some(()) = self.sig_c.recv() => Ok(OsShutdownSignal { name: "Ctrl+C", urgent: false }),
+                Some(()) = self.sig_break.recv() => Ok(OsShutdownSignal { name: "Ctrl+Break", urgent: false }),
+                Some(()) = self.sig_close.recv() => Ok(OsShutdownSignal { name: "Console Close", urgent: true }),
+                Some(()) = self.sig_logoff.recv() => Ok(OsShutdownSignal { name: "Windows Logoff", urgent: true }),
+                Some(()) = self.sig_shutdown.recv() => Ok(OsShutdownSignal { name: "Windows Shutdown", urgent: true }),
+            }
         }
     }
 

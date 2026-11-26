@@ -564,10 +564,17 @@ pub(super) async fn handle_api_request(
                 if let Some(prev_pe) = rb.prev_persisted_enabled {
                     mgr.set_persisted_enabled(prev_pe);
                 }
+                let is_shutting_down = mgr.is_shutting_down()
+                    || shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow());
+                let mut rollback_settings = rb.prev_settings;
+                if is_shutting_down && rollback_settings.enabled {
+                    // 停机排空期间严禁因配置回滚重新拉起 WinDivert，仅还原非启用态配置
+                    rollback_settings.enabled = false;
+                }
                 let mgr_clone = Arc::clone(mgr);
                 let rt_handle = tokio::runtime::Handle::current();
                 if let Err(rb_err) = tokio::task::spawn_blocking(move || {
-                    mgr_clone.apply_settings(rb.prev_settings, &rt_handle)
+                    mgr_clone.apply_settings(rollback_settings, &rt_handle)
                 })
                 .await
                 .unwrap_or_else(|join_err| Err(format!("rollback task failed: {join_err}")))

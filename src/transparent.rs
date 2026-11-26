@@ -142,6 +142,7 @@ pub struct TransparentManager {
     dns_server: Arc<DnsServer>,
     settings: Mutex<TransparentSettings>,
     persisted_enabled: AtomicBool,
+    shutting_down: AtomicBool,
     live_hijack_dns: Arc<AtomicBool>,
     live_block_quic: Arc<AtomicBool>,
     stats: Arc<TransparentStatsCounters>,
@@ -179,6 +180,7 @@ impl TransparentManager {
             dns_server,
             settings: Mutex::new(initial_settings),
             persisted_enabled: AtomicBool::new(persisted_enabled),
+            shutting_down: AtomicBool::new(false),
             live_hijack_dns: Arc::new(AtomicBool::new(hijack)),
             live_block_quic: Arc::new(AtomicBool::new(block_quic)),
             stats: Arc::new(TransparentStatsCounters::default()),
@@ -186,6 +188,15 @@ impl TransparentManager {
             lifecycle_lock: Mutex::new(()),
             runtime: Mutex::new(None),
         })
+    }
+
+    /// 标记进程已进入停机阶段，禁止任何后续在线请求或失败回滚重新拉起 WinDivert
+    pub fn mark_shutting_down(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
     }
 
     pub fn settings(&self) -> TransparentSettings {
@@ -252,7 +263,14 @@ impl TransparentManager {
             .lifecycle_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        self.apply_settings_locked(next, rt_handle)
+    }
 
+    fn apply_settings_locked(
+        &self,
+        next: TransparentSettings,
+        rt_handle: &tokio::runtime::Handle,
+    ) -> Result<(), String> {
         let prev = self
             .settings
             .lock()
@@ -297,20 +315,21 @@ impl TransparentManager {
     }
 
     /// 在线更新透明代理附加配置（`hijack_dns` / `block_quic_for_proxied` / `dll_path`）：
-    /// 若当前处于运行态，仍按热重启 semantics 执行并在失败时回滚；若当前未运行，则直接提交新配置供后续启用或提权生效。
+    /// 在 `lifecycle_lock` 内统一判定运行态：若当前处于运行态则按热重启语义执行并在失败时回滚；
+    /// 若当前未运行，则直接提交新配置供后续启用或提权生效。
     pub fn apply_config_update(
         &self,
         mut next: TransparentSettings,
         rt_handle: &tokio::runtime::Handle,
     ) -> Result<(), String> {
-        if self.is_running() {
-            return self.apply_settings(next, rt_handle);
-        }
-
         let _guard = self
             .lifecycle_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+
+        if self.is_running() {
+            return self.apply_settings_locked(next, rt_handle);
+        }
 
         self.live_hijack_dns
             .store(next.hijack_dns, Ordering::Release);
@@ -367,6 +386,12 @@ impl TransparentManager {
         rt_handle: &tokio::runtime::Handle,
         cfg: &TransparentSettings,
     ) -> Result<(), String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(self.set_error(
+                "ERR_SERVER_SHUTTING_DOWN: Server is shutting down; refusing to start transparent proxy."
+                    .to_string(),
+            ));
+        }
         if self
             .runtime
             .lock()
@@ -686,5 +711,20 @@ mod tests {
 
         mgr.set_persisted_enabled(false);
         assert!(!mgr.persisted_settings().enabled);
+
+        // P2-1 回归：进入停机状态后绝不允许重新启动透明代理
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        mgr.mark_shutting_down();
+        assert!(mgr.is_shutting_down());
+        let shutdown_err = mgr
+            .apply_settings(
+                TransparentSettings {
+                    enabled: true,
+                    ..TransparentSettings::default()
+                },
+                rt.handle(),
+            )
+            .expect_err("shutting-down manager must refuse restarting transparent proxy");
+        assert!(shutdown_err.contains("ERR_SERVER_SHUTTING_DOWN"));
     }
 }
