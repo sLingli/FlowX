@@ -583,8 +583,8 @@ pub(super) async fn handle_api_request(
                 if let Some(prev_pe) = rb.prev_persisted_enabled {
                     mgr.set_persisted_enabled(prev_pe);
                 }
-                let is_shutting_down = mgr.is_shutting_down()
-                    || shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow());
+                let is_shutting_down =
+                    mgr.is_shutting_down() || shutdown_tx.as_ref().is_some_and(|tx| *tx.borrow());
                 let mut rollback_settings = rb.prev_settings;
                 if is_shutting_down && rollback_settings.enabled {
                     // 停机排空期间严禁因配置回滚重新拉起 WinDivert，仅还原非启用态配置

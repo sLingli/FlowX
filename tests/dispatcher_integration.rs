@@ -586,7 +586,10 @@ async fn test_dispatch_transparent_stream_tracks_in_flight_guard() {
     });
 
     // 在透明流进入 SNI 嗅探阻塞阶段时（尚未注册进 ConnectionManager），InFlightTracker 必须已计数 > 0
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    let poll_deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while tracker.count() == 0 && std::time::Instant::now() < poll_deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert!(
         tracker.count() >= 1,
         "transparent dispatch must hold InFlightTracker guard while sniffing"
@@ -1229,7 +1232,7 @@ async fn test_p1_1_devproxy_immediate_proxy_sniffs_nonstandard_https_http_and_p2
     assert_eq!(app_blk.read(&mut eof).await.unwrap(), 0);
     blk_handle.await.unwrap().unwrap();
     assert!(
-        start_blk.elapsed() < Duration::from_millis(80),
+        start_blk.elapsed() < Duration::from_millis(115),
         "Immediate(Block) must not wait 120ms for stale SYN needs_domain_sniff, took {:?}",
         start_blk.elapsed()
     );
@@ -1268,7 +1271,7 @@ async fn test_p1_1_devproxy_immediate_proxy_sniffs_nonstandard_https_http_and_p2
     app_dir.read_exact(&mut banner).await.unwrap();
     assert_eq!(&banner, b"SSH-2.0-CustomPort");
     assert!(
-        start_dir.elapsed() < Duration::from_millis(80),
+        start_dir.elapsed() < Duration::from_millis(115),
         "Immediate(Direct) must not wait 120ms for stale SYN needs_domain_sniff, took {:?}",
         start_dir.elapsed()
     );

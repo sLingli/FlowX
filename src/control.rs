@@ -144,3 +144,63 @@ impl ControlError {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_control_error_kind_status_and_localized_payloads() {
+        assert_eq!(ControlErrorKind::BadRequest.status_code(), 400);
+        assert_eq!(
+            ControlErrorKind::BadRequest.http_status_line(),
+            "400 Bad Request"
+        );
+        assert_eq!(ControlErrorKind::NotFound.status_code(), 404);
+        assert_eq!(
+            ControlErrorKind::NotFound.http_status_line(),
+            "404 Not Found"
+        );
+        assert_eq!(ControlErrorKind::Conflict.status_code(), 409);
+        assert_eq!(
+            ControlErrorKind::Conflict.http_status_line(),
+            "409 Conflict"
+        );
+        assert_eq!(ControlErrorKind::ServiceUnavailable.status_code(), 503);
+        assert_eq!(
+            ControlErrorKind::ServiceUnavailable.http_status_line(),
+            "503 Service Unavailable"
+        );
+        assert_eq!(ControlErrorKind::Internal.status_code(), 500);
+        assert_eq!(
+            ControlErrorKind::Internal.http_status_line(),
+            "500 Internal Server Error"
+        );
+
+        let plain = ControlError::not_found("ERR_NODE_NOT_FOUND", "error.node_not_found");
+        let v_en = plain.to_localized_value(Locale::En);
+        assert_eq!(v_en["code"], "ERR_NODE_NOT_FOUND");
+        assert!(v_en.get("detail").is_none());
+        assert!(v_en["error"].as_str().is_some_and(|s| !s.is_empty()));
+
+        let v_zh = plain.to_localized_value(Locale::Zh);
+        assert_eq!(v_zh["code"], "ERR_NODE_NOT_FOUND");
+        assert_ne!(v_en["error"], v_zh["error"]);
+
+        let detailed = ControlError::conflict_with_detail(
+            "ERR_TRANSPARENT_LOW_INTEGRITY",
+            "error.transparent_low_integrity",
+            "Low IL token",
+        );
+        let dj = detailed.to_localized_value(Locale::En);
+        assert_eq!(dj["code"], "ERR_TRANSPARENT_LOW_INTEGRITY");
+        assert_eq!(dj["detail"], "Low IL token");
+        assert_eq!(detailed.kind.status_code(), 409);
+
+        let unavailable = ControlError::service_unavailable(
+            "ERR_SERVER_SHUTTING_DOWN",
+            "error.server_shutting_down",
+        );
+        assert_eq!(unavailable.kind.status_code(), 503);
+    }
+}

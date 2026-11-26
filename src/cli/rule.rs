@@ -340,10 +340,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     )
                     .map_err(|e| control_err_to_cli(e, opts.locale))?;
                     rt.save()?;
-                    (
-                        resolved_id,
-                        json!({ "ok": true, "enabled": next_state }),
-                    )
+                    (resolved_id, json!({ "ok": true, "enabled": next_state }))
                 }
             };
 

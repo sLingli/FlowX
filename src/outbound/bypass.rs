@@ -398,9 +398,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_bypass_port_refcount_overlapping_guards() {
-        let port = 59123u16;
+    #[tokio::test]
+    async fn test_bypass_port_refcount_overlapping_guards() {
+        let _lock = TEST_ACTIVE_MUTEX.lock().await;
+        let _reset = TransparentActiveReset;
+        set_transparent_active(false);
+
+        let port_holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = port_holder.local_addr().unwrap().port();
         assert!(!is_tcp_port_bypassed(port));
         assert!(!is_udp_port_bypassed(port));
 
@@ -422,6 +427,7 @@ mod tests {
             !is_tcp_port_bypassed(port),
             "Port must clear once final guard drops"
         );
+        drop(port_holder);
     }
 
     #[tokio::test]
@@ -503,7 +509,8 @@ mod tests {
         let _reset = TransparentActiveReset;
         set_transparent_active(true);
 
-        let port = 59124u16;
+        let port_holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = port_holder.local_addr().unwrap().port();
         let g_v4 = register_bypass_port_for_family(BypassProtocol::Tcp, false, port);
         assert!(is_tcp_port_bypassed_for_family(port, false));
         assert!(!is_tcp_port_bypassed_for_family(port, true));
@@ -517,6 +524,7 @@ mod tests {
         assert!(is_tcp_port_bypassed_for_family(port, true));
         drop(g_v6);
         assert!(!is_tcp_port_bypassed_for_family(port, true));
+        drop(port_holder);
 
         // Guarded OutboundTcpStream must refuse try_into_inner so bypass guard cannot drop prematurely
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

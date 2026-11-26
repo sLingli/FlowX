@@ -467,3 +467,79 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_integrity_level_helpers_and_com_guard() {
+        assert!(is_low_integrity_rid(0x0000));
+        assert!(is_low_integrity_rid(0x1000));
+        assert!(is_low_integrity_rid(SECURITY_MANDATORY_MEDIUM_RID - 1));
+        assert!(!is_low_integrity_rid(SECURITY_MANDATORY_MEDIUM_RID));
+        assert!(!is_low_integrity_rid(0x3000));
+
+        // Aligned GetTokenInformation query succeeds on live Windows process token
+        let rid =
+            process_integrity_rid().expect("current Windows process must expose integrity RID");
+        let low_il = is_low_integrity_process();
+        assert_eq!(low_il, is_low_integrity_rid(rid));
+
+        // Guarded branches of relaunch_elevated_with_replace_pid that never open UAC
+        if is_process_elevated() {
+            let err = relaunch_elevated_with_replace_pid(&[]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+            assert!(
+                err.to_string()
+                    .starts_with("ERR_TRANSPARENT_ALREADY_ELEVATED:"),
+                "unexpected already-elevated error: {err}"
+            );
+        } else if low_il {
+            let err = relaunch_elevated_with_replace_pid(&[]).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            assert!(
+                err.to_string()
+                    .starts_with("ERR_TRANSPARENT_LOW_INTEGRITY:"),
+                "unexpected low-integrity error: {err}"
+            );
+        }
+
+        // StaComGuard initializes and uninitializes cleanly on a dedicated worker thread
+        // (Low-IL sandboxes may block ole32.dll/USER32 initialization, which must degrade to None cleanly)
+        let initialized = std::thread::spawn(|| {
+            let guard = StaComGuard::init();
+            let ok = guard.is_some();
+            drop(guard);
+            ok
+        })
+        .join()
+        .unwrap();
+        if !low_il {
+            assert!(
+                initialized,
+                "StaComGuard::init should load ole32.dll and initialize COM at Medium/High IL (rid=0x{rid:x})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_elevated_relaunch_args_replaces_flags_and_quotes() {
+        let raw = vec![
+            r"C:\FlowX\flowx.exe".to_string(),
+            "--config".to_string(),
+            r"C:\My Config\flowx.xml".to_string(),
+            "--no-transparent".to_string(),
+            "--replace-pid".to_string(),
+            "999".to_string(),
+            "--replace-pid=888".to_string(),
+        ];
+        let joined = build_elevated_relaunch_args(&raw, 4242, &[]);
+        assert!(joined.contains("--config"));
+        assert!(joined.contains(r#""C:\My Config\flowx.xml""#));
+        assert!(joined.contains("--transparent --replace-pid 4242"));
+        assert!(!joined.contains("--no-transparent"));
+        assert!(!joined.contains("999"));
+        assert!(!joined.contains("888"));
+    }
+}

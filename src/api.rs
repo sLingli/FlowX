@@ -642,7 +642,8 @@ mod tests {
         );
 
         // 锁释放后的新配置变更必须正常落盘且不被先前已取消的任务覆写
-        let fresh_body = r#"{"name":"post-recovery","protocol":"SOCKS5","server_addr":"10.0.0.10:1080"}"#;
+        let fresh_body =
+            r#"{"name":"post-recovery","protocol":"SOCKS5","server_addr":"10.0.0.10:1080"}"#;
         let r_fresh = raw_http(
             api_addr,
             &format!(
@@ -661,12 +662,10 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
         let _ = std::fs::remove_file(&cfg_path);
-        let _ = std::fs::remove_file(
-            cfg_path
-                .parent()
-                .unwrap()
-                .join(format!(".{}.lock", cfg_path.file_name().unwrap().to_string_lossy())),
-        );
+        let _ = std::fs::remove_file(cfg_path.parent().unwrap().join(format!(
+            ".{}.lock",
+            cfg_path.file_name().unwrap().to_string_lossy()
+        )));
     }
 
     #[tokio::test]
@@ -1300,6 +1299,57 @@ mod tests {
             "resp: {resp}"
         );
         assert!(resp.contains("blocked at Low IL"), "resp: {resp}");
+        assert!(!*shutdown_rx.borrow());
+
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_elevate_rejects_non_utf8_body_without_triggering_uac() {
+        let mgr = Arc::new(ConnectionManager::new());
+        let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
+        let nodes = Arc::new(RwLock::new(HashMap::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let invoked_c = Arc::clone(&invoked);
+
+        let srv = ApiServer::new("127.0.0.1:0".parse().unwrap(), mgr, re, nodes)
+            .with_shutdown_sender(shutdown_tx)
+            .with_elevate_runner(Arc::new(move || {
+                invoked_c.store(true, Ordering::SeqCst);
+                Ok(())
+            }));
+        let listener = srv.bind().await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        let mut rx_srv = shutdown_rx.clone();
+        let server_task = tokio::spawn(async move {
+            tokio::select! {
+                res = srv.run(listener, rx_srv.clone()) => res,
+                _ = rx_srv.changed() => Ok(()),
+            }
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let header = format!(
+            "POST /api/transparent/elevate HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(header.as_bytes()).await.unwrap();
+        stream.write_all(&[0xff, 0xfe]).await.unwrap();
+        let mut resp_bytes = Vec::new();
+        stream.read_to_end(&mut resp_bytes).await.unwrap();
+        let resp = String::from_utf8_lossy(&resp_bytes);
+
+        assert!(resp.starts_with("HTTP/1.1 400 Bad Request"), "resp: {resp}");
+        assert!(
+            resp.contains("ERR_INVALID_TRANSPARENT_BODY"),
+            "resp: {resp}"
+        );
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "invalid non-UTF-8 elevate request must not invoke UAC"
+        );
         assert!(!*shutdown_rx.borrow());
 
         server_task.abort();

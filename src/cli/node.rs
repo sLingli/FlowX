@@ -11,9 +11,7 @@ use crate::cli::http_client::{
     ApiTransportError, SilentExitError, api_request_or_offline, api_request_raw, ensure_api_ok,
 };
 use crate::control::node::{add_node, delete_node, list_nodes, patch_node, ping_address};
-use crate::control::{
-    AddNodeRequest, ControlError, PatchNodeRequest, PingResponse, ProxyNodeView,
-};
+use crate::control::{AddNodeRequest, ControlError, PatchNodeRequest, PingResponse, ProxyNodeView};
 
 pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
     let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("list");
@@ -278,7 +276,10 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                         .map(|n| n.server_addr.clone())
                         .ok_or_else(|| {
                             control_err_to_cli(
-                                ControlError::not_found("ERR_NODE_NOT_FOUND", "error.node_not_found"),
+                                ControlError::not_found(
+                                    "ERR_NODE_NOT_FOUND",
+                                    "error.node_not_found",
+                                ),
                                 opts.locale,
                             )
                         })?

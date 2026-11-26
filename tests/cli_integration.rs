@@ -17,12 +17,54 @@ use tokio::sync::watch;
 
 use common::DEFAULT_SELF_PORTS;
 
+/// RAII temp XML config guard that removes both the config file and its `.filename.lock` sidecar.
+struct TempConfigGuard {
+    path: std::path::PathBuf,
+}
+
+impl TempConfigGuard {
+    fn new(prefix: &str) -> Self {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("{prefix}_{}_{}.xml", std::process::id(), ts));
+        let guard = Self { path };
+        guard.cleanup();
+        guard
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn as_str(&self) -> String {
+        self.path.to_string_lossy().to_string()
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
+            let lock_path = parent.join(format!(".{}.lock", name.to_string_lossy()));
+            let _ = std::fs::remove_file(lock_path);
+        }
+    }
+}
+
+impl Drop for TempConfigGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 #[tokio::test]
 async fn test_cli_strict_arg_validation() {
-    let mut temp_cfg = std::env::current_dir().unwrap().join("target");
-    temp_cfg.push(format!("flowx_cli_unused_{}.xml", std::process::id()));
-    let _ = std::fs::remove_file(&temp_cfg);
-    let cfg_str = temp_cfg.to_string_lossy().to_string();
+    let temp_cfg_guard = TempConfigGuard::new("flowx_cli_unused");
+    let temp_cfg = temp_cfg_guard.path();
+    let cfg_str = temp_cfg_guard.as_str();
 
     // Unknown typo flag `--targe` must fail
     let err = run_cli(&[
@@ -113,10 +155,9 @@ async fn test_cli_strict_arg_validation() {
 
 #[tokio::test]
 async fn test_cli_offline_crud_and_simulate() {
-    let mut path = std::env::current_dir().unwrap().join("target");
-    path.push(format!("flowx_cli_test_{}.xml", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let cfg_str = path.to_string_lossy().to_string();
+    let cfg_guard = TempConfigGuard::new("flowx_cli_test");
+    let path = cfg_guard.path();
+    let cfg_str = cfg_guard.as_str();
 
     // 1. 添加节点 (显式 `--offline` 离线初始化并写入默认配置 + 新节点 #102，密码刻意命名为 `--json`)
     run_cli(&[
@@ -141,7 +182,7 @@ async fn test_cli_offline_crud_and_simulate() {
     .unwrap();
 
     // 验证 `--pass --json` 写入了密码而不是被解析为全局 `--json`
-    let store = ConfigStore::new(&path);
+    let store = ConfigStore::new(path);
     let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
     assert_eq!(
         rt.proxy_nodes
@@ -235,8 +276,6 @@ async fn test_cli_offline_crud_and_simulate() {
     assert!(rt.proxy_nodes.contains_key(&102));
     assert!(rt.rules.iter().any(|r| r.name == "GitRule"));
     assert_eq!(rt.default_action, Action::Proxy(102));
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -382,14 +421,9 @@ async fn test_cli_online_patch_and_1based_rule_index() {
 
 #[tokio::test]
 async fn test_cli_readonly_commands_do_not_create_missing_config() {
-    let mut path = std::env::current_dir().unwrap().join("target");
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    path.push(format!("flowx_cli_readonly_missing_{}.xml", ts));
-    let _ = std::fs::remove_file(&path);
-    let cfg_str = path.to_string_lossy().to_string();
+    let cfg_guard = TempConfigGuard::new("flowx_cli_readonly_missing");
+    let path = cfg_guard.path();
+    let cfg_str = cfg_guard.as_str();
 
     let cmds: &[&[&str]] = &[
         &["status"],
@@ -422,14 +456,9 @@ async fn test_cli_readonly_commands_do_not_create_missing_config() {
 
 #[tokio::test]
 async fn test_cli_json_errors_and_password_clear_rules() {
-    let mut path = std::env::current_dir().unwrap().join("target");
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    path.push(format!("flowx_cli_pw_rules_{}.xml", ts));
-    let _ = std::fs::remove_file(&path);
-    let cfg_str = path.to_string_lossy().to_string();
+    let cfg_guard = TempConfigGuard::new("flowx_cli_pw_rules");
+    let path = cfg_guard.path();
+    let cfg_str = cfg_guard.as_str();
 
     // 1. Offline add with password but no username fails with structured ERR_PASSWORD_WITHOUT_USERNAME
     let err = run_cli(&[
@@ -603,7 +632,7 @@ async fn test_cli_json_errors_and_password_clear_rules() {
     .await
     .unwrap();
 
-    let store = ConfigStore::new(&path);
+    let store = ConfigStore::new(path);
     let rt = store.load_existing(&DEFAULT_SELF_PORTS).unwrap();
     let node = rt.proxy_nodes.get(&102).unwrap();
     assert_eq!(node.username, None);
@@ -643,27 +672,15 @@ async fn test_cli_json_errors_and_password_clear_rules() {
     assert_eq!(j["code"], "ERR_RULE_CONFLICT");
     assert_eq!(j["error"], "Conflict");
     assert_eq!(j["status"], 409);
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
 async fn test_cli_transparent_commands_and_config_preservation() {
-    let cfg_path = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!(
-            "flowx_cli_transparent_test_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-    let _ = std::fs::remove_file(&cfg_path);
-    let cfg_str = cfg_path.to_string_lossy().to_string();
+    let cfg_guard = TempConfigGuard::new("flowx_cli_transparent_test");
+    let cfg_path = cfg_guard.path();
+    let cfg_str = cfg_guard.as_str();
 
-    // 1. Readonly status must not create missing config file; doctor works cleanly without one
+    // 1. Readonly status must not create missing config file; offline doctor works cleanly without one
     assert!(
         run_cli(&[
             "flowx".into(),
@@ -682,6 +699,7 @@ async fn test_cli_transparent_commands_and_config_preservation() {
         "flowx".into(),
         "--config".into(),
         cfg_str.clone(),
+        "--offline".into(),
         "--json".into(),
         "transparent".into(),
         "doctor".into(),
@@ -773,7 +791,7 @@ async fn test_cli_transparent_commands_and_config_preservation() {
     .await
     .unwrap();
 
-    let loaded = ConfigStore::new(&cfg_path).load_existing(&[]).unwrap();
+    let loaded = ConfigStore::new(cfg_path).load_existing(&[]).unwrap();
     assert!(loaded.transparent_settings.enabled);
     assert!(!loaded.transparent_settings.hijack_dns);
     assert!(!loaded.transparent_settings.block_quic_for_proxied);
@@ -805,13 +823,11 @@ async fn test_cli_transparent_commands_and_config_preservation() {
     .await
     .unwrap();
 
-    let updated = ConfigStore::new(&cfg_path).load_existing(&[]).unwrap();
+    let updated = ConfigStore::new(cfg_path).load_existing(&[]).unwrap();
     assert!(!updated.transparent_settings.enabled);
     assert!(!updated.transparent_settings.hijack_dns);
     assert!(!updated.transparent_settings.block_quic_for_proxied);
     assert!(updated.transparent_settings.dll_path.is_none());
-
-    let _ = std::fs::remove_file(&cfg_path);
 }
 
 #[tokio::test]
@@ -876,4 +892,298 @@ async fn test_cli_transparent_doctor_respects_explicit_api() {
         req_line.starts_with("GET /api/transparent/status "),
         "expected GET /api/transparent/status, got: {req_line}"
     );
+}
+
+#[tokio::test]
+async fn test_cli_offline_control_errors_rule_move_flag_and_ping_all() {
+    use tokio::net::TcpListener;
+
+    let cfg_guard = TempConfigGuard::new("flowx_cli_offline_ctrl");
+    let cfg_path = cfg_guard.path();
+    let cfg_str = cfg_guard.as_str();
+
+    // 1. Create a reachable local node and a rule referencing it
+    let alive_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let alive_addr = alive_listener.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move {
+        for _ in 0..4 {
+            if let Ok((s, _)) = alive_listener.accept().await {
+                drop(s);
+            }
+        }
+    });
+
+    // Save a minimal initial profile pointing default proxy #101 to the reachable local listener
+    let store = ConfigStore::new(cfg_path);
+    let mut profile = flowx::config::ProfileConfig::default_profile();
+    let p101 = &mut profile.proxy_list.as_mut().unwrap().proxies[0];
+    p101.id = 101;
+    p101.name = Some("AliveLocal".into());
+    p101.address = alive_addr.ip().to_string();
+    p101.port = alive_addr.port();
+    store.save_profile(&profile).unwrap();
+
+    // 2. Offline `node ping --all --json` succeeds when every node is reachable
+    run_cli(&[
+        "flowx".into(),
+        "--config".into(),
+        cfg_str.clone(),
+        "--offline".into(),
+        "--json".into(),
+        "node".into(),
+        "ping".into(),
+        "--all".into(),
+    ])
+    .await
+    .unwrap();
+
+    // 3. Offline `node remove` of a referenced node returns structured 409 ERR_NODE_IN_USE
+    let in_use_err = run_cli(&[
+        "flowx".into(),
+        "--config".into(),
+        cfg_str.clone(),
+        "--offline".into(),
+        "--json".into(),
+        "node".into(),
+        "remove".into(),
+        "101".into(),
+    ])
+    .await
+    .unwrap_err();
+    let j = format_cli_error_json(&in_use_err);
+    assert_eq!(j["code"], "ERR_NODE_IN_USE");
+    assert_eq!(j["status"], 409);
+
+    // 4. Offline `node remove` / `node ping` of missing node returns structured 404 ERR_NODE_NOT_FOUND
+    for sub in ["remove", "ping"] {
+        let missing_err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            cfg_str.clone(),
+            "--offline".into(),
+            "--json".into(),
+            "node".into(),
+            sub.into(),
+            "999".into(),
+        ])
+        .await
+        .unwrap_err();
+        let j = format_cli_error_json(&missing_err);
+        assert_eq!(j["code"], "ERR_NODE_NOT_FOUND");
+        assert_eq!(j["status"], 404);
+    }
+
+    // 5. Offline `rule toggle` / `rule move` / `rule remove` missing rule -> 404 ERR_RULE_NOT_FOUND
+    for args in [
+        vec!["rule", "toggle", "999"],
+        vec!["rule", "move", "999", "up"],
+        vec!["rule", "remove", "999"],
+    ] {
+        let mut argv = vec![
+            "flowx".to_string(),
+            "--config".to_string(),
+            cfg_str.clone(),
+            "--offline".to_string(),
+            "--json".to_string(),
+        ];
+        argv.extend(args.into_iter().map(String::from));
+        let err = run_cli(&argv).await.unwrap_err();
+        let j = format_cli_error_json(&err);
+        assert_eq!(j["code"], "ERR_RULE_NOT_FOUND");
+        assert_eq!(j["status"], 404);
+    }
+
+    // 6. Offline `rule move` with invalid direction -> 400 ERR_INVALID_MOVE_DIR
+    let bad_dir_err = run_cli(&[
+        "flowx".into(),
+        "--config".into(),
+        cfg_str.clone(),
+        "--offline".into(),
+        "--json".into(),
+        "rule".into(),
+        "move".into(),
+        "1".into(),
+        "sideways".into(),
+    ])
+    .await
+    .unwrap_err();
+    let j = format_cli_error_json(&bad_dir_err);
+    assert_eq!(j["code"], "ERR_INVALID_MOVE_DIR");
+    assert_eq!(j["status"], 400);
+
+    // 7. Offline `rule move --id 2 up` (flag + positional direction, 1-based index) swaps rules cleanly
+    let before = store.load_existing(&DEFAULT_SELF_PORTS).unwrap().rules;
+    assert!(before.len() >= 2);
+    let second_name = before[1].name.clone();
+    run_cli(&[
+        "flowx".into(),
+        "--config".into(),
+        cfg_str.clone(),
+        "--offline".into(),
+        "--json".into(),
+        "rule".into(),
+        "move".into(),
+        "--id".into(),
+        "2".into(),
+        "up".into(),
+    ])
+    .await
+    .unwrap();
+    let after = store.load_existing(&DEFAULT_SELF_PORTS).unwrap().rules;
+    assert_eq!(after[0].name, second_name);
+
+    // 8. Add an unreachable closed local node; offline `node ping --all --json` exits with status 1
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    run_cli(&[
+        "flowx".into(),
+        "--config".into(),
+        cfg_str.clone(),
+        "--offline".into(),
+        "node".into(),
+        "add".into(),
+        "--name".into(),
+        "DeadLocal".into(),
+        "--addr".into(),
+        dead_addr.to_string(),
+    ])
+    .await
+    .unwrap();
+
+    let ping_all_err = run_cli(&[
+        "flowx".into(),
+        "--config".into(),
+        cfg_str.clone(),
+        "--offline".into(),
+        "--json".into(),
+        "node".into(),
+        "ping".into(),
+        "--all".into(),
+    ])
+    .await
+    .unwrap_err();
+    assert!(
+        ping_all_err.to_string().contains("status 1"),
+        "expected SilentExitError status 1 when any node is unreachable, got: {ping_all_err}"
+    );
+
+    accept_task.abort();
+    let _ = accept_task.await;
+}
+
+#[tokio::test]
+async fn test_cli_online_clear_user_clear_apps_and_rule_move_id_flag() {
+    use flowx::outbound::socks4::Socks4Client;
+
+    let mut nodes_map = HashMap::new();
+    nodes_map.insert(
+        101,
+        ProxyNodeEntry {
+            id: 101,
+            name: "Socks4WithUser".into(),
+            protocol: "SOCKS4".into(),
+            server_addr: "127.0.0.1:10804".into(),
+            username: Some("legacy-uid".into()),
+            client: ProxyNode::Socks4(
+                Socks4Client::new("127.0.0.1:10804").with_user_id("legacy-uid".to_string()),
+            ),
+        },
+    );
+    let proxy_nodes = Arc::new(RwLock::new(nodes_map));
+    let r1 = Rule::from_raw_with_id(
+        10,
+        "FirstRule",
+        true,
+        Some("curl.exe"),
+        Some("example.com"),
+        Some("443"),
+        Action::Direct,
+    );
+    let r2 = Rule::from_raw_with_id(
+        20,
+        "SecondRule",
+        true,
+        Some("git.exe"),
+        Some("github.com"),
+        Some("443"),
+        Action::Proxy(101),
+    );
+    let rule_engine = Arc::new(RuleEngine::new(vec![r1, r2], Action::Direct));
+    let monitor = Arc::new(ConnectionManager::new());
+
+    let server = ApiServer::new(
+        "127.0.0.1:0".parse().unwrap(),
+        monitor,
+        Arc::clone(&rule_engine),
+        Arc::clone(&proxy_nodes),
+    );
+    let listener = server.bind().await.unwrap();
+    let api_addr = listener.local_addr().unwrap().to_string();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let srv_handle = tokio::spawn(async move {
+        let _ = server.run(listener, shutdown_rx).await;
+    });
+
+    // 1. Online `node update 101 --clear-user` clears SOCKS4 UserID cleanly
+    run_cli(&[
+        "flowx".into(),
+        "--api".into(),
+        api_addr.clone(),
+        "--json".into(),
+        "node".into(),
+        "update".into(),
+        "101".into(),
+        "--clear-user".into(),
+    ])
+    .await
+    .unwrap();
+    {
+        let guard = proxy_nodes.read().unwrap();
+        let node = guard.get(&101).unwrap();
+        assert_eq!(node.username, None);
+        assert_eq!(node.client.auth_credentials(), (None, None));
+        assert!(!node.is_auth_configured());
+    }
+
+    // 2. Online `rule update 10 --clear-apps` clears apps while preserving targets & ports
+    run_cli(&[
+        "flowx".into(),
+        "--api".into(),
+        api_addr.clone(),
+        "--json".into(),
+        "rule".into(),
+        "update".into(),
+        "10".into(),
+        "--clear-apps".into(),
+    ])
+    .await
+    .unwrap();
+    {
+        let rules = rule_engine.current_rules();
+        assert_eq!(rules[0].id, 10);
+        assert!(rules[0].apps_raw.is_empty());
+        assert_eq!(rules[0].targets_raw, "example.com");
+        assert_eq!(rules[0].ports_raw, "443");
+    }
+
+    // 3. Online `rule move --id 20 up` moves rule #20 ahead of rule #10
+    run_cli(&[
+        "flowx".into(),
+        "--api".into(),
+        api_addr.clone(),
+        "--json".into(),
+        "rule".into(),
+        "move".into(),
+        "--id".into(),
+        "20".into(),
+        "up".into(),
+    ])
+    .await
+    .unwrap();
+    assert_eq!(rule_engine.current_rules()[0].id, 20);
+    assert_eq!(rule_engine.current_rules()[1].id, 10);
+
+    let _ = shutdown_tx.send(true);
+    let _ = srv_handle.await;
 }

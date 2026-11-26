@@ -720,3 +720,92 @@ pub async fn ping_address_with_context(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn test_ping_address_with_context_guards_and_semaphore_paths() {
+        // 1. Invalid address fails cleanly with detail
+        let (ok, _, msg, detail) =
+            ping_address_with_context("not-a-valid-addr", &[], None, None, Locale::En).await;
+        assert!(!ok);
+        assert!(!msg.is_empty());
+        assert!(detail.is_some());
+
+        // 2. Closed semaphore fails fast with error detail
+        let closed_sem = Semaphore::new(1);
+        closed_sem.close();
+        let (ok, _, _, detail) =
+            ping_address_with_context("127.0.0.1:80", &[], None, Some(&closed_sem), Locale::En)
+                .await;
+        assert!(!ok);
+        assert!(detail.is_some());
+
+        // 3. Fake-IP target is blocked before dialing
+        let (ok, _, msg, detail) =
+            ping_address_with_context("198.18.0.10:1080", &[], None, None, Locale::En).await;
+        assert!(!ok);
+        assert_eq!(msg, t(Locale::En, "error.node_fake_ip"));
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|d| d.contains("Fake-IP") && d.contains("198.18.0.10"))
+        );
+
+        // 4. Self-port loopback target is blocked before dialing
+        let (ok, _, msg, detail) =
+            ping_address_with_context("127.0.0.1:40080", &[40080], None, None, Locale::En).await;
+        assert!(!ok);
+        assert_eq!(msg, t(Locale::En, "error.node_self_loop"));
+        assert!(
+            detail
+                .as_deref()
+                .is_some_and(|d| d.contains("self/loopback"))
+        );
+
+        // 5. Reachable local listener succeeds with semaphore permit
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let sem = Semaphore::new(2);
+        let (ok, _, msg, detail) = ping_address_with_context(
+            &addr.to_string(),
+            &[40001, 40080, 1053],
+            None,
+            Some(&sem),
+            Locale::En,
+        )
+        .await;
+        let _ = accept_task.await;
+        assert!(
+            ok,
+            "expected reachable local listener ping to succeed: {msg}"
+        );
+        assert!(msg.ends_with(" ms"));
+        assert!(detail.is_none());
+
+        // 6. Closed local port fails cleanly (Io refused or 2s Windows loopback SYN-retry timeout)
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let (ok, _, msg, detail) = ping_address_with_context(
+            &dead_addr.to_string(),
+            &[40001, 40080, 1053],
+            None,
+            Some(&sem),
+            Locale::Zh,
+        )
+        .await;
+        assert!(!ok);
+        if detail.is_some() {
+            assert_eq!(msg, t(Locale::Zh, "error.ping_failed"));
+        } else {
+            assert_eq!(msg, t(Locale::Zh, "ping.timeout"));
+        }
+    }
+}

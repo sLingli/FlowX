@@ -273,3 +273,108 @@ pub fn build_system_info(
         transparent: transparent_status_or_fallback(transparent_manager),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::router::{Action, Rule};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn test_parse_simulate_target_edge_cases() {
+        assert_eq!(parse_simulate_target("", None), None);
+        assert_eq!(parse_simulate_target("   ", Some(443)), None);
+        assert_eq!(parse_simulate_target("example.com", Some(0)), None);
+        assert_eq!(parse_simulate_target("example.com:0", None), None);
+
+        assert_eq!(
+            parse_simulate_target("1.1.1.1", None),
+            Some((
+                "1.1.1.1".to_string(),
+                Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))),
+                443
+            ))
+        );
+        assert_eq!(
+            parse_simulate_target("2001:db8::1", Some(8443)),
+            Some((
+                "2001:db8::1".to_string(),
+                Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap())),
+                8443
+            ))
+        );
+        assert_eq!(
+            parse_simulate_target("[::1]:8080", None),
+            Some((
+                "::1".to_string(),
+                Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+                8080
+            ))
+        );
+        assert_eq!(
+            parse_simulate_target("api.github.com:8443", None),
+            Some(("api.github.com".to_string(), None, 8443))
+        );
+        // Explicit port overrides authority port
+        assert_eq!(
+            parse_simulate_target("api.github.com:8443", Some(9000)),
+            Some(("api.github.com".to_string(), None, 9000))
+        );
+    }
+
+    #[test]
+    fn test_simulate_route_with_pool_fake_ip_and_windows_process_path() {
+        let pool = FakeIpPool::new_default();
+        let fake_ip = pool.allocate("api.github.com");
+        let rules = vec![Rule::from_raw_with_id(
+            7,
+            "GitProxy",
+            true,
+            Some("git.exe"),
+            Some("*.github.com"),
+            Some("443"),
+            Action::Proxy(101),
+        )];
+        let engine = RuleEngine::new(rules, Action::Direct);
+
+        let matched = simulate_route_with_pool(
+            SimulateRouteRequest {
+                process: Some(r"C:\Program Files\Git\cmd\git.exe".to_string()),
+                target: format!("{fake_ip}:443"),
+                port: None,
+            },
+            &engine,
+            Some(&pool),
+            Locale::En,
+        )
+        .unwrap();
+        assert!(!matched.is_default);
+        assert_eq!(matched.matched_rule_id, Some(7));
+        assert_eq!(matched.process_name.as_deref(), Some("git.exe"));
+        assert_eq!(
+            matched.process_path.as_deref(),
+            Some(r"C:\Program Files\Git\cmd\git.exe")
+        );
+        assert_eq!(matched.target_host.as_deref(), Some("api.github.com"));
+        assert_eq!(matched.target_ip, None);
+        assert_eq!(matched.action_type, "Proxy");
+        assert_eq!(matched.node_id, Some(101));
+
+        // Unmapped Fake-IP falls back to IP literal and default action
+        let unmapped = simulate_route_with_pool(
+            SimulateRouteRequest {
+                process: None,
+                target: "198.18.250.250:443".to_string(),
+                port: None,
+            },
+            &engine,
+            Some(&pool),
+            Locale::Zh,
+        )
+        .unwrap();
+        assert!(unmapped.is_default);
+        assert_eq!(unmapped.target_host, None);
+        assert_eq!(unmapped.target_ip.as_deref(), Some("198.18.250.250"));
+        assert_eq!(unmapped.action_type, "Direct");
+    }
+}

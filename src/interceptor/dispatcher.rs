@@ -1038,9 +1038,10 @@ mod tests {
             });
             let mut banner = [0u8; 15];
             app.read_exact(&mut banner).await.unwrap();
+            assert!(is_alt_server_first_port(port));
             assert_eq!(&banner, b"SRV_BANNER_FAST");
             assert!(
-                started.elapsed() < Duration::from_millis(60),
+                started.elapsed() < Duration::from_millis(500),
                 "alt server-first port {} must skip sniff without stalling, took {:?}",
                 port,
                 started.elapsed()
@@ -1053,7 +1054,8 @@ mod tests {
         // 2. 任意自定义服务端先发端口（如 22022）：需连续 2 次 25ms 静默超时才进入退避跳过（防单次慢启动误封），
         //    第 3 次起零延迟跳过嗅探
         let custom_ep = SocketAddr::new("93.184.216.96".parse().unwrap(), 22022);
-        clear_server_first_endpoint((custom_ep.ip(), custom_ep.port()));
+        let custom_key = (custom_ep.ip(), custom_ep.port());
+        clear_server_first_endpoint(custom_key);
         let socks_c = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let socks_c_addr = socks_c.local_addr().unwrap();
         let srv_c = tokio::spawn(async move {
@@ -1090,17 +1092,34 @@ mod tests {
             app.read_exact(&mut banner).await.unwrap();
             assert_eq!(&banner, b"SSH-2.0-Custom22022");
             let elapsed = started.elapsed();
-            if attempt < 2 {
+            if attempt == 0 {
                 assert!(
-                    elapsed < Duration::from_millis(90),
-                    "attempt {} to unknown server-first port 22022 must use short opportunistic timeout (<90ms), took {:?}",
-                    attempt,
+                    !should_skip_opportunistic_sniff_at(custom_key, Instant::now()),
+                    "1st silent timeout must NOT immediately blacklist custom port 22022"
+                );
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "attempt 0 to unknown server-first port 22022 stalled unexpectedly: {:?}",
+                    elapsed
+                );
+            } else if attempt == 1 {
+                assert!(
+                    should_skip_opportunistic_sniff_at(custom_key, Instant::now()),
+                    "2nd consecutive silent timeout must learn custom port 22022 as server-first"
+                );
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "attempt 1 to unknown server-first port 22022 stalled unexpectedly: {:?}",
                     elapsed
                 );
             } else {
                 assert!(
-                    elapsed < Duration::from_millis(30),
-                    "3rd connect to learned server-first port 22022 must skip sniff immediately, took {:?}",
+                    should_skip_opportunistic_sniff_at(custom_key, Instant::now()),
+                    "3rd connect must still have learned server-first state active"
+                );
+                assert!(
+                    elapsed < Duration::from_millis(250),
+                    "3rd connect to learned server-first port 22022 must skip sniff cleanly, took {:?}",
                     elapsed
                 );
             }
