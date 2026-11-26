@@ -840,12 +840,21 @@ mod tests {
         assert!(accepted.is_empty());
 
         // 2. BypassPortRegistry 已登记出站 TCP 端口或自身 PID -> 首包 SYN 直接放行
-        let syn_bypass = build_syn([192, 168, 1, 10], 40011, [93, 184, 216, 34], 443, 500);
         {
-            let _guard = register_bypass_port(BypassProtocol::Tcp, 40011);
+            // 动态占用唯一 TCP 临时端口，避免向全局 BypassPortRegistry 注册固定端口 40011 干扰并发单测
+            let tcp_holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let bypass_tcp_port = tcp_holder.local_addr().unwrap().port();
+            let syn_bypass = build_syn(
+                [192, 168, 1, 10],
+                bypass_tcp_port,
+                [93, 184, 216, 34],
+                443,
+                500,
+            );
+            let _guard = register_bypass_port(BypassProtocol::Tcp, bypass_tcp_port);
             assert!(matches!(
                 engine.ingest_outbound_tcp(
-                    syn_bypass.clone(),
+                    syn_bypass,
                     meta,
                     Some(99999),
                     None,
@@ -856,6 +865,8 @@ mod tests {
                 ),
                 TcpIngestOutcome::Passthrough(_)
             ));
+            drop(_guard);
+            drop(tcp_holder);
         }
         assert!(matches!(
             engine.ingest_outbound_tcp(

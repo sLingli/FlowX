@@ -56,6 +56,14 @@ impl BypassPortRegistry {
 static BYPASS_REGISTRY: OnceLock<BypassPortRegistry> = OnceLock::new();
 static TRANSPARENT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// 单元测试专用的线程局部透明代理激活覆盖值，避免 `bypass::tests` 修改进程全局
+    /// `TRANSPARENT_ACTIVE` 时污染并发运行的其它模块单测。
+    static TEST_TRANSPARENT_ACTIVE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
 fn registry() -> &'static BypassPortRegistry {
     BYPASS_REGISTRY.get_or_init(BypassPortRegistry::new)
 }
@@ -67,6 +75,10 @@ pub fn set_transparent_active(active: bool) {
 
 #[inline]
 pub fn is_transparent_active() -> bool {
+    #[cfg(test)]
+    if let Some(override_active) = TEST_TRANSPARENT_ACTIVE_OVERRIDE.with(std::cell::Cell::get) {
+        return override_active;
+    }
     TRANSPARENT_ACTIVE.load(Ordering::Acquire)
 }
 
@@ -389,20 +401,31 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    static TEST_ACTIVE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// 线程局部 RAII 透明激活态守卫：仅影响当前单测线程，绝不向其它并发单测外溢全局状态。
+    struct ScopedTransparentActive {
+        prev: Option<bool>,
+    }
 
-    struct TransparentActiveReset;
-    impl Drop for TransparentActiveReset {
+    impl ScopedTransparentActive {
+        fn new(active: bool) -> Self {
+            let prev = TEST_TRANSPARENT_ACTIVE_OVERRIDE.with(|cell| {
+                let old = cell.get();
+                cell.set(Some(active));
+                old
+            });
+            Self { prev }
+        }
+    }
+
+    impl Drop for ScopedTransparentActive {
         fn drop(&mut self) {
-            set_transparent_active(false);
+            TEST_TRANSPARENT_ACTIVE_OVERRIDE.with(|cell| cell.set(self.prev));
         }
     }
 
     #[tokio::test]
     async fn test_bypass_port_refcount_overlapping_guards() {
-        let _lock = TEST_ACTIVE_MUTEX.lock().await;
-        let _reset = TransparentActiveReset;
-        set_transparent_active(false);
+        let _active = ScopedTransparentActive::new(false);
 
         let port_holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = port_holder.local_addr().unwrap().port();
@@ -432,9 +455,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_guarded_and_split_lifetime() {
-        let _lock = TEST_ACTIVE_MUTEX.lock().await;
-        let _reset = TransparentActiveReset;
-        set_transparent_active(true);
+        let _active = ScopedTransparentActive::new(true);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -462,9 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_tcp_and_bind_udp_skip_bypass_when_transparent_inactive() {
-        let _lock = TEST_ACTIVE_MUTEX.lock().await;
-        let _reset = TransparentActiveReset;
-        set_transparent_active(false);
+        let _active = ScopedTransparentActive::new(false);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -488,9 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bind_udp_guarded_registers_and_releases() {
-        let _lock = TEST_ACTIVE_MUTEX.lock().await;
-        let _reset = TransparentActiveReset;
-        set_transparent_active(true);
+        let _active = ScopedTransparentActive::new(true);
 
         let guarded = bind_udp_guarded("127.0.0.1:0").await.unwrap();
         let port = guarded.local_addr().unwrap().port();
@@ -505,9 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bypass_port_ipv4_ipv6_isolation_and_try_into_inner() {
-        let _lock = TEST_ACTIVE_MUTEX.lock().await;
-        let _reset = TransparentActiveReset;
-        set_transparent_active(true);
+        let _active = ScopedTransparentActive::new(true);
 
         let port_holder = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = port_holder.local_addr().unwrap().port();
@@ -547,5 +562,16 @@ mod tests {
         assert!(is_tcp_port_bypassed_for_family(local_port, false));
         drop(guard_opt);
         assert!(!is_tcp_port_bypassed_for_family(local_port, false));
+    }
+
+    #[test]
+    fn test_scoped_transparent_active_does_not_leak_to_other_threads() {
+        let _active = ScopedTransparentActive::new(true);
+        assert!(is_transparent_active());
+        let other_thread_val = std::thread::spawn(is_transparent_active).join().unwrap();
+        assert!(
+            !other_thread_val,
+            "thread-local test override must never leak TRANSPARENT_ACTIVE to concurrent tests"
+        );
     }
 }

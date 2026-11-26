@@ -10,13 +10,18 @@ mod transparent;
 use anyhow::{Result, bail};
 
 pub use args::{
-    GlobalCliOpts, LaunchMode, parse_global_opts, print_help, resolve_launch_mode, should_run_cli,
+    CliEnv, GlobalCliOpts, LaunchMode, parse_global_opts, parse_global_opts_with_env, print_help,
+    resolve_launch_mode, resolve_launch_mode_with_env, should_run_cli, should_run_cli_with_env,
     wants_json_output,
 };
 pub use http_client::{ApiHttpError, emit_cli_error_and_exit, format_cli_error_json};
 
 pub async fn run_cli(args: &[String]) -> Result<()> {
-    let opts = parse_global_opts(args)?;
+    run_cli_with_env(args, &CliEnv::from_process()).await
+}
+
+pub async fn run_cli_with_env(args: &[String], env: &CliEnv) -> Result<()> {
+    let opts = parse_global_opts_with_env(args, env)?;
     if opts.show_help {
         print_help();
         return Ok(());
@@ -55,10 +60,10 @@ pub async fn run_cli(args: &[String]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CliEnv, GlobalCliOpts, LaunchMode, format_cli_error_json, wants_json_output};
     use crate::cli::args::{
-        ArgSpec, normalize_api_addr, parse_cli_invocation, parse_flags_with_spec,
-        resolve_config_path_from_env,
+        ArgSpec, ParsedCliInvocation, normalize_api_addr, parse_cli_invocation_with_env,
+        parse_flags_with_spec, resolve_config_path_from_env,
     };
     use crate::cli::bridge::DEFAULT_SELF_PORTS;
     use crate::cli::conn::conn_matches_filter;
@@ -69,10 +74,94 @@ mod tests {
     use crate::cli::transparent::build_transparent_doctor_report;
     use crate::config::ConfigStore;
     use crate::i18n::Locale;
+    use anyhow::Result;
     use serde_json::{Value, json};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    async fn run_cli(args: &[String]) -> Result<()> {
+        super::run_cli_with_env(args, &CliEnv::clean()).await
+    }
+
+    fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
+        parse_cli_invocation_with_env(args, &CliEnv::clean())
+    }
+
+    fn parse_global_opts(args: &[String]) -> Result<GlobalCliOpts> {
+        super::parse_global_opts_with_env(args, &CliEnv::clean())
+    }
+
+    fn resolve_launch_mode(args: &[String]) -> Result<LaunchMode> {
+        super::resolve_launch_mode_with_env(args, &CliEnv::clean())
+    }
+
+    fn should_run_cli(args: &[String]) -> bool {
+        super::should_run_cli_with_env(args, &CliEnv::clean())
+    }
+
+    #[test]
+    fn test_cli_env_isolation_and_lazy_flowx_api_validation() {
+        let poisoned = CliEnv {
+            flowx_config: Some("env-custom.xml".into()),
+            flowx_api: Some("://invalid-host-env".into()),
+            locale: Locale::Zh,
+        };
+
+        // `--offline`, explicit `--api`, `--help`, and `serve` must ignore an invalid ambient FLOWX_API
+        let offline = parse_cli_invocation_with_env(
+            &["flowx".into(), "--offline".into(), "status".into()],
+            &poisoned,
+        )
+        .unwrap();
+        assert!(offline.opts.offline);
+        assert_eq!(offline.opts.config_path, "env-custom.xml");
+
+        let explicit = parse_cli_invocation_with_env(
+            &[
+                "flowx".into(),
+                "--api".into(),
+                "127.0.0.1:41234".into(),
+                "status".into(),
+            ],
+            &poisoned,
+        )
+        .unwrap();
+        assert_eq!(explicit.opts.api_addr, "127.0.0.1:41234");
+        assert!(explicit.opts.api_explicit);
+
+        let help =
+            parse_cli_invocation_with_env(&["flowx".into(), "--help".into()], &poisoned).unwrap();
+        assert!(help.opts.show_help);
+
+        let serve =
+            parse_cli_invocation_with_env(&["flowx".into(), "serve".into()], &poisoned).unwrap();
+        assert_eq!(
+            serve.mode,
+            LaunchMode::Serve {
+                config_path: "env-custom.xml".into(),
+                transparent_override: None,
+                replace_pid: None,
+            }
+        );
+
+        // Plain online CLI subcommand without `--api`/`--offline` still validates FLOWX_API
+        assert!(
+            parse_cli_invocation_with_env(&["flowx".into(), "status".into()], &poisoned).is_err()
+        );
+
+        // Valid FLOWX_API is normalized and marks api_explicit=true
+        let valid_env = CliEnv {
+            flowx_config: None,
+            flowx_api: Some("http://127.0.0.1:49080/".into()),
+            locale: Locale::En,
+        };
+        let online =
+            parse_cli_invocation_with_env(&["flowx".into(), "status".into()], &valid_env).unwrap();
+        assert_eq!(online.opts.api_addr, "127.0.0.1:49080");
+        assert!(online.opts.api_explicit);
+    }
+
     #[test]
     fn test_should_run_cli_detection() {
         assert!(!should_run_cli(&["flowx".into()]));
@@ -102,9 +191,7 @@ mod tests {
             ])
             .unwrap(),
             LaunchMode::Serve {
-                config_path: resolve_config_path_from_env(
-                    std::env::var("FLOWX_CONFIG").ok().as_deref()
-                ),
+                config_path: "flowx.xml".into(),
                 transparent_override: Some(true),
                 replace_pid: Some(4321),
             }
@@ -118,9 +205,7 @@ mod tests {
             ])
             .unwrap(),
             LaunchMode::Serve {
-                config_path: resolve_config_path_from_env(
-                    std::env::var("FLOWX_CONFIG").ok().as_deref()
-                ),
+                config_path: "flowx.xml".into(),
                 transparent_override: Some(false),
                 replace_pid: Some(777),
             }

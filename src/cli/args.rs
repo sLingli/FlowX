@@ -85,6 +85,31 @@ fn is_known_subcommand_value_flag(name: &str) -> bool {
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct CliEnv {
+    pub flowx_config: Option<String>,
+    pub flowx_api: Option<String>,
+    pub locale: Locale,
+}
+
+impl CliEnv {
+    pub fn from_process() -> Self {
+        Self {
+            flowx_config: std::env::var("FLOWX_CONFIG").ok(),
+            flowx_api: std::env::var("FLOWX_API").ok(),
+            locale: Locale::from_env(),
+        }
+    }
+
+    pub fn clean() -> Self {
+        Self {
+            flowx_config: None,
+            flowx_api: None,
+            locale: Locale::En,
+        }
+    }
+}
+
 pub(super) fn resolve_config_path_from_env(raw: Option<&str>) -> String {
     raw.map(str::trim)
         .filter(|v| !v.is_empty())
@@ -93,19 +118,22 @@ pub(super) fn resolve_config_path_from_env(raw: Option<&str>) -> String {
 }
 
 pub(super) fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocation> {
-    let mut config_path =
-        resolve_config_path_from_env(std::env::var("FLOWX_CONFIG").ok().as_deref());
-    let locale = Locale::from_env();
-    let env_api = std::env::var("FLOWX_API")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
-    let mut api_addr = env_api
+    parse_cli_invocation_with_env(args, &CliEnv::from_process())
+}
+
+pub(super) fn parse_cli_invocation_with_env(
+    args: &[String],
+    env: &CliEnv,
+) -> Result<ParsedCliInvocation> {
+    let mut config_path = resolve_config_path_from_env(env.flowx_config.as_deref());
+    let locale = env.locale;
+    let env_api = env
+        .flowx_api
         .as_deref()
-        .map(normalize_api_addr)
-        .transpose()?
-        .unwrap_or_else(|| DEFAULT_API_ADDR.to_string());
-    let mut api_explicit = env_api.is_some();
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let mut api_addr = DEFAULT_API_ADDR.to_string();
+    let mut api_explicit = false;
     let mut api_cli_flag = false;
     let mut offline = false;
     let mut json_output = false;
@@ -355,6 +383,17 @@ pub(super) fn parse_cli_invocation(args: &[String]) -> Result<ParsedCliInvocatio
         }
     }
 
+    // 仅在真正需要走在线 API 且未显式传 `--api` / `--offline` / `--help` 时解析环境变量 `FLOWX_API`，
+    // 防止宿主环境中无效的 `FLOWX_API` 破坏离线命令、帮助输出或显式 `--api` 覆盖。
+    if !api_cli_flag
+        && !offline
+        && !show_help
+        && let Some(raw_env_api) = env_api
+    {
+        api_addr = normalize_api_addr(raw_env_api)?;
+        api_explicit = true;
+    }
+
     Ok(ParsedCliInvocation {
         mode: LaunchMode::Cli,
         opts: GlobalCliOpts {
@@ -375,13 +414,28 @@ pub fn resolve_launch_mode(args: &[String]) -> Result<LaunchMode> {
     parse_cli_invocation(args).map(|p| p.mode)
 }
 
+pub fn resolve_launch_mode_with_env(args: &[String], env: &CliEnv) -> Result<LaunchMode> {
+    parse_cli_invocation_with_env(args, env).map(|p| p.mode)
+}
+
 /// 判断命令行参数是否应进入 CLI 子命令模式（含参数解析错误时亦返回 `true` 以便输出 CLI 错误而非静默启动守护进程）
 pub fn should_run_cli(args: &[String]) -> bool {
     !matches!(resolve_launch_mode(args), Ok(LaunchMode::Serve { .. }))
 }
 
+pub fn should_run_cli_with_env(args: &[String], env: &CliEnv) -> bool {
+    !matches!(
+        resolve_launch_mode_with_env(args, env),
+        Ok(LaunchMode::Serve { .. })
+    )
+}
+
 pub fn parse_global_opts(args: &[String]) -> Result<GlobalCliOpts> {
     parse_cli_invocation(args).map(|p| p.opts)
+}
+
+pub fn parse_global_opts_with_env(args: &[String], env: &CliEnv) -> Result<GlobalCliOpts> {
+    parse_cli_invocation_with_env(args, env).map(|p| p.opts)
 }
 
 pub(super) fn normalize_api_addr(raw: &str) -> Result<String> {

@@ -658,11 +658,30 @@ mod tests {
             UdpDecision::Passthrough
         );
         {
-            let _guard = register_bypass_port(BypassProtocol::Udp, 40001);
+            // 动态占用唯一 UDP 临时端口，避免向全局 BypassPortRegistry 注册固定端口 40001 干扰并发单测
+            let udp_holder = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let bypass_udp_port = udp_holder.local_addr().unwrap().port();
+            let mut bypass_dns_pkt = Vec::new();
+            PacketBuilder::ipv4([10, 0, 0, 2], [1, 1, 1, 1], 64)
+                .udp(bypass_udp_port, 53)
+                .write(&mut bypass_dns_pkt, &query_payload)
+                .unwrap();
+            let parsed_bypass_dns = parse_udp_packet(&bypass_dns_pkt).unwrap();
+            let _guard = register_bypass_port(BypassProtocol::Udp, bypass_udp_port);
             assert_eq!(
-                decide_udp_packet(&parsed_dns, Some(99999), true, true, None, None, None),
+                decide_udp_packet(
+                    &parsed_bypass_dns,
+                    Some(99999),
+                    true,
+                    true,
+                    None,
+                    None,
+                    None
+                ),
                 UdpDecision::Passthrough
             );
+            drop(_guard);
+            drop(udp_holder);
         }
 
         // 有域名代理规则 (*.google.com) 时：无关域名 example.com 放行真实 DNS，命中域名 mail.google.com 才劫持

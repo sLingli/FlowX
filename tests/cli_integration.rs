@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use flowx::api::ApiServer;
-use flowx::cli::{format_cli_error_json, run_cli};
+use flowx::cli::{CliEnv, format_cli_error_json, run_cli_with_env};
 use flowx::config::ConfigStore;
 use flowx::interceptor::dispatcher::ProxyNodeEntry;
 use flowx::monitor::ConnectionManager;
@@ -16,6 +16,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use common::DEFAULT_SELF_PORTS;
+
+/// Run CLI in an explicit clean environment so host `FLOWX_API` / `FLOWX_CONFIG` / `FLOWX_LANG`
+/// variables cannot pollute test outcomes.
+async fn run_cli(args: &[String]) -> anyhow::Result<()> {
+    run_cli_with_env(args, &CliEnv::clean()).await
+}
 
 /// RAII temp XML config guard that removes both the config file and its `.filename.lock` sidecar.
 struct TempConfigGuard {
