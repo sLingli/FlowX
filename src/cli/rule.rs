@@ -9,9 +9,19 @@ use crate::cli::bridge::{
     load_rule_backend, offline_resolve_rule_id, resolve_rule_id_from_views,
 };
 use crate::cli::http_client::{api_request_or_offline, api_request_strict, ensure_api_ok};
-use crate::control::rule::{add_rule, patch_rule};
-use crate::control::{AddRuleRequest, PatchRuleRequest};
+use crate::control::rule::{add_rule, delete_rule, move_rule, patch_rule, toggle_rule};
+use crate::control::{
+    AddRuleRequest, ControlError, MoveRuleRequest, PatchRuleRequest, ToggleRuleRequest,
+};
+use crate::i18n::Locale;
 use crate::router::RuleView;
+
+fn rule_not_found_cli_err(locale: Locale) -> anyhow::Error {
+    control_err_to_cli(
+        ControlError::not_found("ERR_RULE_NOT_FOUND", "error.rule_not_found"),
+        locale,
+    )
+}
 
 pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
     let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("list");
@@ -233,7 +243,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             let (resolved_id, res_val) = match load_rule_backend(opts).await? {
                 RuleBackend::Online { rules } => {
                     let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
                     let payload = json!({
                         "id": resolved_id,
                         "name": name,
@@ -251,7 +261,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 RuleBackend::Offline(rt) => {
                     let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
                     let payload = json!({
                         "id": resolved_id,
                         "name": name,
@@ -308,7 +318,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             let (resolved_id, res_val) = match load_rule_backend(opts).await? {
                 RuleBackend::Online { rules } => {
                     let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
                     let (st, val) = api_request_strict(
                         &opts.api_addr,
                         "POST",
@@ -320,15 +330,19 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 RuleBackend::Offline(rt) => {
                     let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    let next_state = rt
-                        .engine
-                        .toggle_rule(resolved_id, enabled)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
+                    let next_state = toggle_rule(
+                        ToggleRuleRequest {
+                            id: resolved_id,
+                            enabled,
+                        },
+                        &rt.engine,
+                    )
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                     rt.save()?;
                     (
                         resolved_id,
-                        json!({ "ok": true, "id": resolved_id, "enabled": next_state }),
+                        json!({ "ok": true, "enabled": next_state }),
                     )
                 }
             };
@@ -355,22 +369,41 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                     max_pos: 2,
                 },
             )?;
-            let id_str = resolve_id_arg(&pos, &flags, "Missing rule <ID> for `flowx rule move`")?;
-            let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
             let flag_dir = flags.get("dir").or_else(|| flags.get("direction"));
-            let direction = match (pos.get(1), flag_dir) {
-                (Some(_), Some(_)) => {
-                    bail!("Cannot specify both positional <DIRECTION> and --dir/--direction")
+            let (id_str, direction) = if let Some(flag_id) = flags.get("id") {
+                if pos.len() > 1 {
+                    bail!("Cannot specify both positional <ID> and --id");
                 }
-                (Some(p), None) => p.clone(),
-                (None, Some(f)) => f.clone(),
-                (None, None) => bail!("Missing direction <up|down|top|bottom>"),
+                let dir = match (pos.first(), flag_dir) {
+                    (Some(_), Some(_)) => {
+                        bail!("Cannot specify both positional <DIRECTION> and --dir/--direction")
+                    }
+                    (Some(p), None) => p.clone(),
+                    (None, Some(f)) => f.clone(),
+                    (None, None) => bail!("Missing direction <up|down|top|bottom>"),
+                };
+                (flag_id.clone(), dir)
+            } else {
+                let id = pos
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Missing rule <ID> for `flowx rule move`"))?;
+                let dir = match (pos.get(1), flag_dir) {
+                    (Some(_), Some(_)) => {
+                        bail!("Cannot specify both positional <DIRECTION> and --dir/--direction")
+                    }
+                    (Some(p), None) => p.clone(),
+                    (None, Some(f)) => f.clone(),
+                    (None, None) => bail!("Missing direction <up|down|top|bottom>"),
+                };
+                (id, dir)
             };
+            let raw_id: u64 = id_str.parse().context("Invalid rule ID")?;
 
             let (resolved_id, res_val) = match load_rule_backend(opts).await? {
                 RuleBackend::Online { rules } => {
                     let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
                     let (st, val) = api_request_strict(
                         &opts.api_addr,
                         "POST",
@@ -382,20 +415,19 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 RuleBackend::Offline(rt) => {
                     let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    let moved = rt
-                        .engine
-                        .move_rule(resolved_id, &direction)
-                        .ok_or_else(|| {
-                            anyhow!("Invalid move target or direction '{}'", direction)
-                        })?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
+                    let moved = move_rule(
+                        MoveRuleRequest {
+                            id: resolved_id,
+                            direction: direction.clone(),
+                        },
+                        &rt.engine,
+                    )
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                     if moved {
                         rt.save()?;
                     }
-                    (
-                        resolved_id,
-                        json!({ "ok": true, "id": resolved_id, "moved": moved }),
-                    )
+                    (resolved_id, json!({ "ok": true, "moved": moved }))
                 }
             };
 
@@ -428,7 +460,7 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
             let (resolved_id, res_val) = match load_rule_backend(opts).await? {
                 RuleBackend::Online { rules } => {
                     let resolved_id = resolve_rule_id_from_views(&rules, raw_id)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
                     let (st, val) = api_request_strict(
                         &opts.api_addr,
                         "DELETE",
@@ -440,12 +472,11 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 RuleBackend::Offline(rt) => {
                     let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, opts.locale)
-                        .ok_or_else(|| anyhow!("Routing rule #{} not found", raw_id))?;
-                    if !rt.engine.delete_rule(resolved_id) {
-                        bail!("Routing rule #{} not found", raw_id);
-                    }
+                        .ok_or_else(|| rule_not_found_cli_err(opts.locale))?;
+                    delete_rule(resolved_id, &rt.engine)
+                        .map_err(|e| control_err_to_cli(e, opts.locale))?;
                     rt.save()?;
-                    (resolved_id, json!({ "ok": true, "id": resolved_id }))
+                    (resolved_id, json!({ "ok": true }))
                 }
             };
 

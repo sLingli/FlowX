@@ -228,7 +228,26 @@ pub(super) async fn handle_api_request(
         return Ok(());
     }
 
-    let req_body = std::str::from_utf8(body_bytes).unwrap_or("");
+    let req_body = match std::str::from_utf8(body_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            if method == "POST" && path == "/api/transparent/elevate" {
+                send_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    JSON_CONTENT_TYPE,
+                    &json_error(
+                        locale,
+                        "ERR_INVALID_TRANSPARENT_BODY",
+                        "error.invalid_transparent_body",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            ""
+        }
+    };
 
     // POST /api/transparent/elevate 采用前置无锁一次性原子闸门：
     // 1) 在排队等待 mutation_lock 之前先检查 elevating，避免 UAC 弹窗超过 5s 时并发请求返回 503 或取消后连续弹第二个 UAC；

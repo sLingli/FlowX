@@ -10,9 +10,10 @@ use crate::cli::bridge::{
 use crate::cli::http_client::{
     ApiTransportError, SilentExitError, api_request_or_offline, api_request_raw, ensure_api_ok,
 };
-use crate::control::node::{add_node, list_nodes, patch_node, ping_address};
-use crate::control::{AddNodeRequest, PatchNodeRequest, PingResponse, ProxyNodeView};
-use crate::router::Action;
+use crate::control::node::{add_node, delete_node, list_nodes, patch_node, ping_address};
+use crate::control::{
+    AddNodeRequest, ControlError, PatchNodeRequest, PingResponse, ProxyNodeView,
+};
 
 pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
     let sub = opts.rest.get(1).map(|s| s.as_str()).unwrap_or("list");
@@ -226,29 +227,10 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 ensure_api_ok(st, val)?
             } else {
                 let rt = load_offline_runtime(&opts.config_path)?;
-                let rules = rt.engine.current_rules();
-                let current_default = rt.engine.default_action();
-                let is_referenced = rules
-                    .iter()
-                    .any(|r| matches!(r.action, Action::Proxy(pid) if pid == id))
-                    || matches!(current_default, Action::Proxy(pid) if pid == id);
-                if is_referenced {
-                    bail!(
-                        "Node #{} is referenced by active rules or default action and cannot be removed",
-                        id
-                    );
-                }
-                let removed = rt
-                    .nodes
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id)
-                    .is_some();
-                if !removed {
-                    bail!("Proxy node #{} not found", id);
-                }
+                delete_node(id, &rt.nodes, &rt.engine)
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 rt.save()?;
-                json!({ "ok": true, "id": id })
+                json!({ "ok": true })
             };
 
             if opts.json_output {
@@ -294,7 +276,12 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     guard
                         .get(&id)
                         .map(|n| n.server_addr.clone())
-                        .ok_or_else(|| anyhow!("Proxy node #{} not found", id))?
+                        .ok_or_else(|| {
+                            control_err_to_cli(
+                                ControlError::not_found("ERR_NODE_NOT_FOUND", "error.node_not_found"),
+                                opts.locale,
+                            )
+                        })?
                 };
                 let (ok, latency_ms, message, detail) =
                     ping_address(&addr, &DEFAULT_SELF_PORTS, opts.locale).await;

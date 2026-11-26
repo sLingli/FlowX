@@ -162,7 +162,7 @@ pub(crate) fn is_loopback_domain(host: &str) -> bool {
         || (bytes.len() > 10 && bytes[bytes.len() - 10..].eq_ignore_ascii_case(b".localhost"))
 }
 
-/// 枚举本机在线网络接口上处于 Preferred 状态的单播 IP 地址（用于防 DNS 重绑定直连本机开放端口）
+/// 枚举本机在线网络接口上处于 Preferred / Deprecated 状态的单播 IP 地址（用于防 DNS 重绑定直连本机开放端口）
 pub fn local_interface_ips() -> Vec<IpAddr> {
     use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
     use windows_sys::Win32::NetworkManagement::IpHelper::{
@@ -171,7 +171,8 @@ pub fn local_interface_ips() -> Vec<IpAddr> {
     };
     use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
     use windows_sys::Win32::Networking::WinSock::{
-        AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred, SOCKADDR_IN, SOCKADDR_IN6,
+        AF_INET, AF_INET6, AF_UNSPEC, IpDadStateDeprecated, IpDadStatePreferred, SOCKADDR_IN,
+        SOCKADDR_IN6,
     };
 
     let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
@@ -199,7 +200,8 @@ pub fn local_interface_ips() -> Vec<IpAddr> {
                 }
                 let mut unicast_ptr = unsafe { (*adapter_ptr).FirstUnicastAddress };
                 while !unicast_ptr.is_null() {
-                    if unsafe { (*unicast_ptr).DadState } != IpDadStatePreferred {
+                    let dad_state = unsafe { (*unicast_ptr).DadState };
+                    if dad_state != IpDadStatePreferred && dad_state != IpDadStateDeprecated {
                         unicast_ptr = unsafe { (*unicast_ptr).Next };
                         continue;
                     }

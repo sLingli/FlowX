@@ -17,7 +17,7 @@ mod entry {
     use std::net::SocketAddr;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
-    use tracing::{Level, info, warn};
+    use tracing::{info, level_filters::LevelFilter, warn};
     use tracing_subscriber::FmtSubscriber;
 
     use flowx::api::{ApiServer, SystemRuntimeContext};
@@ -549,26 +549,58 @@ mod entry {
         }
     }
 
-    fn parse_log_level(raw: Option<&str>) -> Level {
-        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-            Some("trace") => Level::TRACE,
-            Some("debug") => Level::DEBUG,
-            Some("warn" | "warning") => Level::WARN,
-            Some("error") => Level::ERROR,
-            _ => Level::INFO,
+    fn parse_single_log_level(token: &str) -> Option<LevelFilter> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Some(LevelFilter::OFF),
+            "trace" => Some(LevelFilter::TRACE),
+            "debug" => Some(LevelFilter::DEBUG),
+            "info" => Some(LevelFilter::INFO),
+            "warn" | "warning" => Some(LevelFilter::WARN),
+            "error" => Some(LevelFilter::ERROR),
+            _ => None,
         }
     }
 
-    fn resolve_log_level() -> Level {
-        let raw = std::env::var("FLOWX_LOG")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| {
-                std::env::var("RUST_LOG")
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
-            });
-        parse_log_level(raw.as_deref())
+    fn parse_log_level(raw: Option<&str>) -> LevelFilter {
+        let Some(raw_str) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+            return LevelFilter::INFO;
+        };
+        if let Some(direct) = parse_single_log_level(raw_str) {
+            return direct;
+        }
+        let mut flowx_level: Option<LevelFilter> = None;
+        let mut fallback_level: Option<LevelFilter> = None;
+        for part in raw_str.split(',') {
+            let directive = part.trim();
+            if directive.is_empty() {
+                continue;
+            }
+            if let Some((target, lvl)) = directive.split_once('=') {
+                let target_lower = target.trim().to_ascii_lowercase();
+                if let Some(parsed) = parse_single_log_level(lvl)
+                    && (target_lower == "flowx" || target_lower.starts_with("flowx::"))
+                {
+                    flowx_level = Some(parsed);
+                }
+            } else if let Some(parsed) = parse_single_log_level(directive) {
+                fallback_level = Some(parsed);
+            }
+        }
+        flowx_level.or(fallback_level).unwrap_or(LevelFilter::INFO)
+    }
+
+    fn resolve_log_level_from(flowx_log: Option<&str>, rust_log: Option<&str>) -> LevelFilter {
+        let raw = flowx_log
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .or_else(|| rust_log.map(str::trim).filter(|v| !v.is_empty()));
+        parse_log_level(raw)
+    }
+
+    fn resolve_log_level() -> LevelFilter {
+        let flowx_log = std::env::var("FLOWX_LOG").ok();
+        let rust_log = std::env::var("RUST_LOG").ok();
+        resolve_log_level_from(flowx_log.as_deref(), rust_log.as_deref())
     }
 
     #[cfg(test)]
@@ -577,13 +609,33 @@ mod entry {
 
         #[test]
         fn test_parse_log_level() {
-            assert_eq!(parse_log_level(None), Level::INFO);
-            assert_eq!(parse_log_level(Some("")), Level::INFO);
-            assert_eq!(parse_log_level(Some("debug")), Level::DEBUG);
-            assert_eq!(parse_log_level(Some(" DEBUG ")), Level::DEBUG);
-            assert_eq!(parse_log_level(Some("trace")), Level::TRACE);
-            assert_eq!(parse_log_level(Some("warning")), Level::WARN);
-            assert_eq!(parse_log_level(Some("error")), Level::ERROR);
+            assert_eq!(parse_log_level(None), LevelFilter::INFO);
+            assert_eq!(parse_log_level(Some("")), LevelFilter::INFO);
+            assert_eq!(parse_log_level(Some("debug")), LevelFilter::DEBUG);
+            assert_eq!(parse_log_level(Some(" DEBUG ")), LevelFilter::DEBUG);
+            assert_eq!(parse_log_level(Some("trace")), LevelFilter::TRACE);
+            assert_eq!(parse_log_level(Some("warning")), LevelFilter::WARN);
+            assert_eq!(parse_log_level(Some("error")), LevelFilter::ERROR);
+            assert_eq!(parse_log_level(Some("off")), LevelFilter::OFF);
+            assert_eq!(parse_log_level(Some("flowx=debug")), LevelFilter::DEBUG);
+            assert_eq!(
+                parse_log_level(Some("warn,flowx=trace")),
+                LevelFilter::TRACE
+            );
+            assert_eq!(parse_log_level(Some("info,flowx=off")), LevelFilter::OFF);
+            assert_eq!(
+                parse_log_level(Some("other_crate=debug,warn")),
+                LevelFilter::WARN
+            );
+            assert_eq!(
+                resolve_log_level_from(Some("error"), Some("debug")),
+                LevelFilter::ERROR
+            );
+            assert_eq!(
+                resolve_log_level_from(Some("   "), Some("flowx=debug")),
+                LevelFilter::DEBUG
+            );
+            assert_eq!(resolve_log_level_from(None, None), LevelFilter::INFO);
         }
 
         #[tokio::test]

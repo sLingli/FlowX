@@ -373,7 +373,7 @@ pub fn relaunch_elevated_with_replace_pid(extra_args: &[String]) -> io::Result<(
     if is_process_elevated() {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "Process is already running with Administrator privileges",
+            "ERR_TRANSPARENT_ALREADY_ELEVATED: Process is already running with Administrator privileges",
         ));
     }
 

@@ -2,7 +2,7 @@
 /dist
 /flowx.xml
 .*flowx*.tmp*
-.*.xml.lock
+.*.lock
 /driver
 /packages/*/LICENSE
 /packages/*/*.tgz
