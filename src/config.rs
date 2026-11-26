@@ -614,7 +614,7 @@ pub struct ConfigStore {
     save_lock: Mutex<()>,
 }
 
-struct ConfigFileLock {
+pub(crate) struct ConfigFileLock {
     file: std::fs::File,
 }
 
@@ -671,7 +671,7 @@ impl ConfigStore {
         }
     }
 
-    fn acquire_cross_process_lock(&self) -> Result<ConfigFileLock> {
+    pub(crate) fn acquire_cross_process_lock(&self) -> Result<ConfigFileLock> {
         let parent_dir = self.path.parent().filter(|p| !p.as_os_str().is_empty());
         if let Some(parent) = parent_dir {
             std::fs::create_dir_all(parent)?;
@@ -736,6 +736,17 @@ impl ConfigStore {
             return Ok(runtime);
         }
         ProfileConfig::default_profile().into_runtime(self_ports)
+    }
+
+    /// 先持有跨进程文件锁再加载配置（若明确 `NotFound` 则返回内存默认配置，不写入 XML）；
+    /// 供离线 CLI 在整个读-改-写事务期间持有 `ConfigFileLock`，防止并发 `--offline` 命令或守护进程保存造成 lost update。
+    pub(crate) fn lock_and_load_existing_or_default(
+        &self,
+        self_ports: &[u16],
+    ) -> Result<(RuntimeProfile, ConfigFileLock)> {
+        let file_lock = self.acquire_cross_process_lock()?;
+        let runtime = self.load_existing_or_default(self_ports)?;
+        Ok((runtime, file_lock))
     }
 
     /// 从磁盘加载配置；仅在明确 `NotFound` 时生成默认配置，其他 I/O 错误直接失败以免覆盖不可读配置
@@ -826,6 +837,19 @@ impl ConfigStore {
     ) -> Result<()> {
         let cfg = Self::snapshot_runtime_with_transparent(proxy_nodes, rule_engine, transparent);
         self.save_profile(&cfg)
+    }
+
+    /// 在调用方已持有该配置 `ConfigFileLock` 的前提下原子落盘（避免 Windows 独占文件锁重入自死锁）
+    pub(crate) fn save_runtime_with_transparent_holding_lock(
+        &self,
+        proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
+        rule_engine: &RuleEngine,
+        transparent: Option<&TransparentSettings>,
+        _file_lock: &ConfigFileLock,
+    ) -> Result<()> {
+        let cfg = Self::snapshot_runtime_with_transparent(proxy_nodes, rule_engine, transparent);
+        let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.write_config_atomic_inner(&cfg, None)
     }
 
     fn write_config_atomic(&self, cfg: &ProfileConfig) -> Result<()> {
@@ -1462,5 +1486,77 @@ mod tests {
         // 4. Default profile yields disabled transparent defaults
         let def_rt = ProfileConfig::default_profile().into_runtime(&[]).unwrap();
         assert_eq!(def_rt.transparent_settings, TransparentSettings::default());
+    }
+
+    #[test]
+    fn test_lock_and_load_prevents_concurrent_offline_lost_update() {
+        let tmp = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_offline_rmw_lock_{}_{}.xml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let lock_path = ConfigStore::new(&tmp).lock_file_path();
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&lock_path);
+
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(tmp.clone(), lock_path);
+
+        let mut handles = Vec::new();
+        for worker in 0..4usize {
+            let path_clone = tmp.clone();
+            handles.push(std::thread::spawn(move || {
+                let store = ConfigStore::new(&path_clone);
+                for round in 0..5usize {
+                    let (rt, file_lock) = store
+                        .lock_and_load_existing_or_default(&[])
+                        .expect("lock_and_load must succeed");
+                    let nodes = RwLock::new(rt.proxy_nodes);
+                    let engine = RuleEngine::new(rt.rules, rt.default_action);
+                    engine.add_rule(Rule::from_raw(
+                        format!("rmw-w{worker}-r{round}"),
+                        true,
+                        None,
+                        Some(&format!("w{worker}r{round}.example")),
+                        None,
+                        Action::Direct,
+                    ));
+                    store
+                        .save_runtime_with_transparent_holding_lock(
+                            &nodes,
+                            &engine,
+                            Some(&rt.transparent_settings),
+                            &file_lock,
+                        )
+                        .expect("locked save must succeed");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_rt = ConfigStore::new(&tmp).load_existing(&[]).unwrap();
+        for worker in 0..4usize {
+            for round in 0..5usize {
+                let expected = format!("rmw-w{worker}-r{round}");
+                assert!(
+                    final_rt.rules.iter().any(|r| r.name == expected),
+                    "lost update detected: missing rule {expected}"
+                );
+            }
+        }
     }
 }

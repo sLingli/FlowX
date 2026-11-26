@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::args::GlobalCliOpts;
 use crate::cli::http_client::{ApiHttpError, api_request_or_offline, ensure_api_ok};
-use crate::config::ConfigStore;
+use crate::config::{ConfigFileLock, ConfigStore};
 use crate::control::ControlError;
 use crate::i18n::Locale;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
@@ -27,25 +27,38 @@ pub(super) struct OfflineRuntime {
     pub(super) nodes: RwLock<HashMap<u32, ProxyNodeEntry>>,
     pub(super) engine: RuleEngine,
     pub(super) transparent: TransparentSettings,
+    file_lock: Option<ConfigFileLock>,
 }
 
 impl OfflineRuntime {
     pub(super) fn save(&self) -> Result<()> {
-        self.store
-            .save_runtime_with_transparent(&self.nodes, &self.engine, Some(&self.transparent))
+        match &self.file_lock {
+            Some(lock) => self.store.save_runtime_with_transparent_holding_lock(
+                &self.nodes,
+                &self.engine,
+                Some(&self.transparent),
+                lock,
+            ),
+            None => self.store.save_runtime_with_transparent(
+                &self.nodes,
+                &self.engine,
+                Some(&self.transparent),
+            ),
+        }
     }
 }
 
 pub(super) fn load_offline_runtime(config_path: &str) -> Result<OfflineRuntime> {
     let store = ConfigStore::new(config_path);
-    let rt = store
-        .load_existing_or_default(&DEFAULT_SELF_PORTS)
+    let (rt, file_lock) = store
+        .lock_and_load_existing_or_default(&DEFAULT_SELF_PORTS)
         .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
     Ok(OfflineRuntime {
         store,
         nodes: RwLock::new(rt.proxy_nodes),
         engine: RuleEngine::new(rt.rules, rt.default_action),
         transparent: rt.transparent_settings,
+        file_lock: Some(file_lock),
     })
 }
 
@@ -59,6 +72,7 @@ pub(super) fn load_offline_runtime_readonly(config_path: &str) -> Result<Offline
         nodes: RwLock::new(rt.proxy_nodes),
         engine: RuleEngine::new(rt.rules, rt.default_action),
         transparent: rt.transparent_settings,
+        file_lock: None,
     })
 }
 
