@@ -17,12 +17,29 @@ const DEFAULT_WINDIVERT_URL =
 const DEFAULT_WINDIVERT_SHA256 =
   "63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15";
 
-function getUserFallbackDriverDir() {
+function getUserFlowxDataDir() {
   const localAppData =
     process.env.LOCALAPPDATA && process.env.LOCALAPPDATA.trim()
       ? process.env.LOCALAPPDATA.trim()
       : path.join(os.homedir(), "AppData", "Local");
-  return path.join(localAppData, "FlowX", "driver");
+  return path.join(localAppData, "FlowX");
+}
+
+function getUserFallbackDriverDir() {
+  return path.join(getUserFlowxDataDir(), "driver");
+}
+
+function getSavedDriverDirPointerPath() {
+  return path.join(getUserFlowxDataDir(), "driver-dir.txt");
+}
+
+function existsIncludingSymlink(targetPath) {
+  try {
+    fs.lstatSync(targetPath);
+    return true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function hasPairedDriver(dir) {
@@ -30,6 +47,42 @@ function hasPairedDriver(dir) {
     fs.existsSync(path.join(dir, "WinDivert.dll")) &&
     fs.existsSync(path.join(dir, "WinDivert64.sys"))
   );
+}
+
+function readSavedDriverDir() {
+  try {
+    const raw = fs.readFileSync(getSavedDriverDirPointerPath(), "utf8").trim();
+    return raw ? path.resolve(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function persistSavedDriverDir(targetDir) {
+  const pointerPath = getSavedDriverDirPointerPath();
+  const resolved = path.resolve(targetDir);
+  if (resolved === path.resolve(pkgDriverDir)) {
+    try {
+      fs.rmSync(pointerPath, { force: true });
+    } catch (_) {}
+    return true;
+  }
+  const parentDir = path.dirname(pointerPath);
+  const tmpPath = path.join(
+    parentDir,
+    `.driver-dir.tmp.${process.pid}-${crypto.randomBytes(4).toString("hex")}`
+  );
+  try {
+    fs.mkdirSync(parentDir, { recursive: true });
+    fs.writeFileSync(tmpPath, `${resolved}\n`, "utf8");
+    fs.renameSync(tmpPath, pointerPath);
+    return true;
+  } catch (_) {
+    try {
+      fs.rmSync(tmpPath, { force: true });
+    } catch (_) {}
+    return false;
+  }
 }
 
 function isDirWritable(targetParent) {
@@ -65,6 +118,13 @@ function buildChildEnv(preferredDriverDir) {
   if (preferredDriverDir && hasPairedDriver(preferredDriverDir)) {
     if (path.resolve(preferredDriverDir) !== path.resolve(pkgDriverDir)) {
       env.FLOWX_WINDIVERT_DLL = path.join(preferredDriverDir, "WinDivert.dll");
+    }
+    return env;
+  }
+  const savedDir = readSavedDriverDir();
+  if (savedDir && hasPairedDriver(savedDir)) {
+    if (path.resolve(savedDir) !== path.resolve(pkgDriverDir)) {
+      env.FLOWX_WINDIVERT_DLL = path.join(savedDir, "WinDivert.dll");
     }
     return env;
   }
@@ -130,6 +190,17 @@ function parseSetupArgs(args) {
       "When specifying a custom --url, also pass --sha256 <64-hex> to verify integrity."
     );
   }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(opts.url);
+  } catch (_) {
+    throw new Error(`Invalid --url '${opts.url}': expected a valid https:// URL.`);
+  }
+  if (parsedUrl.protocol !== "https:") {
+    throw new Error(
+      `Insecure --url '${opts.url}': only https:// download URLs are allowed.`
+    );
+  }
   if (!/^[0-9a-fA-F]{64}$/.test(opts.sha256)) {
     throw new Error("Invalid --sha256: expected a 64-character hexadecimal SHA-256 digest.");
   }
@@ -157,42 +228,76 @@ function findFileInTree(root, targetName, requiredParentDir) {
 }
 
 function atomicInstallDriverFiles(targetDir, dllSrc, sysSrc, licSrc) {
-  const parentDir = path.dirname(targetDir);
-  const baseName = path.basename(targetDir);
-  fs.mkdirSync(parentDir, { recursive: true });
+  fs.mkdirSync(targetDir, { recursive: true });
+
+  const entries = [
+    { name: "WinDivert.dll", src: dllSrc },
+    { name: "WinDivert64.sys", src: sysSrc },
+  ];
+  if (licSrc) {
+    entries.push({ name: "LICENSE-WinDivert.txt", src: licSrc });
+  }
 
   const nonce = `${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  const stagingDir = path.join(parentDir, `.${baseName}.staging.${nonce}`);
-  const backupDir = path.join(parentDir, `.${baseName}.backup.${nonce}`);
+  const staged = entries.map((e) => ({
+    ...e,
+    destPath: path.join(targetDir, e.name),
+    tmpPath: path.join(targetDir, `.flowx.tmp.${e.name}.${nonce}`),
+    bakPath: path.join(targetDir, `.flowx.bak.${e.name}.${nonce}`),
+  }));
+
+  const swapped = [];
+  const backups = [];
 
   try {
-    fs.mkdirSync(stagingDir, { recursive: true });
-    fs.copyFileSync(dllSrc, path.join(stagingDir, "WinDivert.dll"));
-    fs.copyFileSync(sysSrc, path.join(stagingDir, "WinDivert64.sys"));
-    if (licSrc) {
-      fs.copyFileSync(licSrc, path.join(stagingDir, "LICENSE-WinDivert.txt"));
+    // 1. Stage all driver files inside targetDir first so unrelated files in targetDir are never touched
+    for (const item of staged) {
+      fs.copyFileSync(item.src, item.tmpPath);
     }
 
-    let movedExisting = false;
-    if (fs.existsSync(targetDir)) {
-      fs.renameSync(targetDir, backupDir);
-      movedExisting = true;
+    // 2. Replace only the managed driver files one-by-one with full rollback on any error
+    for (const item of staged) {
+      if (existsIncludingSymlink(item.destPath)) {
+        fs.renameSync(item.destPath, item.bakPath);
+        backups.push(item);
+      }
+      fs.renameSync(item.tmpPath, item.destPath);
+      swapped.push(item);
     }
-    try {
-      fs.renameSync(stagingDir, targetDir);
-    } catch (err) {
-      if (movedExisting && fs.existsSync(backupDir) && !fs.existsSync(targetDir)) {
+
+    // 3. Best-effort cleanup of per-file backups after commit (AV/handle locks must not fail committed install)
+    for (const item of backups) {
+      try {
+        fs.rmSync(item.bakPath, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        console.warn(
+          `Warning: Could not remove temporary backup ${item.bakPath}: ${cleanupErr.message}`
+        );
+      }
+    }
+  } catch (err) {
+    for (let i = swapped.length - 1; i >= 0; i--) {
+      try {
+        fs.rmSync(swapped[i].destPath, { recursive: true, force: true });
+      } catch (_) {}
+    }
+    for (let i = backups.length - 1; i >= 0; i--) {
+      const item = backups[i];
+      if (existsIncludingSymlink(item.bakPath) && !existsIncludingSymlink(item.destPath)) {
         try {
-          fs.renameSync(backupDir, targetDir);
+          fs.renameSync(item.bakPath, item.destPath);
         } catch (_) {}
       }
-      throw err;
     }
-    if (movedExisting) {
-      fs.rmSync(backupDir, { recursive: true, force: true });
-    }
+    throw err;
   } finally {
-    fs.rmSync(stagingDir, { recursive: true, force: true });
+    for (const item of staged) {
+      try {
+        if (existsIncludingSymlink(item.tmpPath)) {
+          fs.rmSync(item.tmpPath, { force: true });
+        }
+      } catch (_) {}
+    }
   }
 }
 
@@ -235,7 +340,13 @@ Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_
   }
 
   if (!opts.force && hasPairedDriver(targetDriverDir)) {
+    const saved = persistSavedDriverDir(targetDriverDir);
     console.log(`WinDivert driver files are already present at ${targetDriverDir}`);
+    if (path.resolve(targetDriverDir) !== path.resolve(pkgDriverDir) && !saved) {
+      console.log(
+        `Note: Could not persist custom driver path under %LOCALAPPDATA%\\FlowX. Set FLOWX_WINDIVERT_DLL="${path.join(targetDriverDir, "WinDivert.dll")}" or configure --dll-path manually.`
+      );
+    }
     runDoctorAndExit(targetDriverDir);
     return;
   }
@@ -252,7 +363,7 @@ Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$ErrorActionPreference='Stop'; Invoke-WebRequest -Uri $env:FLOWX_WD_URL -OutFile $env:FLOWX_WD_ZIP -UseBasicParsing",
+        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $env:FLOWX_WD_URL -OutFile $env:FLOWX_WD_ZIP -UseBasicParsing",
       ],
       {
         stdio: "inherit",
@@ -312,24 +423,35 @@ Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_
     }
 
     atomicInstallDriverFiles(targetDriverDir, dllSrc, sysSrc, licSrc);
+    const pointerSaved = persistSavedDriverDir(targetDriverDir);
     console.log(`Installed WinDivert x64 drivers -> ${targetDriverDir}`);
     if (path.resolve(targetDriverDir) !== path.resolve(pkgDriverDir)) {
-      console.log(
-        `Note: Installed to user-writable directory. The 'flowx' CLI wrapper automatically sets FLOWX_WINDIVERT_DLL; if running flowx.exe directly, configure --dll-path "${path.join(targetDriverDir, "WinDivert.dll")}".`
-      );
+      if (pointerSaved) {
+        console.log(
+          `Note: Saved driver directory to ${getSavedDriverDirPointerPath()}; future 'flowx' wrapper invocations will automatically set FLOWX_WINDIVERT_DLL. If running flowx.exe directly, configure --dll-path "${path.join(targetDriverDir, "WinDivert.dll")}".`
+        );
+      } else {
+        console.log(
+          `Note: Could not persist driver path under %LOCALAPPDATA%\\FlowX. Set FLOWX_WINDIVERT_DLL="${path.join(targetDriverDir, "WinDivert.dll")}" or configure --dll-path "${path.join(targetDriverDir, "WinDivert.dll")}" manually.`
+        );
+      }
     }
     runDoctorAndExit(targetDriverDir);
   } catch (err) {
     console.error(`Error: ${err.message}`);
     process.exit(1);
   } finally {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch (_) {}
   }
 }
 
 function main() {
-  if (process.platform !== "win32") {
-    console.error("Error: FlowX only supports Windows (win32 x64).");
+  if (process.platform !== "win32" || process.arch !== "x64") {
+    console.error(
+      `Error: FlowX only supports Windows x64 (win32 x64); detected ${process.platform} ${process.arch}.`
+    );
     process.exit(1);
   }
 
@@ -346,7 +468,9 @@ function main() {
     process.exit(1);
   }
 
+  // Keep the Node wrapper alive on Ctrl+C and Ctrl+Break so flowx.exe can stop WinDivert and flush DNS cleanly
   process.on("SIGINT", () => {});
+  process.on("SIGBREAK", () => {});
   const child = spawn(exePath, args, {
     stdio: "inherit",
     env: buildChildEnv(null),
@@ -370,4 +494,8 @@ if (require.main === module) {
 module.exports = {
   parseSetupArgs,
   atomicInstallDriverFiles,
+  buildChildEnv,
+  persistSavedDriverDir,
+  readSavedDriverDir,
+  getSavedDriverDirPointerPath,
 };

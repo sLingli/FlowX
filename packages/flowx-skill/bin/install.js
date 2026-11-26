@@ -160,6 +160,15 @@ function copyDir(src, dst) {
   return count;
 }
 
+function existsIncludingSymlink(targetPath) {
+  try {
+    fs.lstatSync(targetPath);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 function installSkillAtomically(srcDir, targetDir) {
   const parentDir = path.dirname(targetDir);
   const baseName = path.basename(targetDir);
@@ -172,14 +181,18 @@ function installSkillAtomically(srcDir, targetDir) {
   try {
     const fileCount = copyDir(srcDir, stagingDir);
     let movedExisting = false;
-    if (fs.existsSync(targetDir)) {
+    if (existsIncludingSymlink(targetDir)) {
       fs.renameSync(targetDir, backupDir);
       movedExisting = true;
     }
     try {
       fs.renameSync(stagingDir, targetDir);
     } catch (err) {
-      if (movedExisting && fs.existsSync(backupDir) && !fs.existsSync(targetDir)) {
+      if (
+        movedExisting &&
+        existsIncludingSymlink(backupDir) &&
+        !existsIncludingSymlink(targetDir)
+      ) {
         try {
           fs.renameSync(backupDir, targetDir);
         } catch (_) {}
@@ -187,11 +200,21 @@ function installSkillAtomically(srcDir, targetDir) {
       throw err;
     }
     if (movedExisting) {
-      fs.rmSync(backupDir, { recursive: true, force: true });
+      try {
+        fs.rmSync(backupDir, { recursive: true, force: true });
+      } catch (cleanupErr) {
+        console.warn(
+          `Warning: Could not remove backup directory ${backupDir}: ${cleanupErr.message}`
+        );
+      }
     }
     return fileCount;
   } finally {
-    fs.rmSync(stagingDir, { recursive: true, force: true });
+    try {
+      if (existsIncludingSymlink(stagingDir)) {
+        fs.rmSync(stagingDir, { recursive: true, force: true });
+      }
+    } catch (_) {}
   }
 }
 

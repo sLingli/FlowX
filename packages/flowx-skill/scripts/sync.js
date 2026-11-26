@@ -56,6 +56,15 @@ function copyTreeNormalized(src, dst) {
   }
 }
 
+function existsIncludingSymlink(targetPath) {
+  try {
+    fs.lstatSync(targetPath);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 fs.mkdirSync(dstSkillsParent, { recursive: true });
 const nonce = `${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
 const stagingDir = path.join(dstSkillsParent, `.flowx.staging.${nonce}`);
@@ -64,14 +73,18 @@ const backupDir = path.join(dstSkillsParent, `.flowx.backup.${nonce}`);
 try {
   copyTreeNormalized(srcSkillDir, stagingDir);
   let movedOld = false;
-  if (fs.existsSync(dstSkillDir)) {
+  if (existsIncludingSymlink(dstSkillDir)) {
     fs.renameSync(dstSkillDir, backupDir);
     movedOld = true;
   }
   try {
     fs.renameSync(stagingDir, dstSkillDir);
   } catch (err) {
-    if (movedOld && fs.existsSync(backupDir) && !fs.existsSync(dstSkillDir)) {
+    if (
+      movedOld &&
+      existsIncludingSymlink(backupDir) &&
+      !existsIncludingSymlink(dstSkillDir)
+    ) {
       try {
         fs.renameSync(backupDir, dstSkillDir);
       } catch (_) {}
@@ -79,10 +92,20 @@ try {
     throw err;
   }
   if (movedOld) {
-    fs.rmSync(backupDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      console.warn(
+        `Warning: Could not remove backup directory ${backupDir}: ${cleanupErr.message}`
+      );
+    }
   }
 } finally {
-  fs.rmSync(stagingDir, { recursive: true, force: true });
+  try {
+    if (existsIncludingSymlink(stagingDir)) {
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    }
+  } catch (_) {}
 }
 
 const licenseText = normalizeLf(fs.readFileSync(srcLicense, "utf8"));
