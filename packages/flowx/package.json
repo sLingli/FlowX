@@ -17,7 +17,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sLingli/FlowX.git"
+    "url": "git+https://github.com/sLingli/FlowX.git",
+    "directory": "packages/flowx"
   },
   "license": "MIT",
   "author": "sLingli <YS111165542@outlook.com>",
@@ -35,7 +36,8 @@
   },
   "files": [
     "bin",
-    "native",
+    "native/flowx.exe",
+    "!native/driver/**",
     "flowx.example.xml",
     "README.md",
     "LICENSE"

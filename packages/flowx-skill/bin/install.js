@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -27,6 +28,7 @@ OPTIONS:
 function parseArgs(argv) {
   const opts = {
     client: "auto",
+    clientExplicit: false,
     project: false,
     dir: null,
     dryRun: false,
@@ -43,18 +45,36 @@ function parseArgs(argv) {
       opts.dryRun = true;
     } else if (arg === "--client" || arg === "-c") {
       const val = argv[++i];
+      if (!val || !val.trim()) throw new Error("Missing value for --client");
+      opts.client = val.trim().toLowerCase();
+      opts.clientExplicit = true;
+    } else if (arg.startsWith("--client=")) {
+      const val = arg.slice("--client=".length).trim();
       if (!val) throw new Error("Missing value for --client");
       opts.client = val.toLowerCase();
-    } else if (arg.startsWith("--client=")) {
-      opts.client = arg.slice("--client=".length).toLowerCase();
+      opts.clientExplicit = true;
     } else if (arg === "--dir" || arg === "-d") {
       const val = argv[++i];
+      if (!val || !val.trim()) throw new Error("Missing value for --dir");
+      opts.dir = val.trim();
+    } else if (arg.startsWith("--dir=")) {
+      const val = arg.slice("--dir=".length).trim();
       if (!val) throw new Error("Missing value for --dir");
       opts.dir = val;
-    } else if (arg.startsWith("--dir=")) {
-      opts.dir = arg.slice("--dir=".length);
     } else {
       throw new Error(`Unknown option: ${arg}`);
+    }
+  }
+
+  if (!opts.help) {
+    if (opts.dir && opts.project) {
+      throw new Error("Cannot combine --dir with --project");
+    }
+    if (opts.dir && opts.clientExplicit) {
+      throw new Error("Cannot combine --dir with --client");
+    }
+    if (opts.project && opts.clientExplicit) {
+      throw new Error("Cannot combine --project with --client");
     }
   }
   return opts;
@@ -100,13 +120,12 @@ function resolveTargets(opts) {
   }
 
   if (opts.client !== "auto") {
-    const match = candidates[opts.client];
-    if (!match) {
+    if (!Object.hasOwn(candidates, opts.client)) {
       throw new Error(
         `Unknown --client '${opts.client}'. Expected: auto, agents, claude, codex, cursor, gemini, all`
       );
     }
-    return [path.join(match[1], "flowx")];
+    return [path.join(candidates[opts.client][1], "flowx")];
   }
 
   const detected = Object.values(candidates)
@@ -141,6 +160,41 @@ function copyDir(src, dst) {
   return count;
 }
 
+function installSkillAtomically(srcDir, targetDir) {
+  const parentDir = path.dirname(targetDir);
+  const baseName = path.basename(targetDir);
+  fs.mkdirSync(parentDir, { recursive: true });
+
+  const nonce = `${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
+  const stagingDir = path.join(parentDir, `.${baseName}.staging.${nonce}`);
+  const backupDir = path.join(parentDir, `.${baseName}.backup.${nonce}`);
+
+  try {
+    const fileCount = copyDir(srcDir, stagingDir);
+    let movedExisting = false;
+    if (fs.existsSync(targetDir)) {
+      fs.renameSync(targetDir, backupDir);
+      movedExisting = true;
+    }
+    try {
+      fs.renameSync(stagingDir, targetDir);
+    } catch (err) {
+      if (movedExisting && fs.existsSync(backupDir) && !fs.existsSync(targetDir)) {
+        try {
+          fs.renameSync(backupDir, targetDir);
+        } catch (_) {}
+      }
+      throw err;
+    }
+    if (movedExisting) {
+      fs.rmSync(backupDir, { recursive: true, force: true });
+    }
+    return fileCount;
+  } finally {
+    fs.rmSync(stagingDir, { recursive: true, force: true });
+  }
+}
+
 function main() {
   let opts;
   try {
@@ -168,15 +222,27 @@ function main() {
     process.exit(1);
   }
 
-  for (const target of targets) {
-    if (opts.dryRun) {
-      console.log(`[dry-run] Would install flowx skill -> ${target}`);
-      continue;
+  try {
+    for (const target of targets) {
+      if (opts.dryRun) {
+        console.log(`[dry-run] Would install flowx skill -> ${target}`);
+        continue;
+      }
+      const fileCount = installSkillAtomically(bundledSkillDir, target);
+      console.log(`Installed flowx skill (${fileCount} files) -> ${target}`);
     }
-    fs.rmSync(target, { recursive: true, force: true });
-    const fileCount = copyDir(bundledSkillDir, target);
-    console.log(`Installed flowx skill (${fileCount} files) -> ${target}`);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  parseArgs,
+  resolveTargets,
+  installSkillAtomically,
+};

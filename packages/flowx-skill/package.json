@@ -17,7 +17,7 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sLingli/FlowX.git",
-    "directory": "skills/flowx"
+    "directory": "packages/flowx-skill"
   },
   "license": "MIT",
   "author": "sLingli <YS111165542@outlook.com>",

@@ -11,26 +11,28 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   build-and-test:
     name: Windows Rust Build & Test
     runs-on: windows-latest
     timeout-minutes: 25
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
+          toolchain: stable
           components: clippy
 
       - name: Cache Cargo dependencies and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Run Clippy linter
         run: cargo clippy --all-targets --locked -- -D warnings
@@ -45,25 +47,42 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          function Assert-LastExitCode([string]$Step) {
+            if ($LASTEXITCODE -ne 0) {
+              throw "$Step failed with exit code $LASTEXITCODE"
+            }
+          }
+
           .\target\release\flowx.exe --version
+          Assert-LastExitCode "flowx --version"
+
           .\target\release\flowx.exe --help | Out-Null
+          Assert-LastExitCode "flowx --help"
+
           $statusJson = .\target\release\flowx.exe --config flowx.example.xml --offline status --json
+          Assert-LastExitCode "flowx status --json"
           $status = $statusJson | ConvertFrom-Json
           if ($status.mode -ne 'offline') { throw "Unexpected status mode: $($status.mode)" }
+
           $simJson = .\target\release\flowx.exe --config flowx.example.xml --offline sim --app git.exe --target api.github.com:443 --json
+          Assert-LastExitCode "flowx sim --json"
           $sim = $simJson | ConvertFrom-Json
           if ($sim.action -notmatch 'Proxy') { throw "Unexpected sim action: $($sim.action)" }
+
           $docJson = .\target\release\flowx.exe --config flowx.example.xml --offline transparent doctor --json
+          Assert-LastExitCode "flowx transparent doctor --json"
           $null = $docJson | ConvertFrom-Json
 
   validate-skill:
     name: Validate AI Agent Skill
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Validate skills/flowx structure and frontmatter
         run: |
@@ -118,7 +137,7 @@ jobs:
           PY
 
       - name: Smoke test @slingli/flowx-skill package
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
 
