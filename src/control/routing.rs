@@ -376,5 +376,107 @@ mod tests {
         assert_eq!(unmapped.target_host, None);
         assert_eq!(unmapped.target_ip.as_deref(), Some("198.18.250.250"));
         assert_eq!(unmapped.action_type, "Direct");
+
+        // Invalid simulate targets fail with ERR_INVALID_SIMULATE_TARGET (400)
+        for (bad_target, bad_port) in [
+            ("", None),
+            ("   ", Some(443)),
+            ("example.com", Some(0)),
+            ("example.com:0", None),
+        ] {
+            let err = simulate_route(
+                SimulateRouteRequest {
+                    process: None,
+                    target: bad_target.to_string(),
+                    port: bad_port,
+                },
+                &engine,
+                Locale::En,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, "ERR_INVALID_SIMULATE_TARGET");
+            assert_eq!(err.kind, crate::control::ControlErrorKind::BadRequest);
+        }
+    }
+
+    #[test]
+    fn test_set_default_action_validation_and_updates() {
+        use crate::outbound::chain::ProxyNode;
+        use crate::outbound::socks5::Socks5Client;
+
+        let engine = RuleEngine::new(Vec::new(), Action::Direct);
+        let mut map = HashMap::new();
+        map.insert(
+            101,
+            ProxyNodeEntry {
+                id: 101,
+                name: "Main".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: "10.0.0.2:1080".into(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new("10.0.0.2:1080")),
+            },
+        );
+        let nodes = RwLock::new(map);
+
+        // Missing proxy node -> ERR_NODE_NOT_FOUND; invalid action -> ERR_INVALID_RULE_ACTION
+        assert_eq!(
+            set_default_action(
+                SetDefaultActionRequest {
+                    action: "Proxy".into(),
+                    node_id: Some(999),
+                },
+                &engine,
+                &nodes,
+                Locale::En,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_NODE_NOT_FOUND"
+        );
+        assert_eq!(
+            set_default_action(
+                SetDefaultActionRequest {
+                    action: "Unknown".into(),
+                    node_id: None,
+                },
+                &engine,
+                &nodes,
+                Locale::En,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_INVALID_RULE_ACTION"
+        );
+
+        let proxy_res = set_default_action(
+            SetDefaultActionRequest {
+                action: "Proxy".into(),
+                node_id: Some(101),
+            },
+            &engine,
+            &nodes,
+            Locale::En,
+        )
+        .unwrap();
+        assert!(proxy_res.ok);
+        assert_eq!(proxy_res.default_action_type, "Proxy");
+        assert_eq!(proxy_res.default_node_id, Some(101));
+        assert_eq!(engine.default_action(), Action::Proxy(101));
+
+        let block_res = set_default_action(
+            SetDefaultActionRequest {
+                action: "Block".into(),
+                node_id: None,
+            },
+            &engine,
+            &nodes,
+            Locale::Zh,
+        )
+        .unwrap();
+        assert!(block_res.ok);
+        assert_eq!(block_res.default_action_type, "Block");
+        assert_eq!(block_res.default_node_id, None);
+        assert_eq!(engine.default_action(), Action::Block);
     }
 }

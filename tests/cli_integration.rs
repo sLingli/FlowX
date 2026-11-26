@@ -15,55 +15,12 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
-use common::DEFAULT_SELF_PORTS;
+use common::{DEFAULT_SELF_PORTS, TempConfigGuard};
 
 /// Run CLI in an explicit clean environment so host `FLOWX_API` / `FLOWX_CONFIG` / `FLOWX_LANG`
 /// variables cannot pollute test outcomes.
 async fn run_cli(args: &[String]) -> anyhow::Result<()> {
     run_cli_with_env(args, &CliEnv::clean()).await
-}
-
-/// RAII temp XML config guard that removes both the config file and its `.filename.lock` sidecar.
-struct TempConfigGuard {
-    path: std::path::PathBuf,
-}
-
-impl TempConfigGuard {
-    fn new(prefix: &str) -> Self {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!("{prefix}_{}_{}.xml", std::process::id(), ts));
-        let guard = Self { path };
-        guard.cleanup();
-        guard
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-
-    fn as_str(&self) -> String {
-        self.path.to_string_lossy().to_string()
-    }
-
-    fn cleanup(&self) {
-        let _ = std::fs::remove_file(&self.path);
-        if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
-            let lock_path = parent.join(format!(".{}.lock", name.to_string_lossy()));
-            let _ = std::fs::remove_file(lock_path);
-        }
-    }
-}
-
-impl Drop for TempConfigGuard {
-    fn drop(&mut self) {
-        self.cleanup();
-    }
 }
 
 #[tokio::test]
@@ -1192,4 +1149,248 @@ async fn test_cli_online_clear_user_clear_apps_and_rule_move_id_flag() {
 
     let _ = shutdown_tx.send(true);
     let _ = srv_handle.await;
+}
+
+#[tokio::test]
+async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
+    use std::process::Command;
+    use tokio::net::TcpListener;
+
+    let bin = env!("CARGO_BIN_EXE_flowx");
+    let cfg_guard = TempConfigGuard::new("flowx_cli_bin_stdio");
+    let cfg_str = cfg_guard.as_str();
+
+    let run_bin = |args: &[&str], extra_env: &[(&str, &str)]| -> std::process::Output {
+        let mut cmd = Command::new(bin);
+        for k in [
+            "FLOWX_API",
+            "FLOWX_CONFIG",
+            "FLOWX_LANG",
+            "LC_ALL",
+            "LC_MESSAGES",
+            "LANG",
+        ] {
+            cmd.env_remove(k);
+        }
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        cmd.args(args).output().expect("spawn flowx binary")
+    };
+
+    // Prepare a profile with 1 reachable local node (id=101) referenced by DevProxy
+    let alive = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let alive_addr = alive.local_addr().unwrap();
+    let accept_task = tokio::spawn(async move {
+        for _ in 0..4 {
+            if let Ok((s, _)) = alive.accept().await {
+                drop(s);
+            }
+        }
+    });
+    let store = ConfigStore::new(cfg_guard.path());
+    let mut profile = flowx::config::ProfileConfig::default_profile();
+    let p101 = &mut profile.proxy_list.as_mut().unwrap().proxies[0];
+    p101.address = alive_addr.ip().to_string();
+    p101.port = alive_addr.port();
+    store.save_profile(&profile).unwrap();
+
+    // 1. Offline `status --json` succeeds even with poisoned host FLOWX_API and emits valid JSON on stdout
+    let out_status = run_bin(
+        &["--config", &cfg_str, "--offline", "status", "--json"],
+        &[("FLOWX_API", "://poisoned-host-env")],
+    );
+    assert!(
+        out_status.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out_status.stderr)
+    );
+    let status_json: Value = serde_json::from_slice(&out_status.stdout).unwrap();
+    assert_eq!(status_json["mode"], "offline");
+    assert_eq!(status_json["nodes_count"], 1);
+    assert_eq!(status_json["rules_count"], 2);
+
+    // 2. Offline `rule list --json` emits pure JSON array without `index` field
+    let out_rules = run_bin(
+        &["--config", &cfg_str, "--offline", "rule", "list", "--json"],
+        &[],
+    );
+    assert!(out_rules.status.success());
+    let rules_json: Value = serde_json::from_slice(&out_rules.stdout).unwrap();
+    let arr = rules_json.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr[0].get("index").is_none());
+    assert_eq!(arr[0]["name"], "LocalBypass");
+
+    // 3. Offline `rule toggle` and `rule move --id 2 up` emit exact API-compatible JSON payloads
+    let out_toggle = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "rule",
+            "toggle",
+            "1",
+            "--disable",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(out_toggle.status.success());
+    let toggle_json: Value = serde_json::from_slice(&out_toggle.stdout).unwrap();
+    assert_eq!(
+        toggle_json,
+        serde_json::json!({"ok": true, "enabled": false})
+    );
+
+    let out_move = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "rule",
+            "move",
+            "--id",
+            "2",
+            "up",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(out_move.status.success());
+    let move_json: Value = serde_json::from_slice(&out_move.stdout).unwrap();
+    assert_eq!(move_json, serde_json::json!({"ok": true, "moved": true}));
+
+    // 4. Offline `sim --json` returns matched rule and trace array
+    let out_sim = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "sim",
+            "--app",
+            "git.exe",
+            "--target",
+            "api.github.com:443",
+            "--json",
+        ],
+        &[],
+    );
+    assert!(out_sim.status.success());
+    let sim_json: Value = serde_json::from_slice(&out_sim.stdout).unwrap();
+    assert_eq!(sim_json["action_type"], "Proxy");
+    assert_eq!(sim_json["node_id"], 101);
+    assert!(sim_json["trace"].as_array().is_some_and(|t| !t.is_empty()));
+
+    // 5. `emit_cli_error_and_exit`:
+    //    - with `--json`: emits structured JSON error to stdout, keeps stderr empty, exits 1
+    //    - without `--json`: emits plain-text `Error:` message to stderr, keeps stdout empty, exits 1
+    let out_in_use = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "--json",
+            "node",
+            "remove",
+            "101",
+        ],
+        &[],
+    );
+    assert_eq!(out_in_use.status.code(), Some(1));
+    assert!(
+        out_in_use.stderr.is_empty(),
+        "--json error must emit JSON on stdout without polluting stderr: {}",
+        String::from_utf8_lossy(&out_in_use.stderr)
+    );
+    let err_in_use: Value = serde_json::from_slice(&out_in_use.stdout).unwrap();
+    assert_eq!(err_in_use["ok"], Value::Bool(false));
+    assert_eq!(err_in_use["code"], "ERR_NODE_IN_USE");
+    assert_eq!(err_in_use["status"], 409);
+
+    let out_missing_rule = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "--json",
+            "rule",
+            "remove",
+            "999",
+        ],
+        &[],
+    );
+    assert_eq!(out_missing_rule.status.code(), Some(1));
+    assert!(out_missing_rule.stderr.is_empty());
+    let err_missing_rule: Value = serde_json::from_slice(&out_missing_rule.stdout).unwrap();
+    assert_eq!(err_missing_rule["ok"], Value::Bool(false));
+    assert_eq!(err_missing_rule["code"], "ERR_RULE_NOT_FOUND");
+    assert_eq!(err_missing_rule["status"], 404);
+
+    let out_plain_err = run_bin(
+        &["--config", &cfg_str, "--offline", "rule", "remove", "999"],
+        &[],
+    );
+    assert_eq!(out_plain_err.status.code(), Some(1));
+    assert!(
+        out_plain_err.stdout.is_empty(),
+        "non-JSON error must not write to stdout: {}",
+        String::from_utf8_lossy(&out_plain_err.stdout)
+    );
+    let plain_stderr = String::from_utf8_lossy(&out_plain_err.stderr);
+    assert!(
+        plain_stderr.contains("Error:"),
+        "non-JSON error must write to stderr: {plain_stderr}"
+    );
+
+    // 6. `node ping --all --json` with unreachable node prints full JSON report on stdout,
+    //    nothing extra on stderr (SilentExitError), and exits with code 1
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead.local_addr().unwrap().to_string();
+    drop(dead);
+    let out_add_dead = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "--json",
+            "node",
+            "add",
+            "--name",
+            "DeadSubproc",
+            "--addr",
+            &dead_addr,
+        ],
+        &[],
+    );
+    assert!(out_add_dead.status.success());
+    let add_json: Value = serde_json::from_slice(&out_add_dead.stdout).unwrap();
+    assert_eq!(add_json["ok"], Value::Bool(true));
+
+    let out_ping_all = run_bin(
+        &[
+            "--config",
+            &cfg_str,
+            "--offline",
+            "--json",
+            "node",
+            "ping",
+            "--all",
+        ],
+        &[],
+    );
+    assert_eq!(out_ping_all.status.code(), Some(1));
+    assert!(
+        out_ping_all.stderr.is_empty(),
+        "SilentExitError must not emit duplicate error JSON to stderr: {}",
+        String::from_utf8_lossy(&out_ping_all.stderr)
+    );
+    let ping_all_json: Value = serde_json::from_slice(&out_ping_all.stdout).unwrap();
+    assert_eq!(ping_all_json["ok"], Value::Bool(false));
+    assert_eq!(ping_all_json["total"], 2);
+    assert_eq!(ping_all_json["reachable"], 1);
+    assert_eq!(ping_all_json["unreachable"], 1);
+
+    accept_task.abort();
+    let _ = accept_task.await;
 }

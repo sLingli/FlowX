@@ -80,6 +80,51 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    struct TempConfigGuard {
+        path: std::path::PathBuf,
+    }
+
+    impl TempConfigGuard {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "{prefix}_{}_{}.xml",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+            let g = Self { path };
+            g.cleanup();
+            g
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn as_str(&self) -> String {
+            self.path.to_string_lossy().to_string()
+        }
+
+        fn cleanup(&self) {
+            let _ = std::fs::remove_file(&self.path);
+            if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
+                let _ =
+                    std::fs::remove_file(parent.join(format!(".{}.lock", name.to_string_lossy())));
+            }
+        }
+    }
+
+    impl Drop for TempConfigGuard {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
     async fn run_cli(args: &[String]) -> Result<()> {
         super::run_cli_with_env(args, &CliEnv::clean()).await
     }
@@ -770,19 +815,8 @@ mod tests {
         elev_srv.await.unwrap();
 
         // 3. Offline & online `node update --clear-user` + conflict rejection + `node ping --all`
-        let cfg_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_cli_parity_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let _ = std::fs::remove_file(&cfg_path);
-        let cfg_str = cfg_path.to_string_lossy().to_string();
+        let cfg_guard = TempConfigGuard::new("flowx_cli_parity");
+        let cfg_str = cfg_guard.as_str();
 
         run_cli(&[
             "flowx".into(),
@@ -833,14 +867,14 @@ mod tests {
         ])
         .await
         .unwrap();
-        let store = ConfigStore::new(&cfg_path);
+        let store = ConfigStore::new(cfg_guard.path());
         let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
         assert_eq!(rt.proxy_nodes.get(&102).unwrap().username, None);
         assert_eq!(
             rt.proxy_nodes.get(&102).unwrap().client.auth_credentials(),
             (None, None)
         );
-        let _ = std::fs::remove_file(&cfg_path);
+        drop(cfg_guard);
 
         // `node ping --all` conflicts with positional ID
         assert!(
@@ -916,19 +950,8 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
-        let cfg_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_cli_rule_clr_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let _ = std::fs::remove_file(&cfg_path);
-        let cfg_str = cfg_path.to_string_lossy().to_string();
+        let cfg_guard = TempConfigGuard::new("flowx_cli_rule_clr");
+        let cfg_str = cfg_guard.as_str();
 
         run_cli(&[
             "flowx".into(),
@@ -989,7 +1012,7 @@ mod tests {
         ])
         .await
         .unwrap();
-        let store = ConfigStore::new(&cfg_path);
+        let store = ConfigStore::new(cfg_guard.path());
         let (rt, _) = store.load_or_init(&DEFAULT_SELF_PORTS).unwrap();
         assert_eq!(rt.rules[0].apps_raw, "");
         assert_eq!(rt.rules[0].targets_raw, "");
@@ -1008,7 +1031,7 @@ mod tests {
         ])
         .await
         .unwrap();
-        let _ = std::fs::remove_file(&cfg_path);
+        drop(cfg_guard);
 
         // `conn list` invalid filter validation and filtering helper
         assert!(

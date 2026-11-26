@@ -45,3 +45,49 @@ pub async fn raw_http(addr: SocketAddr, req: &str) -> String {
     s.read_to_end(&mut buf).await.unwrap();
     String::from_utf8(buf).unwrap()
 }
+
+/// RAII temp XML config guard that removes both the XML file and its `.filename.lock` sidecar
+/// on creation and on drop (even if a test panics).
+#[allow(dead_code)]
+pub struct TempConfigGuard {
+    path: std::path::PathBuf,
+}
+
+#[allow(dead_code)]
+impl TempConfigGuard {
+    pub fn new(prefix: &str) -> Self {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("{prefix}_{}_{}.xml", std::process::id(), ts));
+        let guard = Self { path };
+        guard.cleanup();
+        guard
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub fn as_str(&self) -> String {
+        self.path.to_string_lossy().to_string()
+    }
+
+    pub fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
+            let lock_path = parent.join(format!(".{}.lock", name.to_string_lossy()));
+            let _ = std::fs::remove_file(lock_path);
+        }
+    }
+}
+
+impl Drop for TempConfigGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}

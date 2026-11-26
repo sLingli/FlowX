@@ -1087,7 +1087,18 @@ mod tests {
     fn test_config_store_atomic_persistence() {
         let mut path = std::env::current_dir().unwrap().join("target");
         path.push(format!("flowx_test_{}_{}.xml", std::process::id(), 1));
+        let lock_path = ConfigStore::new(&path).lock_file_path();
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(path.clone(), lock_path);
 
         let store = ConfigStore::new(&path);
         let (runtime, created) = store.load_or_init(&[40001, 40080]).unwrap();
@@ -1115,8 +1126,6 @@ mod tests {
         assert_eq!(reloaded.rules[2].name, "BlockAds");
         assert!(!reloaded.rules[2].enabled);
         assert_eq!(reloaded.rules[2].action, Action::Block);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -326,3 +326,365 @@ pub fn delete_rule(rule_id: u64, rule_engine: &RuleEngine) -> Result<(), Control
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::control::ControlErrorKind;
+    use crate::outbound::chain::ProxyNode;
+    use crate::outbound::socks5::Socks5Client;
+
+    fn sample_nodes() -> RwLock<HashMap<u32, ProxyNodeEntry>> {
+        let mut map = HashMap::new();
+        for id in [101u32, 102u32] {
+            map.insert(
+                id,
+                ProxyNodeEntry {
+                    id,
+                    name: format!("Node{id}"),
+                    protocol: "SOCKS5".into(),
+                    server_addr: format!("10.0.0.{id}:1080"),
+                    username: None,
+                    client: ProxyNode::Socks5(Socks5Client::new(format!("10.0.0.{id}:1080"))),
+                },
+            );
+        }
+        RwLock::new(map)
+    }
+
+    #[test]
+    fn test_parse_and_validate_action_and_add_rule_validation() {
+        let nodes = sample_nodes();
+        let engine = RuleEngine::new(Vec::new(), Action::Direct);
+
+        assert_eq!(
+            parse_and_validate_action("direct", None, &nodes).unwrap(),
+            Action::Direct
+        );
+        assert_eq!(
+            parse_and_validate_action("BLOCK", None, &nodes).unwrap(),
+            Action::Block
+        );
+        assert_eq!(
+            parse_and_validate_action("Proxy", Some(101), &nodes).unwrap(),
+            Action::Proxy(101)
+        );
+        assert_eq!(
+            parse_and_validate_action("Proxy", None, &nodes)
+                .unwrap_err()
+                .code,
+            "ERR_MISSING_NODE_FOR_PROXY"
+        );
+        assert_eq!(
+            parse_and_validate_action("Proxy", Some(999), &nodes)
+                .unwrap_err()
+                .code,
+            "ERR_NODE_NOT_FOUND"
+        );
+        assert_eq!(
+            parse_and_validate_action("Bogus", None, &nodes)
+                .unwrap_err()
+                .code,
+            "ERR_INVALID_RULE_ACTION"
+        );
+
+        // Empty rule name
+        let err = add_rule(
+            AddRuleRequest {
+                name: "   ".into(),
+                apps: None,
+                targets: None,
+                ports: None,
+                action: "Direct".into(),
+                node_id: None,
+            },
+            &engine,
+            &nodes,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "ERR_EMPTY_RULE_NAME");
+
+        // Invalid app / target / port patterns fail closed
+        assert_eq!(
+            add_rule(
+                AddRuleRequest {
+                    name: "BadApps".into(),
+                    apps: Some(";;;".into()),
+                    targets: None,
+                    ports: None,
+                    action: "Direct".into(),
+                    node_id: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_INVALID_APP_PATTERN"
+        );
+        assert_eq!(
+            add_rule(
+                AddRuleRequest {
+                    name: "BadTargets".into(),
+                    apps: None,
+                    targets: Some(";;;".into()),
+                    ports: None,
+                    action: "Direct".into(),
+                    node_id: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_INVALID_TARGET_PATTERN"
+        );
+        assert_eq!(
+            add_rule(
+                AddRuleRequest {
+                    name: "BadPorts".into(),
+                    apps: None,
+                    targets: None,
+                    ports: Some("not-a-port".into()),
+                    action: "Direct".into(),
+                    node_id: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_INVALID_PORT_FORMAT"
+        );
+
+        // Valid add
+        let id = add_rule(
+            AddRuleRequest {
+                name: "DevGit".into(),
+                apps: Some("git.exe".into()),
+                targets: Some("*.github.com".into()),
+                ports: Some("443".into()),
+                action: "Proxy".into(),
+                node_id: Some(101),
+            },
+            &engine,
+            &nodes,
+        )
+        .unwrap();
+        let rules = engine.current_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].id, id);
+        assert_eq!(rules[0].action, Action::Proxy(101));
+    }
+
+    #[test]
+    fn test_update_patch_toggle_move_and_delete_rule() {
+        let nodes = sample_nodes();
+        let engine = RuleEngine::new(Vec::new(), Action::Direct);
+
+        let id1 = add_rule(
+            AddRuleRequest {
+                name: "First".into(),
+                apps: Some("curl.exe".into()),
+                targets: Some("example.com".into()),
+                ports: Some("80;443".into()),
+                action: "Proxy".into(),
+                node_id: Some(101),
+            },
+            &engine,
+            &nodes,
+        )
+        .unwrap();
+        let id2 = add_rule(
+            AddRuleRequest {
+                name: "Second".into(),
+                apps: None,
+                targets: Some("10.0.0.0/8".into()),
+                ports: None,
+                action: "Direct".into(),
+                node_id: None,
+            },
+            &engine,
+            &nodes,
+        )
+        .unwrap();
+
+        // update_rule missing id -> 404
+        let miss = update_rule(
+            UpdateRuleRequest {
+                id: 999999,
+                name: "Ghost".into(),
+                apps: None,
+                targets: None,
+                ports: None,
+                action: "Direct".into(),
+                node_id: None,
+            },
+            &engine,
+            &nodes,
+        )
+        .unwrap_err();
+        assert_eq!(miss.kind, ControlErrorKind::NotFound);
+        assert_eq!(miss.code, "ERR_RULE_NOT_FOUND");
+
+        // update_rule replaces fields on existing rule
+        assert_eq!(
+            update_rule(
+                UpdateRuleRequest {
+                    id: id1,
+                    name: "FirstUpdated".into(),
+                    apps: Some("git.exe".into()),
+                    targets: Some("github.com".into()),
+                    ports: Some("443".into()),
+                    action: "Proxy".into(),
+                    node_id: Some(101),
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap(),
+            id1
+        );
+
+        // patch_rule: node_id alone works on existing Proxy rule, clears apps via Some(""), keeps targets
+        patch_rule(
+            PatchRuleRequest {
+                id: id1,
+                name: None,
+                apps: Some("".into()),
+                targets: None,
+                ports: None,
+                action: None,
+                node_id: Some(102),
+                enabled: Some(false),
+            },
+            &engine,
+            &nodes,
+        )
+        .unwrap();
+        let r1 = engine.current_rules()[0].clone();
+        assert_eq!(r1.action, Action::Proxy(102));
+        assert!(r1.apps_raw.is_empty());
+        assert_eq!(r1.targets_raw, "github.com");
+        assert!(!r1.enabled);
+
+        // patch_rule: node_id alone rejected on Direct rule; empty name rejected
+        assert_eq!(
+            patch_rule(
+                PatchRuleRequest {
+                    id: id2,
+                    name: None,
+                    apps: None,
+                    targets: None,
+                    ports: None,
+                    action: None,
+                    node_id: Some(101),
+                    enabled: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_INVALID_RULE_ACTION"
+        );
+        assert_eq!(
+            patch_rule(
+                PatchRuleRequest {
+                    id: id2,
+                    name: Some("  ".into()),
+                    apps: None,
+                    targets: None,
+                    ports: None,
+                    action: None,
+                    node_id: None,
+                    enabled: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_EMPTY_RULE_NAME"
+        );
+
+        // toggle_rule flip and explicit set + 404
+        assert!(
+            toggle_rule(
+                ToggleRuleRequest {
+                    id: id1,
+                    enabled: None
+                },
+                &engine
+            )
+            .unwrap()
+        );
+        assert!(
+            !toggle_rule(
+                ToggleRuleRequest {
+                    id: id1,
+                    enabled: Some(false)
+                },
+                &engine
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            toggle_rule(
+                ToggleRuleRequest {
+                    id: 999999,
+                    enabled: None
+                },
+                &engine
+            )
+            .unwrap_err()
+            .code,
+            "ERR_RULE_NOT_FOUND"
+        );
+
+        // move_rule invalid direction -> 400; valid move -> reorders; missing -> 404
+        assert_eq!(
+            move_rule(
+                MoveRuleRequest {
+                    id: id2,
+                    direction: "sideways".into()
+                },
+                &engine
+            )
+            .unwrap_err()
+            .code,
+            "ERR_INVALID_MOVE_DIR"
+        );
+        assert!(
+            move_rule(
+                MoveRuleRequest {
+                    id: id2,
+                    direction: "up".into()
+                },
+                &engine
+            )
+            .unwrap()
+        );
+        assert_eq!(engine.current_rules()[0].id, id2);
+        assert_eq!(
+            move_rule(
+                MoveRuleRequest {
+                    id: 999999,
+                    direction: "top".into()
+                },
+                &engine
+            )
+            .unwrap_err()
+            .code,
+            "ERR_RULE_NOT_FOUND"
+        );
+
+        // delete_rule existing + missing
+        delete_rule(id1, &engine).unwrap();
+        assert_eq!(engine.current_rules().len(), 1);
+        assert_eq!(
+            delete_rule(id1, &engine).unwrap_err().code,
+            "ERR_RULE_NOT_FOUND"
+        );
+    }
+}

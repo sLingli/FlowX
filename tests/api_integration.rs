@@ -148,11 +148,8 @@ async fn test_api_security_and_validation() {
 
 #[tokio::test]
 async fn test_api_mutates_and_persists_xml() {
-    let mut path = std::env::current_dir().unwrap().join("target");
-    path.push(format!("flowx_api_persist_{}.xml", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-
-    let store = Arc::new(ConfigStore::new(&path));
+    let cfg_guard = common::TempConfigGuard::new("flowx_api_persist");
+    let store = Arc::new(ConfigStore::new(cfg_guard.path()));
     let (rt, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
 
     let mgr = Arc::new(ConnectionManager::new());
@@ -194,17 +191,12 @@ async fn test_api_mutates_and_persists_xml() {
             .values()
             .any(|n| n.name == "HK-Test" && n.protocol == "HTTP")
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
 async fn test_api_system_and_rule_toggle_move() {
-    let mut path = std::env::current_dir().unwrap().join("target");
-    path.push(format!("flowx_api_rule_ops_{}.xml", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-
-    let store = Arc::new(ConfigStore::new(&path));
+    let cfg_guard = common::TempConfigGuard::new("flowx_api_rule_ops");
+    let store = Arc::new(ConfigStore::new(cfg_guard.path()));
     let (rt, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
     let rule1_id = rt.rules[0].id;
     let rule2_id = rt.rules[1].id;
@@ -286,8 +278,6 @@ async fn test_api_system_and_rule_toggle_move() {
     assert_eq!(reloaded.rules[0].name, "DevProxy");
     assert_eq!(reloaded.rules[1].name, "LocalBypass");
     assert!(!reloaded.rules[1].enabled);
-
-    let _ = std::fs::remove_file(&path);
 }
 
 /// P1-1 & P1-3 回归测试：
@@ -542,11 +532,8 @@ async fn test_api_connections_view_is_localized() {
 
 #[tokio::test]
 async fn test_api_update_node_rule_default_and_simulate() {
-    let mut path = std::env::current_dir().unwrap().join("target");
-    path.push(format!("flowx_api_stage2_{}.xml", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-
-    let store = Arc::new(ConfigStore::new(&path));
+    let cfg_guard = common::TempConfigGuard::new("flowx_api_stage2");
+    let store = Arc::new(ConfigStore::new(cfg_guard.path()));
     let (rt, _) = store.load_or_init(&[40001, 40080, 1053]).unwrap();
     let rule2_id = rt.rules[1].id;
 
@@ -666,8 +653,6 @@ async fn test_api_update_node_rule_default_and_simulate() {
     );
     assert_eq!(reloaded.rules[1].name, "GitRule");
     assert_eq!(reloaded.default_action, Action::Proxy(101));
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[tokio::test]
@@ -1792,20 +1777,8 @@ async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_ov
     use flowx::interceptor::dispatcher::DispatcherConfig;
     use flowx::interceptor::process::ProcessTracker;
 
-    let cfg_path = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!(
-            "flowx_api_transparent_override_test_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-    let _ = std::fs::remove_file(&cfg_path);
-
-    let store = Arc::new(ConfigStore::new(&cfg_path));
+    let cfg_guard = common::TempConfigGuard::new("flowx_api_transparent_override_test");
+    let store = Arc::new(ConfigStore::new(cfg_guard.path()));
     let mgr = Arc::new(ConnectionManager::new());
     let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
     let nodes = Arc::new(RwLock::new(HashMap::new()));
@@ -1898,7 +1871,6 @@ async fn test_api_mutations_preserve_persisted_transparent_enabled_across_cli_ov
 
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;
-    let _ = std::fs::remove_file(&cfg_path);
 }
 
 #[tokio::test]
@@ -1908,20 +1880,8 @@ async fn test_api_transparent_config_succeeds_after_boot_start_failure() {
     use flowx::interceptor::dispatcher::DispatcherConfig;
     use flowx::interceptor::process::ProcessTracker;
 
-    let cfg_path = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join(format!(
-            "flowx_api_boot_fail_cfg_test_{}_{}.xml",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-    let _ = std::fs::remove_file(&cfg_path);
-
-    let store = Arc::new(ConfigStore::new(&cfg_path));
+    let cfg_guard = common::TempConfigGuard::new("flowx_api_boot_fail_cfg_test");
+    let store = Arc::new(ConfigStore::new(cfg_guard.path()));
     let mgr = Arc::new(ConnectionManager::new());
     let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
     let nodes = Arc::new(RwLock::new(HashMap::new()));
@@ -2007,5 +1967,4 @@ async fn test_api_transparent_config_succeeds_after_boot_start_failure() {
 
     let _ = shutdown_tx.send(true);
     let _ = server_task.await;
-    let _ = std::fs::remove_file(&cfg_path);
 }

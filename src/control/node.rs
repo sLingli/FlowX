@@ -808,4 +808,350 @@ mod tests {
             assert_eq!(msg, t(Locale::Zh, "ping.timeout"));
         }
     }
+
+    #[test]
+    fn test_add_update_patch_delete_and_list_nodes() {
+        use crate::control::ControlErrorKind;
+        use crate::router::{Action, Rule, RuleEngine};
+
+        let nodes = RwLock::new(HashMap::new());
+        let self_ports = [40001u16, 40080, 1053];
+
+        // Validation errors on add_node
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "  ".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: None,
+                    password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_EMPTY_NODE_NAME"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "BadProto".into(),
+                    protocol: "VMESS".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: None,
+                    password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_UNSUPPORTED_PROTOCOL"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "FakeIp".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "198.18.0.5:1080".into(),
+                    username: None,
+                    password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_NODE_FAKE_IP"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "SelfLoop".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "127.0.0.1:40080".into(),
+                    username: None,
+                    password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_NODE_SELF_LOOP"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "BadHttpUser".into(),
+                    protocol: "HTTP".into(),
+                    server_addr: "10.0.0.2:8080".into(),
+                    username: Some("a:b".into()),
+                    password: Some("pw".into()),
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_HTTP_USERNAME_COLON"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "Socks4Pw".into(),
+                    protocol: "SOCKS4".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: Some("uid".into()),
+                    password: Some("".into()),
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_SOCKS4_PASSWORD_UNSUPPORTED"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "EmptyPw".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: Some("alice".into()),
+                    password: Some("".into()),
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_EMPTY_PASSWORD"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "NoPw".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: Some("alice".into()),
+                    password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_USERNAME_WITHOUT_PASSWORD"
+        );
+        assert_eq!(
+            add_node(
+                AddNodeRequest {
+                    name: "PwNoUser".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: None,
+                    password: Some("secret".into()),
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_PASSWORD_WITHOUT_USERNAME"
+        );
+
+        // Add valid SOCKS5 (with auth) and SOCKS4 (with user_id)
+        let id1 = add_node(
+            AddNodeRequest {
+                name: "S5".into(),
+                protocol: "socks5".into(),
+                server_addr: "10.0.0.2:1080".into(),
+                username: Some("alice".into()),
+                password: Some("secret".into()),
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
+        let id2 = add_node(
+            AddNodeRequest {
+                name: "S4".into(),
+                protocol: "SOCKS4".into(),
+                server_addr: "10.0.0.3:1080".into(),
+                username: Some("uid".into()),
+                password: None,
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
+        let listed = list_nodes(&nodes);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, id1);
+        assert!(listed[0].auth_configured && listed[0].password_configured);
+        assert_eq!(listed[1].id, id2);
+        assert!(listed[1].auth_configured && !listed[1].password_configured);
+
+        // update_node (PUT): keep_password defaults to false -> fails if reusing username without password
+        assert_eq!(
+            update_node(
+                UpdateNodeRequest {
+                    id: id1,
+                    name: "S5".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: Some("alice".into()),
+                    password: None,
+                    keep_password: None,
+                    clear_password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_USERNAME_WITHOUT_PASSWORD"
+        );
+        // Changing username with keep_password=true requires new password
+        assert_eq!(
+            update_node(
+                UpdateNodeRequest {
+                    id: id1,
+                    name: "S5".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: Some("bob".into()),
+                    password: None,
+                    keep_password: Some(true),
+                    clear_password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE"
+        );
+        // Valid PUT with keep_password=true preserves secret
+        update_node(
+            UpdateNodeRequest {
+                id: id1,
+                name: "S5-Renamed".into(),
+                protocol: "HTTP".into(),
+                server_addr: "10.0.0.2:8080".into(),
+                username: Some("alice".into()),
+                password: None,
+                keep_password: Some(true),
+                clear_password: None,
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
+        assert_eq!(
+            nodes
+                .read()
+                .unwrap()
+                .get(&id1)
+                .unwrap()
+                .client
+                .auth_credentials(),
+            (Some("alice"), Some("secret"))
+        );
+
+        // patch_node: conflicting clear_username + username -> 400; clear_username + clear_password=false -> 400
+        assert_eq!(
+            patch_node(
+                PatchNodeRequest {
+                    id: id1,
+                    name: None,
+                    protocol: None,
+                    server_addr: None,
+                    username: Some("carol".into()),
+                    password: None,
+                    keep_password: None,
+                    clear_password: None,
+                    clear_username: Some(true),
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_CONFLICTING_USERNAME_OPTIONS"
+        );
+        assert_eq!(
+            patch_node(
+                PatchNodeRequest {
+                    id: id1,
+                    name: None,
+                    protocol: None,
+                    server_addr: None,
+                    username: None,
+                    password: None,
+                    keep_password: None,
+                    clear_password: Some(false),
+                    clear_username: Some(true),
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err()
+            .code,
+            "ERR_CONFLICTING_PASSWORD_OPTIONS"
+        );
+        // Valid patch with clear_username clears both username & password
+        patch_node(
+            PatchNodeRequest {
+                id: id1,
+                name: None,
+                protocol: None,
+                server_addr: None,
+                username: None,
+                password: None,
+                keep_password: None,
+                clear_password: None,
+                clear_username: Some(true),
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
+        assert!(
+            !nodes
+                .read()
+                .unwrap()
+                .get(&id1)
+                .unwrap()
+                .is_auth_configured()
+        );
+
+        // delete_node blocks deletion when referenced by rule or default_action
+        let engine_rule_ref = RuleEngine::new(
+            vec![Rule::from_raw(
+                "RefId1",
+                true,
+                None,
+                None,
+                None,
+                Action::Proxy(id1),
+            )],
+            Action::Proxy(id2),
+        );
+        let err_rule = delete_node(id1, &nodes, &engine_rule_ref).unwrap_err();
+        assert_eq!(err_rule.kind, ControlErrorKind::Conflict);
+        assert_eq!(err_rule.code, "ERR_NODE_IN_USE");
+        let err_def = delete_node(id2, &nodes, &engine_rule_ref).unwrap_err();
+        assert_eq!(err_def.kind, ControlErrorKind::Conflict);
+        assert_eq!(err_def.code, "ERR_NODE_IN_USE");
+
+        let empty_engine = RuleEngine::new(Vec::new(), Action::Direct);
+        delete_node(id2, &nodes, &empty_engine).unwrap();
+        let err_missing = delete_node(id2, &nodes, &empty_engine).unwrap_err();
+        assert_eq!(err_missing.kind, ControlErrorKind::NotFound);
+        assert_eq!(err_missing.code, "ERR_NODE_NOT_FOUND");
+    }
 }

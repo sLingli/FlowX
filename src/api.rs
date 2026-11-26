@@ -686,7 +686,21 @@ mod tests {
                     .unwrap()
                     .as_nanos()
             ));
+        let lock_path = cfg_path.parent().unwrap().join(format!(
+            ".{}.lock",
+            cfg_path.file_name().unwrap().to_string_lossy()
+        ));
         let _ = std::fs::remove_file(&cfg_path);
+        let _ = std::fs::remove_file(&lock_path);
+
+        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_file(&self.1);
+            }
+        }
+        let _cleanup = Cleanup(cfg_path.clone(), lock_path);
 
         let store = Arc::new(ConfigStore::new(&cfg_path));
         let mgr = Arc::new(ConnectionManager::new());
@@ -901,7 +915,6 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
-        let _ = std::fs::remove_file(&cfg_path);
     }
 
     #[tokio::test]
