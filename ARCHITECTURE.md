@@ -18,7 +18,7 @@ flowchart TD
     subgraph InterceptionLayer ["入站、透明拦截与进程识别层"]
         MixedInbound["混合协议入站 (src/inbound.rs · 127.0.0.1:40001)"]
         TransparentEngine["WinDivert + smoltcp 透明代理引擎 (src/transparent.rs · src/transparent/)"]
-        ProcessTracker["TCP/UDP 四元组进程追踪器 (src/interceptor/process.rs)"]
+        ProcessTracker["TCP 四元组 / UDP 本地端点进程追踪器 (src/interceptor/process.rs)"]
     end
 
     subgraph CoreEngine ["FlowX 核心路由与协议引擎"]
@@ -51,8 +51,8 @@ flowchart TD
     TransparentEngine -->|"透明 DNS 查询 / real_ip 观测"| DnsServer
     DnsServer --> FakeIpEngine
     MixedInbound --> Dispatcher
-    ProcessTracker -.->|"Windows: GetExtendedTcpTable / GetExtendedUdpTable"| Dispatcher
-    ProcessTracker -.->|"UDP/TCP PID 兜底查询"| TransparentEngine
+    ProcessTracker -.->|"Windows: GetExtendedTcpTable (TCP 四元组)"| Dispatcher
+    ProcessTracker -.->|"TCP 四元组 / UDP 本地端点 (GetExtendedUdpTable) PID 兜底查询"| TransparentEngine
     Dispatcher --> FakeIpEngine
     Dispatcher --> RouterEngine
     Dispatcher --> OutboundMgr
@@ -121,7 +121,7 @@ src/
 ├── interceptor.rs          # 入站流分发与进程追踪模块导出
 ├── interceptor/
 │   ├── dispatcher.rs       # 显式与透明 TCP 流调度、首包 SNI/Host 嗅探与出站拨号
-│   └── process.rs          # Windows TCP/UDP 四元组 PID 追踪与有界身份缓存
+│   └── process.rs          # Windows TCP 四元组 / UDP 本地端点 PID 追踪与有界身份缓存
 ├── outbound.rs             # RelayStream 抽象、TargetAddr 解析与本机接口回环防护
 ├── outbound/
 │   ├── relay.rs            # 全双工透明流中继与双向静默超时看门狗
@@ -162,8 +162,8 @@ tests/
 - **有界 HTTP 装帧与双向流闭合**：从代理握手报文中提取真实目标地址与端口，并使用 `find_http_header_end`（增量扫描游标）与 RFC 9110 严格 OWS (`SP` / `HTAB`) 裁剪保持 $O(N)$ 解析与严格的 HTTP `Transfer-Encoding` token 校验；对 `HTTP` 明文转发自动改写为 origin-form，剥离逐跳代理头并强制 `Connection: close`，在出站端（`src/outbound/http_relay.rs`）按 `Content-Length` / 严格 `Transfer-Encoding: chunked` 状态机完成有界请求体转发并隔离多余前导字节（防止同连接 HTTP 流水线走私），下行 `relay_http_response_downlink` 解析 `1xx` 过渡帧与 HTTP/1.x 响应头/有界响应体（`HEAD`/`204`/`304`、`chunked`、`Content-Length`）并将 `Connection: keep-alive` 改写为 `Connection: close`，响应完毕立即优雅收尾以免忽略 `Connection: close` 的源站挂起至 120s 空闲超时，同时兼容延迟应答与早期 `4xx` 响应。
 - **自连回环防护**：拒绝目标指向 FlowX 自身服务端口（`40001` / `40080` / `1053`）与本机接口地址的请求，杜绝自连死循环；连接目标按 `TargetAddr::to_authority_string()` 输出标准 `[ipv6]:port` 权威格式。
 
-### 3.2 进程四元组精确追踪 (`src/interceptor/process.rs`)
-- **Windows 原生实现**：调用 `GetExtendedTcpTable` / `GetExtendedUdpTable` 按字节偏移安全读取表项与完整四元组（`local == client && remote == server`）精确检索归属 PID，再通过 `QueryFullProcessImageNameW` 获取完整可执行路径（遇 `ERROR_INSUFFICIENT_BUFFER` 动态倍增缓冲至多 `32768` 宽字符）；`local_interface_ips()` 使用 8 字节对齐的 `Vec<u64>` 缓冲区调用 `GetAdaptersAddresses`。
+### 3.2 进程精确追踪 (`src/interceptor/process.rs`)
+- **Windows 原生实现**：TCP 侧调用 `GetExtendedTcpTable` 按字节偏移安全读取表项与完整四元组（`local == client && remote == server`）精确检索归属 PID；UDP 侧调用 `GetExtendedUdpTable` 按本地端点二元组（`local_ip + local_port`，含通配绑定 `0.0.0.0`/`::` 兜底匹配）检索归属 PID；随后通过 `QueryFullProcessImageNameW` 获取完整可执行路径（遇 `ERROR_INSUFFICIENT_BUFFER` 动态倍增缓冲至多 `32768` 宽字符）。
 - **有界缓存与并发隔离**：采用 **10 秒进程身份缓存 (`pid_cache`)**（容量上限 `1024`，绑定进程创建时间校验防 PID 复用且不缓存短命进程 `Unknown`），并通过 `Semaphore(8)`（`200ms` 等待上限）与 `spawn_blocking` 隔离阻塞式系统调用，避免阻塞 Tokio 调度线程。
 
 ### 3.3 DNS 拦截、被动观测与 Fake-IP 机制 (`src/dns.rs`, `src/dns/{codec,upstream,server}.rs`)
@@ -179,11 +179,11 @@ tests/
 ### 3.5 Windows WinDivert 系统级透明代理引擎 (`src/transparent.rs`, `src/transparent/`)
 - **三句柄分层捕获 (`runtime.rs`, `windivert_ffi.rs`, `pid_table.rs`)**：Windows 管理员权限下动态加载受信任绝对路径成对的 `WinDivert.dll` / `WinDivert64.sys`，同时打开：(1) `SOCKET` 层 `SNIFF | RECV_ONLY` 句柄维护分片 `SocketPidTable` 与 TCP 关闭旁路失效；(2) 出站 `NETWORK` 层句柄按规则分流 TCP / UDP-53 / UDP-443 QUIC / Fake-IP UDP 与 IPv4/IPv6 分片；(3) 独立入站 `NETWORK` 层内联同步观测句柄（`inbound and !loopback and !impostor and udp.SrcPort == 53`，`flags = 0`，未设 `WINDIVERT_FLAG_FRAGMENTS` 由 WinDivert 内核自动重组完整入站 IP 包）先将 `InspectDns` 应答中的 `real_ip -> domain` 落盘后再无条件原样重注入 OS（出站原包直接 `emit_passthrough`，消除 DNS 应答与 TCP SYN 竞态，同时完整保留 OS 原生接口、VPN 绑定、超 `4096B` EDNS0 与 `fe80::` `scope_id`）。
 - **有界 IPv4/IPv6 分片重组与卸载兼容 (`fragment.rs`, `dns_hijack.rs`, `netstack/packet.rs`)**：先校验合法性/重叠后再执行容量驱逐，严格按 RFC 6946 隔离 IPv6 原子分片，完整支持 `0/43/51/60/135(Mobility)/139(HIP)/140(SHIM6)` 最多 8 层 IPv6 扩展头、post-Fragment 非 TCP/UDP (`58/50/59`) 逐片透传，以及 Windows NDIS LSO / UDP `length == 0` 卸载报文解析。
-- **用户态 TCP 协议栈与权威首包嗅探 (`netstack.rs`, `netstack/{packet,bridge}.rs`, `sniffer.rs`, `outbound/bypass.rs`)**：单所有权 `smoltcp` 引擎负责四元组劫持、半关闭与非优雅取消/断链槽位回收（`poll_shutdown` 仅在写缓冲排空且发 FIN 后置位 `graceful_shutdown`）；`BypassPortRegistry` 按 TCP/UDP 与 IPv4/IPv6 四表隔离登记 FlowX 自身出站源端口并保证 socket 先于守卫析构；`sniffer.rs` 支持跨多条 TLS Record 拆分的 `ClientHello` SNI 与 HTTP `Host` 严格主机名嗅探，在 `NeedsDomainSniff` 及 `Immediate(Proxy | Chain)`（覆盖 `8444`/`9443`/`2083`/`3000` 等非标准端口，豁免已知服务端先发端口）下优先提取权威域名，且异步确定 `Immediate(Direct | Block)` 后绝不被 SYN 期过期嗅探标记拖慢。
+- **用户态 TCP 协议栈与权威首包嗅探 (`netstack.rs`, `netstack/{packet,bridge}.rs`, `sniffer.rs`, `src/outbound/bypass.rs`)**：单所有权 `smoltcp` 引擎负责四元组劫持、半关闭与非优雅取消/断链槽位回收（`poll_shutdown` 仅在写缓冲排空且发 FIN 后置位 `graceful_shutdown`）；`BypassPortRegistry` 按 TCP/UDP 与 IPv4/IPv6 四表隔离登记 FlowX 自身出站源端口并保证 socket 先于守卫析构；`sniffer.rs` 支持跨多条 TLS Record 拆分的 `ClientHello` SNI 与 HTTP `Host` 严格主机名嗅探，在 `NeedsDomainSniff` 及 `Immediate(Proxy | Chain)`（覆盖 `8444`/`9443`/`2083`/`3000` 等非标准端口，豁免已知服务端先发端口）下优先提取权威域名，且异步确定 `Immediate(Direct | Block)` 后绝不被 SYN 期过期嗅探标记拖慢。
 - **UAC 平滑提权与配置隔离 (`platform.rs`, `api/transparent.rs`)**：`POST /api/transparent/elevate` 使用独立无锁原子闸门并在 `spawn_blocking` 内持有 `ElevateFlagResetGuard` 与 `shutdown_tx`（与 `Ctrl+C` 的 `503 ERR_SERVER_SHUTTING_DOWN` 明确区分），通过 `ShellExecuteW("runas")` 以 `--transparent --replace-pid <old_pid>` 接管端口；`--transparent` / `--no-transparent` 仅覆写本次运行时状态，不污染磁盘 `<TransparentProxy enabled="...">`；`flowx transparent status | enable | disable | config | doctor` 均统一遵循 `--api` / `$FLOWX_API` / `--offline` 语义。
 
 ### 3.6 多协议出站与代理链 (`src/outbound.rs`, `src/outbound/`)
-- **协议与上游 DNS 防护**：`DirectOutbound`、`Socks5Client`（RFC 1928/1929 账密认证）、`HttpConnectClient`（Basic 认证、`username` 禁冒号、CRLF 与非法目标字符校验）与 `Socks4Client`（含 SOCKS4a 域名扩展）统一通过上游 UDP DNS 解析并经 `validate_direct_ips` 过滤 Fake-IP（`198.18.0.0/15`）、回环及本机接口上的 FlowX 服务端口，支持多 IP 有限故障转移。
+- **协议与上游 DNS 防护**：`DirectOutbound`、`Socks5Client`（RFC 1928/1929 账密认证）、`HttpConnectClient`（Basic 认证、`username` 禁冒号、CRLF 与非法目标字符校验）与 `Socks4Client`（含 SOCKS4a 域名扩展）统一通过上游 UDP DNS 解析并经 `validate_direct_ips` 过滤 Fake-IP（`198.18.0.0/15`）、回环及本机接口上的 FlowX 服务端口，支持多 IP 有限故障转移；`src/outbound.rs` 中的 `local_interface_ips()` 使用 8 字节对齐的 `Vec<u64>` 缓冲区调用 `GetAdaptersAddresses`（同时纳入 `IpDadStatePreferred` 与 `IpDadStateDeprecated` 接口地址）。
 - **多跳代理链 (`chain.rs`)**：支持在已有隧道流上递归握手串联多跳节点，在构建期与中间跳拨号期统一执行循环检测、`local_interface_ips()`/`self_ports`/Fake-IP 防护与全链路超时控制。
 - **流量监视中继 (`relay.rs`, `http_relay.rs`)**：全双工对拷采用双向同时静默 120 秒空闲超时与半关闭持续传输支持（内部统一超时看门狗），并具备实时手动熔断切断通知。
 

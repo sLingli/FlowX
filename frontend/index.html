@@ -4119,7 +4119,12 @@
 
     function renderSystemInfo() {
       const s = state.system;
-      if (!s || !s.inbound_addr) return;
+      if (!s || !s.inbound_addr) {
+        if ((s && s.transparent) || state.tpBusy || state.tpElevating) {
+          renderTransparentCard(s ? s.transparent : null);
+        }
+        return;
+      }
       document.getElementById('sys-version').textContent = 'v' + (s.version || '0.1.0');
       document.getElementById('sidebar-inbound').textContent = s.inbound_addr;
       document.getElementById('sidebar-uptime').textContent = formatDuration(s.uptime_secs);
@@ -4151,9 +4156,10 @@
       renderTransparentCard(s.transparent);
     }
 
-    function setStatusChip(el, dotTone, label) {
+    function setStatusChip(el, dotTone, label, i18nKey) {
       if (!el) return;
-      el.innerHTML = `<span class="signal-dot ${dotTone}" aria-hidden="true"></span><span>${escapeHtml(label)}</span>`;
+      const i18nAttr = i18nKey ? ` data-i18n="${escapeHtml(i18nKey)}"` : '';
+      el.innerHTML = `<span class="signal-dot ${dotTone}" aria-hidden="true"></span><span${i18nAttr}>${escapeHtml(label)}</span>`;
     }
 
     function renderTransparentCard(tp) {
@@ -4169,18 +4175,18 @@
 
       const statusBadge = document.getElementById('tp-status-badge');
       if (running) {
-        setStatusChip(statusBadge, 'live', t('tp_status_running'));
+        setStatusChip(statusBadge, 'live', t('tp_status_running'), 'tp_status_running');
       } else if (enabled) {
-        setStatusChip(statusBadge, 'warn', t('tp_status_pending'));
+        setStatusChip(statusBadge, 'warn', t('tp_status_pending'), 'tp_status_pending');
       } else {
-        setStatusChip(statusBadge, '', t('tp_status_disabled'));
+        setStatusChip(statusBadge, '', t('tp_status_disabled'), 'tp_status_disabled');
       }
 
       const adminBadge = document.getElementById('tp-admin-badge');
       if (elevated) {
-        setStatusChip(adminBadge, 'ok', t('tp_admin_yes'));
+        setStatusChip(adminBadge, 'ok', t('tp_admin_yes'), 'tp_admin_yes');
       } else {
-        setStatusChip(adminBadge, '', t('tp_admin_no'));
+        setStatusChip(adminBadge, '', t('tp_admin_no'), 'tp_admin_no');
       }
 
       const elevateBtn = document.getElementById('btn-tp-elevate');
