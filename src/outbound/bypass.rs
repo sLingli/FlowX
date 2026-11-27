@@ -401,9 +401,11 @@ mod tests {
     use super::*;
     use tokio::net::TcpListener;
 
-    /// 线程局部 RAII 透明激活态守卫：仅影响当前单测线程，绝不向其它并发单测外溢全局状态。
+    /// 线程局部 RAII 透明激活态守卫：仅影响当前单测线程，且显式 `!Send + !Sync`，
+    /// 静态阻止在多线程 Tokio 运行时跨 `.await` 持有导致线程局部变量覆写丢失。
     struct ScopedTransparentActive {
         prev: Option<bool>,
+        _not_send: std::marker::PhantomData<*const ()>,
     }
 
     impl ScopedTransparentActive {
@@ -413,7 +415,10 @@ mod tests {
                 cell.set(Some(active));
                 old
             });
-            Self { prev }
+            Self {
+                prev,
+                _not_send: std::marker::PhantomData,
+            }
         }
     }
 

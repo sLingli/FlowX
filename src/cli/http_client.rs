@@ -547,19 +547,12 @@ pub(super) async fn api_request_strict_with_io_timeout(
 
 pub(super) async fn api_request_strict(
     api_addr: &str,
+    locale: Locale,
     method: &str,
     path: &str,
     body: Option<&Value>,
 ) -> Result<(u16, Value)> {
-    api_request_strict_with_io_timeout(
-        api_addr,
-        Locale::from_env(),
-        method,
-        path,
-        body,
-        API_IO_TIMEOUT,
-    )
-    .await
+    api_request_strict_with_io_timeout(api_addr, locale, method, path, body, API_IO_TIMEOUT).await
 }
 
 pub(super) async fn api_request_or_offline(

@@ -341,6 +341,39 @@ fn resolve_updated_credentials(
     ))
 }
 
+pub(crate) fn validate_add_node_request(
+    req: &AddNodeRequest,
+    self_ports: &[u16],
+) -> Result<(), ControlError> {
+    let (_, protocol, _, username, explicit_password) = validate_node_base(
+        &req.name,
+        &req.protocol,
+        &req.server_addr,
+        req.username.clone(),
+        req.password.clone(),
+        self_ports,
+    )?;
+    if protocol == "SOCKS4" && explicit_password.is_some() {
+        return Err(ControlError::bad_request(
+            "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
+            "error.socks4_password_unsupported",
+        ));
+    }
+    if explicit_password.as_deref() == Some("") {
+        return Err(ControlError::bad_request(
+            "ERR_EMPTY_PASSWORD",
+            "error.empty_password",
+        ));
+    }
+    if protocol != "SOCKS4" && username.is_some() && explicit_password.is_none() {
+        return Err(ControlError::bad_request(
+            "ERR_USERNAME_WITHOUT_PASSWORD",
+            "error.username_without_password",
+        ));
+    }
+    Ok(())
+}
+
 pub fn add_node(
     req: AddNodeRequest,
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,

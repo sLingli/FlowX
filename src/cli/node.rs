@@ -5,12 +5,14 @@ use serde_json::{Value, json};
 
 use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec, resolve_id_arg};
 use crate::cli::bridge::{
-    DEFAULT_SELF_PORTS, control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly,
+    DEFAULT_SELF_PORTS, control_err_to_cli, load_offline_runtime_readonly, mutate_offline_runtime,
 };
 use crate::cli::http_client::{
     ApiTransportError, SilentExitError, api_request_or_offline, api_request_raw, ensure_api_ok,
 };
-use crate::control::node::{add_node, delete_node, list_nodes, patch_node, ping_address};
+use crate::control::node::{
+    add_node, delete_node, list_nodes, patch_node, ping_address, validate_add_node_request,
+};
 use crate::control::{AddNodeRequest, ControlError, PatchNodeRequest, PingResponse, ProxyNodeView};
 
 pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
@@ -106,11 +108,16 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let rt = load_offline_runtime(&opts.config_path)?;
                 let req: AddNodeRequest = serde_json::from_value(payload)?;
-                let new_id = add_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                // 静态参数先在加锁前校验，避免向不存在的配置路径提交非法参数时提前建出父目录或 .lock 文件
+                validate_add_node_request(&req, &DEFAULT_SELF_PORTS)
                     .map_err(|e| control_err_to_cli(e, opts.locale))?;
-                rt.save()?;
+                let locale = opts.locale;
+                let new_id = mutate_offline_runtime(&opts.config_path, |rt| {
+                    let id = add_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                        .map_err(|e| control_err_to_cli(e, locale))?;
+                    Ok((id, true))
+                })?;
                 json!({ "ok": true, "id": new_id })
             };
 
@@ -187,11 +194,13 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let rt = load_offline_runtime(&opts.config_path)?;
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
-                let updated_id = patch_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
-                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
-                rt.save()?;
+                let locale = opts.locale;
+                let updated_id = mutate_offline_runtime(&opts.config_path, |rt| {
+                    let uid = patch_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                        .map_err(|e| control_err_to_cli(e, locale))?;
+                    Ok((uid, true))
+                })?;
                 json!({ "ok": true, "id": updated_id })
             };
 
@@ -224,10 +233,12 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ensure_api_ok(st, val)?
             } else {
-                let rt = load_offline_runtime(&opts.config_path)?;
-                delete_node(id, &rt.nodes, &rt.engine)
-                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
-                rt.save()?;
+                let locale = opts.locale;
+                mutate_offline_runtime(&opts.config_path, |rt| {
+                    delete_node(id, &rt.nodes, &rt.engine)
+                        .map_err(|e| control_err_to_cli(e, locale))?;
+                    Ok(((), true))
+                })?;
                 json!({ "ok": true })
             };
 

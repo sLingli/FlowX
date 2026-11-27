@@ -12,7 +12,7 @@ use anyhow::{Result, bail};
 pub use args::{
     CliEnv, GlobalCliOpts, LaunchMode, parse_global_opts, parse_global_opts_with_env, print_help,
     resolve_launch_mode, resolve_launch_mode_with_env, should_run_cli, should_run_cli_with_env,
-    wants_json_output,
+    wants_json_output, wants_json_output_with_env,
 };
 pub use http_client::{ApiHttpError, emit_cli_error_and_exit, format_cli_error_json};
 
@@ -60,7 +60,10 @@ pub async fn run_cli_with_env(args: &[String], env: &CliEnv) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CliEnv, GlobalCliOpts, LaunchMode, format_cli_error_json, wants_json_output};
+    use super::{
+        CliEnv, GlobalCliOpts, LaunchMode, format_cli_error_json, wants_json_output,
+        wants_json_output_with_env,
+    };
     use crate::cli::args::{
         ArgSpec, ParsedCliInvocation, normalize_api_addr, parse_cli_invocation_with_env,
         parse_flags_with_spec, resolve_config_path_from_env,
@@ -178,6 +181,33 @@ mod tests {
         let help =
             parse_cli_invocation_with_env(&["flowx".into(), "--help".into()], &poisoned).unwrap();
         assert!(help.opts.show_help);
+
+        // Local meta subcommands `help`, `version`, `--version`, `-V` also ignore invalid FLOWX_API
+        for meta in ["help", "version", "--version", "-V"] {
+            let parsed =
+                parse_cli_invocation_with_env(&["flowx".into(), meta.into()], &poisoned).unwrap();
+            assert_eq!(parsed.opts.rest.first().map(String::as_str), Some(meta));
+        }
+
+        // `wants_json_output_with_env` handles `--replace-pid` value flag and ignores poisoned env
+        assert!(!wants_json_output_with_env(
+            &[
+                "flowx".into(),
+                "--replace-pid".into(),
+                "--json".into(),
+                "serve".into(),
+            ],
+            &poisoned
+        ));
+        assert!(wants_json_output_with_env(
+            &[
+                "flowx".into(),
+                "--offline".into(),
+                "--json".into(),
+                "status".into(),
+            ],
+            &poisoned
+        ));
 
         let serve =
             parse_cli_invocation_with_env(&["flowx".into(), "serve".into()], &poisoned).unwrap();
@@ -1073,10 +1103,12 @@ mod tests {
 
         let conn_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let conn_addr = conn_listener.local_addr().unwrap().to_string();
+        let (hdr_tx, hdr_rx) = tokio::sync::oneshot::channel::<String>();
         let conn_srv = tokio::spawn(async move {
             let (mut sock, _) = conn_listener.accept().await.unwrap();
             let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await.unwrap();
+            let n = sock.read(&mut buf).await.unwrap();
+            let _ = hdr_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
             let body = r#"[{"id":1,"process_name":"chrome.exe","process_path":"C:\\chrome.exe","pid":10,"target":"github.com:443","rule_name":"DevProxy","action":"Proxy (#101)","action_type":"Proxy","duration_secs":1,"uploaded_bytes":0,"downloaded_bytes":0,"upload_bytes_per_sec":0,"download_bytes_per_sec":0}]"#;
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -1085,20 +1117,35 @@ mod tests {
             );
             sock.write_all(resp.as_bytes()).await.unwrap();
         });
-        run_cli(&[
-            "flowx".into(),
-            "--api".into(),
-            conn_addr,
-            "--json".into(),
-            "conn".into(),
-            "list".into(),
-            "--filter".into(),
-            "proxy".into(),
-            "--search".into(),
-            "chrome".into(),
-        ])
+        let zh_env = CliEnv {
+            flowx_config: None,
+            flowx_api: None,
+            locale: Locale::Zh,
+        };
+        super::run_cli_with_env(
+            &[
+                "flowx".into(),
+                "--api".into(),
+                conn_addr,
+                "--json".into(),
+                "conn".into(),
+                "list".into(),
+                "--filter".into(),
+                "proxy".into(),
+                "--search".into(),
+                "chrome".into(),
+            ],
+            &zh_env,
+        )
         .await
         .unwrap();
         conn_srv.await.unwrap();
+        let raw_req = hdr_rx.await.unwrap();
+        assert!(
+            raw_req
+                .to_ascii_lowercase()
+                .contains("accept-language: zh-cn"),
+            "api_request_strict must forward CliEnv.locale in Accept-Language, got: {raw_req}"
+        );
     }
 }

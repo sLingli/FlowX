@@ -383,11 +383,16 @@ pub(super) fn parse_cli_invocation_with_env(
         }
     }
 
-    // 仅在真正需要走在线 API 且未显式传 `--api` / `--offline` / `--help` 时解析环境变量 `FLOWX_API`，
-    // 防止宿主环境中无效的 `FLOWX_API` 破坏离线命令、帮助输出或显式 `--api` 覆盖。
+    // 仅在真正需要走在线 API 且未显式传 `--api` / `--offline` / 帮助或版本子命令时解析环境变量 `FLOWX_API`，
+    // 防止宿主环境中无效的 `FLOWX_API` 破坏离线命令、帮助/版本输出或显式 `--api` 覆盖。
+    let is_local_meta_cmd = show_help
+        || matches!(
+            rest.first().map(String::as_str),
+            Some("help" | "version" | "--version" | "-V")
+        );
     if !api_cli_flag
         && !offline
-        && !show_help
+        && !is_local_meta_cmd
         && let Some(raw_env_api) = env_api
     {
         api_addr = normalize_api_addr(raw_env_api)?;
@@ -530,7 +535,11 @@ pub(super) fn normalize_api_addr(raw: &str) -> Result<String> {
 }
 
 pub fn wants_json_output(args: &[String]) -> bool {
-    if let Ok(parsed) = parse_cli_invocation(args) {
+    wants_json_output_with_env(args, &CliEnv::from_process())
+}
+
+pub fn wants_json_output_with_env(args: &[String], env: &CliEnv) -> bool {
+    if let Ok(parsed) = parse_cli_invocation_with_env(args, env) {
         return parsed.opts.json_output;
     }
     let mut expect_value = false;
@@ -545,7 +554,7 @@ pub fn wants_json_output(args: &[String]) -> bool {
         if arg == "--json" {
             return true;
         }
-        if matches!(arg.as_str(), "-c" | "--config" | "--api") {
+        if matches!(arg.as_str(), "--config" | "--api" | "--replace-pid") {
             expect_value = true;
             continue;
         }

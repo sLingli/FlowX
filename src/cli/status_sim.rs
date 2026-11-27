@@ -2,7 +2,9 @@ use anyhow::{Context, Result, bail};
 use serde_json::json;
 
 use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec, split_action_spec};
-use crate::cli::bridge::{control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly};
+use crate::cli::bridge::{
+    control_err_to_cli, load_offline_runtime_readonly, mutate_offline_runtime,
+};
 use crate::cli::http_client::{api_request_or_offline, api_request_strict, ensure_api_ok};
 use crate::control::routing::{set_default_action, simulate_route};
 use crate::control::{SetDefaultActionRequest, SimulateRouteRequest};
@@ -30,7 +32,7 @@ pub(super) async fn cmd_status(opts: &GlobalCliOpts) -> Result<()> {
     {
         let sys_val = ensure_api_ok(status, raw_sys)?;
         let (stats_status, raw_stats) =
-            api_request_strict(&opts.api_addr, "GET", "/api/stats", None).await?;
+            api_request_strict(&opts.api_addr, opts.locale, "GET", "/api/stats", None).await?;
         let stats_val = ensure_api_ok(stats_status, raw_stats)?;
 
         let out = json!({
@@ -166,11 +168,13 @@ pub(super) async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
         {
             ensure_api_ok(st, val)?
         } else {
-            let rt = load_offline_runtime(&opts.config_path)?;
             let req: SetDefaultActionRequest = serde_json::from_value(payload)?;
-            let resp = set_default_action(req, &rt.engine, &rt.nodes, opts.locale)
-                .map_err(|e| control_err_to_cli(e, opts.locale))?;
-            rt.save()?;
+            let locale = opts.locale;
+            let resp = mutate_offline_runtime(&opts.config_path, |rt| {
+                let r = set_default_action(req, &rt.engine, &rt.nodes, locale)
+                    .map_err(|e| control_err_to_cli(e, locale))?;
+                Ok((r, true))
+            })?;
             serde_json::to_value(resp)?
         };
 

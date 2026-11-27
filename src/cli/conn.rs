@@ -48,7 +48,8 @@ pub(super) async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
                 .filter(|s| !s.is_empty());
 
             let (st, val) =
-                api_request_strict(&opts.api_addr, "GET", "/api/connections", None).await?;
+                api_request_strict(&opts.api_addr, opts.locale, "GET", "/api/connections", None)
+                    .await?;
             let v = ensure_api_ok(st, val)?;
             let filtered: Vec<Value> = v
                 .as_array()
@@ -101,6 +102,7 @@ pub(super) async fn cmd_conn(opts: &GlobalCliOpts) -> Result<()> {
             let id: u64 = id_str.parse().context("Invalid connection ID")?;
             let (st, val) = api_request_strict(
                 &opts.api_addr,
+                opts.locale,
                 "POST",
                 &format!("/api/connections/kill?id={}", id),
                 None,

@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::args::GlobalCliOpts;
 use crate::cli::http_client::{ApiHttpError, api_request_or_offline, ensure_api_ok};
-use crate::config::{ConfigFileLock, ConfigStore};
+use crate::config::{ConfigStore, LockedRuntimeState};
 use crate::control::ControlError;
 use crate::i18n::Locale;
 use crate::interceptor::dispatcher::ProxyNodeEntry;
@@ -27,39 +27,18 @@ pub(super) struct OfflineRuntime {
     pub(super) nodes: RwLock<HashMap<u32, ProxyNodeEntry>>,
     pub(super) engine: RuleEngine,
     pub(super) transparent: TransparentSettings,
-    file_lock: Option<ConfigFileLock>,
 }
 
-impl OfflineRuntime {
-    pub(super) fn save(&self) -> Result<()> {
-        match &self.file_lock {
-            Some(lock) => self.store.save_runtime_with_transparent_holding_lock(
-                &self.nodes,
-                &self.engine,
-                Some(&self.transparent),
-                lock,
-            ),
-            None => self.store.save_runtime_with_transparent(
-                &self.nodes,
-                &self.engine,
-                Some(&self.transparent),
-            ),
-        }
-    }
-}
-
-pub(super) fn load_offline_runtime(config_path: &str) -> Result<OfflineRuntime> {
+/// 在 `ConfigStore` 规范锁序（`save_lock -> ConfigFileLock`）下执行离线读-改-写事务，
+/// 彻底避免并发 `--offline` / 守护进程保存的 lost update 与 AB-BA 死锁。
+pub(super) fn mutate_offline_runtime<F, T>(config_path: &str, f: F) -> Result<T>
+where
+    F: FnOnce(&mut LockedRuntimeState) -> Result<(T, bool)>,
+{
     let store = ConfigStore::new(config_path);
-    let (rt, file_lock) = store
-        .lock_and_load_existing_or_default(&DEFAULT_SELF_PORTS)
-        .with_context(|| format!("Failed to load configuration file: {}", config_path))?;
-    Ok(OfflineRuntime {
-        store,
-        nodes: RwLock::new(rt.proxy_nodes),
-        engine: RuleEngine::new(rt.rules, rt.default_action),
-        transparent: rt.transparent_settings,
-        file_lock: Some(file_lock),
-    })
+    store
+        .update_with_lock(&DEFAULT_SELF_PORTS, f)
+        .with_context(|| format!("Failed to update configuration file: {}", config_path))
 }
 
 pub(super) fn load_offline_runtime_readonly(config_path: &str) -> Result<OfflineRuntime> {
@@ -72,7 +51,6 @@ pub(super) fn load_offline_runtime_readonly(config_path: &str) -> Result<Offline
         nodes: RwLock::new(rt.proxy_nodes),
         engine: RuleEngine::new(rt.rules, rt.default_action),
         transparent: rt.transparent_settings,
-        file_lock: None,
     })
 }
 
@@ -100,7 +78,7 @@ pub(super) fn offline_resolve_rule_id(
 
 pub(super) enum RuleBackend {
     Online { rules: Vec<RuleView> },
-    Offline(OfflineRuntime),
+    Offline,
 }
 
 pub(super) async fn load_rule_backend(opts: &GlobalCliOpts) -> Result<RuleBackend> {
@@ -108,8 +86,6 @@ pub(super) async fn load_rule_backend(opts: &GlobalCliOpts) -> Result<RuleBacken
         let rules: Vec<RuleView> = serde_json::from_value(ensure_api_ok(st, val)?)?;
         Ok(RuleBackend::Online { rules })
     } else {
-        Ok(RuleBackend::Offline(load_offline_runtime(
-            &opts.config_path,
-        )?))
+        Ok(RuleBackend::Offline)
     }
 }

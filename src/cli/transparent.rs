@@ -2,7 +2,9 @@ use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
 use crate::cli::args::{ArgSpec, GlobalCliOpts, parse_flags_with_spec};
-use crate::cli::bridge::{control_err_to_cli, load_offline_runtime, load_offline_runtime_readonly};
+use crate::cli::bridge::{
+    control_err_to_cli, load_offline_runtime_readonly, mutate_offline_runtime,
+};
 use crate::cli::http_client::{
     API_ELEVATE_IO_TIMEOUT, ApiHttpError, api_request_or_offline,
     api_request_strict_with_io_timeout, ensure_api_ok,
@@ -199,13 +201,12 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ("ONLINE", ensure_api_ok(st, val)?)
             } else {
-                let mut rt = load_offline_runtime(&opts.config_path)?;
-                rt.transparent.enabled = target_enabled;
-                rt.save()?;
-                (
-                    "OFFLINE",
-                    serde_json::to_value(probe_status(&rt.transparent))?,
-                )
+                let status_val = mutate_offline_runtime(&opts.config_path, |rt| {
+                    rt.transparent.enabled = target_enabled;
+                    let val = serde_json::to_value(probe_status(&rt.transparent))?;
+                    Ok((val, true))
+                })?;
+                ("OFFLINE", status_val)
             };
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&res_val)?);
@@ -287,20 +288,20 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
             {
                 ("ONLINE", ensure_api_ok(st, val)?)
             } else {
-                let mut rt = load_offline_runtime(&opts.config_path)?;
-                let req = TransparentConfigRequest {
-                    hijack_dns,
-                    block_quic_for_proxied: block_quic,
-                    dll_path,
-                    clear_dll_path: clear_dll_path.then_some(true),
-                };
-                rt.transparent = apply_transparent_config_fields(&rt.transparent, req)
-                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
-                rt.save()?;
-                (
-                    "OFFLINE",
-                    serde_json::to_value(probe_status(&rt.transparent))?,
-                )
+                let locale = opts.locale;
+                let status_val = mutate_offline_runtime(&opts.config_path, |rt| {
+                    let req = TransparentConfigRequest {
+                        hijack_dns,
+                        block_quic_for_proxied: block_quic,
+                        dll_path,
+                        clear_dll_path: clear_dll_path.then_some(true),
+                    };
+                    rt.transparent = apply_transparent_config_fields(&rt.transparent, req)
+                        .map_err(|e| control_err_to_cli(e, locale))?;
+                    let val = serde_json::to_value(probe_status(&rt.transparent))?;
+                    Ok((val, true))
+                })?;
+                ("OFFLINE", status_val)
             };
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&res_val)?);
