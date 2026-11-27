@@ -89,16 +89,21 @@ mod tests {
 
     impl TempConfigGuard {
         fn new(prefix: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+
+            static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+            let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
             let path = std::env::current_dir()
                 .unwrap()
                 .join("target")
                 .join(format!(
-                    "{prefix}_{}_{}.xml",
+                    "{prefix}_{}_{}_{}.xml",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
-                        .as_nanos()
+                        .as_nanos(),
+                    seq
                 ));
             let g = Self { path };
             g.cleanup();
@@ -116,8 +121,16 @@ mod tests {
         fn cleanup(&self) {
             let _ = std::fs::remove_file(&self.path);
             if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
-                let _ =
-                    std::fs::remove_file(parent.join(format!(".{}.lock", name.to_string_lossy())));
+                let file_name = name.to_string_lossy();
+                let _ = std::fs::remove_file(parent.join(format!(".{file_name}.lock")));
+                let tmp_prefix = format!(".{file_name}.tmp.");
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
             }
         }
     }
@@ -336,10 +349,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_explicit_api_and_timeout_no_offline_fallback() {
-        let mut temp_cfg = std::env::current_dir().unwrap().join("target");
-        temp_cfg.push(format!("flowx_cli_nofallback_{}.xml", std::process::id()));
-        let _ = std::fs::remove_file(&temp_cfg);
-        let cfg_str = temp_cfg.to_string_lossy().to_string();
+        let temp_cfg_guard = TempConfigGuard::new("flowx_cli_nofallback");
+        let temp_cfg = temp_cfg_guard.path();
+        let cfg_str = temp_cfg_guard.as_str();
 
         // Bind then drop ephemeral listener to get a guaranteed refused localhost port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -655,18 +667,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_cli_transparent_dll_path_validation_and_doctor_report_semantics() {
-        let cfg_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_cli_tp_val_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let cfg_str = cfg_path.display().to_string();
+        let cfg_guard = TempConfigGuard::new("flowx_cli_tp_val");
+        let cfg_path = cfg_guard.path();
+        let cfg_str = cfg_guard.as_str();
 
         // 1. Invalid --dll-path emits structured ERR_TRANSPARENT_INVALID_DLL_PATH matching API
         for bad_path in [

@@ -1093,24 +1093,65 @@ mod tests {
         assert_eq!(rebuilt, default_cfg);
     }
 
-    #[test]
-    fn test_config_store_atomic_persistence() {
-        let mut path = std::env::current_dir().unwrap().join("target");
-        path.push(format!("flowx_test_{}_{}.xml", std::process::id(), 1));
-        let lock_path = ConfigStore::new(&path).lock_file_path();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&lock_path);
+    struct TempTestConfig {
+        path: PathBuf,
+    }
 
-        struct Cleanup(PathBuf, PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-                let _ = std::fs::remove_file(&self.1);
+    impl TempTestConfig {
+        fn new(prefix: &str) -> Self {
+            static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+            let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "{prefix}_{}_{}_{}.xml",
+                    std::process::id(),
+                    ts,
+                    seq
+                ));
+            let guard = Self { path };
+            guard.cleanup();
+            guard
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn cleanup(&self) {
+            let _ = std::fs::remove_file(&self.path);
+            if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
+                let file_name = name.to_string_lossy();
+                let _ = std::fs::remove_file(parent.join(format!(".{file_name}.lock")));
+                let tmp_prefix = format!(".{file_name}.tmp.");
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
             }
         }
-        let _cleanup = Cleanup(path.clone(), lock_path);
+    }
 
-        let store = ConfigStore::new(&path);
+    impl Drop for TempTestConfig {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
+    }
+
+    #[test]
+    fn test_config_store_atomic_persistence() {
+        let cfg_guard = TempTestConfig::new("flowx_test");
+        let path = cfg_guard.path();
+
+        let store = ConfigStore::new(path);
         let (runtime, created) = store.load_or_init(&[40001, 40080]).unwrap();
         assert!(created);
         assert!(path.exists());
@@ -1353,19 +1394,8 @@ mod tests {
         }
 
         // Concurrent load_or_init inside workspace target dir produces a valid config file cleanly
-        let tmp = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_init_lock_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let _ = std::fs::remove_file(&tmp);
-        let store = std::sync::Arc::new(ConfigStore::new(&tmp));
+        let cfg_guard = TempTestConfig::new("flowx_init_lock");
+        let store = std::sync::Arc::new(ConfigStore::new(cfg_guard.path()));
         let mut handles = Vec::new();
         for _ in 0..4 {
             let s = std::sync::Arc::clone(&store);
@@ -1379,26 +1409,12 @@ mod tests {
             }
         }
         assert_eq!(created_count, 1);
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(store.lock_file_path());
     }
 
     #[test]
     fn test_config_store_cross_instance_file_lock_serializes_concurrent_saves() {
-        let tmp = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_xproc_lock_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let _ = std::fs::remove_file(&tmp);
-        let lock_path = ConfigStore::new(&tmp).lock_file_path();
-        let _ = std::fs::remove_file(&lock_path);
+        let cfg_guard = TempTestConfig::new("flowx_xproc_lock");
+        let tmp = cfg_guard.path().to_path_buf();
 
         let mut handles = Vec::new();
         for worker in 0..4usize {
@@ -1427,8 +1443,6 @@ mod tests {
 
         let loaded = ConfigStore::new(&tmp).load_existing(&[]).unwrap();
         assert!(loaded.rules.iter().any(|r| r.name == "LocalBypass"));
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&lock_path);
     }
 
     #[test]
@@ -1509,29 +1523,8 @@ mod tests {
 
     #[test]
     fn test_lock_and_load_prevents_concurrent_offline_lost_update() {
-        let tmp = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_offline_rmw_lock_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let lock_path = ConfigStore::new(&tmp).lock_file_path();
-        let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&lock_path);
-
-        struct Cleanup(PathBuf, PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-                let _ = std::fs::remove_file(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(tmp.clone(), lock_path);
+        let cfg_guard = TempTestConfig::new("flowx_offline_rmw_lock");
+        let tmp = cfg_guard.path().to_path_buf();
 
         let mut handles = Vec::new();
         for worker in 0..4usize {

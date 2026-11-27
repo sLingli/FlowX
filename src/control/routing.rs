@@ -396,11 +396,13 @@ mod tests {
             .unwrap_err();
             assert_eq!(err.code, "ERR_INVALID_SIMULATE_TARGET");
             assert_eq!(err.kind, crate::control::ControlErrorKind::BadRequest);
+            assert_eq!(err.message_key, "error.invalid_simulate_target");
         }
     }
 
     #[test]
     fn test_set_default_action_validation_and_updates() {
+        use crate::control::ControlErrorKind;
         use crate::outbound::chain::ProxyNode;
         use crate::outbound::socks5::Socks5Client;
 
@@ -420,36 +422,35 @@ mod tests {
         let nodes = RwLock::new(map);
 
         // Missing proxy node -> ERR_NODE_NOT_FOUND; invalid action -> ERR_INVALID_RULE_ACTION
-        assert_eq!(
-            set_default_action(
-                SetDefaultActionRequest {
-                    action: "Proxy".into(),
-                    node_id: Some(999),
-                },
-                &engine,
-                &nodes,
-                Locale::En,
-            )
-            .unwrap_err()
-            .code,
-            "ERR_NODE_NOT_FOUND"
-        );
-        assert_eq!(
-            set_default_action(
-                SetDefaultActionRequest {
-                    action: "Unknown".into(),
-                    node_id: None,
-                },
-                &engine,
-                &nodes,
-                Locale::En,
-            )
-            .unwrap_err()
-            .code,
-            "ERR_INVALID_RULE_ACTION"
-        );
+        let err_missing = set_default_action(
+            SetDefaultActionRequest {
+                action: "Proxy".into(),
+                node_id: Some(999),
+            },
+            &engine,
+            &nodes,
+            Locale::En,
+        )
+        .unwrap_err();
+        assert_eq!(err_missing.kind, ControlErrorKind::BadRequest);
+        assert_eq!(err_missing.code, "ERR_NODE_NOT_FOUND");
+        assert_eq!(err_missing.message_key, "error.node_not_found");
 
-        let proxy_res = set_default_action(
+        let err_invalid = set_default_action(
+            SetDefaultActionRequest {
+                action: "Unknown".into(),
+                node_id: None,
+            },
+            &engine,
+            &nodes,
+            Locale::En,
+        )
+        .unwrap_err();
+        assert_eq!(err_invalid.kind, ControlErrorKind::BadRequest);
+        assert_eq!(err_invalid.code, "ERR_INVALID_RULE_ACTION");
+        assert_eq!(err_invalid.message_key, "error.invalid_rule_action");
+
+        let proxy_en = set_default_action(
             SetDefaultActionRequest {
                 action: "Proxy".into(),
                 node_id: Some(101),
@@ -459,12 +460,27 @@ mod tests {
             Locale::En,
         )
         .unwrap();
-        assert!(proxy_res.ok);
-        assert_eq!(proxy_res.default_action_type, "Proxy");
-        assert_eq!(proxy_res.default_node_id, Some(101));
+        assert!(proxy_en.ok);
+        assert_eq!(proxy_en.default_action_type, "Proxy");
+        assert_eq!(proxy_en.default_node_id, Some(101));
+        assert!(
+            proxy_en.default_action.contains("101"),
+            "unexpected en proxy action: {}",
+            proxy_en.default_action
+        );
         assert_eq!(engine.default_action(), Action::Proxy(101));
 
-        let block_res = set_default_action(
+        let block_en = set_default_action(
+            SetDefaultActionRequest {
+                action: "Block".into(),
+                node_id: None,
+            },
+            &engine,
+            &nodes,
+            Locale::En,
+        )
+        .unwrap();
+        let block_zh = set_default_action(
             SetDefaultActionRequest {
                 action: "Block".into(),
                 node_id: None,
@@ -474,9 +490,100 @@ mod tests {
             Locale::Zh,
         )
         .unwrap();
-        assert!(block_res.ok);
-        assert_eq!(block_res.default_action_type, "Block");
-        assert_eq!(block_res.default_node_id, None);
+        assert!(block_zh.ok);
+        assert_eq!(block_zh.default_action_type, "Block");
+        assert_eq!(block_zh.default_node_id, None);
+        assert_ne!(
+            block_en.default_action, block_zh.default_action,
+            "localized default_action text should differ between En and Zh"
+        );
         assert_eq!(engine.default_action(), Action::Block);
+    }
+
+    #[test]
+    fn test_build_system_info_memory_and_runtime_context() {
+        use crate::outbound::chain::ProxyNode;
+        use crate::outbound::socks5::Socks5Client;
+
+        let mut map = HashMap::new();
+        map.insert(
+            101,
+            ProxyNodeEntry {
+                id: 101,
+                name: "Node101".into(),
+                protocol: "SOCKS5".into(),
+                server_addr: "10.0.0.2:1080".into(),
+                username: None,
+                client: ProxyNode::Socks5(Socks5Client::new("10.0.0.2:1080")),
+            },
+        );
+        let nodes = RwLock::new(map);
+        let engine = RuleEngine::new(
+            vec![
+                Rule::from_raw("R1", true, None, None, None, Action::Direct),
+                Rule::from_raw("R2", false, None, None, None, Action::Block),
+            ],
+            Action::Proxy(101),
+        );
+        let started = Instant::now();
+
+        // Memory-only fallback when runtime_ctx and config_store are None
+        let mem_en = build_system_info(
+            41080,
+            None,
+            None,
+            None,
+            &nodes,
+            &engine,
+            started,
+            Locale::En,
+        );
+        let mem_zh = build_system_info(
+            41080,
+            None,
+            None,
+            None,
+            &nodes,
+            &engine,
+            started,
+            Locale::Zh,
+        );
+        assert_eq!(mem_en.api_addr, "127.0.0.1:41080");
+        assert_eq!(mem_en.nodes_count, 1);
+        assert_eq!(mem_en.rules_count, 2);
+        assert_eq!(mem_en.enabled_rules_count, 1);
+        assert_eq!(mem_en.default_action_type, "Proxy");
+        assert_eq!(mem_en.default_node_id, Some(101));
+        assert_eq!(mem_en.fake_ip_count, 0);
+        assert_ne!(mem_en.config_path, mem_zh.config_path);
+
+        // Full runtime_ctx + config_store populates live addresses & fake_ip_count
+        let pool = Arc::new(FakeIpPool::new_default());
+        let _ = pool.allocate("demo.example.com");
+        let ctx = SystemRuntimeContext {
+            inbound_addr: "127.0.0.1:41001".parse().unwrap(),
+            dns_addr: "127.0.0.1:1153".parse().unwrap(),
+            upstream_dns: "1.1.1.1:53".parse().unwrap(),
+            api_addr: "127.0.0.1:41080".parse().unwrap(),
+            fake_ip_pool: pool,
+            block_ipv6: true,
+            started_at: started,
+        };
+        let store = ConfigStore::new("custom-test.xml");
+        let full = build_system_info(
+            41080,
+            Some(&ctx),
+            Some(&store),
+            None,
+            &nodes,
+            &engine,
+            started,
+            Locale::En,
+        );
+        assert_eq!(full.inbound_addr, "127.0.0.1:41001");
+        assert_eq!(full.dns_addr, "127.0.0.1:1153");
+        assert_eq!(full.upstream_dns, "1.1.1.1:53");
+        assert_eq!(full.fake_ip_count, 1);
+        assert_eq!(full.config_path, "custom-test.xml");
     }
 }

@@ -847,11 +847,17 @@ mod tests {
         use crate::control::ControlErrorKind;
         use crate::router::{Action, Rule, RuleEngine};
 
+        fn assert_err(err: ControlError, kind: ControlErrorKind, code: &str, message_key: &str) {
+            assert_eq!(err.kind, kind, "unexpected kind for {code}");
+            assert_eq!(err.code, code);
+            assert_eq!(err.message_key, message_key);
+        }
+
         let nodes = RwLock::new(HashMap::new());
         let self_ports = [40001u16, 40080, 1053];
 
-        // Validation errors on add_node
-        assert_eq!(
+        // Validation errors on add_node (assert kind + code + message_key)
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "  ".into(),
@@ -863,11 +869,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_EMPTY_NODE_NAME"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_EMPTY_NODE_NAME",
+            "error.empty_node_name",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "BadProto".into(),
@@ -879,11 +886,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_UNSUPPORTED_PROTOCOL"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_UNSUPPORTED_PROTOCOL",
+            "error.unsupported_protocol",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "FakeIp".into(),
@@ -895,11 +903,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_NODE_FAKE_IP"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_NODE_FAKE_IP",
+            "error.node_fake_ip",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "SelfLoop".into(),
@@ -911,11 +920,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_NODE_SELF_LOOP"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_NODE_SELF_LOOP",
+            "error.node_self_loop",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "BadHttpUser".into(),
@@ -927,11 +937,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_HTTP_USERNAME_COLON"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_HTTP_USERNAME_COLON",
+            "error.http_username_colon",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "Socks4Pw".into(),
@@ -943,11 +954,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_SOCKS4_PASSWORD_UNSUPPORTED"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
+            "error.socks4_password_unsupported",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "EmptyPw".into(),
@@ -959,11 +971,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_EMPTY_PASSWORD"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_EMPTY_PASSWORD",
+            "error.empty_password",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "NoPw".into(),
@@ -975,11 +988,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_USERNAME_WITHOUT_PASSWORD"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_USERNAME_WITHOUT_PASSWORD",
+            "error.username_without_password",
         );
-        assert_eq!(
+        assert_err(
             add_node(
                 AddNodeRequest {
                     name: "PwNoUser".into(),
@@ -991,9 +1005,10 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_PASSWORD_WITHOUT_USERNAME"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_PASSWORD_WITHOUT_USERNAME",
+            "error.password_without_username",
         );
 
         // Add valid SOCKS5 (with auth) and SOCKS4 (with user_id)
@@ -1028,8 +1043,28 @@ mod tests {
         assert_eq!(listed[1].id, id2);
         assert!(listed[1].auth_configured && !listed[1].password_configured);
 
-        // update_node (PUT): keep_password defaults to false -> fails if reusing username without password
-        assert_eq!(
+        // update_node (PUT): missing id -> 404; keep_password defaults to false
+        assert_err(
+            update_node(
+                UpdateNodeRequest {
+                    id: 9999,
+                    name: "Ghost".into(),
+                    protocol: "SOCKS5".into(),
+                    server_addr: "10.0.0.2:1080".into(),
+                    username: None,
+                    password: None,
+                    keep_password: None,
+                    clear_password: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err(),
+            ControlErrorKind::NotFound,
+            "ERR_NODE_NOT_FOUND",
+            "error.node_not_found",
+        );
+        assert_err(
             update_node(
                 UpdateNodeRequest {
                     id: id1,
@@ -1044,12 +1079,13 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_USERNAME_WITHOUT_PASSWORD"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_USERNAME_WITHOUT_PASSWORD",
+            "error.username_without_password",
         );
         // Changing username with keep_password=true requires new password
-        assert_eq!(
+        assert_err(
             update_node(
                 UpdateNodeRequest {
                     id: id1,
@@ -1064,9 +1100,10 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_PASSWORD_REQUIRED_ON_USER_CHANGE",
+            "error.password_required_on_user_change",
         );
         // Valid PUT with keep_password=true preserves secret
         update_node(
@@ -1095,8 +1132,99 @@ mod tests {
             (Some("alice"), Some("secret"))
         );
 
-        // patch_node: conflicting clear_username + username -> 400; clear_username + clear_password=false -> 400
+        // patch_node: keeps existing password by default when only renaming
+        patch_node(
+            PatchNodeRequest {
+                id: id1,
+                name: Some("S5-Patched".into()),
+                protocol: None,
+                server_addr: None,
+                username: None,
+                password: None,
+                keep_password: None,
+                clear_password: None,
+                clear_username: None,
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
         assert_eq!(
+            nodes
+                .read()
+                .unwrap()
+                .get(&id1)
+                .unwrap()
+                .client
+                .auth_credentials(),
+            (Some("alice"), Some("secret"))
+        );
+
+        // patch_node: clear_password with changed username -> 400; clear_password with unchanged username clears both
+        assert_err(
+            patch_node(
+                PatchNodeRequest {
+                    id: id1,
+                    name: None,
+                    protocol: None,
+                    server_addr: None,
+                    username: Some("other".into()),
+                    password: None,
+                    keep_password: None,
+                    clear_password: Some(true),
+                    clear_username: None,
+                },
+                &nodes,
+                &self_ports,
+            )
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_USERNAME_WITHOUT_PASSWORD",
+            "error.username_without_password",
+        );
+        patch_node(
+            PatchNodeRequest {
+                id: id1,
+                name: None,
+                protocol: None,
+                server_addr: None,
+                username: None,
+                password: None,
+                keep_password: None,
+                clear_password: Some(true),
+                clear_username: None,
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
+        assert!(
+            !nodes
+                .read()
+                .unwrap()
+                .get(&id1)
+                .unwrap()
+                .is_auth_configured()
+        );
+
+        // Restore credentials then test conflicting clear_username / clear_password options
+        patch_node(
+            PatchNodeRequest {
+                id: id1,
+                name: None,
+                protocol: None,
+                server_addr: None,
+                username: Some("alice".into()),
+                password: Some("secret2".into()),
+                keep_password: None,
+                clear_password: None,
+                clear_username: None,
+            },
+            &nodes,
+            &self_ports,
+        )
+        .unwrap();
+        assert_err(
             patch_node(
                 PatchNodeRequest {
                     id: id1,
@@ -1112,11 +1240,12 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_CONFLICTING_USERNAME_OPTIONS"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_CONFLICTING_USERNAME_OPTIONS",
+            "error.conflicting_username_options",
         );
-        assert_eq!(
+        assert_err(
             patch_node(
                 PatchNodeRequest {
                     id: id1,
@@ -1132,9 +1261,10 @@ mod tests {
                 &nodes,
                 &self_ports,
             )
-            .unwrap_err()
-            .code,
-            "ERR_CONFLICTING_PASSWORD_OPTIONS"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_CONFLICTING_PASSWORD_OPTIONS",
+            "error.conflicting_password_options",
         );
         // Valid patch with clear_username clears both username & password
         patch_node(
@@ -1174,17 +1304,26 @@ mod tests {
             )],
             Action::Proxy(id2),
         );
-        let err_rule = delete_node(id1, &nodes, &engine_rule_ref).unwrap_err();
-        assert_eq!(err_rule.kind, ControlErrorKind::Conflict);
-        assert_eq!(err_rule.code, "ERR_NODE_IN_USE");
-        let err_def = delete_node(id2, &nodes, &engine_rule_ref).unwrap_err();
-        assert_eq!(err_def.kind, ControlErrorKind::Conflict);
-        assert_eq!(err_def.code, "ERR_NODE_IN_USE");
+        assert_err(
+            delete_node(id1, &nodes, &engine_rule_ref).unwrap_err(),
+            ControlErrorKind::Conflict,
+            "ERR_NODE_IN_USE",
+            "error.node_in_use",
+        );
+        assert_err(
+            delete_node(id2, &nodes, &engine_rule_ref).unwrap_err(),
+            ControlErrorKind::Conflict,
+            "ERR_NODE_IN_USE",
+            "error.node_in_use",
+        );
 
         let empty_engine = RuleEngine::new(Vec::new(), Action::Direct);
         delete_node(id2, &nodes, &empty_engine).unwrap();
-        let err_missing = delete_node(id2, &nodes, &empty_engine).unwrap_err();
-        assert_eq!(err_missing.kind, ControlErrorKind::NotFound);
-        assert_eq!(err_missing.code, "ERR_NODE_NOT_FOUND");
+        assert_err(
+            delete_node(id2, &nodes, &empty_engine).unwrap_err(),
+            ControlErrorKind::NotFound,
+            "ERR_NODE_NOT_FOUND",
+            "error.node_not_found",
+        );
     }
 }

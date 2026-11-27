@@ -908,9 +908,9 @@ async fn test_api_patch_and_auth_and_simulate_parity() {
 #[tokio::test]
 async fn test_api_persist_failure_rolls_back_and_returns_500_and_auth_validation() {
     // 1. Unwritable parent path (regular file used as parent directory) forces save_profile to fail
-    let mut blocker = std::env::current_dir().unwrap().join("target");
-    blocker.push(format!("flowx_readonly_parent_{}.tmp", std::process::id()));
-    std::fs::write(&blocker, b"not-a-directory").unwrap();
+    let blocker_guard = common::TempConfigGuard::with_ext("flowx_readonly_parent", "tmp");
+    let blocker = blocker_guard.path();
+    std::fs::write(blocker, b"not-a-directory").unwrap();
     let bad_cfg_path = blocker.join("flowx.xml");
     let store = Arc::new(ConfigStore::new(&bad_cfg_path));
 
@@ -970,7 +970,7 @@ async fn test_api_persist_failure_rolls_back_and_returns_500_and_auth_validation
         re.current_rules().is_empty(),
         "Failed disk persistence must roll back added rule"
     );
-    let _ = std::fs::remove_file(&blocker);
+    drop(blocker_guard);
 
     // 2. Password without username / HTTP ':' in username / empty string password semantics (P1-5 + P1-6b)
     let (api_addr, api_nodes, _api_re, _tx2) = spawn_test_api().await;

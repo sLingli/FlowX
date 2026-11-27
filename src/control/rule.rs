@@ -352,6 +352,12 @@ mod tests {
         RwLock::new(map)
     }
 
+    fn assert_ctrl_err(err: ControlError, kind: ControlErrorKind, code: &str, message_key: &str) {
+        assert_eq!(err.kind, kind, "unexpected kind for {code}");
+        assert_eq!(err.code, code);
+        assert_eq!(err.message_key, message_key);
+    }
+
     #[test]
     fn test_parse_and_validate_action_and_add_rule_validation() {
         let nodes = sample_nodes();
@@ -369,43 +375,47 @@ mod tests {
             parse_and_validate_action("Proxy", Some(101), &nodes).unwrap(),
             Action::Proxy(101)
         );
-        assert_eq!(
-            parse_and_validate_action("Proxy", None, &nodes)
-                .unwrap_err()
-                .code,
-            "ERR_MISSING_NODE_FOR_PROXY"
+        assert_ctrl_err(
+            parse_and_validate_action("Proxy", None, &nodes).unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_MISSING_NODE_FOR_PROXY",
+            "error.missing_node_id_for_proxy",
         );
-        assert_eq!(
-            parse_and_validate_action("Proxy", Some(999), &nodes)
-                .unwrap_err()
-                .code,
-            "ERR_NODE_NOT_FOUND"
+        assert_ctrl_err(
+            parse_and_validate_action("Proxy", Some(999), &nodes).unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_NODE_NOT_FOUND",
+            "error.node_not_found",
         );
-        assert_eq!(
-            parse_and_validate_action("Bogus", None, &nodes)
-                .unwrap_err()
-                .code,
-            "ERR_INVALID_RULE_ACTION"
+        assert_ctrl_err(
+            parse_and_validate_action("Bogus", None, &nodes).unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_INVALID_RULE_ACTION",
+            "error.invalid_rule_action",
         );
 
         // Empty rule name
-        let err = add_rule(
-            AddRuleRequest {
-                name: "   ".into(),
-                apps: None,
-                targets: None,
-                ports: None,
-                action: "Direct".into(),
-                node_id: None,
-            },
-            &engine,
-            &nodes,
-        )
-        .unwrap_err();
-        assert_eq!(err.code, "ERR_EMPTY_RULE_NAME");
+        assert_ctrl_err(
+            add_rule(
+                AddRuleRequest {
+                    name: "   ".into(),
+                    apps: None,
+                    targets: None,
+                    ports: None,
+                    action: "Direct".into(),
+                    node_id: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_EMPTY_RULE_NAME",
+            "error.empty_rule_name",
+        );
 
         // Invalid app / target / port patterns fail closed
-        assert_eq!(
+        assert_ctrl_err(
             add_rule(
                 AddRuleRequest {
                     name: "BadApps".into(),
@@ -418,11 +428,12 @@ mod tests {
                 &engine,
                 &nodes,
             )
-            .unwrap_err()
-            .code,
-            "ERR_INVALID_APP_PATTERN"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_INVALID_APP_PATTERN",
+            "error.invalid_app_pattern",
         );
-        assert_eq!(
+        assert_ctrl_err(
             add_rule(
                 AddRuleRequest {
                     name: "BadTargets".into(),
@@ -435,11 +446,12 @@ mod tests {
                 &engine,
                 &nodes,
             )
-            .unwrap_err()
-            .code,
-            "ERR_INVALID_TARGET_PATTERN"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_INVALID_TARGET_PATTERN",
+            "error.invalid_target_pattern",
         );
-        assert_eq!(
+        assert_ctrl_err(
             add_rule(
                 AddRuleRequest {
                     name: "BadPorts".into(),
@@ -452,9 +464,10 @@ mod tests {
                 &engine,
                 &nodes,
             )
-            .unwrap_err()
-            .code,
-            "ERR_INVALID_PORT_FORMAT"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_INVALID_PORT_FORMAT",
+            "error.invalid_port_format",
         );
 
         // Valid add
@@ -510,24 +523,27 @@ mod tests {
         .unwrap();
 
         // update_rule missing id -> 404
-        let miss = update_rule(
-            UpdateRuleRequest {
-                id: 999999,
-                name: "Ghost".into(),
-                apps: None,
-                targets: None,
-                ports: None,
-                action: "Direct".into(),
-                node_id: None,
-            },
-            &engine,
-            &nodes,
-        )
-        .unwrap_err();
-        assert_eq!(miss.kind, ControlErrorKind::NotFound);
-        assert_eq!(miss.code, "ERR_RULE_NOT_FOUND");
+        assert_ctrl_err(
+            update_rule(
+                UpdateRuleRequest {
+                    id: 999999,
+                    name: "Ghost".into(),
+                    apps: None,
+                    targets: None,
+                    ports: None,
+                    action: "Direct".into(),
+                    node_id: None,
+                },
+                &engine,
+                &nodes,
+            )
+            .unwrap_err(),
+            ControlErrorKind::NotFound,
+            "ERR_RULE_NOT_FOUND",
+            "error.rule_not_found",
+        );
 
-        // update_rule replaces fields on existing rule
+        // update_rule replaces fields on existing rule and updates RuleEngine state
         assert_eq!(
             update_rule(
                 UpdateRuleRequest {
@@ -545,6 +561,16 @@ mod tests {
             .unwrap(),
             id1
         );
+        {
+            let updated_r1 = &engine.current_rules()[0];
+            assert_eq!(updated_r1.id, id1);
+            assert_eq!(updated_r1.name, "FirstUpdated");
+            assert_eq!(updated_r1.apps_raw, "git.exe");
+            assert_eq!(updated_r1.targets_raw, "github.com");
+            assert_eq!(updated_r1.ports_raw, "443");
+            assert_eq!(updated_r1.action, Action::Proxy(101));
+            assert!(updated_r1.enabled);
+        }
 
         // patch_rule: node_id alone works on existing Proxy rule, clears apps via Some(""), keeps targets
         patch_rule(
@@ -569,7 +595,7 @@ mod tests {
         assert!(!r1.enabled);
 
         // patch_rule: node_id alone rejected on Direct rule; empty name rejected
-        assert_eq!(
+        assert_ctrl_err(
             patch_rule(
                 PatchRuleRequest {
                     id: id2,
@@ -584,11 +610,12 @@ mod tests {
                 &engine,
                 &nodes,
             )
-            .unwrap_err()
-            .code,
-            "ERR_INVALID_RULE_ACTION"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_INVALID_RULE_ACTION",
+            "error.invalid_rule_action",
         );
-        assert_eq!(
+        assert_ctrl_err(
             patch_rule(
                 PatchRuleRequest {
                     id: id2,
@@ -603,9 +630,10 @@ mod tests {
                 &engine,
                 &nodes,
             )
-            .unwrap_err()
-            .code,
-            "ERR_EMPTY_RULE_NAME"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_EMPTY_RULE_NAME",
+            "error.empty_rule_name",
         );
 
         // toggle_rule flip and explicit set + 404
@@ -629,31 +657,33 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(
+        assert_ctrl_err(
             toggle_rule(
                 ToggleRuleRequest {
                     id: 999999,
-                    enabled: None
+                    enabled: None,
                 },
-                &engine
+                &engine,
             )
-            .unwrap_err()
-            .code,
-            "ERR_RULE_NOT_FOUND"
+            .unwrap_err(),
+            ControlErrorKind::NotFound,
+            "ERR_RULE_NOT_FOUND",
+            "error.rule_not_found",
         );
 
         // move_rule invalid direction -> 400; valid move -> reorders; missing -> 404
-        assert_eq!(
+        assert_ctrl_err(
             move_rule(
                 MoveRuleRequest {
                     id: id2,
-                    direction: "sideways".into()
+                    direction: "sideways".into(),
                 },
-                &engine
+                &engine,
             )
-            .unwrap_err()
-            .code,
-            "ERR_INVALID_MOVE_DIR"
+            .unwrap_err(),
+            ControlErrorKind::BadRequest,
+            "ERR_INVALID_MOVE_DIR",
+            "error.invalid_move_direction",
         );
         assert!(
             move_rule(
@@ -666,25 +696,28 @@ mod tests {
             .unwrap()
         );
         assert_eq!(engine.current_rules()[0].id, id2);
-        assert_eq!(
+        assert_ctrl_err(
             move_rule(
                 MoveRuleRequest {
                     id: 999999,
-                    direction: "top".into()
+                    direction: "top".into(),
                 },
-                &engine
+                &engine,
             )
-            .unwrap_err()
-            .code,
-            "ERR_RULE_NOT_FOUND"
+            .unwrap_err(),
+            ControlErrorKind::NotFound,
+            "ERR_RULE_NOT_FOUND",
+            "error.rule_not_found",
         );
 
         // delete_rule existing + missing
         delete_rule(id1, &engine).unwrap();
         assert_eq!(engine.current_rules().len(), 1);
-        assert_eq!(
-            delete_rule(id1, &engine).unwrap_err().code,
-            "ERR_RULE_NOT_FOUND"
+        assert_ctrl_err(
+            delete_rule(id1, &engine).unwrap_err(),
+            ControlErrorKind::NotFound,
+            "ERR_RULE_NOT_FOUND",
+            "error.rule_not_found",
         );
     }
 }

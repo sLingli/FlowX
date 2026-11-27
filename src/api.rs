@@ -459,9 +459,9 @@ mod tests {
         assert_eq!(read_err.code_and_key().0, "ERR_REQUEST_TIMEOUT");
 
         // 3. Staged persist-before-commit leaves default action untouched when disk write fails
-        let mut blocker = std::env::current_dir().unwrap().join("target");
-        blocker.push(format!("flowx_staged_persist_{}.tmp", std::process::id()));
-        std::fs::write(&blocker, b"not-a-directory").unwrap();
+        let blocker_guard = TempTestFile::with_ext("flowx_staged_persist", "tmp");
+        let blocker = blocker_guard.path();
+        std::fs::write(blocker, b"not-a-directory").unwrap();
         let store = Arc::new(ConfigStore::new(blocker.join("flowx.xml")));
         let mgr = Arc::new(ConnectionManager::new());
         let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
@@ -493,17 +493,71 @@ mod tests {
         assert!(r_def.starts_with("HTTP/1.1 500 Internal Server Error"));
         assert!(r_def.contains("ERR_CONFIG_PERSIST_FAILED"));
         assert_eq!(re.default_action(), Action::Direct);
-        let _ = std::fs::remove_file(&blocker);
+    }
+
+    struct TempTestFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TempTestFile {
+        fn new(prefix: &str) -> Self {
+            Self::with_ext(prefix, "xml")
+        }
+
+        fn with_ext(prefix: &str, ext: &str) -> Self {
+            static NEXT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::current_dir()
+                .unwrap()
+                .join("target")
+                .join(format!(
+                    "{prefix}_{}_{}_{}.{}",
+                    std::process::id(),
+                    ts,
+                    seq,
+                    ext
+                ));
+            let guard = Self { path };
+            guard.cleanup();
+            guard
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn cleanup(&self) {
+            let _ = std::fs::remove_file(&self.path);
+            if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
+                let file_name = name.to_string_lossy();
+                let _ = std::fs::remove_file(parent.join(format!(".{file_name}.lock")));
+                let tmp_prefix = format!(".{file_name}.tmp.");
+                if let Ok(entries) = std::fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for TempTestFile {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
     }
 
     #[tokio::test]
     async fn test_api_persist_timeout_and_mutation_isolation_do_not_starve_health_or_kill() {
-        let cfg_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!("test_persist_isolation_{}.xml", std::process::id()));
-        let _ = std::fs::remove_file(&cfg_path);
-        let store = Arc::new(ConfigStore::new(&cfg_path));
+        let cfg_guard = TempTestFile::new("test_persist_isolation");
+        let cfg_path = cfg_guard.path();
+        let store = Arc::new(ConfigStore::new(cfg_path));
         store
             .save_profile(&crate::config::ProfileConfig::default_profile())
             .unwrap();
@@ -635,7 +689,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         // 确认已超时回滚的暂存快照绝不会在锁释放后延迟覆盖磁盘配置
-        let on_disk_after_unlock = std::fs::read_to_string(&cfg_path).unwrap();
+        let on_disk_after_unlock = std::fs::read_to_string(cfg_path).unwrap();
         assert!(
             !on_disk_after_unlock.contains("flood-"),
             "timed-out rolled-back snapshots must never be written to disk after lock release: {on_disk_after_unlock}"
@@ -655,17 +709,12 @@ mod tests {
         )
         .await;
         assert!(r_fresh.starts_with("HTTP/1.1 200 OK"), "fresh: {r_fresh}");
-        let on_disk_after_fresh = std::fs::read_to_string(&cfg_path).unwrap();
+        let on_disk_after_fresh = std::fs::read_to_string(cfg_path).unwrap();
         assert!(on_disk_after_fresh.contains("post-recovery"));
         assert!(!on_disk_after_fresh.contains("flood-"));
 
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
-        let _ = std::fs::remove_file(&cfg_path);
-        let _ = std::fs::remove_file(cfg_path.parent().unwrap().join(format!(
-            ".{}.lock",
-            cfg_path.file_name().unwrap().to_string_lossy()
-        )));
     }
 
     #[tokio::test]
@@ -675,34 +724,8 @@ mod tests {
         use crate::interceptor::dispatcher::DispatcherConfig;
         use crate::interceptor::process::ProcessTracker;
 
-        let cfg_path = std::env::current_dir()
-            .unwrap()
-            .join("target")
-            .join(format!(
-                "flowx_api_transparent_test_{}_{}.xml",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        let lock_path = cfg_path.parent().unwrap().join(format!(
-            ".{}.lock",
-            cfg_path.file_name().unwrap().to_string_lossy()
-        ));
-        let _ = std::fs::remove_file(&cfg_path);
-        let _ = std::fs::remove_file(&lock_path);
-
-        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-                let _ = std::fs::remove_file(&self.1);
-            }
-        }
-        let _cleanup = Cleanup(cfg_path.clone(), lock_path);
-
-        let store = Arc::new(ConfigStore::new(&cfg_path));
+        let cfg_guard = TempTestFile::new("flowx_api_transparent_test");
+        let store = Arc::new(ConfigStore::new(cfg_guard.path()));
         let mgr = Arc::new(ConnectionManager::new());
         let re = Arc::new(RuleEngine::new(Vec::new(), Action::Direct));
         let nodes = Arc::new(RwLock::new(HashMap::new()));

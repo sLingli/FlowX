@@ -1153,14 +1153,15 @@ async fn test_cli_online_clear_user_clear_apps_and_rule_move_id_flag() {
 
 #[tokio::test]
 async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
-    use std::process::Command;
+    use std::time::Duration;
     use tokio::net::TcpListener;
+    use tokio::process::Command;
 
     let bin = env!("CARGO_BIN_EXE_flowx");
     let cfg_guard = TempConfigGuard::new("flowx_cli_bin_stdio");
     let cfg_str = cfg_guard.as_str();
 
-    let run_bin = |args: &[&str], extra_env: &[(&str, &str)]| -> std::process::Output {
+    async fn run_bin(bin: &str, args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
         let mut cmd = Command::new(bin);
         for k in [
             "FLOWX_API",
@@ -1175,8 +1176,11 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        cmd.args(args).output().expect("spawn flowx binary")
-    };
+        tokio::time::timeout(Duration::from_secs(15), cmd.args(args).output())
+            .await
+            .expect("flowx subprocess timed out")
+            .expect("spawn flowx binary")
+    }
 
     // Prepare a profile with 1 reachable local node (id=101) referenced by DevProxy
     let alive = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1195,16 +1199,31 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     p101.port = alive_addr.port();
     store.save_profile(&profile).unwrap();
 
+    // 0. Local meta commands (`help`, `version`, `--version`, `-V`) succeed even with poisoned FLOWX_API
+    for meta in ["help", "version", "--version", "-V"] {
+        let out_meta = run_bin(bin, &[meta], &[("FLOWX_API", "://poisoned-host-env")]).await;
+        assert!(
+            out_meta.status.success(),
+            "{meta} failed under poisoned FLOWX_API: {}",
+            String::from_utf8_lossy(&out_meta.stderr)
+        );
+        assert!(out_meta.stderr.is_empty());
+        assert!(!out_meta.stdout.is_empty());
+    }
+
     // 1. Offline `status --json` succeeds even with poisoned host FLOWX_API and emits valid JSON on stdout
     let out_status = run_bin(
+        bin,
         &["--config", &cfg_str, "--offline", "status", "--json"],
         &[("FLOWX_API", "://poisoned-host-env")],
-    );
+    )
+    .await;
     assert!(
         out_status.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out_status.stderr)
     );
+    assert!(out_status.stderr.is_empty());
     let status_json: Value = serde_json::from_slice(&out_status.stdout).unwrap();
     assert_eq!(status_json["mode"], "offline");
     assert_eq!(status_json["nodes_count"], 1);
@@ -1212,10 +1231,13 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
 
     // 2. Offline `rule list --json` emits pure JSON array without `index` field
     let out_rules = run_bin(
+        bin,
         &["--config", &cfg_str, "--offline", "rule", "list", "--json"],
         &[],
-    );
+    )
+    .await;
     assert!(out_rules.status.success());
+    assert!(out_rules.stderr.is_empty());
     let rules_json: Value = serde_json::from_slice(&out_rules.stdout).unwrap();
     let arr = rules_json.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -1224,6 +1246,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
 
     // 3. Offline `rule toggle` and `rule move --id 2 up` emit exact API-compatible JSON payloads
     let out_toggle = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1235,8 +1258,10 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "--json",
         ],
         &[],
-    );
+    )
+    .await;
     assert!(out_toggle.status.success());
+    assert!(out_toggle.stderr.is_empty());
     let toggle_json: Value = serde_json::from_slice(&out_toggle.stdout).unwrap();
     assert_eq!(
         toggle_json,
@@ -1244,6 +1269,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     );
 
     let out_move = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1256,13 +1282,16 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "--json",
         ],
         &[],
-    );
+    )
+    .await;
     assert!(out_move.status.success());
+    assert!(out_move.stderr.is_empty());
     let move_json: Value = serde_json::from_slice(&out_move.stdout).unwrap();
     assert_eq!(move_json, serde_json::json!({"ok": true, "moved": true}));
 
     // 4. Offline `sim --json` returns matched rule and trace array
     let out_sim = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1275,8 +1304,10 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "--json",
         ],
         &[],
-    );
+    )
+    .await;
     assert!(out_sim.status.success());
+    assert!(out_sim.stderr.is_empty());
     let sim_json: Value = serde_json::from_slice(&out_sim.stdout).unwrap();
     assert_eq!(sim_json["action_type"], "Proxy");
     assert_eq!(sim_json["node_id"], 101);
@@ -1286,6 +1317,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     //    - with `--json`: emits structured JSON error to stdout, keeps stderr empty, exits 1
     //    - without `--json`: emits plain-text `Error:` message to stderr, keeps stdout empty, exits 1
     let out_in_use = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1296,7 +1328,8 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "101",
         ],
         &[],
-    );
+    )
+    .await;
     assert_eq!(out_in_use.status.code(), Some(1));
     assert!(
         out_in_use.stderr.is_empty(),
@@ -1309,6 +1342,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     assert_eq!(err_in_use["status"], 409);
 
     let out_missing_rule = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1319,7 +1353,8 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "999",
         ],
         &[],
-    );
+    )
+    .await;
     assert_eq!(out_missing_rule.status.code(), Some(1));
     assert!(out_missing_rule.stderr.is_empty());
     let err_missing_rule: Value = serde_json::from_slice(&out_missing_rule.stdout).unwrap();
@@ -1328,9 +1363,11 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     assert_eq!(err_missing_rule["status"], 404);
 
     let out_plain_err = run_bin(
+        bin,
         &["--config", &cfg_str, "--offline", "rule", "remove", "999"],
         &[],
-    );
+    )
+    .await;
     assert_eq!(out_plain_err.status.code(), Some(1));
     assert!(
         out_plain_err.stdout.is_empty(),
@@ -1349,6 +1386,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     let dead_addr = dead.local_addr().unwrap().to_string();
     drop(dead);
     let out_add_dead = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1362,12 +1400,15 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             &dead_addr,
         ],
         &[],
-    );
+    )
+    .await;
     assert!(out_add_dead.status.success());
+    assert!(out_add_dead.stderr.is_empty());
     let add_json: Value = serde_json::from_slice(&out_add_dead.stdout).unwrap();
     assert_eq!(add_json["ok"], Value::Bool(true));
 
     let out_ping_all = run_bin(
+        bin,
         &[
             "--config",
             &cfg_str,
@@ -1378,7 +1419,8 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "--all",
         ],
         &[],
-    );
+    )
+    .await;
     assert_eq!(out_ping_all.status.code(), Some(1));
     assert!(
         out_ping_all.stderr.is_empty(),

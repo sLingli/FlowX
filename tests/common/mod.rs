@@ -46,8 +46,8 @@ pub async fn raw_http(addr: SocketAddr, req: &str) -> String {
     String::from_utf8(buf).unwrap()
 }
 
-/// RAII temp XML config guard that removes both the XML file and its `.filename.lock` sidecar
-/// on creation and on drop (even if a test panics).
+/// RAII temp file/config guard that removes the file, its `.filename.lock` sidecar,
+/// and any leftover `.filename.tmp.*` staging files on creation and on drop (even on panic).
 #[allow(dead_code)]
 pub struct TempConfigGuard {
     path: std::path::PathBuf,
@@ -56,6 +56,14 @@ pub struct TempConfigGuard {
 #[allow(dead_code)]
 impl TempConfigGuard {
     pub fn new(prefix: &str) -> Self {
+        Self::with_ext(prefix, "xml")
+    }
+
+    pub fn with_ext(prefix: &str, ext: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT_TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
+        let seq = NEXT_TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -63,7 +71,13 @@ impl TempConfigGuard {
         let path = std::env::current_dir()
             .unwrap()
             .join("target")
-            .join(format!("{prefix}_{}_{}.xml", std::process::id(), ts));
+            .join(format!(
+                "{prefix}_{}_{}_{}.{}",
+                std::process::id(),
+                ts,
+                seq,
+                ext
+            ));
         let guard = Self { path };
         guard.cleanup();
         guard
@@ -80,8 +94,17 @@ impl TempConfigGuard {
     pub fn cleanup(&self) {
         let _ = std::fs::remove_file(&self.path);
         if let (Some(parent), Some(name)) = (self.path.parent(), self.path.file_name()) {
-            let lock_path = parent.join(format!(".{}.lock", name.to_string_lossy()));
+            let file_name = name.to_string_lossy();
+            let lock_path = parent.join(format!(".{file_name}.lock"));
             let _ = std::fs::remove_file(lock_path);
+            let tmp_prefix = format!(".{file_name}.tmp.");
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(&tmp_prefix) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
         }
     }
 }
