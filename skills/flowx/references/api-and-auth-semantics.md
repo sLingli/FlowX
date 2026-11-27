@@ -104,6 +104,6 @@
 `flowx transparent doctor --json` 与 `flowx transparent status --json` 核心字段：
 - `mode`：`ONLINE`（查询运行中守护进程）或 `OFFLINE`（检测当前进程权限与本地配置）。
 - `elevated`：目标实例是否具备 Windows 管理员权限。
-- `dll_found` / `sys_found`：是否在可信路径定位到成对的 `WinDivert.dll` 与 `WinDivert64.sys`（优先使用 `transparent config --dll-path` 指定的本机绝对路径；未配置时仅搜索 `flowx.exe` 同级目录、同级 `driver\` 子目录及环境变量 `$env:FLOWX_WINDIVERT_DLL` 指向的本机绝对路径，**不搜索当前工作目录 CWD**）。
+- `dll_found` / `sys_found`：是否在可信路径定位到成对的 `WinDivert.dll` 与 `WinDivert64.sys`（优先级：先匹配 `transparent config --dll-path` 指定的本机绝对路径；未配置时优先匹配环境变量 `$env:FLOWX_WINDIVERT_DLL`，再依次回落至 `flowx.exe` 同级目录与同级 `driver\` 子目录，**不搜索当前工作目录 CWD**）。
 - `running` / `ready`：WinDivert 驱动是否正在运行 / 环境是否已全部就绪。
 - `tcp_intercepted_total` / `tcp_passthrough_total` / `dns_hijacked_total` / `quic_blocked_total`：透明引擎实时拦截、旁路直通、DNS 劫持与 QUIC 阻断计数。

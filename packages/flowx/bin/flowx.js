@@ -42,17 +42,32 @@ function existsIncludingSymlink(targetPath) {
   }
 }
 
+function isRegularFile(targetPath) {
+  try {
+    return fs.statSync(targetPath).isFile();
+  } catch (_) {
+    return false;
+  }
+}
+
+function sameWinPath(a, b) {
+  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+}
+
 function hasPairedDriver(dir) {
   return (
-    fs.existsSync(path.join(dir, "WinDivert.dll")) &&
-    fs.existsSync(path.join(dir, "WinDivert64.sys"))
+    isRegularFile(path.join(dir, "WinDivert.dll")) &&
+    isRegularFile(path.join(dir, "WinDivert64.sys"))
   );
 }
 
 function readSavedDriverDir() {
   try {
     const raw = fs.readFileSync(getSavedDriverDirPointerPath(), "utf8").trim();
-    return raw ? path.resolve(raw) : null;
+    if (!raw || !path.isAbsolute(raw)) {
+      return null;
+    }
+    return path.resolve(raw);
   } catch (_) {
     return null;
   }
@@ -61,11 +76,13 @@ function readSavedDriverDir() {
 function persistSavedDriverDir(targetDir) {
   const pointerPath = getSavedDriverDirPointerPath();
   const resolved = path.resolve(targetDir);
-  if (resolved === path.resolve(pkgDriverDir)) {
+  if (sameWinPath(resolved, pkgDriverDir)) {
     try {
       fs.rmSync(pointerPath, { force: true });
-    } catch (_) {}
-    return true;
+      return !existsIncludingSymlink(pointerPath);
+    } catch (_) {
+      return false;
+    }
   }
   const parentDir = path.dirname(pointerPath);
   const tmpPath = path.join(
@@ -116,14 +133,14 @@ function buildChildEnv(preferredDriverDir) {
     return env;
   }
   if (preferredDriverDir && hasPairedDriver(preferredDriverDir)) {
-    if (path.resolve(preferredDriverDir) !== path.resolve(pkgDriverDir)) {
+    if (!sameWinPath(preferredDriverDir, pkgDriverDir)) {
       env.FLOWX_WINDIVERT_DLL = path.join(preferredDriverDir, "WinDivert.dll");
     }
     return env;
   }
   const savedDir = readSavedDriverDir();
   if (savedDir && hasPairedDriver(savedDir)) {
-    if (path.resolve(savedDir) !== path.resolve(pkgDriverDir)) {
+    if (!sameWinPath(savedDir, pkgDriverDir)) {
       env.FLOWX_WINDIVERT_DLL = path.join(savedDir, "WinDivert.dll");
     }
     return env;
@@ -135,6 +152,19 @@ function buildChildEnv(preferredDriverDir) {
     }
   }
   return env;
+}
+
+function redactUrlForLog(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    if (u.username || u.password) {
+      u.username = "";
+      u.password = "";
+    }
+    return u.toString();
+  } catch (_) {
+    return rawUrl;
+  }
 }
 
 function parseSetupArgs(args) {
@@ -185,6 +215,9 @@ function parseSetupArgs(args) {
       throw new Error(`Unknown option for setup-driver: ${a}`);
     }
   }
+  if (opts.help) {
+    return opts;
+  }
   if (opts.customUrl && !opts.customHash) {
     throw new Error(
       "When specifying a custom --url, also pass --sha256 <64-hex> to verify integrity."
@@ -230,42 +263,51 @@ function findFileInTree(root, targetName, requiredParentDir) {
 function atomicInstallDriverFiles(targetDir, dllSrc, sysSrc, licSrc) {
   fs.mkdirSync(targetDir, { recursive: true });
 
-  const entries = [
-    { name: "WinDivert.dll", src: dllSrc },
-    { name: "WinDivert64.sys", src: sysSrc },
-  ];
-  if (licSrc) {
-    entries.push({ name: "LICENSE-WinDivert.txt", src: licSrc });
-  }
+  const managedNames = ["WinDivert.dll", "WinDivert64.sys", "LICENSE-WinDivert.txt"];
+  const sourceByName = {
+    "WinDivert.dll": dllSrc,
+    "WinDivert64.sys": sysSrc,
+    "LICENSE-WinDivert.txt": licSrc || null,
+  };
 
   const nonce = `${process.pid}-${crypto.randomBytes(4).toString("hex")}`;
-  const staged = entries.map((e) => ({
-    ...e,
-    destPath: path.join(targetDir, e.name),
-    tmpPath: path.join(targetDir, `.flowx.tmp.${e.name}.${nonce}`),
-    bakPath: path.join(targetDir, `.flowx.bak.${e.name}.${nonce}`),
+  const items = managedNames.map((name) => ({
+    name,
+    src: sourceByName[name],
+    destPath: path.join(targetDir, name),
+    tmpPath: path.join(targetDir, `.flowx.tmp.${name}.${nonce}`),
+    bakPath: path.join(targetDir, `.flowx.bak.${name}.${nonce}`),
   }));
 
-  const swapped = [];
   const backups = [];
+  const swapped = [];
 
   try {
-    // 1. Stage all driver files inside targetDir first so unrelated files in targetDir are never touched
-    for (const item of staged) {
-      fs.copyFileSync(item.src, item.tmpPath);
+    // Phase 1: Stage all new driver files inside targetDir first (never touches existing files on copy failure)
+    for (const item of items) {
+      if (item.src) {
+        fs.copyFileSync(item.src, item.tmpPath);
+      }
     }
 
-    // 2. Replace only the managed driver files one-by-one with full rollback on any error
-    for (const item of staged) {
+    // Phase 2: Move ALL existing managed target files (including stale LICENSE-WinDivert.txt when licSrc is null)
+    // to backups BEFORE placing any new file, avoiding half-new/half-old state if a driver file is locked.
+    for (const item of items) {
       if (existsIncludingSymlink(item.destPath)) {
         fs.renameSync(item.destPath, item.bakPath);
         backups.push(item);
       }
-      fs.renameSync(item.tmpPath, item.destPath);
-      swapped.push(item);
     }
 
-    // 3. Best-effort cleanup of per-file backups after commit (AV/handle locks must not fail committed install)
+    // Phase 3: Move all staged new files into their final destinations
+    for (const item of items) {
+      if (item.src) {
+        fs.renameSync(item.tmpPath, item.destPath);
+        swapped.push(item);
+      }
+    }
+
+    // Phase 4: Best-effort cleanup of per-file backups after commit (AV/handle locks must not fail committed install)
     for (const item of backups) {
       try {
         fs.rmSync(item.bakPath, { recursive: true, force: true });
@@ -291,7 +333,7 @@ function atomicInstallDriverFiles(targetDir, dllSrc, sysSrc, licSrc) {
     }
     throw err;
   } finally {
-    for (const item of staged) {
+    for (const item of items) {
       try {
         if (existsIncludingSymlink(item.tmpPath)) {
           fs.rmSync(item.tmpPath, { force: true });
@@ -325,26 +367,31 @@ function runSetupDriver(subArgs) {
     process.exit(1);
   }
 
-  const targetDriverDir = resolveInstallDriverDir(opts.dir);
-
   if (opts.help) {
+    const displayTarget = opts.dir
+      ? path.resolve(opts.dir)
+      : `${pkgDriverDir} (or ${getUserFallbackDriverDir()} when node_modules is read-only)`;
     console.log(`flowx setup-driver — Download and verify official WinDivert 2.2.2 x64 driver
 
 USAGE:
   flowx setup-driver [--force] [--dir <PATH>] [--url <ZIP_URL> --sha256 <HEX>]
 
-Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_modules is read-only):
-  ${targetDriverDir}
+Default install location:
+  ${displayTarget}
 `);
     return;
   }
 
+  const targetDriverDir = resolveInstallDriverDir(opts.dir);
+
   if (!opts.force && hasPairedDriver(targetDriverDir)) {
     const saved = persistSavedDriverDir(targetDriverDir);
     console.log(`WinDivert driver files are already present at ${targetDriverDir}`);
-    if (path.resolve(targetDriverDir) !== path.resolve(pkgDriverDir) && !saved) {
+    if (!saved) {
       console.log(
-        `Note: Could not persist custom driver path under %LOCALAPPDATA%\\FlowX. Set FLOWX_WINDIVERT_DLL="${path.join(targetDriverDir, "WinDivert.dll")}" or configure --dll-path manually.`
+        sameWinPath(targetDriverDir, pkgDriverDir)
+          ? `Warning: Could not remove stale driver pointer at ${getSavedDriverDirPointerPath()}. Delete it manually if another driver directory is still being loaded.`
+          : `Note: Could not persist custom driver path under %LOCALAPPDATA%\\FlowX. Set FLOWX_WINDIVERT_DLL="${path.join(targetDriverDir, "WinDivert.dll")}" or configure --dll-path manually.`
       );
     }
     runDoctorAndExit(targetDriverDir);
@@ -356,14 +403,14 @@ Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_
   const extractDir = path.join(tmpDir, "extracted");
 
   try {
-    console.log(`Downloading WinDivert from ${opts.url} ...`);
+    console.log(`Downloading WinDivert from ${redactUrlForLog(opts.url)} ...`);
     const dl = spawnSync(
       "powershell.exe",
       [
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri $env:FLOWX_WD_URL -OutFile $env:FLOWX_WD_ZIP -UseBasicParsing",
+        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; $resp = Invoke-WebRequest -Uri $env:FLOWX_WD_URL -OutFile $env:FLOWX_WD_ZIP -UseBasicParsing -PassThru; if ($resp -and $resp.BaseResponse -and $resp.BaseResponse.ResponseUri -and $resp.BaseResponse.ResponseUri.Scheme -ne 'https') { Remove-Item -Force -ErrorAction SilentlyContinue $env:FLOWX_WD_ZIP; throw ('Blocked non-HTTPS redirect to ' + $resp.BaseResponse.ResponseUri.Scheme) }",
       ],
       {
         stdio: "inherit",
@@ -425,7 +472,7 @@ Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_
     atomicInstallDriverFiles(targetDriverDir, dllSrc, sysSrc, licSrc);
     const pointerSaved = persistSavedDriverDir(targetDriverDir);
     console.log(`Installed WinDivert x64 drivers -> ${targetDriverDir}`);
-    if (path.resolve(targetDriverDir) !== path.resolve(pkgDriverDir)) {
+    if (!sameWinPath(targetDriverDir, pkgDriverDir)) {
       if (pointerSaved) {
         console.log(
           `Note: Saved driver directory to ${getSavedDriverDirPointerPath()}; future 'flowx' wrapper invocations will automatically set FLOWX_WINDIVERT_DLL. If running flowx.exe directly, configure --dll-path "${path.join(targetDriverDir, "WinDivert.dll")}".`
@@ -435,6 +482,10 @@ Default install location (falls back to %LOCALAPPDATA%\\FlowX\\driver when node_
           `Note: Could not persist driver path under %LOCALAPPDATA%\\FlowX. Set FLOWX_WINDIVERT_DLL="${path.join(targetDriverDir, "WinDivert.dll")}" or configure --dll-path "${path.join(targetDriverDir, "WinDivert.dll")}" manually.`
         );
       }
+    } else if (!pointerSaved) {
+      console.log(
+        `Warning: Could not remove stale driver pointer at ${getSavedDriverDirPointerPath()}. Delete it manually if another driver directory is still being loaded.`
+      );
     }
     runDoctorAndExit(targetDriverDir);
   } catch (err) {
@@ -498,4 +549,6 @@ module.exports = {
   persistSavedDriverDir,
   readSavedDriverDir,
   getSavedDriverDirPointerPath,
+  sameWinPath,
+  redactUrlForLog,
 };

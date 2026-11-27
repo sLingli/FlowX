@@ -495,6 +495,32 @@ fn locate_windivert_in_candidates(
     }
 }
 
+fn locate_windivert_files_with_env(
+    custom_dll_path: Option<&str>,
+    env_dll_path: Option<&str>,
+    exe_dir: Option<&Path>,
+    sys_name: &str,
+) -> WinDivertAvailability {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(custom) = custom_dll_path.and_then(resolve_candidate_dll_path) {
+        candidates.push(custom);
+    } else if custom_dll_path.is_none_or(|p| p.trim().is_empty()) {
+        // 未在 flowx.xml 显式配置 custom_dll_path 时，优先采用显式环境变量 FLOWX_WINDIVERT_DLL
+        // （含 npm 包装器 `setup-driver --dir <自定义目录>` 持久化的路径），再回落至 exe 目录与 exe/driver 目录
+        if let Some(env_p) = env_dll_path
+            && let Some(cand) = resolve_candidate_dll_path(env_p)
+        {
+            candidates.push(cand);
+        }
+        if let Some(dir) = exe_dir {
+            candidates.push(dir.join("WinDivert.dll"));
+            candidates.push(dir.join("driver").join("WinDivert.dll"));
+        }
+    }
+
+    locate_windivert_in_candidates(candidates, sys_name)
+}
+
 /// 探测 `WinDivert.dll` 与对应架构内核驱动 `.sys` 是否同目录配对就位（仅检查显式配置、环境变量与程序目录，禁止回退当前工作目录）
 pub fn locate_windivert_files(custom_dll_path: Option<&str>) -> WinDivertAvailability {
     let sys_name = if cfg!(target_pointer_width = "64") {
@@ -502,25 +528,16 @@ pub fn locate_windivert_files(custom_dll_path: Option<&str>) -> WinDivertAvailab
     } else {
         "WinDivert32.sys"
     };
-
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(custom) = custom_dll_path.and_then(resolve_candidate_dll_path) {
-        candidates.push(custom);
-    } else if custom_dll_path.is_none_or(|p| p.trim().is_empty()) {
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            candidates.push(dir.join("WinDivert.dll"));
-            candidates.push(dir.join("driver").join("WinDivert.dll"));
-        }
-        if let Ok(env_p) = std::env::var("FLOWX_WINDIVERT_DLL")
-            && let Some(cand) = resolve_candidate_dll_path(&env_p)
-        {
-            candidates.push(cand);
-        }
-    }
-
-    locate_windivert_in_candidates(candidates, sys_name)
+    let env_dll = std::env::var("FLOWX_WINDIVERT_DLL").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    locate_windivert_files_with_env(
+        custom_dll_path,
+        env_dll.as_deref(),
+        exe_dir.as_deref(),
+        sys_name,
+    )
 }
 
 /// 动态加载并托管的 `WinDivert.dll` 函数表；销毁时自动 `FreeLibrary`
@@ -1027,5 +1044,68 @@ mod tests {
         assert!(resolve_candidate_dll_path(r"C:\bad?dir\WinDivert.dll").is_none());
         assert!(resolve_candidate_dll_path(r"C:\bad*dir\WinDivert.dll").is_none());
         assert!(resolve_candidate_dll_path(r"C:\bad:dir\WinDivert.dll").is_none());
+    }
+
+    #[test]
+    fn test_locate_windivert_priority_custom_over_env_over_exe_dir() {
+        let sys_name = if cfg!(target_pointer_width = "64") {
+            "WinDivert64.sys"
+        } else {
+            "WinDivert32.sys"
+        };
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_wd_prio_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(root.clone());
+
+        let exe_dir = root.join("native");
+        let exe_drv = exe_dir.join("driver");
+        let env_drv = root.join("custom_env_driver");
+        let xml_drv = root.join("custom_xml_driver");
+        for d in [&exe_drv, &env_drv, &xml_drv] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("WinDivert.dll"), b"dll").unwrap();
+            std::fs::write(d.join(sys_name), b"sys").unwrap();
+        }
+
+        // 1. No XML custom_dll_path + FLOWX_WINDIVERT_DLL set -> FLOWX_WINDIVERT_DLL wins over native/driver
+        let env_dll = env_drv.join("WinDivert.dll").display().to_string();
+        let via_env =
+            locate_windivert_files_with_env(None, Some(&env_dll), Some(&exe_dir), sys_name);
+        assert!(via_env.dll_found && via_env.sys_found);
+        assert_eq!(via_env.dll_path.as_deref(), Some(env_dll.as_str()));
+
+        // 2. Explicit XML custom_dll_path wins over both FLOWX_WINDIVERT_DLL and native/driver
+        let xml_dll = xml_drv.join("WinDivert.dll").display().to_string();
+        let via_xml = locate_windivert_files_with_env(
+            Some(&xml_dll),
+            Some(&env_dll),
+            Some(&exe_dir),
+            sys_name,
+        );
+        assert!(via_xml.dll_found && via_xml.sys_found);
+        assert_eq!(via_xml.dll_path.as_deref(), Some(xml_dll.as_str()));
+
+        // 3. No XML custom_dll_path + no FLOWX_WINDIVERT_DLL -> falls back to exe_dir/driver
+        let via_exe = locate_windivert_files_with_env(None, None, Some(&exe_dir), sys_name);
+        assert!(via_exe.dll_found && via_exe.sys_found);
+        assert_eq!(
+            via_exe.dll_path.as_deref(),
+            Some(exe_drv.join("WinDivert.dll").display().to_string().as_str())
+        );
     }
 }
