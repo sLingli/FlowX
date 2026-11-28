@@ -787,6 +787,36 @@ mod tests {
             build_transparent_doctor_report("OFFLINE", &online_no_cfg, "./local-cli.xml");
         assert_eq!(offline_report["ready"], true);
         assert_eq!(offline_report["config_path"], "./local-cli.xml");
+        assert_eq!(offline_report["warnings"].as_array().unwrap().len(), 0);
+
+        // 5. Ignored untrusted FLOWX_WINDIVERT_DLL after fallback surfaces in `warnings` while keeping `ready: true`
+        let ignored_env_status = json!({
+            "elevated": true,
+            "running": false,
+            "dll_found": true,
+            "sys_found": true,
+            "dll_path": r"C:\FlowX\driver\WinDivert.dll",
+            "sys_path": r"C:\FlowX\driver\WinDivert64.sys",
+            "searched_dirs": [
+                r"FLOWX_WINDIVERT_DLL (ignored untrusted/invalid: \\server\share\WinDivert.dll)",
+                r"C:\FlowX\driver",
+            ],
+            "enabled": false,
+            "last_error": null,
+        });
+        let warn_report =
+            build_transparent_doctor_report("OFFLINE", &ignored_env_status, "./local-cli.xml");
+        assert_eq!(warn_report["ready"], true);
+        assert!(warn_report["issues"].as_array().unwrap().is_empty());
+        let warnings = warn_report["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0]
+                .as_str()
+                .unwrap()
+                .contains("FLOWX_WINDIVERT_DLL"),
+            "unexpected warning: {warnings:?}"
+        );
 
         // 5. Low-integrity status blocks readiness and surfaces actionable issue
         let low_il_status = json!({

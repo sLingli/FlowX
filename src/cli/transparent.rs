@@ -88,6 +88,7 @@ pub(super) fn build_transparent_doctor_report(
         .map(str::to_string);
 
     let mut issues: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     if low_integrity {
         issues.push(
             "Process is running at Windows Low Mandatory Integrity Level (for example inherited from a restricted/sandboxed folder); UAC elevation and USER32/SHELL32 initialization are blocked. Copy or install FlowX into a standard directory, or launch from an Administrator terminal."
@@ -104,6 +105,15 @@ pub(super) fn build_transparent_doctor_report(
             "Missing WinDivert binaries (dll_found={}, sys_found={}); place WinDivert.dll and WinDivert64.sys next to flowx.exe or set --dll-path. Searched: {:?}",
             dll_found, sys_found, searched_dirs
         ));
+    } else {
+        for note in &searched_dirs {
+            if note.starts_with("FLOWX_WINDIVERT_DLL (ignored") {
+                warnings.push(format!(
+                    "Fell back to another trusted WinDivert directory because {}",
+                    note
+                ));
+            }
+        }
     }
     if let Some(ref err) = last_error {
         issues.push(format!("Last runtime error: {}", err));
@@ -136,6 +146,7 @@ pub(super) fn build_transparent_doctor_report(
         "block_quic_for_proxied": block_quic,
         "last_error": last_error,
         "issues": issues,
+        "warnings": warnings,
     })
 }
 
@@ -336,6 +347,10 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 .as_array()
                 .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
+            let warnings: Vec<&str> = report["warnings"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
             if opts.json_output {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -363,6 +378,12 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                     println!("  Issues:");
                     for issue in &issues {
                         println!("    - {}", issue);
+                    }
+                }
+                if !warnings.is_empty() {
+                    println!("  Warnings:");
+                    for warning in &warnings {
+                        println!("    - {}", warning);
                     }
                 }
             }

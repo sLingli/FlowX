@@ -17,7 +17,7 @@ const DEFAULT_WINDIVERT_URL =
 const DEFAULT_WINDIVERT_SHA256 =
   "63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15";
 
-const INVALID_WIN_PATH_CHARS = /[\x00-\x1f\x7f"<>|*?:]/;
+const INVALID_WIN_PATH_CHARS = /[\x00-\x1f\x7f-\x9f"<>|*?:]/;
 
 const DOWNLOAD_WINDIVERT_PS_SCRIPT = [
   "$ErrorActionPreference = 'Stop'",
@@ -70,6 +70,8 @@ const DOWNLOAD_WINDIVERT_PS_SCRIPT = [
   "        continue",
   "      }",
   "      if ($code -ge 200 -and $code -lt 300) {",
+  "        $expectedLen = $resp.ContentLength",
+  "        $writtenLen = [int64]0",
   "        $inStream = $resp.GetResponseStream()",
   "        if ($null -eq $inStream) {",
   "          throw 'Empty HTTP response stream'",
@@ -77,9 +79,14 @@ const DOWNLOAD_WINDIVERT_PS_SCRIPT = [
   "        $outStream = [IO.File]::Create($env:FLOWX_WD_ZIP)",
   "        try {",
   "          $inStream.CopyTo($outStream)",
+  "          $outStream.Flush()",
+  "          $writtenLen = $outStream.Length",
   "        } finally {",
   "          $outStream.Dispose()",
   "          $inStream.Dispose()",
+  "        }",
+  "        if ($expectedLen -ge 0 -and $writtenLen -ne $expectedLen) {",
+  "          throw ('Truncated HTTP download: expected ' + $expectedLen + ' bytes, got ' + $writtenLen)",
   "        }",
   "        $downloaded = $true",
   "        break",
@@ -95,7 +102,7 @@ const DOWNLOAD_WINDIVERT_PS_SCRIPT = [
   "    throw 'WinDivert download did not complete'",
   "  }",
   "} catch {",
-  "  Remove-Item -Force -ErrorAction SilentlyContinue $env:FLOWX_WD_ZIP",
+  "  Remove-Item -LiteralPath $env:FLOWX_WD_ZIP -Force -ErrorAction SilentlyContinue",
   "  throw",
   "}",
 ].join("\n");
@@ -133,8 +140,18 @@ function isRegularFile(targetPath) {
   }
 }
 
+function normalizeLocalWinPath(rawPath) {
+  const resolved = path.resolve(rawPath);
+  // Node on Windows strips trailing `\` from verbatim disk roots (`\\?\C:\` -> `\\?\C:`),
+  // which fails Rust's `Prefix::VerbatimDisk` validation; restore the trailing root separator.
+  if (/^\\\\\?\\[a-zA-Z]:$/.test(resolved)) {
+    return `${resolved}\\`;
+  }
+  return resolved;
+}
+
 function sameWinPath(a, b) {
-  return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  return normalizeLocalWinPath(a).toLowerCase() === normalizeLocalWinPath(b).toLowerCase();
 }
 
 function isTrustedLocalWinPath(rawPath) {
@@ -170,21 +187,12 @@ function validateExplicitDriverDir(rawDir) {
   if (!trimmed) {
     throw new Error("Missing value for --dir");
   }
-  const isVerbatimDisk = /^\\\\\?\\[a-zA-Z]:\\/.test(trimmed);
-  if (isVerbatimDisk && !isTrustedLocalWinPath(trimmed)) {
+  if (!isTrustedLocalWinPath(trimmed)) {
     throw new Error(
-      `Invalid --dir '${trimmed}': must be a trusted local Windows disk path without '.'/'..' or invalid characters.`
+      `Invalid --dir '${trimmed}': must be a trusted absolute local Windows disk path (e.g. C:\\FlowX\\driver) without '.'/'..', UNC/drive-relative prefixes, or invalid characters.`
     );
   }
-  if (
-    !isVerbatimDisk &&
-    (/^[\\/]/.test(trimmed) || /^[a-zA-Z]:(?![\\/])/.test(trimmed))
-  ) {
-    throw new Error(
-      `Invalid --dir '${trimmed}': must be a local disk path (not a UNC or drive-relative path).`
-    );
-  }
-  const resolved = path.resolve(trimmed);
+  const resolved = normalizeLocalWinPath(trimmed);
   if (!isTrustedLocalWinPath(resolved)) {
     throw new Error(
       `Invalid --dir '${trimmed}': resolved path '${resolved}' is not a trusted local Windows disk path.`
@@ -206,7 +214,7 @@ function readSavedDriverDir() {
     if (!raw || !isTrustedLocalWinPath(raw)) {
       return null;
     }
-    const resolved = path.resolve(raw);
+    const resolved = normalizeLocalWinPath(raw);
     if (!isTrustedLocalWinPath(resolved)) {
       return null;
     }
@@ -218,7 +226,7 @@ function readSavedDriverDir() {
 
 function persistSavedDriverDir(targetDir) {
   const pointerPath = getSavedDriverDirPointerPath();
-  const resolved = path.resolve(targetDir);
+  const resolved = normalizeLocalWinPath(targetDir);
   if (!isTrustedLocalWinPath(resolved)) {
     return false;
   }
@@ -270,7 +278,7 @@ function resolveInstallDriverDir(explicitDir) {
   if (isDirWritable(nativeDir) && isTrustedLocalWinPath(pkgDriverDir)) {
     return pkgDriverDir;
   }
-  const fallback = path.resolve(getUserFallbackDriverDir());
+  const fallback = normalizeLocalWinPath(getUserFallbackDriverDir());
   if (!isTrustedLocalWinPath(fallback)) {
     throw new Error(
       `Fallback driver directory '${fallback}' is not a trusted local Windows disk path; pass --dir <LOCAL_DISK_PATH>.`
@@ -311,19 +319,20 @@ function buildChildEnv(preferredDriverDir) {
 }
 
 function redactUrlForLog(rawUrl) {
-  try {
-    const u = new URL(rawUrl);
-    if (u.username || u.password) {
-      u.username = "";
-      u.password = "";
+  const trimmed = String(rawUrl ?? "").trim();
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed)) {
+    try {
+      const u = new URL(trimmed);
+      if (u.username || u.password) {
+        u.username = "";
+        u.password = "";
+      }
+      return u.toString();
+    } catch (_) {
+      return trimmed.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/?#]*@/, "$1");
     }
-    return u.toString();
-  } catch (_) {
-    return String(rawUrl).replace(
-      /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/?#]*@/,
-      "$1"
-    );
   }
+  return trimmed.replace(/^[^/?#]*@/, "");
 }
 
 function parseSetupArgs(args) {
@@ -533,7 +542,7 @@ function runSetupDriver(subArgs) {
 
   if (opts.help) {
     const displayTarget = opts.dir
-      ? path.resolve(opts.dir)
+      ? normalizeLocalWinPath(opts.dir)
       : `${pkgDriverDir} (or ${getUserFallbackDriverDir()} when node_modules is read-only)`;
     console.log(`flowx setup-driver — Download and verify official WinDivert 2.2.2 x64 driver
 
@@ -618,7 +627,7 @@ Default install location:
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "$ErrorActionPreference='Stop'; Expand-Archive -Path $env:FLOWX_WD_ZIP -DestinationPath $env:FLOWX_WD_OUT -Force",
+        "$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath $env:FLOWX_WD_ZIP -DestinationPath $env:FLOWX_WD_OUT -Force",
       ],
       {
         stdio: "inherit",
@@ -724,6 +733,7 @@ module.exports = {
   readSavedDriverDir,
   getSavedDriverDirPointerPath,
   sameWinPath,
+  normalizeLocalWinPath,
   redactUrlForLog,
   isTrustedLocalWinPath,
   validateExplicitDriverDir,
