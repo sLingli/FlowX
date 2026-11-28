@@ -502,15 +502,26 @@ fn locate_windivert_files_with_env(
     sys_name: &str,
 ) -> WinDivertAvailability {
     let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(custom) = custom_dll_path.and_then(resolve_candidate_dll_path) {
-        candidates.push(custom);
-    } else if custom_dll_path.is_none_or(|p| p.trim().is_empty()) {
+    let mut rejected_notes: Vec<String> = Vec::new();
+    if let Some(raw_custom) = custom_dll_path.map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some(custom) = resolve_candidate_dll_path(raw_custom) {
+            candidates.push(custom);
+        } else {
+            rejected_notes.push(format!(
+                "custom_dll_path (rejected untrusted/invalid: {raw_custom})"
+            ));
+        }
+    } else {
         // 未在 flowx.xml 显式配置 custom_dll_path 时，优先采用显式环境变量 FLOWX_WINDIVERT_DLL
         // （含 npm 包装器 `setup-driver --dir <自定义目录>` 持久化的路径），再回落至 exe 目录与 exe/driver 目录
-        if let Some(env_p) = env_dll_path
-            && let Some(cand) = resolve_candidate_dll_path(env_p)
-        {
-            candidates.push(cand);
+        if let Some(raw_env) = env_dll_path.map(str::trim).filter(|p| !p.is_empty()) {
+            if let Some(cand) = resolve_candidate_dll_path(raw_env) {
+                candidates.push(cand);
+            } else {
+                rejected_notes.push(format!(
+                    "FLOWX_WINDIVERT_DLL (ignored untrusted/invalid: {raw_env})"
+                ));
+            }
         }
         if let Some(dir) = exe_dir {
             candidates.push(dir.join("WinDivert.dll"));
@@ -518,7 +529,12 @@ fn locate_windivert_files_with_env(
         }
     }
 
-    locate_windivert_in_candidates(candidates, sys_name)
+    let mut avail = locate_windivert_in_candidates(candidates, sys_name);
+    if !rejected_notes.is_empty() {
+        rejected_notes.extend(avail.searched_dirs);
+        avail.searched_dirs = rejected_notes;
+    }
+    avail
 }
 
 /// 探测 `WinDivert.dll` 与对应架构内核驱动 `.sys` 是否同目录配对就位（仅检查显式配置、环境变量与程序目录，禁止回退当前工作目录）
@@ -1101,11 +1117,71 @@ mod tests {
         assert_eq!(via_xml.dll_path.as_deref(), Some(xml_dll.as_str()));
 
         // 3. No XML custom_dll_path + no FLOWX_WINDIVERT_DLL -> falls back to exe_dir/driver
-        let via_exe = locate_windivert_files_with_env(None, None, Some(&exe_dir), sys_name);
-        assert!(via_exe.dll_found && via_exe.sys_found);
+        let via_exe_drv = locate_windivert_files_with_env(None, None, Some(&exe_dir), sys_name);
+        assert!(via_exe_drv.dll_found && via_exe_drv.sys_found);
         assert_eq!(
-            via_exe.dll_path.as_deref(),
+            via_exe_drv.dll_path.as_deref(),
             Some(exe_drv.join("WinDivert.dll").display().to_string().as_str())
+        );
+
+        // 4. Empty/blank XML custom_dll_path behaves like None (falls back to FLOWX_WINDIVERT_DLL)
+        let via_blank_xml =
+            locate_windivert_files_with_env(Some("   "), Some(&env_dll), Some(&exe_dir), sys_name);
+        assert!(via_blank_xml.dll_found && via_blank_xml.sys_found);
+        assert_eq!(via_blank_xml.dll_path.as_deref(), Some(env_dll.as_str()));
+
+        // 5. Invalid non-empty XML custom_dll_path fails closed (never falls back to env/exe_dir) and reports diagnostic
+        let bad_xml = locate_windivert_files_with_env(
+            Some(r"..\bad\WinDivert.dll"),
+            Some(&env_dll),
+            Some(&exe_dir),
+            sys_name,
+        );
+        assert!(!bad_xml.dll_found && !bad_xml.sys_found);
+        assert!(bad_xml.dll_path.is_none());
+        assert!(
+            bad_xml
+                .searched_dirs
+                .iter()
+                .any(|s| s.contains("custom_dll_path") && s.contains(r"..\bad\WinDivert.dll")),
+            "expected rejected custom_dll_path diagnostic in searched_dirs: {:?}",
+            bad_xml.searched_dirs
+        );
+
+        // 6. Sibling exe_dir\WinDivert.dll: FLOWX_WINDIVERT_DLL still wins; without env, sibling wins over exe_dir\driver
+        std::fs::write(exe_dir.join("WinDivert.dll"), b"dll").unwrap();
+        std::fs::write(exe_dir.join(sys_name), b"sys").unwrap();
+        let env_beats_sibling =
+            locate_windivert_files_with_env(None, Some(&env_dll), Some(&exe_dir), sys_name);
+        assert_eq!(
+            env_beats_sibling.dll_path.as_deref(),
+            Some(env_dll.as_str())
+        );
+        let sibling_beats_driver =
+            locate_windivert_files_with_env(None, None, Some(&exe_dir), sys_name);
+        assert_eq!(
+            sibling_beats_driver.dll_path.as_deref(),
+            Some(exe_dir.join("WinDivert.dll").display().to_string().as_str())
+        );
+
+        // 7. Untrusted/relative FLOWX_WINDIVERT_DLL is ignored, reported in searched_dirs, and falls back to exe_dir
+        let bad_env = locate_windivert_files_with_env(
+            None,
+            Some(r"\\fileserver\share\WinDivert.dll"),
+            Some(&exe_dir),
+            sys_name,
+        );
+        assert!(bad_env.dll_found && bad_env.sys_found);
+        assert_eq!(
+            bad_env.dll_path.as_deref(),
+            Some(exe_dir.join("WinDivert.dll").display().to_string().as_str())
+        );
+        assert!(
+            bad_env.searched_dirs.iter().any(|s| {
+                s.contains("FLOWX_WINDIVERT_DLL") && s.contains(r"\\fileserver\share\WinDivert.dll")
+            }),
+            "expected ignored FLOWX_WINDIVERT_DLL note in searched_dirs: {:?}",
+            bad_env.searched_dirs
         );
     }
 }

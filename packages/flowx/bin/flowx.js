@@ -17,6 +17,89 @@ const DEFAULT_WINDIVERT_URL =
 const DEFAULT_WINDIVERT_SHA256 =
   "63cb41763bb4b20f600b6de04e991a9c2be73279e317d4d82f237b150c5f3f15";
 
+const INVALID_WIN_PATH_CHARS = /[\x00-\x1f\x7f"<>|*?:]/;
+
+const DOWNLOAD_WINDIVERT_PS_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12",
+  "$maxHops = 10",
+  "$currentUri = $null",
+  "if (-not [Uri]::TryCreate($env:FLOWX_WD_URL, [UriKind]::Absolute, [ref]$currentUri) -or $currentUri.Scheme -ne 'https') {",
+  "  throw 'Blocked non-HTTPS download URL'",
+  "}",
+  "$downloaded = $false",
+  "try {",
+  "  for ($hop = 0; $hop -le $maxHops; $hop++) {",
+  "    [Net.HttpWebRequest]$req = [Net.WebRequest]::Create($currentUri)",
+  "    $req.Method = 'GET'",
+  "    $req.AllowAutoRedirect = $false",
+  "    $req.Timeout = 30000",
+  "    $req.ReadWriteTimeout = 60000",
+  "    $req.UserAgent = 'FlowX-Setup-Driver/1.0'",
+  "    $resp = $null",
+  "    try {",
+  "      try {",
+  "        $resp = [Net.HttpWebResponse]$req.GetResponse()",
+  "      } catch [Net.WebException] {",
+  "        if ($_.Exception.Response -is [Net.HttpWebResponse]) {",
+  "          $resp = [Net.HttpWebResponse]$_.Exception.Response",
+  "        } else {",
+  "          throw",
+  "        }",
+  "      }",
+  "      if ($null -eq $resp -or $null -eq $resp.ResponseUri -or $resp.ResponseUri.Scheme -ne 'https') {",
+  "        throw 'Blocked non-HTTPS response URI'",
+  "      }",
+  "      $code = [int]$resp.StatusCode",
+  "      if ($code -in 301, 302, 303, 307, 308) {",
+  "        if ($hop -eq $maxHops) {",
+  "          throw 'Too many HTTP redirects while downloading WinDivert'",
+  "        }",
+  "        $loc = $resp.Headers['Location']",
+  "        if ([string]::IsNullOrWhiteSpace($loc)) {",
+  "          throw ('HTTP ' + $code + ' redirect missing Location header')",
+  "        }",
+  "        $nextUri = $null",
+  "        if (-not [Uri]::TryCreate($currentUri, $loc, [ref]$nextUri) -or -not $nextUri.IsAbsoluteUri) {",
+  "          throw 'Invalid redirect Location URI'",
+  "        }",
+  "        if ($nextUri.Scheme -ne 'https') {",
+  "          throw ('Blocked non-HTTPS redirect scheme: ' + $nextUri.Scheme)",
+  "        }",
+  "        $currentUri = $nextUri",
+  "        continue",
+  "      }",
+  "      if ($code -ge 200 -and $code -lt 300) {",
+  "        $inStream = $resp.GetResponseStream()",
+  "        if ($null -eq $inStream) {",
+  "          throw 'Empty HTTP response stream'",
+  "        }",
+  "        $outStream = [IO.File]::Create($env:FLOWX_WD_ZIP)",
+  "        try {",
+  "          $inStream.CopyTo($outStream)",
+  "        } finally {",
+  "          $outStream.Dispose()",
+  "          $inStream.Dispose()",
+  "        }",
+  "        $downloaded = $true",
+  "        break",
+  "      }",
+  "      throw ('HTTP ' + $code + ' ' + $resp.StatusDescription)",
+  "    } finally {",
+  "      if ($null -ne $resp) {",
+  "        $resp.Close()",
+  "      }",
+  "    }",
+  "  }",
+  "  if (-not $downloaded) {",
+  "    throw 'WinDivert download did not complete'",
+  "  }",
+  "} catch {",
+  "  Remove-Item -Force -ErrorAction SilentlyContinue $env:FLOWX_WD_ZIP",
+  "  throw",
+  "}",
+].join("\n");
+
 function getUserFlowxDataDir() {
   const localAppData =
     process.env.LOCALAPPDATA && process.env.LOCALAPPDATA.trim()
@@ -54,6 +137,62 @@ function sameWinPath(a, b) {
   return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
 }
 
+function isTrustedLocalWinPath(rawPath) {
+  if (typeof rawPath !== "string") {
+    return false;
+  }
+  const trimmed = rawPath.trim();
+  if (!trimmed) {
+    return false;
+  }
+  let rest;
+  if (/^[a-zA-Z]:[\\/]/.test(trimmed)) {
+    rest = trimmed.slice(3);
+  } else if (/^\\\\\?\\[a-zA-Z]:\\/.test(trimmed)) {
+    rest = trimmed.slice(7);
+    if (rest.includes("/")) {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  const parts = rest.split(/[\\/]+/).filter(Boolean);
+  for (const part of parts) {
+    if (part === "." || part === ".." || INVALID_WIN_PATH_CHARS.test(part)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function validateExplicitDriverDir(rawDir) {
+  const trimmed = typeof rawDir === "string" ? rawDir.trim() : "";
+  if (!trimmed) {
+    throw new Error("Missing value for --dir");
+  }
+  const isVerbatimDisk = /^\\\\\?\\[a-zA-Z]:\\/.test(trimmed);
+  if (isVerbatimDisk && !isTrustedLocalWinPath(trimmed)) {
+    throw new Error(
+      `Invalid --dir '${trimmed}': must be a trusted local Windows disk path without '.'/'..' or invalid characters.`
+    );
+  }
+  if (
+    !isVerbatimDisk &&
+    (/^[\\/]/.test(trimmed) || /^[a-zA-Z]:(?![\\/])/.test(trimmed))
+  ) {
+    throw new Error(
+      `Invalid --dir '${trimmed}': must be a local disk path (not a UNC or drive-relative path).`
+    );
+  }
+  const resolved = path.resolve(trimmed);
+  if (!isTrustedLocalWinPath(resolved)) {
+    throw new Error(
+      `Invalid --dir '${trimmed}': resolved path '${resolved}' is not a trusted local Windows disk path.`
+    );
+  }
+  return resolved;
+}
+
 function hasPairedDriver(dir) {
   return (
     isRegularFile(path.join(dir, "WinDivert.dll")) &&
@@ -64,10 +203,14 @@ function hasPairedDriver(dir) {
 function readSavedDriverDir() {
   try {
     const raw = fs.readFileSync(getSavedDriverDirPointerPath(), "utf8").trim();
-    if (!raw || !path.isAbsolute(raw)) {
+    if (!raw || !isTrustedLocalWinPath(raw)) {
       return null;
     }
-    return path.resolve(raw);
+    const resolved = path.resolve(raw);
+    if (!isTrustedLocalWinPath(resolved)) {
+      return null;
+    }
+    return resolved;
   } catch (_) {
     return null;
   }
@@ -76,6 +219,9 @@ function readSavedDriverDir() {
 function persistSavedDriverDir(targetDir) {
   const pointerPath = getSavedDriverDirPointerPath();
   const resolved = path.resolve(targetDir);
+  if (!isTrustedLocalWinPath(resolved)) {
+    return false;
+  }
   if (sameWinPath(resolved, pkgDriverDir)) {
     try {
       fs.rmSync(pointerPath, { force: true });
@@ -119,12 +265,18 @@ function isDirWritable(targetParent) {
 
 function resolveInstallDriverDir(explicitDir) {
   if (explicitDir) {
-    return path.resolve(explicitDir);
+    return validateExplicitDriverDir(explicitDir);
   }
-  if (isDirWritable(nativeDir)) {
+  if (isDirWritable(nativeDir) && isTrustedLocalWinPath(pkgDriverDir)) {
     return pkgDriverDir;
   }
-  return getUserFallbackDriverDir();
+  const fallback = path.resolve(getUserFallbackDriverDir());
+  if (!isTrustedLocalWinPath(fallback)) {
+    throw new Error(
+      `Fallback driver directory '${fallback}' is not a trusted local Windows disk path; pass --dir <LOCAL_DISK_PATH>.`
+    );
+  }
+  return fallback;
 }
 
 function buildChildEnv(preferredDriverDir) {
@@ -132,14 +284,18 @@ function buildChildEnv(preferredDriverDir) {
   if (env.FLOWX_WINDIVERT_DLL && env.FLOWX_WINDIVERT_DLL.trim()) {
     return env;
   }
-  if (preferredDriverDir && hasPairedDriver(preferredDriverDir)) {
+  if (
+    preferredDriverDir &&
+    isTrustedLocalWinPath(preferredDriverDir) &&
+    hasPairedDriver(preferredDriverDir)
+  ) {
     if (!sameWinPath(preferredDriverDir, pkgDriverDir)) {
       env.FLOWX_WINDIVERT_DLL = path.join(preferredDriverDir, "WinDivert.dll");
     }
     return env;
   }
   const savedDir = readSavedDriverDir();
-  if (savedDir && hasPairedDriver(savedDir)) {
+  if (savedDir && isTrustedLocalWinPath(savedDir) && hasPairedDriver(savedDir)) {
     if (!sameWinPath(savedDir, pkgDriverDir)) {
       env.FLOWX_WINDIVERT_DLL = path.join(savedDir, "WinDivert.dll");
     }
@@ -147,7 +303,7 @@ function buildChildEnv(preferredDriverDir) {
   }
   if (!hasPairedDriver(pkgDriverDir)) {
     const userDir = getUserFallbackDriverDir();
-    if (hasPairedDriver(userDir)) {
+    if (isTrustedLocalWinPath(userDir) && hasPairedDriver(userDir)) {
       env.FLOWX_WINDIVERT_DLL = path.join(userDir, "WinDivert.dll");
     }
   }
@@ -163,7 +319,10 @@ function redactUrlForLog(rawUrl) {
     }
     return u.toString();
   } catch (_) {
-    return rawUrl;
+    return String(rawUrl).replace(
+      /^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/?#]*@/,
+      "$1"
+    );
   }
 }
 
@@ -218,6 +377,9 @@ function parseSetupArgs(args) {
   if (opts.help) {
     return opts;
   }
+  if (opts.dir !== null) {
+    opts.dir = validateExplicitDriverDir(opts.dir);
+  }
   if (opts.customUrl && !opts.customHash) {
     throw new Error(
       "When specifying a custom --url, also pass --sha256 <64-hex> to verify integrity."
@@ -227,11 +389,13 @@ function parseSetupArgs(args) {
   try {
     parsedUrl = new URL(opts.url);
   } catch (_) {
-    throw new Error(`Invalid --url '${opts.url}': expected a valid https:// URL.`);
+    throw new Error(
+      `Invalid --url '${redactUrlForLog(opts.url)}': expected a valid https:// URL.`
+    );
   }
   if (parsedUrl.protocol !== "https:") {
     throw new Error(
-      `Insecure --url '${opts.url}': only https:// download URLs are allowed.`
+      `Insecure --url '${redactUrlForLog(opts.url)}': only https:// download URLs are allowed.`
     );
   }
   if (!/^[0-9a-fA-F]{64}$/.test(opts.sha256)) {
@@ -382,7 +546,13 @@ Default install location:
     return;
   }
 
-  const targetDriverDir = resolveInstallDriverDir(opts.dir);
+  let targetDriverDir;
+  try {
+    targetDriverDir = resolveInstallDriverDir(opts.dir);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
 
   if (!opts.force && hasPairedDriver(targetDriverDir)) {
     const saved = persistSavedDriverDir(targetDriverDir);
@@ -404,13 +574,17 @@ Default install location:
 
   try {
     console.log(`Downloading WinDivert from ${redactUrlForLog(opts.url)} ...`);
+    const encodedDownloadScript = Buffer.from(
+      DOWNLOAD_WINDIVERT_PS_SCRIPT,
+      "utf16le"
+    ).toString("base64");
     const dl = spawnSync(
       "powershell.exe",
       [
         "-NoProfile",
         "-NonInteractive",
-        "-Command",
-        "$ErrorActionPreference='Stop'; [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12; $resp = Invoke-WebRequest -Uri $env:FLOWX_WD_URL -OutFile $env:FLOWX_WD_ZIP -UseBasicParsing -PassThru; if ($resp -and $resp.BaseResponse -and $resp.BaseResponse.ResponseUri -and $resp.BaseResponse.ResponseUri.Scheme -ne 'https') { Remove-Item -Force -ErrorAction SilentlyContinue $env:FLOWX_WD_ZIP; throw ('Blocked non-HTTPS redirect to ' + $resp.BaseResponse.ResponseUri.Scheme) }",
+        "-EncodedCommand",
+        encodedDownloadScript,
       ],
       {
         stdio: "inherit",
@@ -551,4 +725,7 @@ module.exports = {
   getSavedDriverDirPointerPath,
   sameWinPath,
   redactUrlForLog,
+  isTrustedLocalWinPath,
+  validateExplicitDriverDir,
+  DOWNLOAD_WINDIVERT_PS_SCRIPT,
 };
