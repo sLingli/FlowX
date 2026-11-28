@@ -16,7 +16,7 @@ use crate::outbound::TargetAddr;
 use crate::router::{RouteContext, RuleEngine, RuleTraceStep};
 use crate::transparent::{TransparentManager, TransparentRuntimeStatus};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SetDefaultActionRequest {
     pub action: String, // "Direct", "Block", "Proxy"
     pub node_id: Option<u32>,

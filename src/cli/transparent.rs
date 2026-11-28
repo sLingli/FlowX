@@ -6,8 +6,8 @@ use crate::cli::bridge::{
     control_err_to_cli, load_offline_runtime_readonly, mutate_offline_runtime,
 };
 use crate::cli::http_client::{
-    API_ELEVATE_IO_TIMEOUT, ApiHttpError, api_request_or_offline,
-    api_request_strict_with_io_timeout, ensure_api_ok,
+    API_ELEVATE_IO_TIMEOUT, api_request_or_offline, api_request_strict_with_io_timeout,
+    ensure_api_ok,
 };
 use crate::control::TransparentConfigRequest;
 use crate::control::transparent::apply_transparent_config_fields;
@@ -254,19 +254,6 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
             };
             let clear_dll_path = flags.contains_key("clear-dll-path");
             let dll_path = flags.get("dll-path").cloned();
-            if let Some(ref raw_path) = dll_path
-                && !crate::transparent::is_valid_custom_dll_path_input(raw_path)
-            {
-                let msg = crate::i18n::t(opts.locale, "error.transparent_invalid_dll_path");
-                return Err(anyhow::Error::new(ApiHttpError::from_value(
-                    400,
-                    json!({
-                        "code": "ERR_TRANSPARENT_INVALID_DLL_PATH",
-                        "error": msg,
-                    }),
-                    true,
-                )));
-            }
 
             let mut payload = serde_json::Map::new();
             if let Some(v) = hijack_dns {
@@ -289,14 +276,17 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                 ("ONLINE", ensure_api_ok(st, val)?)
             } else {
                 let locale = opts.locale;
+                let req = TransparentConfigRequest {
+                    hijack_dns,
+                    block_quic_for_proxied: block_quic,
+                    dll_path,
+                    clear_dll_path: clear_dll_path.then_some(true),
+                };
+                // 离线模式加锁前复用控制层统一校验，保证带完整 `key` 且不提前创建目录或 `.lock`
+                apply_transparent_config_fields(&TransparentSettings::default(), req.clone())
+                    .map_err(|e| control_err_to_cli(e, locale))?;
                 let status_val = mutate_offline_runtime(&opts.config_path, |rt| {
-                    let req = TransparentConfigRequest {
-                        hijack_dns,
-                        block_quic_for_proxied: block_quic,
-                        dll_path,
-                        clear_dll_path: clear_dll_path.then_some(true),
-                    };
-                    rt.transparent = apply_transparent_config_fields(&rt.transparent, req)
+                    rt.transparent = apply_transparent_config_fields(&rt.transparent, req.clone())
                         .map_err(|e| control_err_to_cli(e, locale))?;
                     let val = serde_json::to_value(probe_status(&rt.transparent))?;
                     Ok((val, true))

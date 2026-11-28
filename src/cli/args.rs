@@ -212,8 +212,16 @@ pub(super) fn parse_cli_invocation_with_env(
             i += 1;
             continue;
         }
-        if (arg == "--version" || arg == "-V") && !in_subcommand {
-            rest.push(arg.clone());
+        if (arg == "--version" || arg == "-V")
+            && (!in_subcommand
+                || matches!(
+                    rest.first().map(String::as_str),
+                    Some("version" | "--version" | "-V")
+                ))
+        {
+            if !in_subcommand {
+                rest.push(arg.clone());
+            }
             i += 1;
             continue;
         }

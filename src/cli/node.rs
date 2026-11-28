@@ -12,6 +12,7 @@ use crate::cli::http_client::{
 };
 use crate::control::node::{
     add_node, delete_node, list_nodes, patch_node, ping_address, validate_add_node_request,
+    validate_patch_node_request_static,
 };
 use crate::control::{AddNodeRequest, ControlError, PatchNodeRequest, PingResponse, ProxyNodeView};
 
@@ -114,7 +115,7 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                     .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 let locale = opts.locale;
                 let new_id = mutate_offline_runtime(&opts.config_path, |rt| {
-                    let id = add_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                    let id = add_node(req.clone(), &rt.nodes, &DEFAULT_SELF_PORTS)
                         .map_err(|e| control_err_to_cli(e, locale))?;
                     Ok((id, true))
                 })?;
@@ -195,9 +196,11 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 ensure_api_ok(st, val)?
             } else {
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
+                validate_patch_node_request_static(&req, &DEFAULT_SELF_PORTS)
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 let locale = opts.locale;
                 let updated_id = mutate_offline_runtime(&opts.config_path, |rt| {
-                    let uid = patch_node(req, &rt.nodes, &DEFAULT_SELF_PORTS)
+                    let uid = patch_node(req.clone(), &rt.nodes, &DEFAULT_SELF_PORTS)
                         .map_err(|e| control_err_to_cli(e, locale))?;
                     Ok((uid, true))
                 })?;

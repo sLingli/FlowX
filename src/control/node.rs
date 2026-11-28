@@ -48,7 +48,7 @@ pub fn list_nodes(proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>) -> Vec<Pro
     list
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AddNodeRequest {
     pub name: String,
     pub protocol: String,
@@ -69,7 +69,7 @@ pub struct UpdateNodeRequest {
     pub clear_password: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct PatchNodeRequest {
     pub id: u32,
     pub name: Option<String>,
@@ -97,15 +97,7 @@ pub struct PingResponse {
     pub detail: Option<String>,
 }
 
-#[allow(clippy::type_complexity)]
-fn validate_node_base(
-    name_raw: &str,
-    protocol_raw: &str,
-    server_addr_raw: &str,
-    username_raw: Option<String>,
-    explicit_password: Option<String>,
-    self_ports: &[u16],
-) -> Result<(String, String, String, Option<String>, Option<String>), ControlError> {
+fn validate_node_name(name_raw: &str) -> Result<String, ControlError> {
     let name = name_raw.trim().to_string();
     if name.is_empty() {
         return Err(ControlError::bad_request(
@@ -119,7 +111,10 @@ fn validate_node_base(
             "error.invalid_node_name",
         ));
     }
+    Ok(name)
+}
 
+fn validate_node_protocol(protocol_raw: &str) -> Result<String, ControlError> {
     let protocol = protocol_raw.trim().to_ascii_uppercase();
     if !matches!(protocol.as_str(), "SOCKS5" | "SOCKS4" | "HTTP") {
         return Err(ControlError::bad_request(
@@ -127,7 +122,13 @@ fn validate_node_base(
             "error.unsupported_protocol",
         ));
     }
+    Ok(protocol)
+}
 
+fn validate_node_server_addr(
+    server_addr_raw: &str,
+    self_ports: &[u16],
+) -> Result<String, ControlError> {
     let server_addr = server_addr_raw.trim().to_string();
     let Ok(target_parsed) = parse_target_addr(&server_addr) else {
         return Err(ControlError::bad_request(
@@ -170,7 +171,13 @@ fn validate_node_base(
             }
         }
     }
+    Ok(server_addr)
+}
 
+fn validate_node_username(
+    username_raw: Option<String>,
+    protocol: Option<&str>,
+) -> Result<Option<String>, ControlError> {
     let username = username_raw
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty());
@@ -182,13 +189,58 @@ fn validate_node_base(
                 "error.invalid_username",
             ));
         }
-        if protocol == "HTTP" && u.contains(':') {
+        if protocol == Some("HTTP") && u.contains(':') {
             return Err(ControlError::bad_request(
                 "ERR_HTTP_USERNAME_COLON",
                 "error.http_username_colon",
             ));
         }
     }
+    Ok(username)
+}
+
+fn validate_password_option_conflicts(
+    explicit_password: &Option<String>,
+    keep_password: Option<bool>,
+    clear_password: Option<bool>,
+) -> Result<(), ControlError> {
+    let explicit_empty = explicit_password.as_deref() == Some("");
+    let explicit_non_empty = explicit_password.as_deref().is_some_and(|p| !p.is_empty());
+
+    if clear_password == Some(true) && (keep_password == Some(true) || explicit_non_empty) {
+        return Err(ControlError::bad_request(
+            "ERR_CONFLICTING_PASSWORD_OPTIONS",
+            "error.conflicting_password_options",
+        ));
+    }
+    if keep_password == Some(true) && explicit_non_empty {
+        return Err(ControlError::bad_request(
+            "ERR_CONFLICTING_PASSWORD_OPTIONS",
+            "error.conflicting_password_options",
+        ));
+    }
+    if explicit_empty && (keep_password == Some(true) || clear_password == Some(false)) {
+        return Err(ControlError::bad_request(
+            "ERR_CONFLICTING_PASSWORD_OPTIONS",
+            "error.conflicting_password_options",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::type_complexity)]
+fn validate_node_base(
+    name_raw: &str,
+    protocol_raw: &str,
+    server_addr_raw: &str,
+    username_raw: Option<String>,
+    explicit_password: Option<String>,
+    self_ports: &[u16],
+) -> Result<(String, String, String, Option<String>, Option<String>), ControlError> {
+    let name = validate_node_name(name_raw)?;
+    let protocol = validate_node_protocol(protocol_raw)?;
+    let server_addr = validate_node_server_addr(server_addr_raw, self_ports)?;
+    let username = validate_node_username(username_raw, Some(protocol.as_str()))?;
 
     if let Some(p) = &explicit_password {
         if crate::config::has_control_or_oversize(p, 255) {
@@ -250,29 +302,11 @@ fn resolve_updated_credentials(
     keep_password: Option<bool>,
     clear_password: Option<bool>,
 ) -> Result<(Option<String>, Option<String>), ControlError> {
+    validate_password_option_conflicts(&explicit_password, keep_password, clear_password)?;
+
     let has_raw_password_field = explicit_password.is_some();
     let explicit_empty = explicit_password.as_deref() == Some("");
     let explicit_non_empty = explicit_password.filter(|p| !p.is_empty());
-
-    if clear_password == Some(true) && (keep_password == Some(true) || explicit_non_empty.is_some())
-    {
-        return Err(ControlError::bad_request(
-            "ERR_CONFLICTING_PASSWORD_OPTIONS",
-            "error.conflicting_password_options",
-        ));
-    }
-    if keep_password == Some(true) && explicit_non_empty.is_some() {
-        return Err(ControlError::bad_request(
-            "ERR_CONFLICTING_PASSWORD_OPTIONS",
-            "error.conflicting_password_options",
-        ));
-    }
-    if explicit_empty && (keep_password == Some(true) || clear_password == Some(false)) {
-        return Err(ControlError::bad_request(
-            "ERR_CONFLICTING_PASSWORD_OPTIONS",
-            "error.conflicting_password_options",
-        ));
-    }
 
     if protocol == "SOCKS4" {
         if has_raw_password_field || keep_password == Some(true) {
@@ -341,11 +375,19 @@ fn resolve_updated_credentials(
     ))
 }
 
-pub(crate) fn validate_add_node_request(
+struct ValidatedNewNode {
+    name: String,
+    protocol: String,
+    server_addr: String,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+fn validate_and_prepare_add_node(
     req: &AddNodeRequest,
     self_ports: &[u16],
-) -> Result<(), ControlError> {
-    let (_, protocol, _, username, explicit_password) = validate_node_base(
+) -> Result<ValidatedNewNode, ControlError> {
+    let (name, protocol, server_addr, username, explicit_password) = validate_node_base(
         &req.name,
         &req.protocol,
         &req.server_addr,
@@ -371,6 +413,80 @@ pub(crate) fn validate_add_node_request(
             "error.username_without_password",
         ));
     }
+    Ok(ValidatedNewNode {
+        name,
+        protocol,
+        server_addr,
+        username,
+        password: explicit_password,
+    })
+}
+
+pub(crate) fn validate_add_node_request(
+    req: &AddNodeRequest,
+    self_ports: &[u16],
+) -> Result<(), ControlError> {
+    validate_and_prepare_add_node(req, self_ports).map(|_| ())
+}
+
+pub(crate) fn validate_patch_node_request_static(
+    req: &PatchNodeRequest,
+    self_ports: &[u16],
+) -> Result<(), ControlError> {
+    if req.clear_username == Some(true)
+        && req
+            .username
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+    {
+        return Err(ControlError::bad_request(
+            "ERR_CONFLICTING_USERNAME_OPTIONS",
+            "error.conflicting_username_options",
+        ));
+    }
+    validate_password_option_conflicts(&req.password, req.keep_password, req.clear_password)?;
+    if let Some(ref name) = req.name {
+        validate_node_name(name)?;
+    }
+    let protocol = match req.protocol.as_deref() {
+        Some(p) => Some(validate_node_protocol(p)?),
+        None => None,
+    };
+    if let Some(ref addr) = req.server_addr {
+        validate_node_server_addr(addr, self_ports)?;
+    }
+    if req.clear_username != Some(true) {
+        let _ = validate_node_username(req.username.clone(), protocol.as_deref())?;
+    }
+    if let Some(ref p) = req.password {
+        if crate::config::has_control_or_oversize(p, 255) {
+            return Err(ControlError::bad_request(
+                "ERR_INVALID_PASSWORD",
+                "error.invalid_password",
+            ));
+        }
+        if protocol.as_deref() == Some("SOCKS4") {
+            return Err(ControlError::bad_request(
+                "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
+                "error.socks4_password_unsupported",
+            ));
+        }
+        if req.clear_username == Some(true)
+            && protocol.as_deref() != Some("SOCKS4")
+            && !p.is_empty()
+        {
+            return Err(ControlError::bad_request(
+                "ERR_PASSWORD_WITHOUT_USERNAME",
+                "error.password_without_username",
+            ));
+        }
+    }
+    if protocol.as_deref() == Some("SOCKS4") && req.keep_password == Some(true) {
+        return Err(ControlError::bad_request(
+            "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
+            "error.socks4_password_unsupported",
+        ));
+    }
     Ok(())
 }
 
@@ -379,46 +495,19 @@ pub fn add_node(
     proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
     self_ports: &[u16],
 ) -> Result<u32, ControlError> {
-    let (name, protocol, server_addr, username, explicit_password) = validate_node_base(
-        &req.name,
-        &req.protocol,
-        &req.server_addr,
-        req.username,
-        req.password,
-        self_ports,
-    )?;
+    let v = validate_and_prepare_add_node(&req, self_ports)?;
 
-    if protocol == "SOCKS4" && explicit_password.is_some() {
-        return Err(ControlError::bad_request(
-            "ERR_SOCKS4_PASSWORD_UNSUPPORTED",
-            "error.socks4_password_unsupported",
-        ));
-    }
-    if explicit_password.as_deref() == Some("") {
-        return Err(ControlError::bad_request(
-            "ERR_EMPTY_PASSWORD",
-            "error.empty_password",
-        ));
-    }
-    if protocol != "SOCKS4" && username.is_some() && explicit_password.is_none() {
-        return Err(ControlError::bad_request(
-            "ERR_USERNAME_WITHOUT_PASSWORD",
-            "error.username_without_password",
-        ));
-    }
-    let password = explicit_password;
-
-    let client = build_proxy_client(&protocol, &server_addr, &username, &password);
+    let client = build_proxy_client(&v.protocol, &v.server_addr, &v.username, &v.password);
     let mut nodes_guard = proxy_nodes.write().unwrap_or_else(|e| e.into_inner());
     let new_id = nodes_guard.keys().max().copied().unwrap_or(100) + 1;
     nodes_guard.insert(
         new_id,
         ProxyNodeEntry {
             id: new_id,
-            name,
-            protocol,
-            server_addr,
-            username,
+            name: v.name,
+            protocol: v.protocol,
+            server_addr: v.server_addr,
+            username: v.username,
             client,
         },
     );

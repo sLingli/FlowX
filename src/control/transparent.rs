@@ -11,7 +11,7 @@ pub struct TransparentToggleRequest {
     pub enabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TransparentConfigRequest {
     pub hijack_dns: Option<bool>,
     pub block_quic_for_proxied: Option<bool>,

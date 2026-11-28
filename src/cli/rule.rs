@@ -9,7 +9,10 @@ use crate::cli::bridge::{
     mutate_offline_runtime, offline_resolve_rule_id, resolve_rule_id_from_views,
 };
 use crate::cli::http_client::{api_request_or_offline, api_request_strict, ensure_api_ok};
-use crate::control::rule::{add_rule, delete_rule, move_rule, patch_rule, toggle_rule};
+use crate::control::rule::{
+    add_rule, delete_rule, move_rule, patch_rule, toggle_rule, validate_add_rule_request_static,
+    validate_move_direction, validate_patch_rule_fields_static,
+};
 use crate::control::{
     AddRuleRequest, ControlError, MoveRuleRequest, PatchRuleRequest, ToggleRuleRequest,
 };
@@ -155,9 +158,11 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 ensure_api_ok(st, val)?
             } else {
                 let req: AddRuleRequest = serde_json::from_value(payload)?;
+                validate_add_rule_request_static(&req)
+                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 let locale = opts.locale;
                 let new_id = mutate_offline_runtime(&opts.config_path, |rt| {
-                    let id = add_rule(req, &rt.engine, &rt.nodes)
+                    let id = add_rule(req.clone(), &rt.engine, &rt.nodes)
                         .map_err(|e| control_err_to_cli(e, locale))?;
                     Ok((id, true))
                 })?;
@@ -268,16 +273,24 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 RuleBackend::Offline => {
                     let locale = opts.locale;
+                    validate_patch_rule_fields_static(
+                        name.as_deref(),
+                        action.as_deref(),
+                        apps.as_deref(),
+                        targets.as_deref(),
+                        ports.as_deref(),
+                    )
+                    .map_err(|e| control_err_to_cli(e, locale))?;
                     mutate_offline_runtime(&opts.config_path, |rt| {
                         let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, locale)
                             .ok_or_else(|| rule_not_found_cli_err(locale))?;
                         let payload = json!({
                             "id": resolved_id,
-                            "name": name,
-                            "apps": apps,
-                            "targets": targets,
-                            "ports": ports,
-                            "action": action,
+                            "name": &name,
+                            "apps": &apps,
+                            "targets": &targets,
+                            "ports": &ports,
+                            "action": &action,
                             "node_id": node_id,
                             "enabled": enabled,
                         });
@@ -428,6 +441,8 @@ pub(super) async fn cmd_rule(opts: &GlobalCliOpts) -> Result<()> {
                 }
                 RuleBackend::Offline => {
                     let locale = opts.locale;
+                    validate_move_direction(&direction)
+                        .map_err(|e| control_err_to_cli(e, locale))?;
                     mutate_offline_runtime(&opts.config_path, |rt| {
                         let resolved_id = offline_resolve_rule_id(&rt.engine, raw_id, locale)
                             .ok_or_else(|| rule_not_found_cli_err(locale))?;

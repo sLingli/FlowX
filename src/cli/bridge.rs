@@ -33,7 +33,7 @@ pub(super) struct OfflineRuntime {
 /// 彻底避免并发 `--offline` / 守护进程保存的 lost update 与 AB-BA 死锁。
 pub(super) fn mutate_offline_runtime<F, T>(config_path: &str, f: F) -> Result<T>
 where
-    F: FnOnce(&mut LockedRuntimeState) -> Result<(T, bool)>,
+    F: FnMut(&mut LockedRuntimeState) -> Result<(T, bool)>,
 {
     let store = ConfigStore::new(config_path);
     store

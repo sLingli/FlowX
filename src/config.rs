@@ -746,13 +746,26 @@ impl ConfigStore {
 
     /// 以统一的规范锁序（`save_lock -> ConfigFileLock`）持有跨进程文件锁执行离线读-改-写事务：
     /// 1) 杜绝 `save_lock` 与 `ConfigFileLock` 间的 AB-BA 锁序反转死锁；
-    /// 2) 防止并发 `--offline` CLI 写操作与守护进程保存互相覆盖（lost update）；
-    /// 3) 闭包返回 `Ok((val, true))` 时在同一锁作用域内原子落盘，返回 `Ok((val, false))` 或 `Err` 时不写盘。
-    pub(crate) fn update_with_lock<F, T>(&self, self_ports: &[u16], f: F) -> Result<T>
+    /// 2) 当配置文件与锁文件均尚未存在时，先在内存中以默认配置无副作用预演，遇到静态/动态错误或无需写盘时直接返回，绝不提前创建父目录与 `.lock` 文件；
+    /// 3) 防止并发 `--offline` CLI 写操作与守护进程保存互相覆盖（lost update）；
+    /// 4) 闭包返回 `Ok((val, true))` 时在同一锁作用域内原子落盘，返回 `Ok((val, false))` 或 `Err` 时不写盘。
+    pub(crate) fn update_with_lock<F, T>(&self, self_ports: &[u16], mut f: F) -> Result<T>
     where
-        F: FnOnce(&mut LockedRuntimeState) -> Result<(T, bool)>,
+        F: FnMut(&mut LockedRuntimeState) -> Result<(T, bool)>,
     {
         let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.path.exists() && !self.lock_file_path().exists() {
+            let probe_rt = ProfileConfig::default_profile().into_runtime(self_ports)?;
+            let mut probe_state = LockedRuntimeState {
+                nodes: RwLock::new(probe_rt.proxy_nodes),
+                engine: RuleEngine::new(probe_rt.rules, probe_rt.default_action),
+                transparent: probe_rt.transparent_settings,
+            };
+            let (probe_result, should_save) = f(&mut probe_state)?;
+            if !should_save {
+                return Ok(probe_result);
+            }
+        }
         let _file_lock = self.acquire_cross_process_lock()?;
         let rt = self.load_existing_or_default(self_ports)?;
         let mut state = LockedRuntimeState {

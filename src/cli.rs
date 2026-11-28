@@ -37,6 +37,21 @@ pub async fn run_cli_with_env(args: &[String], env: &CliEnv) -> Result<()> {
             Ok(())
         }
         "version" | "--version" | "-V" => {
+            let tail = if opts.rest.len() > 1 {
+                &opts.rest[1..]
+            } else {
+                &[]
+            };
+            let _ = args::parse_flags_with_spec(
+                tail,
+                args::ArgSpec {
+                    cmd_label: "flowx version",
+                    value_flags: &[],
+                    bool_flags: &[],
+                    min_pos: 0,
+                    max_pos: 0,
+                },
+            )?;
             if opts.json_output {
                 println!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION"));
             } else {
@@ -700,6 +715,10 @@ mod tests {
                 err_json["code"], "ERR_TRANSPARENT_INVALID_DLL_PATH",
                 "unexpected CLI JSON error for {bad_path:?}: {err_json}"
             );
+            assert_eq!(
+                err_json["key"], "error.transparent_invalid_dll_path",
+                "missing localized key in CLI JSON error for {bad_path:?}: {err_json}"
+            );
         }
         assert!(!cfg_path.exists());
 
@@ -1150,5 +1169,180 @@ mod tests {
                 .contains("accept-language: zh-cn"),
             "api_request_strict must forward CliEnv.locale in Accept-Language, got: {raw_req}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cli_version_strict_args_and_offline_zero_lock_side_effects() {
+        let poisoned = CliEnv {
+            flowx_config: None,
+            flowx_api: Some("://invalid-host-env".into()),
+            locale: Locale::En,
+        };
+
+        // 1. Valid idempotent version invocations succeed even under poisoned FLOWX_API
+        for ok_args in [
+            vec!["flowx", "version"],
+            vec!["flowx", "--version"],
+            vec!["flowx", "-V"],
+            vec!["flowx", "--version", "--version"],
+            vec!["flowx", "-V", "-V"],
+            vec!["flowx", "version", "--version"],
+            vec!["flowx", "--version", "-V", "--json"],
+        ] {
+            let owned: Vec<String> = ok_args.into_iter().map(String::from).collect();
+            super::run_cli_with_env(&owned, &poisoned)
+                .await
+                .unwrap_or_else(|e| panic!("expected success for {:?}, got: {e:#}", owned));
+        }
+
+        // 2. Trailing positional args, unknown/subcommand flags, or --version on other subcommands must fail
+        for bad_args in [
+            vec!["flowx", "version", "bogus"],
+            vec!["flowx", "--version", "--name", "foo"],
+            vec!["flowx", "-V", "--all"],
+            vec!["flowx", "--version", "--", "extra"],
+            vec!["flowx", "status", "--version"],
+        ] {
+            let owned: Vec<String> = bad_args.into_iter().map(String::from).collect();
+            assert!(
+                super::run_cli_with_env(&owned, &poisoned).await.is_err(),
+                "expected error for {:?}",
+                owned
+            );
+        }
+
+        // 3. Offline invalid requests, missing dynamic IDs, and no-op moves must NOT create nonexistent parent dir or .lock
+        let missing_dir = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "flowx_no_side_effect_dir_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        struct DirCleanup(std::path::PathBuf);
+        impl Drop for DirCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _dir_cleanup = DirCleanup(missing_dir.clone());
+        let missing_cfg = missing_dir.join("nested").join("flowx.xml");
+        let missing_cfg_str = missing_cfg.to_string_lossy().to_string();
+
+        let err_cases: &[&[&str]] = &[
+            &["node", "add", "--name", "Bad", "--addr", "not-a-valid-addr"],
+            &["node", "update", "101", "--name", ""],
+            &["node", "update", "101", "--addr", "bad-addr"],
+            &["node", "update", "999", "--name", "MissingNode"],
+            &["node", "remove", "999"],
+            &["rule", "add", "--name", "", "--action", "Direct"],
+            &["rule", "add", "--name", "R", "--action", "Bogus"],
+            &["rule", "add", "--name", "R", "--action", "Proxy:999"],
+            &[
+                "rule", "add", "--name", "R", "--action", "Direct", "--ports", "abc",
+            ],
+            &["rule", "update", "1", "--name", ""],
+            &["rule", "update", "1", "--action", "Bogus"],
+            &["rule", "update", "1", "--ports", "abc"],
+            &["rule", "update", "999", "--name", "MissingRule"],
+            &["rule", "move", "1", "sideways"],
+            &["rule", "move", "999", "up"],
+            &["default", "Bogus"],
+            &["default", "Proxy"],
+            &["default", "Proxy:999"],
+            &[
+                "transparent",
+                "config",
+                "--dll-path",
+                r"..\evil\WinDivert.dll",
+            ],
+        ];
+        for tail in err_cases {
+            let mut argv = vec![
+                "flowx".to_string(),
+                "--config".to_string(),
+                missing_cfg_str.clone(),
+                "--offline".to_string(),
+            ];
+            argv.extend(tail.iter().map(|s| s.to_string()));
+            assert!(
+                run_cli(&argv).await.is_err(),
+                "expected failure for offline case {:?}",
+                tail
+            );
+            assert!(
+                !missing_dir.exists(),
+                "failed offline case {:?} must not create parent directory {:?}",
+                tail,
+                missing_dir
+            );
+        }
+
+        // No-op `rule move 1 up` (rule #1 already at top of default profile) also must not create dir/.lock
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            missing_cfg_str,
+            "--offline".into(),
+            "rule".into(),
+            "move".into(),
+            "1".into(),
+            "up".into(),
+        ])
+        .await
+        .unwrap();
+        assert!(
+            !missing_dir.exists(),
+            "no-op offline rule move must not create parent directory or .lock"
+        );
+
+        // 4. Existing config file without .lock: static validation errors must not create .lock
+        let existing_guard = TempConfigGuard::new("flowx_existing_nolock");
+        let existing_path = existing_guard.path();
+        let existing_str = existing_guard.as_str();
+        let existing_lock = existing_path.parent().unwrap().join(format!(
+            ".{}.lock",
+            existing_path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(
+            existing_path,
+            crate::config::ProfileConfig::default_profile()
+                .to_xml()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(!existing_lock.exists());
+
+        for tail in [
+            &["node", "update", "101", "--protocol", "BOGUS"][..],
+            &["rule", "add", "--name", "R", "--action", "Bogus"][..],
+            &["rule", "update", "1", "--action", "Bogus"][..],
+            &["rule", "move", "1", "sideways"][..],
+            &["default", "Bogus"][..],
+            &["transparent", "config", "--dll-path", "WinDivert.dll"][..],
+        ] {
+            let mut argv = vec![
+                "flowx".to_string(),
+                "--config".to_string(),
+                existing_str.clone(),
+                "--offline".to_string(),
+            ];
+            argv.extend(tail.iter().map(|s| s.to_string()));
+            assert!(
+                run_cli(&argv).await.is_err(),
+                "expected failure for {:?}",
+                tail
+            );
+            assert!(
+                !existing_lock.exists(),
+                "static error for {:?} must not create lock file {:?}",
+                tail,
+                existing_lock
+            );
+        }
     }
 }
