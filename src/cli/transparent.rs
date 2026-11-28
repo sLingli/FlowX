@@ -282,9 +282,6 @@ pub(super) async fn cmd_transparent(opts: &GlobalCliOpts) -> Result<()> {
                     dll_path,
                     clear_dll_path: clear_dll_path.then_some(true),
                 };
-                // 离线模式加锁前复用控制层统一校验，保证带完整 `key` 且不提前创建目录或 `.lock`
-                apply_transparent_config_fields(&TransparentSettings::default(), req.clone())
-                    .map_err(|e| control_err_to_cli(e, locale))?;
                 let status_val = mutate_offline_runtime(&opts.config_path, |rt| {
                     rt.transparent = apply_transparent_config_fields(&rt.transparent, req.clone())
                         .map_err(|e| control_err_to_cli(e, locale))?;

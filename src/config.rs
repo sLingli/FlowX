@@ -746,28 +746,94 @@ impl ConfigStore {
 
     /// 以统一的规范锁序（`save_lock -> ConfigFileLock`）持有跨进程文件锁执行离线读-改-写事务：
     /// 1) 杜绝 `save_lock` 与 `ConfigFileLock` 间的 AB-BA 锁序反转死锁；
-    /// 2) 当配置文件与锁文件均尚未存在时，先在内存中以默认配置无副作用预演，遇到静态/动态错误或无需写盘时直接返回，绝不提前创建父目录与 `.lock` 文件；
-    /// 3) 防止并发 `--offline` CLI 写操作与守护进程保存互相覆盖（lost update）；
-    /// 4) 闭包返回 `Ok((val, true))` 时在同一锁作用域内原子落盘，返回 `Ok((val, false))` 或 `Err` 时不写盘。
+    /// 2) 当 `.lock` 尚不存在时先在内存中无副作用预演，遇到静态/动态错误或无需写盘的空操作直接返回，
+    ///    绝不提前创建不存在的父目录或残留 `.lock`，且保持与在线 API 完全一致的校验优先级；
+    /// 3) 加锁后若磁盘快照未变化，直接复用预演状态原子落盘并返回预演结果，杜绝二次执行 `into_runtime` / `f` 导致规则 ID 跳号；
+    /// 4) 若预演窗口内有并发进程改写了磁盘配置，则基于最新磁盘内容重跑一次 `f` 后原子落盘，避免 lost update。
     pub(crate) fn update_with_lock<F, T>(&self, self_ports: &[u16], mut f: F) -> Result<T>
     where
         F: FnMut(&mut LockedRuntimeState) -> Result<(T, bool)>,
     {
         let _guard = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.path.exists() && !self.lock_file_path().exists() {
-            let probe_rt = ProfileConfig::default_profile().into_runtime(self_ports)?;
-            let mut probe_state = LockedRuntimeState {
-                nodes: RwLock::new(probe_rt.proxy_nodes),
-                engine: RuleEngine::new(probe_rt.rules, probe_rt.default_action),
-                transparent: probe_rt.transparent_settings,
+        let lock_path = self.lock_file_path();
+
+        let mut precomputed: Option<(Option<String>, LockedRuntimeState, T)> = None;
+        if !lock_path.exists() {
+            let probe_source: Option<Option<String>> = match std::fs::read_to_string(&self.path) {
+                Ok(xml) => Some(Some(xml)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+                // 暂态 I/O（如并发 rename 共享冲突）交由加锁路径统一读取处理
+                Err(_) => None,
             };
-            let (probe_result, should_save) = f(&mut probe_state)?;
-            if !should_save {
-                return Ok(probe_result);
+            if let Some(raw_opt) = probe_source {
+                let probe_rt = match raw_opt.as_deref() {
+                    Some(xml) => ProfileConfig::from_xml(xml)
+                        .with_context(|| {
+                            format!(
+                                "Failed to parse XML configuration file: {}",
+                                self.path.display()
+                            )
+                        })?
+                        .into_runtime(self_ports)?,
+                    None => ProfileConfig::default_profile().into_runtime(self_ports)?,
+                };
+                let mut probe_state = LockedRuntimeState {
+                    nodes: RwLock::new(probe_rt.proxy_nodes),
+                    engine: RuleEngine::new(probe_rt.rules, probe_rt.default_action),
+                    transparent: probe_rt.transparent_settings,
+                };
+                match f(&mut probe_state) {
+                    Ok((probe_result, false)) => {
+                        if !lock_path.exists() {
+                            return Ok(probe_result);
+                        }
+                    }
+                    Ok((probe_result, true)) => {
+                        precomputed = Some((raw_opt, probe_state, probe_result));
+                    }
+                    Err(err) => {
+                        if !lock_path.exists() {
+                            return Err(err);
+                        }
+                    }
+                }
             }
         }
+
         let _file_lock = self.acquire_cross_process_lock()?;
-        let rt = self.load_existing_or_default(self_ports)?;
+        let disk_raw = match std::fs::read_to_string(&self.path) {
+            Ok(xml) => Some(xml),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to read configuration file: {}", self.path.display())
+                });
+            }
+        };
+
+        if let Some((probe_raw, probe_state, probe_result)) = precomputed
+            && probe_raw == disk_raw
+        {
+            let cfg = Self::snapshot_runtime_with_transparent(
+                &probe_state.nodes,
+                &probe_state.engine,
+                Some(&probe_state.transparent),
+            );
+            self.write_config_atomic_inner(&cfg, None)?;
+            return Ok(probe_result);
+        }
+
+        let rt = match disk_raw.as_deref() {
+            Some(xml) => ProfileConfig::from_xml(xml)
+                .with_context(|| {
+                    format!(
+                        "Failed to parse XML configuration file: {}",
+                        self.path.display()
+                    )
+                })?
+                .into_runtime(self_ports)?,
+            None => ProfileConfig::default_profile().into_runtime(self_ports)?,
+        };
         let mut state = LockedRuntimeState {
             nodes: RwLock::new(rt.proxy_nodes),
             engine: RuleEngine::new(rt.rules, rt.default_action),
@@ -1575,5 +1641,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_update_with_lock_runs_closure_once_on_new_and_existing_unlocked_config() {
+        let cfg_guard = TempTestConfig::new("flowx_update_once");
+        let store = ConfigStore::new(cfg_guard.path());
+
+        // 1. Brand-new config file: closure executes exactly once (no double NEXT_RULE_ID bump)
+        let mut calls_new = 0usize;
+        let new_rule_id = store
+            .update_with_lock(&[], |state| {
+                calls_new += 1;
+                let r = Rule::from_raw(
+                    "OnceRule",
+                    true,
+                    None,
+                    Some("once.example"),
+                    None,
+                    Action::Direct,
+                );
+                let id = r.id;
+                state.engine.add_rule(r);
+                Ok((id, true))
+            })
+            .unwrap();
+        assert_eq!(
+            calls_new, 1,
+            "new config update_with_lock must invoke f once"
+        );
+        let loaded = store.load_existing(&[]).unwrap();
+        assert_eq!(loaded.rules.len(), 3);
+        assert!(new_rule_id >= 1);
+
+        // 2. Existing config file without .lock: closure still executes exactly once
+        let _ = std::fs::remove_file(store.lock_file_path());
+        assert!(!store.lock_file_path().exists());
+        let mut calls_existing = 0usize;
+        store
+            .update_with_lock(&[], |state| {
+                calls_existing += 1;
+                state.engine.add_rule(Rule::from_raw(
+                    "SecondOnceRule",
+                    true,
+                    None,
+                    Some("second.example"),
+                    None,
+                    Action::Direct,
+                ));
+                Ok(((), true))
+            })
+            .unwrap();
+        assert_eq!(
+            calls_existing, 1,
+            "existing unlocked config update_with_lock must invoke f once"
+        );
+        assert_eq!(store.load_existing(&[]).unwrap().rules.len(), 4);
     }
 }

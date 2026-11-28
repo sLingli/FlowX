@@ -33,6 +33,23 @@ pub async fn run_cli_with_env(args: &[String], env: &CliEnv) -> Result<()> {
 
     match cmd {
         "help" | "--help" | "-h" => {
+            if cmd == "help" {
+                let tail = if opts.rest.len() > 1 {
+                    &opts.rest[1..]
+                } else {
+                    &[]
+                };
+                let _ = args::parse_flags_with_spec(
+                    tail,
+                    args::ArgSpec {
+                        cmd_label: "flowx help",
+                        value_flags: &[],
+                        bool_flags: &[],
+                        min_pos: 0,
+                        max_pos: 0,
+                    },
+                )?;
+            }
             print_help();
             Ok(())
         }
@@ -1195,13 +1212,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("expected success for {:?}, got: {e:#}", owned));
         }
 
-        // 2. Trailing positional args, unknown/subcommand flags, or --version on other subcommands must fail
+        // 2. Trailing positional args, unknown/subcommand flags, `--` before flag-like subcommands, or `help extra` must fail
         for bad_args in [
             vec!["flowx", "version", "bogus"],
             vec!["flowx", "--version", "--name", "foo"],
             vec!["flowx", "-V", "--all"],
             vec!["flowx", "--version", "--", "extra"],
             vec!["flowx", "status", "--version"],
+            vec!["flowx", "--", "--version"],
+            vec!["flowx", "--", "--help"],
+            vec!["flowx", "--", "-V"],
+            vec!["flowx", "help", "extra"],
+            vec!["flowx", "help", "--name", "foo"],
         ] {
             let owned: Vec<String> = bad_args.into_iter().map(String::from).collect();
             assert!(
@@ -1300,7 +1322,8 @@ mod tests {
             "no-op offline rule move must not create parent directory or .lock"
         );
 
-        // 4. Existing config file without .lock: static validation errors must not create .lock
+        // 4. Existing config file without .lock: static errors, dynamic errors, no-op moves,
+        // and online/offline error-priority parity must all hold without creating .lock
         let existing_guard = TempConfigGuard::new("flowx_existing_nolock");
         let existing_path = existing_guard.path();
         let existing_str = existing_guard.as_str();
@@ -1308,13 +1331,23 @@ mod tests {
             ".{}.lock",
             existing_path.file_name().unwrap().to_string_lossy()
         ));
-        std::fs::write(
-            existing_path,
-            crate::config::ProfileConfig::default_profile()
-                .to_xml()
-                .unwrap(),
-        )
-        .unwrap();
+        let mut seeded_profile = crate::config::ProfileConfig::default_profile();
+        seeded_profile
+            .proxy_list
+            .as_mut()
+            .unwrap()
+            .proxies
+            .push(crate::config::ProxyItem {
+                id: 102,
+                proxy_type: "SOCKS4".to_string(),
+                name: Some("Socks4Node".to_string()),
+                address: "10.0.0.2".to_string(),
+                port: 1080,
+                username: None,
+                password: None,
+                options: None,
+            });
+        std::fs::write(existing_path, seeded_profile.to_xml().unwrap()).unwrap();
         assert!(!existing_lock.exists());
 
         for tail in [
@@ -1324,6 +1357,8 @@ mod tests {
             &["rule", "move", "1", "sideways"][..],
             &["default", "Bogus"][..],
             &["transparent", "config", "--dll-path", "WinDivert.dll"][..],
+            &["rule", "update", "999", "--name", "Missing"][..],
+            &["node", "update", "999", "--name", "Missing"][..],
         ] {
             let mut argv = vec![
                 "flowx".to_string(),
@@ -1339,10 +1374,82 @@ mod tests {
             );
             assert!(
                 !existing_lock.exists(),
-                "static error for {:?} must not create lock file {:?}",
+                "error for {:?} must not create lock file {:?}",
                 tail,
                 existing_lock
             );
         }
+
+        // No-op `rule move 1 up` on existing unlocked XML must not create .lock
+        run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            existing_str.clone(),
+            "--offline".into(),
+            "rule".into(),
+            "move".into(),
+            "1".into(),
+            "up".into(),
+        ])
+        .await
+        .unwrap();
+        assert!(!existing_lock.exists());
+
+        // Online/offline error-priority parity: missing ID + invalid field reports 404 (not 400)
+        let rule_404 = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            existing_str.clone(),
+            "--offline".into(),
+            "rule".into(),
+            "update".into(),
+            "999".into(),
+            "--name".into(),
+            "".into(),
+        ])
+        .await
+        .unwrap_err();
+        let rule_404_json = format_cli_error_json(&rule_404);
+        assert_eq!(rule_404_json["status"], 404);
+        assert_eq!(rule_404_json["code"], "ERR_RULE_NOT_FOUND");
+        assert!(!existing_lock.exists());
+
+        let node_404 = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            existing_str.clone(),
+            "--offline".into(),
+            "node".into(),
+            "update".into(),
+            "999".into(),
+            "--name".into(),
+            "".into(),
+        ])
+        .await
+        .unwrap_err();
+        let node_404_json = format_cli_error_json(&node_404);
+        assert_eq!(node_404_json["status"], 404);
+        assert_eq!(node_404_json["code"], "ERR_NODE_NOT_FOUND");
+        assert!(!existing_lock.exists());
+
+        // Existing SOCKS4 node updated with `--clear-user --pass x` reports ERR_SOCKS4_PASSWORD_UNSUPPORTED
+        let socks4_err = run_cli(&[
+            "flowx".into(),
+            "--config".into(),
+            existing_str,
+            "--offline".into(),
+            "node".into(),
+            "update".into(),
+            "102".into(),
+            "--clear-user".into(),
+            "--pass".into(),
+            "x".into(),
+        ])
+        .await
+        .unwrap_err();
+        let socks4_json = format_cli_error_json(&socks4_err);
+        assert_eq!(socks4_json["status"], 400);
+        assert_eq!(socks4_json["code"], "ERR_SOCKS4_PASSWORD_UNSUPPORTED");
+        assert!(!existing_lock.exists());
     }
 }

@@ -151,6 +151,14 @@ pub(super) fn parse_cli_invocation_with_env(
             if in_subcommand {
                 rest.extend(args[i..].iter().cloned());
             } else {
+                if let Some(first_after) = args.get(i + 1)
+                    && first_after.starts_with('-')
+                {
+                    bail!(
+                        "Unknown subcommand '{}'. Run `flowx --help` for usage.",
+                        first_after
+                    );
+                }
                 rest.extend(args[i + 1..].iter().cloned());
             }
             break;

@@ -10,10 +10,7 @@ use crate::cli::bridge::{
 use crate::cli::http_client::{
     ApiTransportError, SilentExitError, api_request_or_offline, api_request_raw, ensure_api_ok,
 };
-use crate::control::node::{
-    add_node, delete_node, list_nodes, patch_node, ping_address, validate_add_node_request,
-    validate_patch_node_request_static,
-};
+use crate::control::node::{add_node, delete_node, list_nodes, patch_node, ping_address};
 use crate::control::{AddNodeRequest, ControlError, PatchNodeRequest, PingResponse, ProxyNodeView};
 
 pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
@@ -110,9 +107,6 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 ensure_api_ok(st, val)?
             } else {
                 let req: AddNodeRequest = serde_json::from_value(payload)?;
-                // 静态参数先在加锁前校验，避免向不存在的配置路径提交非法参数时提前建出父目录或 .lock 文件
-                validate_add_node_request(&req, &DEFAULT_SELF_PORTS)
-                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 let locale = opts.locale;
                 let new_id = mutate_offline_runtime(&opts.config_path, |rt| {
                     let id = add_node(req.clone(), &rt.nodes, &DEFAULT_SELF_PORTS)
@@ -196,8 +190,6 @@ pub(super) async fn cmd_node(opts: &GlobalCliOpts) -> Result<()> {
                 ensure_api_ok(st, val)?
             } else {
                 let req: PatchNodeRequest = serde_json::from_value(payload)?;
-                validate_patch_node_request_static(&req, &DEFAULT_SELF_PORTS)
-                    .map_err(|e| control_err_to_cli(e, opts.locale))?;
                 let locale = opts.locale;
                 let updated_id = mutate_offline_runtime(&opts.config_path, |rt| {
                     let uid = patch_node(req.clone(), &rt.nodes, &DEFAULT_SELF_PORTS)

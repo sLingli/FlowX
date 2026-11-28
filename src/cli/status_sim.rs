@@ -7,7 +7,6 @@ use crate::cli::bridge::{
 };
 use crate::cli::http_client::{api_request_or_offline, api_request_strict, ensure_api_ok};
 use crate::control::routing::{set_default_action, simulate_route};
-use crate::control::rule::validate_action_syntax;
 use crate::control::{SetDefaultActionRequest, SimulateRouteRequest};
 use crate::router::format_action_desc;
 
@@ -170,8 +169,6 @@ pub(super) async fn cmd_default(opts: &GlobalCliOpts) -> Result<()> {
             ensure_api_ok(st, val)?
         } else {
             let req: SetDefaultActionRequest = serde_json::from_value(payload)?;
-            validate_action_syntax(&req.action, req.node_id)
-                .map_err(|e| control_err_to_cli(e, opts.locale))?;
             let locale = opts.locale;
             let resp = mutate_offline_runtime(&opts.config_path, |rt| {
                 let r = set_default_action(req.clone(), &rt.engine, &rt.nodes, locale)

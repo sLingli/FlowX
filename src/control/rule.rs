@@ -52,9 +52,10 @@ pub struct MoveRuleRequest {
     pub direction: String, // "up" | "down" | "top" | "bottom"
 }
 
-pub(crate) fn validate_action_syntax(
+pub(crate) fn parse_and_validate_action(
     action_raw: &str,
     node_id: Option<u32>,
+    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
 ) -> Result<Action, ControlError> {
     match action_raw.trim().to_ascii_uppercase().as_str() {
         "DIRECT" => Ok(Action::Direct),
@@ -66,6 +67,16 @@ pub(crate) fn validate_action_syntax(
                     "error.missing_node_id_for_proxy",
                 ));
             };
+            let exists = {
+                let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
+                nodes_guard.contains_key(&nid)
+            };
+            if !exists {
+                return Err(ControlError::bad_request(
+                    "ERR_NODE_NOT_FOUND",
+                    "error.node_not_found",
+                ));
+            }
             Ok(Action::Proxy(nid))
         }
         _ => Err(ControlError::bad_request(
@@ -75,104 +86,7 @@ pub(crate) fn validate_action_syntax(
     }
 }
 
-pub(crate) fn parse_and_validate_action(
-    action_raw: &str,
-    node_id: Option<u32>,
-    proxy_nodes: &RwLock<HashMap<u32, ProxyNodeEntry>>,
-) -> Result<Action, ControlError> {
-    let action = validate_action_syntax(action_raw, node_id)?;
-    if let Action::Proxy(nid) = action {
-        let exists = {
-            let nodes_guard = proxy_nodes.read().unwrap_or_else(|e| e.into_inner());
-            nodes_guard.contains_key(&nid)
-        };
-        if !exists {
-            return Err(ControlError::bad_request(
-                "ERR_NODE_NOT_FOUND",
-                "error.node_not_found",
-            ));
-        }
-    }
-    Ok(action)
-}
-
-pub(crate) fn validate_add_rule_request_static(req: &AddRuleRequest) -> Result<(), ControlError> {
-    let name = req.name.trim();
-    if name.is_empty() {
-        return Err(ControlError::bad_request(
-            "ERR_EMPTY_RULE_NAME",
-            "error.empty_rule_name",
-        ));
-    }
-    let action = validate_action_syntax(&req.action, req.node_id)?;
-    let apps_clean = req.apps.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let targets_clean = req
-        .targets
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let ports_clean = req
-        .ports
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let probe = Rule::from_raw_with_id(
-        0,
-        name,
-        true,
-        apps_clean,
-        targets_clean,
-        ports_clean,
-        action,
-    );
-    validate_rule_probe(&probe, apps_clean, targets_clean, ports_clean)
-}
-
-pub(crate) fn validate_patch_rule_fields_static(
-    name: Option<&str>,
-    action: Option<&str>,
-    apps: Option<&str>,
-    targets: Option<&str>,
-    ports: Option<&str>,
-) -> Result<(), ControlError> {
-    if let Some(n) = name
-        && n.trim().is_empty()
-    {
-        return Err(ControlError::bad_request(
-            "ERR_EMPTY_RULE_NAME",
-            "error.empty_rule_name",
-        ));
-    }
-    if let Some(act) = action
-        && !matches!(
-            act.trim().to_ascii_uppercase().as_str(),
-            "DIRECT" | "BLOCK" | "PROXY"
-        )
-    {
-        return Err(ControlError::bad_request(
-            "ERR_INVALID_RULE_ACTION",
-            "error.invalid_rule_action",
-        ));
-    }
-    let apps_clean = apps.map(str::trim).filter(|s| !s.is_empty());
-    let targets_clean = targets.map(str::trim).filter(|s| !s.is_empty());
-    let ports_clean = ports.map(str::trim).filter(|s| !s.is_empty());
-    if apps_clean.is_some() || targets_clean.is_some() || ports_clean.is_some() {
-        let probe = Rule::from_raw_with_id(
-            0,
-            "probe",
-            true,
-            apps_clean,
-            targets_clean,
-            ports_clean,
-            Action::Direct,
-        );
-        validate_rule_probe(&probe, apps_clean, targets_clean, ports_clean)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_move_direction(direction: &str) -> Result<(), ControlError> {
+fn validate_move_direction(direction: &str) -> Result<(), ControlError> {
     if !matches!(
         direction.trim().to_ascii_lowercase().as_str(),
         "up" | "down" | "top" | "bottom"
