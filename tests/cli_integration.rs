@@ -1163,6 +1163,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
 
     async fn run_bin(bin: &str, args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
         let mut cmd = Command::new(bin);
+        cmd.kill_on_drop(true);
         for k in [
             "FLOWX_API",
             "FLOWX_CONFIG",
@@ -1199,16 +1200,33 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
     p101.port = alive_addr.port();
     store.save_profile(&profile).unwrap();
 
-    // 0. Local meta commands (`help`, `version`, `--version`, `-V`) succeed even with poisoned FLOWX_API
-    for meta in ["help", "version", "--version", "-V"] {
-        let out_meta = run_bin(bin, &[meta], &[("FLOWX_API", "://poisoned-host-env")]).await;
+    // 0. Local meta commands (`help`, `version`, `--version`, `-V`, repeated `--version`) succeed even with poisoned FLOWX_API
+    for meta_args in [
+        &["help"][..],
+        &["version"][..],
+        &["--version"][..],
+        &["-V"][..],
+        &["--version", "--version"][..],
+    ] {
+        let out_meta = run_bin(bin, meta_args, &[("FLOWX_API", "://poisoned-host-env")]).await;
         assert!(
             out_meta.status.success(),
-            "{meta} failed under poisoned FLOWX_API: {}",
+            "{meta_args:?} failed under poisoned FLOWX_API: {}",
             String::from_utf8_lossy(&out_meta.stderr)
         );
         assert!(out_meta.stderr.is_empty());
         assert!(!out_meta.stdout.is_empty());
+    }
+    // Trailing/unknown args on `version` / `--version` must fail cleanly with non-zero exit
+    for bad_ver in [
+        &["version", "bogus"][..],
+        &["--version", "--name", "foo"][..],
+    ] {
+        let out_bad_ver = run_bin(bin, bad_ver, &[("FLOWX_API", "://poisoned-host-env")]).await;
+        assert!(
+            !out_bad_ver.status.success(),
+            "{bad_ver:?} should fail cleanly"
+        );
     }
 
     // 1. Offline `status --json` succeeds even with poisoned host FLOWX_API and emits valid JSON on stdout

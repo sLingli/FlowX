@@ -553,6 +553,57 @@ mod tests {
         }
     }
 
+    /// RAII 阻塞线程守卫：保证即便测试中途断言 panic，也会先释放锁并 `join` 后台线程，
+    /// 再由外层 `TempTestFile::drop` 清理临时配置文件，杜绝删文件后延迟写盘残留。
+    struct BlockerThreadGuard {
+        release_tx: Option<std::sync::mpsc::Sender<bool>>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl BlockerThreadGuard {
+        fn spawn_lock_holder<F>(store: Arc<ConfigStore>, on_normal_release: F) -> Self
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<bool>();
+            let handle = std::thread::spawn(move || {
+                let lock = store.lock_save_for_test();
+                let _ = hold_tx.send(());
+                let normal_release = matches!(release_rx.recv(), Ok(true));
+                drop(lock);
+                if normal_release {
+                    on_normal_release();
+                }
+            });
+            hold_rx.recv().unwrap();
+            Self {
+                release_tx: Some(release_tx),
+                handle: Some(handle),
+            }
+        }
+
+        fn release_and_join(mut self) {
+            if let Some(tx) = self.release_tx.take() {
+                let _ = tx.send(true);
+            }
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    impl Drop for BlockerThreadGuard {
+        fn drop(&mut self) {
+            if let Some(tx) = self.release_tx.take() {
+                let _ = tx.send(false);
+            }
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_api_persist_timeout_and_mutation_isolation_do_not_starve_health_or_kill() {
         let cfg_guard = TempTestFile::new("test_persist_isolation");
@@ -582,7 +633,7 @@ mod tests {
             Arc::clone(&nodes),
         )
         .with_config_store(Arc::clone(&store))
-        .with_persist_timeout(Duration::from_millis(80));
+        .with_persist_timeout(Duration::from_millis(200));
         let listener = server.bind().await.unwrap();
         let api_addr = listener.local_addr().unwrap();
         let api_port = api_addr.port();
@@ -590,15 +641,7 @@ mod tests {
         let server_task = tokio::spawn(async move { server.run(listener, shutdown_rx).await });
 
         // Hold save_lock on a background OS thread to simulate stalled disk I/O across awaits
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let store_blocker = Arc::clone(&store);
-        let blocker_thread = std::thread::spawn(move || {
-            let _guard = store_blocker.lock_save_for_test();
-            let _ = locked_tx.send(());
-            let _ = release_rx.recv();
-        });
-        locked_rx.recv().unwrap();
+        let blocker = BlockerThreadGuard::spawn_lock_holder(Arc::clone(&store), || {});
 
         let mut handles = Vec::new();
         for idx in 0..24 {
@@ -684,8 +727,7 @@ mod tests {
             "stalled writes must roll back memory"
         );
 
-        let _ = release_tx.send(());
-        let _ = blocker_thread.join();
+        blocker.release_and_join();
         tokio::time::sleep(Duration::from_millis(60)).await;
 
         // 确认已超时回滚的暂存快照绝不会在锁释放后延迟覆盖磁盘配置
@@ -894,19 +936,12 @@ mod tests {
         assert!(!saved_after_failed_toggle.transparent_settings.enabled);
 
         // 6. Stalled ConfigStore persistence rolls back transparent settings in memory
-        let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let blocker_store = Arc::clone(&store);
         let blocker_nodes = Arc::clone(&nodes);
         let blocker_re = Arc::clone(&re);
-        let blocker_thread = std::thread::spawn(move || {
-            let _lock = blocker_store.lock_save_for_test();
-            let _ = hold_tx.send(());
-            let _ = release_rx.recv();
-            drop(_lock);
+        let blocker = BlockerThreadGuard::spawn_lock_holder(Arc::clone(&store), move || {
             let _ = blocker_store.save_runtime(&blocker_nodes, &blocker_re);
         });
-        hold_rx.recv().unwrap();
 
         let rollback_body = r#"{"hijack_dns":true,"clear_dll_path":true}"#;
         let rb_resp = raw_http(
@@ -933,8 +968,7 @@ mod tests {
             Some(r"Z:\__nonexistent_windivert_test__\WinDivert.dll")
         );
 
-        let _ = release_tx.send(());
-        let _ = blocker_thread.join();
+        blocker.release_and_join();
         tokio::time::sleep(Duration::from_millis(30)).await;
         let _ = shutdown_tx.send(true);
         let _ = server_task.await;
