@@ -706,16 +706,34 @@ async fn persist_config_async_with_timeout(
         rule_engine,
         transparent.as_ref(),
     );
+    struct CancelOnDrop {
+        token: Arc<crate::config::PersistCancelToken>,
+        armed: bool,
+    }
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            if self.armed {
+                let _ = self.token.try_cancel();
+            }
+        }
+    }
+
     let cancel_token = Arc::new(crate::config::PersistCancelToken::new());
+    let mut cancel_guard = CancelOnDrop {
+        token: Arc::clone(&cancel_token),
+        armed: true,
+    };
     let token_for_task = Arc::clone(&cancel_token);
     let mut handle =
         tokio::task::spawn_blocking(move || store.save_profile_cancellable(&cfg, &token_for_task));
     match tokio::time::timeout(timeout, &mut handle).await {
         Ok(join_res) => {
+            cancel_guard.armed = false;
             join_res.context("Configuration persistence background task failed")??;
             Ok(())
         }
         Err(_) => {
+            cancel_guard.armed = false;
             if cancel_token.try_cancel() {
                 anyhow::bail!("Configuration persistence timed out after {:?}", timeout);
             }

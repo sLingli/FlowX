@@ -553,15 +553,20 @@ mod tests {
         }
     }
 
-    /// RAII 阻塞线程守卫：保证即便测试中途断言 panic，也会先释放锁并 `join` 后台线程，
-    /// 再由外层 `TempTestFile::drop` 清理临时配置文件，杜绝删文件后延迟写盘残留。
+    /// RAII 阻塞线程守卫：保证即便测试中途断言 panic，也会先中止服务端任务（配合 `CancelOnDrop` 取消未提交的写盘令牌）、
+    /// 再释放锁并 `join` 后台线程，最后由外层 `TempTestFile::drop` 清理临时配置文件，杜绝删文件后延迟写盘残留。
     struct BlockerThreadGuard {
+        abort_on_panic: Option<tokio::task::AbortHandle>,
         release_tx: Option<std::sync::mpsc::Sender<bool>>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
 
     impl BlockerThreadGuard {
-        fn spawn_lock_holder<F>(store: Arc<ConfigStore>, on_normal_release: F) -> Self
+        fn spawn_lock_holder<F>(
+            store: Arc<ConfigStore>,
+            abort_on_panic: tokio::task::AbortHandle,
+            on_normal_release: F,
+        ) -> Self
         where
             F: FnOnce() + Send + 'static,
         {
@@ -578,12 +583,14 @@ mod tests {
             });
             hold_rx.recv().unwrap();
             Self {
+                abort_on_panic: Some(abort_on_panic),
                 release_tx: Some(release_tx),
                 handle: Some(handle),
             }
         }
 
         fn release_and_join(mut self) {
+            self.abort_on_panic = None;
             if let Some(tx) = self.release_tx.take() {
                 let _ = tx.send(true);
             }
@@ -595,6 +602,9 @@ mod tests {
 
     impl Drop for BlockerThreadGuard {
         fn drop(&mut self) {
+            if let Some(abort_handle) = self.abort_on_panic.take() {
+                abort_handle.abort();
+            }
             if let Some(tx) = self.release_tx.take() {
                 let _ = tx.send(false);
             }
@@ -641,7 +651,11 @@ mod tests {
         let server_task = tokio::spawn(async move { server.run(listener, shutdown_rx).await });
 
         // Hold save_lock on a background OS thread to simulate stalled disk I/O across awaits
-        let blocker = BlockerThreadGuard::spawn_lock_holder(Arc::clone(&store), || {});
+        let blocker = BlockerThreadGuard::spawn_lock_holder(
+            Arc::clone(&store),
+            server_task.abort_handle(),
+            || {},
+        );
 
         let mut handles = Vec::new();
         for idx in 0..24 {
@@ -939,9 +953,13 @@ mod tests {
         let blocker_store = Arc::clone(&store);
         let blocker_nodes = Arc::clone(&nodes);
         let blocker_re = Arc::clone(&re);
-        let blocker = BlockerThreadGuard::spawn_lock_holder(Arc::clone(&store), move || {
-            let _ = blocker_store.save_runtime(&blocker_nodes, &blocker_re);
-        });
+        let blocker = BlockerThreadGuard::spawn_lock_holder(
+            Arc::clone(&store),
+            server_task.abort_handle(),
+            move || {
+                let _ = blocker_store.save_runtime(&blocker_nodes, &blocker_re);
+            },
+        );
 
         let rollback_body = r#"{"hijack_dns":true,"clear_dll_path":true}"#;
         let rb_resp = raw_http(

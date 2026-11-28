@@ -1163,6 +1163,7 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
 
     async fn run_bin(bin: &str, args: &[&str], extra_env: &[(&str, &str)]) -> std::process::Output {
         let mut cmd = Command::new(bin);
+        cmd.stdin(std::process::Stdio::null());
         cmd.kill_on_drop(true);
         for k in [
             "FLOWX_API",
@@ -1217,10 +1218,12 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
         assert!(out_meta.stderr.is_empty());
         assert!(!out_meta.stdout.is_empty());
     }
-    // Trailing/unknown args on `version` / `--version` must fail cleanly with non-zero exit
+    // Trailing/unknown args on `version` / `--version` / `help` and `-- --version` must fail cleanly
     for bad_ver in [
         &["version", "bogus"][..],
         &["--version", "--name", "foo"][..],
+        &["--", "--version"][..],
+        &["help", "extra"][..],
     ] {
         let out_bad_ver = run_bin(bin, bad_ver, &[("FLOWX_API", "://poisoned-host-env")]).await;
         assert!(
@@ -1228,6 +1231,83 @@ async fn test_cli_binary_stdout_stderr_json_and_emit_cli_error_and_exit() {
             "{bad_ver:?} should fail cleanly"
         );
     }
+
+    // 0b. Brand-new config + offline `rule add` returns real sequential ID (3, not doubled 6),
+    // so subsequent subprocesses can toggle/remove it by that returned ID.
+    let new_cfg_guard = TempConfigGuard::new("flowx_cli_bin_new_rule_id");
+    let new_cfg_str = new_cfg_guard.as_str();
+    let out_add_new = run_bin(
+        bin,
+        &[
+            "--config",
+            &new_cfg_str,
+            "--offline",
+            "--json",
+            "rule",
+            "add",
+            "--name",
+            "BrandNewRule",
+            "--action",
+            "Direct",
+        ],
+        &[],
+    )
+    .await;
+    assert!(
+        out_add_new.status.success(),
+        "new config rule add failed: {}",
+        String::from_utf8_lossy(&out_add_new.stderr)
+    );
+    assert!(out_add_new.stderr.is_empty());
+    let add_new_json: Value = serde_json::from_slice(&out_add_new.stdout).unwrap();
+    assert_eq!(
+        add_new_json["id"], 3,
+        "new config rule add must return ID 3 (not doubled 6): {add_new_json}"
+    );
+    let out_toggle_new = run_bin(
+        bin,
+        &[
+            "--config",
+            &new_cfg_str,
+            "--offline",
+            "--json",
+            "rule",
+            "toggle",
+            "3",
+            "--disable",
+        ],
+        &[],
+    )
+    .await;
+    assert!(
+        out_toggle_new.status.success(),
+        "toggle rule 3 failed: {}",
+        String::from_utf8_lossy(&out_toggle_new.stderr)
+    );
+    assert!(out_toggle_new.stderr.is_empty());
+    let toggle_new_json: Value = serde_json::from_slice(&out_toggle_new.stdout).unwrap();
+    assert_eq!(toggle_new_json["enabled"], false);
+    let out_rm_new = run_bin(
+        bin,
+        &[
+            "--config",
+            &new_cfg_str,
+            "--offline",
+            "--json",
+            "rule",
+            "remove",
+            "3",
+        ],
+        &[],
+    )
+    .await;
+    assert!(
+        out_rm_new.status.success(),
+        "remove rule 3 failed: {}",
+        String::from_utf8_lossy(&out_rm_new.stderr)
+    );
+    assert!(out_rm_new.stderr.is_empty());
+    drop(new_cfg_guard);
 
     // 1. Offline `status --json` succeeds even with poisoned host FLOWX_API and emits valid JSON on stdout
     let out_status = run_bin(
